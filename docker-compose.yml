@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: ontologist-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ontologist
+      POSTGRES_PASSWORD: ontologist
+      POSTGRES_DB: ontologist
+    ports:
+      - "5432:5432"
+    volumes:
+      - ontologist_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ontologist"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: ontologist-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - ontologist_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  ontologist_pg_data:
+  ontologist_redis_data:

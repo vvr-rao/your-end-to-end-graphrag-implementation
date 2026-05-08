@@ -1,0 +1,94 @@
+# =============================================================================
+# models.example.yaml
+#
+# Copy to models.yaml and edit. models.yaml is gitignored.
+#   cp config/models.example.yaml config/models.yaml
+#
+# Maps each LLM task to a provider + model + runtime params. Consumed by
+# backend/app/services/llm_router.py. Provider-agnostic interface — swap models
+# here without touching service code.
+# =============================================================================
+
+tasks:
+  # ---------------------------------------------------------------------------
+  # Cheap, high-volume classification (e.g. doc chunk → likely ontology areas).
+  # Groq's 70B Llama runs at <1s/call, ~10× cheaper than GPT-4-class.
+  # ---------------------------------------------------------------------------
+  chunk_classification:
+    provider: groq
+    model: llama-3.3-70b-versatile
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 2048
+
+  # ---------------------------------------------------------------------------
+  # The hard step: looking at a slice of ontology classes + a doc chunk and
+  # producing structured "MATCHES FOUND" / "MATCH NOT FOUND" JSON. Notebook
+  # uses gpt-4-turbo; we default to Anthropic Sonnet for stronger reasoning
+  # and built-in prompt caching of the system + ontology slice.
+  # ---------------------------------------------------------------------------
+  class_proposal:
+    provider: anthropic
+    model: claude-sonnet-4-7
+    timeout: 180
+    temperature: 0.0
+    max_tokens: 8192
+    # Anthropic prompt caching: cache the system prompt + ontology slice across
+    # the many doc-chunk calls in one expansion run. Significant cost savings.
+    prompt_caching: true
+
+  # ---------------------------------------------------------------------------
+  # Dedup pass: collapse multiple LLM outputs proposing the same class with
+  # slightly different labels. Structured-output reliability matters here.
+  # ---------------------------------------------------------------------------
+  match_dedup:
+    provider: openai
+    model: gpt-4.1
+    timeout: 120
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+
+  # ---------------------------------------------------------------------------
+  # Class-level summarization (Phase 2). Cheap, fast, plenty strong.
+  # ---------------------------------------------------------------------------
+  class_summarization:
+    provider: anthropic
+    model: claude-haiku-4-6
+    timeout: 60
+    temperature: 0.2
+    max_tokens: 1024
+
+  # ---------------------------------------------------------------------------
+  # QA answer synthesis (Phase 2). Highest reasoning task — gets the strongest
+  # model. Low temperature for citation faithfulness.
+  # ---------------------------------------------------------------------------
+  qa_synthesis:
+    provider: anthropic
+    model: claude-sonnet-4-7
+    timeout: 180
+    temperature: 0.1
+    max_tokens: 4096
+
+  # ---------------------------------------------------------------------------
+  # Embeddings — used for chunk_embeddings + class summary embeddings.
+  # text-embedding-3-small (1536 dim) is the default; ~6.5× cheaper than -large
+  # for ~3-5% MTEB lift. Schema's `model` column lets us re-embed later.
+  # ---------------------------------------------------------------------------
+  embeddings:
+    provider: openai
+    model: text-embedding-3-small
+    dim: 1536
+    batch_size: 100
+
+# =============================================================================
+# Retry / backoff defaults (applied by the router via tenacity unless overridden
+# at the task level above).
+# =============================================================================
+defaults:
+  retries:
+    max_attempts: 5
+    initial_wait_seconds: 1
+    max_wait_seconds: 30
+    # Retry only transient errors. Auth/4xx other than 429 fail fast.
+    retry_on_status: [429, 500, 502, 503, 504]

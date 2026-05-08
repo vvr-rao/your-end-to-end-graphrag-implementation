@@ -1,0 +1,57 @@
+# Local Claude Code memory (project goals/context)
+CLAUDE.local.md
+
+# Environment + real config (use .example versions as templates)
+.env
+.env.local
+.env.*.local
+config/config.yaml
+config/models.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# uv
+.uv/
+
+# Frontend (Phase 3)
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Project artifacts
+*.pkl
+llm_audit_log*.txt
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Ontology folders: keep top-level (notes.md tracked) but ignore subdirectories where actual .owl content lives
+source_ontologies/*/
+output_ontologies/*/
+
+# Reference materials (notebooks, scratch) — local-only, not part of source code
+reference/

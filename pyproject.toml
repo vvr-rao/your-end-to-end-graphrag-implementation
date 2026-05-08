@@ -1,0 +1,101 @@
+[project]
+name = "your-personal-ontologist"
+version = "0.0.1"
+description = "GraphRAG-based ontology and document management system"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+
+dependencies = [
+    # API
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "python-multipart>=0.0.20",         # multipart file upload
+
+    # DB / migrations
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30",
+    "alembic>=1.14",
+    "pgvector>=0.3.6",
+
+    # Config / settings
+    "pydantic>=2.10",
+    "pydantic-settings>=2.7",
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+
+    # Ontology + parsing
+    "owlready2>=0.46",
+    "rdflib>=7.1",
+
+    # Document readers
+    "pypdf>=5.1",
+    "python-pptx>=1.0",
+    "python-docx>=1.1",
+    "tiktoken>=0.8",
+
+    # HTTP / resilience
+    "httpx>=0.28",
+    "tenacity>=9.0",
+    "structlog>=24.4",
+
+    # Background jobs
+    "arq>=0.26",
+    "redis>=5.2",
+
+    # LLM providers
+    "openai>=1.59",
+    "anthropic>=0.42",
+    "groq>=0.15",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "httpx>=0.28",                       # ASGI test client
+    "asgi-lifespan>=2.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend/app"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "asgi-lifespan>=2.1",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N", "RUF"]
+ignore = ["E501"]                        # handled by formatter
+
+[tool.ruff.lint.per-file-ignores]
+"backend/app/helpers/*" = ["N802", "N803", "N806"]   # ported helpers may use non-PEP-8 names
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["backend/tests"]
+addopts = "-q --strict-markers"
+
+[tool.mypy]
+python_version = "3.12"
+plugins = ["pydantic.mypy"]
+strict = false                            # tighten gradually
+warn_unused_configs = true
+ignore_missing_imports = true
