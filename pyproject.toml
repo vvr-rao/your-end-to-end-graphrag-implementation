@@ -1,52 +1,47 @@
 [project]
-name = "your-personal-ontologist"
+name = "your-personal-knowledge-graph-creator"
 version = "0.0.1"
-description = "GraphRAG-based ontology and document management system"
+description = "GraphRAG-based ontology and document management system. Exposes FastAPI (REST) and MCP server in parallel so the same operations can be called by clients or by agents."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Proprietary" }
 
 dependencies = [
-    # API
+    # API + MCP (single source of truth — fastapi-mcp auto-exposes routes as MCP tools)
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
     "python-multipart>=0.0.20",         # multipart file upload
-
+    "fastapi-mcp>=0.4",
     # DB / migrations
     "sqlalchemy[asyncio]>=2.0.36",
     "asyncpg>=0.30",
     "alembic>=1.14",
     "pgvector>=0.3.6",
-
     # Config / settings
     "pydantic>=2.10",
     "pydantic-settings>=2.7",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
-
     # Ontology + parsing
     "owlready2>=0.46",
     "rdflib>=7.1",
-
     # Document readers
     "pypdf>=5.1",
     "python-pptx>=1.0",
     "python-docx>=1.1",
     "tiktoken>=0.8",
-
     # HTTP / resilience
     "httpx>=0.28",
     "tenacity>=9.0",
     "structlog>=24.4",
-
     # Background jobs
     "arq>=0.26",
     "redis>=5.2",
-
     # LLM providers
     "openai>=1.59",
     "anthropic>=0.42",
     "groq>=0.15",
+    "requests>=2.33.1",
 ]
 
 [project.optional-dependencies]
