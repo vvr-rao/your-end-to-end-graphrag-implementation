@@ -31,7 +31,7 @@ These ontologies support healthcare, clinical trials, drugs, diseases, treatment
 
 | Ontology | Purpose | Approx. Size | Download |
 |---|---|---|---|
-| OCRe | Clinical research ontology | ~100K triples | https://github.com/OCRediT/OCRe |
+| OCRe | Clinical research ontology | ~100K triples | https://github.com/OCRediT/OCRe |I found the best place is to manually download the .zip from https://bioportal.bioontology.org/ontologies/OCRE|
 | DRON | Drug ontology | ~1M+ triples | https://github.com/ufbmi/DiseaseOntology/tree/master/src/ontology/releases |
 | HPO | Human phenotype ontology | ~500K triples | https://hpo.jax.org/app/download/ontology |
 | MAXO | Medical actions/treatments | ~100K triples | https://github.com/monarch-initiative/MAxO |
