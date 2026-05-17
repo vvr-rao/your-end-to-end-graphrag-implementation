@@ -69,7 +69,7 @@ These ontologies support industrial systems, materials, products, IoT, telemetry
 
 | Ontology | Purpose | Approx. Size | Download |
 |---|---|---|---|
-| OntoCAPE | Industrial process and chemical engineering ontology | ~500K triples | https://www.avt.rwth-aachen.de/cms/AVT/Wirtschaft/SoftwareSimulation/~ipts/OntoCape/ ( https://www.avt.rwth-aachen.de/Ontocape click on "ontocape domin ontology")|
+| OntoCAPE | Industrial process and chemical engineering ontology | ~500K triples | https://www.avt.rwth-aachen.de/cms/AVT/Wirtschaft/SoftwareSimulation/~ipts/OntoCape/ ( https://www.avt.rwth-aachen.de/Ontocape click on "ontocape domain ontology")|
 | SAREF | Smart manufacturing and IoT ontology | ~50K triples | https://saref.etsi.org/ |
 | SSN/SOSA | Sensors and observations ontology | ~10K triples | https://www.w3.org/TR/vocab-ssn/ |
 | GoodRelations | Products, commerce, suppliers | ~20K triples | http://www.heppnetz.de/projects/goodrelations/ |

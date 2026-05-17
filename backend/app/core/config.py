@@ -76,29 +76,35 @@ class Settings(BaseSettings):
         return _load_yaml(CONFIG_DIR / "models.yaml")
 
 
+_SUPABASE_HOST_SUFFIXES = (".supabase.co", ".supabase.com")
+
+
 def _normalize_postgres_dsn(raw: str) -> str:
     """Accept bare `postgresql://` DSNs (e.g. Supabase) and produce an
-    asyncpg-driver DSN with SSL set appropriately for managed hosts.
+    asyncpg-driver DSN with SSL forced on for managed hosts.
 
     Rules:
-      1. `postgresql://` → `postgresql+asyncpg://`
-      2. For *.supabase.co hosts: ensure `ssl=require` is present.
+      1. `postgresql://` (or `postgres://`) → `postgresql+asyncpg://`.
+      2. For any Supabase host (.supabase.co direct, OR .supabase.com pooler):
+         force `sslmode=require` if no `ssl`/`sslmode` param is present.
+         asyncpg's default is `prefer`, which silently falls back to plaintext
+         if the server allows it — Supabase's pooler does allow plaintext, so
+         omitting this means passwords + queries travel unencrypted.
       3. Already-normalized DSNs pass through unchanged.
     """
     parts = urlsplit(raw)
 
     scheme = parts.scheme
-    if scheme == "postgresql":
-        scheme = "postgresql+asyncpg"
-    elif scheme == "postgres":
+    if scheme in ("postgresql", "postgres"):
         scheme = "postgresql+asyncpg"
 
     query_pairs = parse_qsl(parts.query, keep_blank_values=True)
     query_keys = {k.lower() for k, _ in query_pairs}
 
     hostname = (parts.hostname or "").lower()
-    if hostname.endswith(".supabase.co") and "ssl" not in query_keys and "sslmode" not in query_keys:
-        query_pairs.append(("ssl", "require"))
+    is_supabase = any(hostname.endswith(suffix) for suffix in _SUPABASE_HOST_SUFFIXES)
+    if is_supabase and "ssl" not in query_keys and "sslmode" not in query_keys:
+        query_pairs.append(("sslmode", "require"))
 
     return urlunsplit((scheme, parts.netloc, parts.path, urlencode(query_pairs), parts.fragment))
 
