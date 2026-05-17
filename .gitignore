@@ -6,7 +6,9 @@ CLAUDE.local.md
 .env.local
 .env.*.local
 .env.bak*
-.env-bakcup
+.env-bak*
+.env-backup
+.env.backup
 config/config.yaml
 config/models.yaml
 
