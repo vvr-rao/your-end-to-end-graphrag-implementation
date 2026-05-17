@@ -57,5 +57,15 @@ Thumbs.db
 source_ontologies/*/
 output_ontologies/*/
 
+# Source documents: only the top-level notes.md is tracked; everything else
+# (user-supplied PDFs/TXTs) is ignored.
+source_documents/*
+!source_documents/notes.md
+!source_documents/.gitkeep
+
+# User-supplied class suggestions are local config (domain-specific hints).
+# Repo ships a *.example.json template; the real file is gitignored.
+suggested_new_classes.json
+
 # Reference materials (notebooks, scratch) — local-only, not part of source code
 reference/

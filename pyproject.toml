@@ -85,7 +85,10 @@ ignore = ["E501"]                        # handled by formatter
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["backend/tests"]
-addopts = "-q --strict-markers"
+addopts = "-q --strict-markers -m 'not slow'"
+markers = [
+    "slow: deselect by default; runs the multi-ontology deterministic merge across all sample ontologies",
+]
 
 [tool.mypy]
 python_version = "3.12"

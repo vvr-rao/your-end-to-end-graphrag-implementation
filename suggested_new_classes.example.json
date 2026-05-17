@@ -1,0 +1,12 @@
+[
+  {
+    "CLASS_TYPE": "Adverse Events",
+    "CLASS_DESCRIPTION": "Adverse Events listed in a Drug or in a Study",
+    "PARENT_CLASS_TYPE": "NONE"
+  },
+  {
+    "CLASS_TYPE": "Mechanism of Action",
+    "CLASS_DESCRIPTION": "A method by which a given treatment acts on a medical condition",
+    "PARENT_CLASS_TYPE": "NONE"
+  }
+]
