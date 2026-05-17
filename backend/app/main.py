@@ -16,7 +16,10 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi_mcp import FastApiMCP
+
+from backend.app.core.config import get_settings
 
 
 @asynccontextmanager
@@ -32,6 +35,15 @@ app = FastAPI(
         "Same operations callable via REST or via MCP tools (mounted at /mcp)."
     ),
     lifespan=lifespan,
+)
+
+_settings = get_settings()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[_settings.frontend_origin],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 

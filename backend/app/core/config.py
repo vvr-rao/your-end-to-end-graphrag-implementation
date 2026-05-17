@@ -13,9 +13,10 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import yaml
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -26,17 +27,29 @@ class Settings(BaseSettings):
     """Environment-driven secrets and connection strings."""
 
     # --- Secrets / connection strings (from .env) ---
-    database_url: str = Field(..., description="postgresql+asyncpg://...")
+    database_url: str = Field(
+        ...,
+        description=(
+            "Postgres DSN. Accepts the bare Supabase format "
+            "(postgresql://postgres:PASSWORD@db.xxx.supabase.co:5432/postgres); "
+            "the validator below normalizes the scheme to asyncpg and appends "
+            "?ssl=require for *.supabase.co hosts."
+        ),
+    )
     redis_url: str = Field("redis://localhost:6379/0")
 
     openai_api_key: str | None = None
-    anthropic_api_key: str | None = None
     groq_api_key: str | None = None
 
     render_api_key: str | None = None
 
     storage_dir: Path = Path("./uploads")
     bearer_token: str = Field(..., description="Single shared API auth token")
+
+    frontend_origin: str = Field(
+        "http://localhost:5173",
+        description="CORS allow-origin for the React UI. Override in prod to the Render static URL.",
+    )
 
     log_level: str = "INFO"
     env: str = "development"
@@ -48,6 +61,11 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    @field_validator("database_url", mode="after")
+    @classmethod
+    def _normalize_database_url(cls, raw: str) -> str:
+        return _normalize_postgres_dsn(raw)
+
     # --- Layered YAML config (loaded lazily) ---
     @property
     def app_config(self) -> dict[str, Any]:
@@ -56,6 +74,33 @@ class Settings(BaseSettings):
     @property
     def models_config(self) -> dict[str, Any]:
         return _load_yaml(CONFIG_DIR / "models.yaml")
+
+
+def _normalize_postgres_dsn(raw: str) -> str:
+    """Accept bare `postgresql://` DSNs (e.g. Supabase) and produce an
+    asyncpg-driver DSN with SSL set appropriately for managed hosts.
+
+    Rules:
+      1. `postgresql://` → `postgresql+asyncpg://`
+      2. For *.supabase.co hosts: ensure `ssl=require` is present.
+      3. Already-normalized DSNs pass through unchanged.
+    """
+    parts = urlsplit(raw)
+
+    scheme = parts.scheme
+    if scheme == "postgresql":
+        scheme = "postgresql+asyncpg"
+    elif scheme == "postgres":
+        scheme = "postgresql+asyncpg"
+
+    query_pairs = parse_qsl(parts.query, keep_blank_values=True)
+    query_keys = {k.lower() for k, _ in query_pairs}
+
+    hostname = (parts.hostname or "").lower()
+    if hostname.endswith(".supabase.co") and "ssl" not in query_keys and "sslmode" not in query_keys:
+        query_pairs.append(("ssl", "require"))
+
+    return urlunsplit((scheme, parts.netloc, parts.path, urlencode(query_pairs), parts.fragment))
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:

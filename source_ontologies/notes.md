@@ -49,13 +49,13 @@ These ontologies model financial entities, instruments, contracts, securities, o
 
 | Ontology | Purpose | Approx. Size | Download |
 |---|---|---|---|
-| FIBO | Enterprise financial ontology | 5M+ triples | https://github.com/edmcouncil/fibo |
+| FIBO | Enterprise financial ontology | 5M+ triples | https://github.com/edmcouncil/fibo ( https://spec.edmcouncil.org/fibo/page/owl click on "Download FIBO OWL") |
 | FIGI | Financial instrument identifiers | ~100K triples | https://www.openfigi.com/ |
 | ISO 20022 Ontologies | Financial messaging concepts | ~500K triples | https://www.iso20022.org/ |
 | XBRL Taxonomies | Financial reporting semantics | ~1M triples | https://specifications.xbrl.org/ |
 | OMG Financial Ontologies | Finance and regulatory semantics | ~100K triples | https://www.omg.org/spec/ |
 
-Recommended FIBO Modules:
+Some FIBO Modules:
 - fibo-fnd-* (Foundation)
 - fibo-be-* (Business entities)
 - fibo-sec-* (Securities)
@@ -69,7 +69,7 @@ These ontologies support industrial systems, materials, products, IoT, telemetry
 
 | Ontology | Purpose | Approx. Size | Download |
 |---|---|---|---|
-| OntoCAPE | Industrial process and chemical engineering ontology | ~500K triples | https://www.avt.rwth-aachen.de/cms/AVT/Wirtschaft/SoftwareSimulation/~ipts/OntoCape/ |
+| OntoCAPE | Industrial process and chemical engineering ontology | ~500K triples | https://www.avt.rwth-aachen.de/cms/AVT/Wirtschaft/SoftwareSimulation/~ipts/OntoCape/ ( https://www.avt.rwth-aachen.de/Ontocape click on "ontocape domin ontology")|
 | SAREF | Smart manufacturing and IoT ontology | ~50K triples | https://saref.etsi.org/ |
 | SSN/SOSA | Sensors and observations ontology | ~10K triples | https://www.w3.org/TR/vocab-ssn/ |
 | GoodRelations | Products, commerce, suppliers | ~20K triples | http://www.heppnetz.de/projects/goodrelations/ |

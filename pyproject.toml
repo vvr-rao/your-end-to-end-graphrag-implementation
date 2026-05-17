@@ -37,9 +37,8 @@ dependencies = [
     # Background jobs
     "arq>=0.26",
     "redis>=5.2",
-    # LLM providers
+    # LLM providers (OpenAI for most tasks; Groq for chunk_classification only)
     "openai>=1.59",
-    "anthropic>=0.42",
     "groq>=0.15",
     "requests>=2.33.1",
 ]

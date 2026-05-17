@@ -1,0 +1,105 @@
+# =============================================================================
+# render.yaml — Render Blueprint for your-personal-knowledge-graph-creator
+#
+# Services:
+#   - backend  : FastAPI + MCP (Streamable HTTP) — single uvicorn process at /mcp + REST
+#   - worker   : arq background worker (Phase 1+; autoDeploy disabled until WorkerSettings lands)
+#   - frontend : static React + Vite UI
+#   - redis    : managed Redis (used by arq)
+#
+# Postgres is intentionally external (Supabase) — paste your connection string
+# into the `DATABASE_URL` env var of the backend + worker services. The app
+# auto-normalizes the scheme to asyncpg and appends ?ssl=require for *.supabase.co.
+# =============================================================================
+
+services:
+  - type: web
+    name: backend
+    runtime: docker
+    plan: starter
+    region: oregon
+    rootDir: .
+    dockerfilePath: ./backend/Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false                          # paste Supabase DSN in dashboard
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: redis
+          property: connectionString
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: BEARER_TOKEN
+        generateValue: true
+      - key: FRONTEND_ORIGIN
+        sync: false                          # set to the deployed frontend URL
+      - key: STORAGE_DIR
+        value: /var/data/uploads
+      - key: LOG_LEVEL
+        value: INFO
+      - key: ENV
+        value: production
+    disk:
+      name: backend-uploads
+      mountPath: /var/data/uploads
+      sizeGB: 5
+
+  - type: worker
+    name: worker
+    runtime: docker
+    plan: starter
+    region: oregon
+    rootDir: .
+    dockerfilePath: ./backend/Dockerfile
+    dockerCommand: uv run arq backend.app.jobs.worker.WorkerSettings
+    autoDeploy: false                        # enable once Phase 1 ships the worker module
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: redis
+          property: connectionString
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: BEARER_TOKEN
+        fromService:
+          type: web
+          name: backend
+          envVarKey: BEARER_TOKEN
+      - key: STORAGE_DIR
+        value: /var/data/uploads
+      - key: LOG_LEVEL
+        value: INFO
+      - key: ENV
+        value: production
+
+  - type: web
+    name: frontend
+    runtime: static
+    plan: starter
+    region: oregon
+    rootDir: frontend
+    buildCommand: npm ci && npm run build
+    staticPublishPath: ./dist
+    envVars:
+      - key: VITE_API_BASE_URL
+        sync: false                          # set to the backend service URL
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+
+  - type: redis
+    name: redis
+    plan: starter
+    region: oregon
+    ipAllowList: []                          # only Render-internal services
+    maxmemoryPolicy: noeviction
