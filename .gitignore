@@ -57,11 +57,16 @@ Thumbs.db
 source_ontologies/*/
 output_ontologies/*/
 
-# Source documents: only the top-level notes.md is tracked; everything else
-# (user-supplied PDFs/TXTs) is ignored.
+# Source documents: only the top-level notes.md + the bundled downloader
+# CLIs are tracked; everything else (user-supplied PDFs/TXTs, per-tool
+# output folders) is ignored.
 source_documents/*
 !source_documents/notes.md
 !source_documents/.gitkeep
+!source_documents/_downloader_common.py
+!source_documents/dailymed_download.py
+!source_documents/websearch_download.py
+!source_documents/financial_report_download.py
 
 # User-supplied class suggestions are local config (domain-specific hints).
 # Repo ships a *.example.json template; the real file is gitignored.
