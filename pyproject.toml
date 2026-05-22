@@ -41,6 +41,9 @@ dependencies = [
     "openai>=1.59",
     "groq>=0.15",
     "requests>=2.33.1",
+    # Local Dash visualizer (`uv run python -m visualizer`)
+    "dash>=2.18",
+    "dash-cytoscape>=1.0",
 ]
 
 [project.optional-dependencies]

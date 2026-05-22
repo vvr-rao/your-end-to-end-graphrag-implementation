@@ -94,10 +94,35 @@ uv run python -m backend.app.cli expand \
 
 ### How `merge` handles multi-file inputs
 
-- A single `.owl`/`.rdf`/`.ttl`: parsed directly via owlready2.
-- A `.zip` of many files: extracted to a temp directory; every `.owl`/`.rdf`/`.ttl` inside is enumerated. Cross-file `owl:imports` (including OntoCAPE's `file:/C:/...` Windows-style imports and XML `<!ENTITY>` references) are resolved to the local extracted copies via an IRI map. Only the **root** files (those not imported by anything in the set) are loaded; owlready2's import walker pulls in the rest in one pass per root — O(N) instead of O(N²).
-- Imports that point to siblings the zip doesn't ship (e.g. OntoCAPE's reference to a separate `meta_model.owl` package) are stripped from the extracted copies so the rest of the load succeeds.
-- All four sample ontology bundles work: SKOS, OCRe.zip, the OntoCAPE zip (slow but completes), the FIBO `prod.rdf.zip` (also slow), plus the giants (DRON 670MB, HP 73MB) which the `merge` command can parse but which we skip in the test suite.
+- A single `.owl`/`.rdf`/`.ttl`: parsed directly via owlready2 in its own isolated `World()`.
+- A `.zip` of many files: extracted to a temp directory; every `.owl`/`.rdf`/`.ttl` inside is enumerated. Each file is loaded into its **own per-file owlready2.World()** so triples don't accumulate across files (this is what kept FIBO and OntoCAPE merges from hanging — previously the shared `default_world` plus per-call `rdf_graph` snapshot made total extraction O(N²)).
+- Cross-file `owl:imports` (including OntoCAPE's `file:/C:/...` Windows-style imports baked via XML `<!ENTITY>` references, and FIBO's OASIS `catalog-v001.xml` files) are resolved to the local extracted copies via an IRI map.
+- HTTP(S) imports that owlready2 doesn't already know about (FIBO's `https://www.omg.org/...`, `https://spec.edmcouncil.org/...`) are stripped from the extracted copies so owlready2 doesn't hang on a TCP SYN trying to fetch them.
+- `file:` imports that point to siblings the zip doesn't ship (OntoCAPE's reference to a separate `meta_model.owl` package) are also stripped.
+- Per-file failures (a defective XML file mid-zip; an owlready2 incompatibility) are logged and skipped so one bad file doesn't kill the whole merge.
+- Verified merges on the dev machine:
+  - OCRe.zip: 389 classes, ~6s.
+  - HP.owl: 32,085 classes, ~75s.
+  - OntoCAPE zip: 790 classes, 63/64 files (1 skipped due to an orphan `-->` in the source archive), ~50s.
+  - FIBO `prod.rdf.zip`: 2,237 classes / 222 files, ~254s.
+  - DRON.owl (670MB): excluded from automated tests — owlready2 needs ~3GB RAM to parse, which exceeds the 2.7GB ceiling on a typical dev laptop. Verifiable manually on bigger hardware via the CLI.
+
+## Visualizer
+
+A local Dash-based browser viewer for any `.owl` / `.rdf` / `.ttl` file — generated merges or industry inputs.
+
+```bash
+uv run python -m visualizer
+# then open http://127.0.0.1:8050
+```
+
+Features:
+- Dropdown lists files from `output_ontologies/` (Generated) and `source_ontologies/` (Source Ontologies); the **Custom path** field accepts any absolute path.
+- Toggle node types (classes, object properties, data properties, individuals).
+- Substring filter on labels/IRIs; `Hops` slider does N-hop BFS expansion around matches using the same `build_class_graph` / `collect_related_class_iris` helpers the pruning pipeline uses.
+- Click a node to see its labels, comments, superclasses, domain/range, sources.
+- Files larger than 200 MB (DRON) display a "too large to load" message instead of trying to parse.
+- Each file is loaded in its own owlready2 `World()` so switching between two files in one session can't leak entities across them.
 
 ## LLM providers
 
