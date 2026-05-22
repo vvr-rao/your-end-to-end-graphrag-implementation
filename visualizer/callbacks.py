@@ -1,14 +1,14 @@
 """Reactive callbacks for the Dash visualizer: load file -> filter ->
-N-hop expand -> build Cytoscape elements + summary stats + detail card."""
+N-hop expand -> build Cytoscape elements + summary stats. Node clicks
+populate a modal overlay (driven by separate open/close callbacks)."""
 
 from __future__ import annotations
 
 import json
-from collections import deque
 from pathlib import Path
 from typing import Any
 
-from dash import Input, Output, State, no_update
+from dash import Input, Output, State, ctx, no_update
 
 from backend.app.helpers.ontology_pruning import (
     collect_related_class_iris,
@@ -270,10 +270,17 @@ def register_callbacks(app) -> None:
         Input("file-dropdown", "value"),
         Input("custom-path", "value"),
         Input("type-filter", "value"),
-        Input("name-filter", "value"),
+        Input("search-button", "n_clicks"),
+        Input("name-filter", "n_submit"),
         Input("hops-slider", "value"),
+        State("name-filter", "value"),
     )
-    def _on_inputs(file_value, custom_text, types, name_filter, hops):
+    def _on_inputs(file_value, custom_text, types, _clicks, _submits, hops, name_filter):
+        # Search trigger: re-renders happen on Search-button click, name-filter
+        # Enter press (n_submit), or any of the file/type/hops changes. The
+        # name-filter VALUE comes through as State so typing it doesn't re-render
+        # on every keystroke.
+
         # Pick which path wins: custom path overrides dropdown when valid.
         path: Path | None = None
         custom_error = ""
@@ -307,24 +314,47 @@ def register_callbacks(app) -> None:
         return elements, stats_text, status, custom_error
 
     @app.callback(
-        Output("detail-card", "children"),
+        Output("graph", "layout"),
+        Input("layout-name", "value"),
+        Input("fit-button", "n_clicks"),
+        State("layout-name", "value"),
+    )
+    def _on_layout(layout_name, _fit_clicks, current):
+        # Both layout-dropdown changes and Fit-button clicks rebuild the layout
+        # config. animate=False keeps the rebuild snappy on dense graphs.
+        chosen = layout_name or current or "cose"
+        return {"name": chosen, "animate": False}
+
+    @app.callback(
+        Output("modal-backdrop", "style"),
+        Output("modal-title", "children"),
+        Output("modal-body", "children"),
         Input("graph", "tapNodeData"),
+        Input("modal-close", "n_clicks"),
         State("file-dropdown", "value"),
         State("custom-path", "value"),
+        State("modal-backdrop", "style"),
     )
-    def _on_node_tap(node_data, file_value, custom_text):
+    def _modal(node_data, _close_clicks, file_value, custom_text, current_style):
+        triggered = ctx.triggered_id
+        base_style = dict(current_style or {})
+        if triggered == "modal-close":
+            base_style["display"] = "none"
+            return base_style, "", ""
         if not node_data:
-            return "Click a node to see its details."
+            # No tap yet -- keep modal hidden, leave content empty.
+            base_style["display"] = "none"
+            return base_style, "", ""
         path = resolve_custom_path(custom_text or "") or (Path(file_value) if file_value else None)
         if path is None:
-            return "No file loaded."
+            return no_update, no_update, no_update
         loaded = load_ontology(path)
         if loaded is None:
-            return "File no longer loadable."
+            return no_update, no_update, no_update
         kind = node_data.get("kind") or node_data.get("type")
         iri = node_data.get("iri") or node_data.get("id")
         if not iri:
-            return "Selected node has no IRI."
+            return no_update, no_update, no_update
         dict_name = {
             "class": "classes_dict",
             "object_property": "object_properties_dict",
@@ -332,9 +362,12 @@ def register_callbacks(app) -> None:
             "individual": "instances_dict",
         }.get(kind, "classes_dict")
         entity = loaded.get(dict_name, {}).get(iri)
+        title = node_data.get("label") or iri
+        base_style["display"] = "flex"
         if entity is None:
-            return f"{iri}\n(entity not found in {dict_name})"
-        return json.dumps(_summarize_entity(entity), indent=2, default=str)
+            return base_style, title, f"{iri}\n(entity not found in {dict_name})"
+        body = json.dumps(_summarize_entity(entity), indent=2, default=str)
+        return base_style, title, body
 
 
 def _summarize_entity(entity: dict) -> dict:

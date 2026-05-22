@@ -119,8 +119,9 @@ uv run python -m visualizer
 Features:
 - Dropdown lists files from `output_ontologies/` (Generated) and `source_ontologies/` (Source Ontologies); the **Custom path** field accepts any absolute path.
 - Toggle node types (classes, object properties, data properties, individuals).
-- Substring filter on labels/IRIs; `Hops` slider does N-hop BFS expansion around matches using the same `build_class_graph` / `collect_related_class_iris` helpers the pruning pipeline uses.
-- Click a node to see its labels, comments, superclasses, domain/range, sources.
+- **Graph layout chooser**: force-directed (`cose`, default) / tree (`breadthfirst`) / concentric rings / circle / grid / random. The **Fit / reset view** button re-runs the currently-selected layout.
+- **Search**: substring match on labels OR IRIs, case-insensitive. Type a query and either press **Enter** or click the **Search** button to apply. `Hops` slider does N-hop BFS expansion around matches using the same `build_class_graph` / `collect_related_class_iris` helpers the pruning pipeline uses.
+- **Click any node** to open a centered **modal** with its labels, comments, superclasses, domain/range, sources, etc. Close button (or click another node to swap content).
 - Files larger than 200 MB (DRON) display a "too large to load" message instead of trying to parse.
 - Each file is loaded in its own owlready2 `World()` so switching between two files in one session can't leak entities across them.
 

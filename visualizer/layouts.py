@@ -1,5 +1,5 @@
-"""Dash UI layout: sidebar (file picker, filters, stats) + main pane
-(cytoscape graph + selected-node detail card)."""
+"""Dash UI layout: sidebar (file picker, filters, layout, stats) + main pane
+(cytoscape graph) + modal popup overlay for node details."""
 
 from __future__ import annotations
 
@@ -16,6 +16,16 @@ NODE_TYPE_OPTIONS = [
     {"label": "Data properties", "value": "data_property"},
     {"label": "Individuals", "value": "individual"},
 ]
+
+LAYOUT_OPTIONS = [
+    {"label": "Force-directed (cose)", "value": "cose"},
+    {"label": "Tree (breadth-first)", "value": "breadthfirst"},
+    {"label": "Concentric rings", "value": "concentric"},
+    {"label": "Circle", "value": "circle"},
+    {"label": "Grid", "value": "grid"},
+    {"label": "Random", "value": "random"},
+]
+DEFAULT_LAYOUT = "cose"
 
 CYTO_STYLESHEET = [
     {
@@ -108,13 +118,33 @@ def build_layout(files: Sequence[DiscoveredFile]) -> html.Div:
                         labelStyle={"display": "block"},
                     ),
                     html.Hr(),
-                    html.Label("Name filter (substring; matches label or IRI):"),
-                    dcc.Input(
-                        id="name-filter",
-                        type="text",
-                        placeholder="e.g. Person",
-                        debounce=True,
-                        style={"width": "100%"},
+                    html.Label("Graph layout:"),
+                    dcc.Dropdown(
+                        id="layout-name",
+                        options=LAYOUT_OPTIONS,
+                        value=DEFAULT_LAYOUT,
+                        clearable=False,
+                    ),
+                    html.Hr(),
+                    html.Label("Search:"),
+                    html.Div(
+                        style={"display": "flex", "gap": "6px", "marginTop": "4px"},
+                        children=[
+                            dcc.Input(
+                                id="name-filter",
+                                type="text",
+                                placeholder="e.g. Person",
+                                debounce=False,
+                                n_submit=0,
+                                style={"flex": 1, "minWidth": 0},
+                            ),
+                            html.Button("Search", id="search-button", n_clicks=0),
+                        ],
+                    ),
+                    html.Div(
+                        "Substring match on label or IRI · case-insensitive · "
+                        "press Enter or click Search",
+                        style={"fontSize": "11px", "color": "#666", "marginTop": "4px"},
                     ),
                     html.Br(),
                     html.Label("Hops from matches:"),
@@ -133,31 +163,76 @@ def build_layout(files: Sequence[DiscoveredFile]) -> html.Div:
                     html.Div(id="status", style={"marginTop": "12px", "color": "#666"}),
                 ],
             ),
-            # Main pane
+            # Main pane: graph fills the available space; node details show
+            # in a modal overlay (see below) instead of a bottom panel.
             html.Div(
                 style={"flex": 1, "display": "flex", "flexDirection": "column"},
                 children=[
                     cyto.Cytoscape(
                         id="graph",
-                        layout={"name": "cose", "animate": False},
-                        style={"flex": "3", "width": "100%"},
+                        layout={"name": DEFAULT_LAYOUT, "animate": False},
+                        style={"flex": "1", "width": "100%", "height": "100%"},
                         stylesheet=CYTO_STYLESHEET,
                         elements=[],
                     ),
-                    html.Div(
-                        id="detail-card",
-                        style={
-                            "flex": "1",
-                            "padding": "12px",
-                            "borderTop": "1px solid #ddd",
-                            "overflowY": "auto",
-                            "fontFamily": "monospace",
-                            "fontSize": "12px",
-                            "whiteSpace": "pre-wrap",
-                        },
-                        children="Click a node to see its details.",
-                    ),
                 ],
+            ),
+            # Modal overlay for node details. Hidden by default; opens on
+            # node tap, closes via the Close button.
+            html.Div(
+                id="modal-backdrop",
+                style={
+                    "display": "none",
+                    "position": "fixed",
+                    "top": 0,
+                    "left": 0,
+                    "width": "100vw",
+                    "height": "100vh",
+                    "background": "rgba(0,0,0,0.45)",
+                    "zIndex": 1000,
+                    "justifyContent": "center",
+                    "alignItems": "center",
+                },
+                children=html.Div(
+                    id="modal-content",
+                    style={
+                        "background": "#fff",
+                        "padding": "20px",
+                        "borderRadius": "6px",
+                        "maxWidth": "640px",
+                        "width": "90%",
+                        "maxHeight": "80vh",
+                        "overflowY": "auto",
+                        "boxShadow": "0 8px 24px rgba(0,0,0,0.2)",
+                    },
+                    children=[
+                        html.Div(
+                            style={
+                                "display": "flex",
+                                "justifyContent": "space-between",
+                                "alignItems": "center",
+                                "marginBottom": "10px",
+                                "gap": "10px",
+                            },
+                            children=[
+                                html.Strong(
+                                    id="modal-title",
+                                    style={"fontFamily": "sans-serif", "fontSize": "14px"},
+                                ),
+                                html.Button("Close", id="modal-close", n_clicks=0),
+                            ],
+                        ),
+                        html.Pre(
+                            id="modal-body",
+                            style={
+                                "fontFamily": "monospace",
+                                "fontSize": "12px",
+                                "whiteSpace": "pre-wrap",
+                                "margin": 0,
+                            },
+                        ),
+                    ],
+                ),
             ),
         ],
     )
