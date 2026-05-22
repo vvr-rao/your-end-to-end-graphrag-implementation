@@ -38,8 +38,13 @@ def load_version_folder(folder: Path) -> dict[str, Any]:
 
 
 def write_merged_json(version_dir: Path, loaded_ontology: dict[str, Any]) -> Path:
+    """Stream the ontology dict to disk. Using `json.dump(obj, file_handle)`
+    instead of `path.write_text(json.dumps(obj))` avoids materializing the
+    full JSON STRING in memory before writing -- for HP-scale merges that
+    string is ~180 MB and used to OOM-kill the process on 2.7 GB machines."""
     path = version_dir / MERGED_JSON
-    path.write_text(json.dumps(loaded_ontology, indent=2, default=str))
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(loaded_ontology, fh, indent=2, default=str)
     return path
 
 

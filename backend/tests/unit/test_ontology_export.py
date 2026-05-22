@@ -88,3 +88,63 @@ def test_round_trip_through_rdflib(tmp_path: Path) -> None:
     individuals = set(g.subjects(RDF.type, OWL.NamedIndividual))
     assert rdflib.URIRef("http://x/a1") in individuals
     assert (rdflib.URIRef("http://x/a1"), RDF.type, rdflib.URIRef("http://x/A")) in g
+
+
+def test_streaming_export_on_1000_classes(tmp_path: Path) -> None:
+    """Regression test for the OOM-during-write_owl bug. Verifies the
+    streaming export produces a syntactically valid RDF/XML file with
+    the correct class count when the input ontology has ~1000 classes.
+    Each class declares a subClassOf to a 'root' and a raw_axiom_triple
+    so the export touches the same code paths as the HP/FIBO scale runs.
+    """
+    base = "http://example.org/big/"
+    root_iri = base + "Root"
+    classes = {
+        root_iri: {
+            "iri": root_iri,
+            "name": "Root",
+            "labels": ["Root"],
+            "comments": [],
+            "descriptions": [],
+            "superclasses": [],
+            "raw_axiom_triples": [],
+        }
+    }
+    n = 1000
+    for i in range(n):
+        iri = f"{base}C{i:04d}"
+        classes[iri] = {
+            "iri": iri,
+            "name": f"C{i:04d}",
+            "labels": [f"Class {i}"],
+            "comments": [],
+            "descriptions": [f"Auto-generated class number {i}."],
+            "superclasses": [{"kind": "entity", "iri": root_iri, "name": "Root"}],
+            "raw_axiom_triples": [
+                {"predicate": "http://example.org/ann/seq",
+                 "object": {"kind": "literal", "value": i, "datatype": "http://www.w3.org/2001/XMLSchema#integer", "lang": None}},
+            ],
+        }
+    loaded = {
+        "classes_dict": classes,
+        "object_properties_dict": {},
+        "data_properties_dict": {},
+        "instances_dict": {},
+    }
+    out = tmp_path / "big.owl"
+    ontology_export.write_owl(loaded, out)
+    assert out.exists() and out.stat().st_size > 0
+
+    g = rdflib.Graph()
+    g.parse(str(out), format="xml")
+    declared = set(g.subjects(RDF.type, OWL.Class))
+    # All N + 1 (root) classes round-trip.
+    assert len(declared) == n + 1
+    assert rdflib.URIRef(root_iri) in declared
+    # Spot-check one subClassOf link.
+    assert (rdflib.URIRef(f"{base}C0042"), RDFS.subClassOf, rdflib.URIRef(root_iri)) in g
+    # Raw-triple replay survived.
+    assert any(
+        str(p) == "http://example.org/ann/seq"
+        for _, p, _ in g.triples((rdflib.URIRef(f"{base}C0042"), None, None))
+    )

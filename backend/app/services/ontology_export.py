@@ -15,6 +15,7 @@ Output format: RDF/XML (the conventional .owl serialization).
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -257,9 +258,218 @@ def build_owl_graph(
     return graph
 
 
-def write_owl(loaded_ontology: dict[str, Any], output_path: Path, ontology_iri: str = DEFAULT_ONTOLOGY_IRI) -> Path:
-    """Serialize a loaded ontology to RDF/XML at output_path."""
-    graph = build_owl_graph(loaded_ontology, ontology_iri=ontology_iri)
+def write_owl(
+    loaded_ontology: dict[str, Any],
+    output_path: Path,
+    ontology_iri: str = DEFAULT_ONTOLOGY_IRI,
+    *,
+    consume_dict: bool = False,
+) -> Path:
+    """Serialize a loaded ontology to RDF/XML at output_path.
+
+    Uses streaming emission (one entity at a time) so the peak in-memory
+    rdflib Graph stays bounded -- previous behaviour built the FULL graph
+    in memory before serializing, which OOM-killed HP-scale merges on
+    machines with < 4 GiB available RAM.
+
+    Pass `consume_dict=True` when the caller is done with the loaded
+    ontology -- entries are popped from the input dict as they're emitted
+    so the dict's memory footprint shrinks during the run. Used by
+    `pipeline.run_merge` after `write_merged_json` has already persisted
+    the data.
+    """
+    return write_owl_streaming(
+        loaded_ontology,
+        output_path,
+        ontology_iri=ontology_iri,
+        consume_dict=consume_dict,
+    )
+
+
+# Stable XML header used by the streaming writer. The prefixes here must
+# cover every URIRef we emit inside per-entity fragments (rdflib generates
+# `<rdf:Description ...>` blocks using these prefixes).
+_STREAMING_HEADER_TPL = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<rdf:RDF\n'
+    '    xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"\n'
+    '    xmlns:rdfs="http://www.w3.org/2000/01/rdf-schema#"\n'
+    '    xmlns:owl="http://www.w3.org/2002/07/owl#"\n'
+    '    xmlns:xsd="http://www.w3.org/2001/XMLSchema#"\n'
+    '    xmlns:ont="{ontology_iri_slash}">\n'
+    '  <owl:Ontology rdf:about="{ontology_iri}"/>\n'
+)
+
+
+# Prefixes that are already declared on the outer streaming <rdf:RDF> tag.
+# Any others from per-entity rdflib fragments (rdflib auto-coins ns1, ns2, ...
+# for unknown predicate namespaces in raw_axiom_triples) must be re-inlined
+# onto the fragment's outer element so they stay in scope after we drop the
+# fragment's own <rdf:RDF> wrapper.
+_HEADER_PREFIX_NAMES = {"xmlns:rdf", "xmlns:rdfs", "xmlns:owl", "xmlns:xsd", "xmlns:ont"}
+_XMLNS_RE = re.compile(r'xmlns:[\w-]+="[^"]*"')
+
+
+def _strip_rdf_wrapper(xml: str) -> str:
+    """Return everything between the opening `<rdf:RDF ...>` tag and the
+    closing `</rdf:RDF>` from a per-entity rdflib fragment. Any xmlns
+    declarations present on the fragment's wrapper that aren't in the
+    streaming header are inlined onto the fragment's outer element so
+    references like `ns1:foo` stay resolvable."""
+    open_idx = xml.find("<rdf:RDF")
+    if open_idx == -1:
+        return xml
+    open_tag_end = xml.find(">", open_idx)
+    close_tag_start = xml.rfind("</rdf:RDF>")
+    if open_tag_end == -1 or close_tag_start == -1:
+        return xml
+
+    wrapper_tag = xml[open_idx : open_tag_end + 1]
+    body = xml[open_tag_end + 1 : close_tag_start].strip("\n")
+    if not body:
+        return body
+
+    # Pull every xmlns:foo="..." from the fragment's wrapper tag; keep only
+    # the ones the streaming header doesn't already declare.
+    extras = [
+        decl
+        for decl in _XMLNS_RE.findall(wrapper_tag)
+        if decl.split("=", 1)[0] not in _HEADER_PREFIX_NAMES
+    ]
+    if not extras:
+        return body
+
+    # Inject those xmlns declarations into the FIRST open tag in the body
+    # so the prefixes stay in scope for all of its descendants.
+    first_open = body.find("<")
+    if first_open == -1:
+        return body
+    first_close = body.find(">", first_open)
+    if first_close == -1:
+        return body
+    first_tag = body[first_open : first_close + 1]
+    inject = " " + " ".join(extras)
+    if first_tag.endswith("/>"):
+        new_tag = first_tag[:-2] + inject + "/>"
+    else:
+        new_tag = first_tag[:-1] + inject + ">"
+    return body[:first_open] + new_tag + body[first_close + 1 :]
+
+
+def _build_entity_graph(
+    entity_iri: str,
+    type_uri: URIRef,
+    record: dict[str, Any],
+    kind: str,
+) -> Graph:
+    """Build a tiny rdflib Graph holding only the triples for one entity.
+
+    Mirrors the per-entity logic in `build_owl_graph` but in isolation so
+    the caller can serialize each fragment and discard it before moving
+    to the next entity.
+    """
+    g = Graph()
+    g.bind("owl", OWL)
+    g.bind("rdf", RDF)
+    g.bind("rdfs", RDFS)
+    g.bind("xsd", XSD)
+    uri = _uri(entity_iri)
+    if uri is None:
+        return g
+    _add_typed(g, uri, type_uri)
+    _add_annotations(g, uri, record)
+    if kind == "class":
+        _add_subclass_of(g, uri, record.get("superclasses"))
+        _add_equivalence_and_disjoint(g, uri, record)
+    elif kind in ("object_property", "data_property"):
+        _add_property_domain_range(g, uri, record)
+        _add_property_characteristics(g, uri, record)
+        for sp in record.get("superproperties") or []:
+            sp_uri = _uri(sp)
+            if sp_uri is not None:
+                g.add((uri, RDFS.subPropertyOf, sp_uri))
+        inv = _uri(record.get("inverse_property"))
+        if inv is not None:
+            g.add((uri, OWL.inverseOf, inv))
+    elif kind == "instance":
+        for parent in record.get("classes") or record.get("types") or []:
+            parent_uri = _uri(parent)
+            if parent_uri is not None:
+                g.add((uri, RDF.type, parent_uri))
+    _replay_raw_triples(g, uri, record.get("raw_axiom_triples"))
+    return g
+
+
+def write_owl_streaming(
+    loaded_ontology: dict[str, Any],
+    output_path: Path,
+    ontology_iri: str = DEFAULT_ONTOLOGY_IRI,
+    *,
+    consume_dict: bool = False,
+) -> Path:
+    """Stream-serialize a loaded ontology to RDF/XML at output_path.
+
+    Each class/property/instance is serialized through its own tiny
+    rdflib.Graph, the wrapper is stripped, and the inner fragment is
+    appended to the output file. This keeps memory bounded to one
+    entity's triples regardless of total ontology size.
+
+    When `consume_dict=True`, entries are popped from
+    `loaded_ontology["..._dict"]` as they're emitted so the in-memory
+    dict shrinks during the run. For HP-class merges (32 K entries +
+    raw_axiom_triples ≈ 500 MB dict on a 2.7 GB machine) this is the
+    difference between OOM and success -- the caller has already written
+    `merged.json` and won't reuse the dict, so consuming it is safe.
+    """
+    import gc
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    graph.serialize(destination=str(output_path), format="xml")
+    iri_slash = ontology_iri.rstrip("#/") + "/"
+    with output_path.open("w", encoding="utf-8") as fh:
+        fh.write(
+            _STREAMING_HEADER_TPL.format(
+                ontology_iri=ontology_iri,
+                ontology_iri_slash=iri_slash,
+            )
+        )
+
+        def _emit(entity_iri: str, type_uri: URIRef, record: dict[str, Any], kind: str) -> None:
+            g = _build_entity_graph(entity_iri, type_uri, record, kind)
+            if len(g) == 0:
+                return
+            xml = g.serialize(format="pretty-xml")
+            body = _strip_rdf_wrapper(xml)
+            if body:
+                fh.write(body)
+                fh.write("\n")
+
+        def _drain(dict_name: str, type_uri: URIRef, kind: str) -> None:
+            source = loaded_ontology.get(dict_name, {})
+            if consume_dict:
+                # Iterate by popping so each entity's Python objects can be
+                # GC'd as we move on. Iterating by .items() would keep all
+                # references alive in the dict until the loop ends.
+                keys = list(source.keys())
+                processed = 0
+                for iri in keys:
+                    record = source.pop(iri, None)
+                    if record is None:
+                        continue
+                    _emit(iri, type_uri, record, kind)
+                    del record
+                    processed += 1
+                    # Encourage GC every few thousand entities so RSS
+                    # doesn't drift up over the run.
+                    if processed % 4096 == 0:
+                        gc.collect()
+            else:
+                for iri, record in source.items():
+                    _emit(iri, type_uri, record, kind)
+
+        _drain("classes_dict", OWL.Class, "class")
+        _drain("object_properties_dict", OWL.ObjectProperty, "object_property")
+        _drain("data_properties_dict", OWL.DatatypeProperty, "data_property")
+        _drain("instances_dict", OWL.NamedIndividual, "instance")
+
+        fh.write("</rdf:RDF>\n")
     return output_path

@@ -38,7 +38,13 @@ def run_merge(
 
     json_path = folder_io.write_merged_json(version_dir, loaded)
     print(f"[merge] wrote {json_path.name} ({json_path.stat().st_size:,} bytes)")
-    owl_path = ontology_export.write_owl(loaded, version_dir / folder_io.MERGED_OWL)
+    # `consume_dict=True`: drop in-memory dict entries as they're emitted to
+    # the OWL. After write_merged_json the dict has already been persisted,
+    # nothing further needs it, and on HP-scale merges the freed memory is
+    # the difference between OOM and success.
+    owl_path = ontology_export.write_owl(
+        loaded, version_dir / folder_io.MERGED_OWL, consume_dict=True
+    )
     print(f"[merge] wrote {owl_path.name} ({owl_path.stat().st_size:,} bytes)")
 
     versioning.write_manifest(

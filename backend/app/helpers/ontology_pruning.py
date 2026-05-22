@@ -679,35 +679,52 @@ def collect_full_class_hierarchy(
     """For each seed IRI, return seeds plus ALL ancestors plus ALL
     descendants via the IS-A (subClassOf) hierarchy.
 
-    Unlike `collect_related_class_iris`, this walks ONLY the subClassOf
-    relation (not the undirected restriction graph), and the walk is
-    UNBOUNDED -- the full ancestor + descendant transitive closure.
+    The ancestor and descendant walks are SEPARATE traversals starting
+    from the seeds, NOT a single BFS over the undirected IS-A graph:
 
-    Use this when you want to preserve the complete IS-A context of a
-    set of classes (e.g. the prune step preserves enough hierarchy that
-    every kept class's place in the taxonomy is unambiguous).
+      - Ancestor walk: from each seed, follow `parent_of` only.
+      - Descendant walk: from each seed, follow `children_of` only.
+
+    This means siblings of ancestors are NOT pulled in. If A subClassOf
+    Mammal, and B subClassOf Mammal, seeding on A retains
+    {A, Mammal, Animal, ..., A's descendants} but NOT B and B's
+    descendants. Otherwise an ontology with a single common root (HP's
+    BFO hierarchy is one example) would expand any single seed to the
+    entire ontology.
+
+    Unlike `collect_related_class_iris`, this walks ONLY subClassOf (not
+    the undirected restriction graph), and the walk is UNBOUNDED in
+    depth -- the full ancestor + descendant transitive closure of the
+    seeds.
     """
     parent_of, children_of = _build_isa_indexes(classes_dict)
-    keep: set[str] = set()
-    queue: deque[str] = deque()
-    for iri in seed_iris:
-        if iri in classes_dict and iri not in keep:
-            keep.add(iri)
-            queue.append(iri)
-    # Walk up to ancestors AND down to descendants in one pass: parent_of
-    # and children_of together describe every IS-A neighbor, so a BFS over
-    # their union from each seed visits the full connected IS-A component
-    # reachable from that seed.
-    while queue:
-        cur = queue.popleft()
-        for nxt in parent_of.get(cur, ()):
-            if nxt not in keep:
-                keep.add(nxt)
-                queue.append(nxt)
-        for nxt in children_of.get(cur, ()):
-            if nxt not in keep:
-                keep.add(nxt)
-                queue.append(nxt)
+    seeds = [iri for iri in seed_iris if iri in classes_dict]
+    keep: set[str] = set(seeds)
+
+    # Ancestor walk: parents of seeds, parents-of-parents, etc. No
+    # descent step here -- we stay on the upward chain.
+    upward_queue: deque[str] = deque(seeds)
+    upward_visited: set[str] = set(seeds)
+    while upward_queue:
+        cur = upward_queue.popleft()
+        for parent in parent_of.get(cur, ()):
+            if parent not in upward_visited:
+                upward_visited.add(parent)
+                keep.add(parent)
+                upward_queue.append(parent)
+
+    # Descendant walk: children of seeds, grandchildren, etc. No ascent
+    # step here -- we stay on the downward chain.
+    downward_queue: deque[str] = deque(seeds)
+    downward_visited: set[str] = set(seeds)
+    while downward_queue:
+        cur = downward_queue.popleft()
+        for child in children_of.get(cur, ()):
+            if child not in downward_visited:
+                downward_visited.add(child)
+                keep.add(child)
+                downward_queue.append(child)
+
     return keep
 
 

@@ -155,8 +155,21 @@ def enumerate_inputs(inputs: list[Path]) -> OntologyInputs:
                         )
                     )
         elif path.suffix.lower() in ONTOLOGY_SUFFIXES:
+            # Copy user-supplied source files into a per-bundle temp dir so
+            # _strip_unresolved_imports can safely rewrite them without
+            # touching the user's tree on disk. Symmetric with how
+            # zip-extracted files already get handled in temp.
+            tmp = bundle._exit_stack.enter_context(
+                tempfile.TemporaryDirectory(prefix="onto_src_")
+            )
+            tmp_copy = Path(tmp) / path.name
+            shutil.copy2(path, tmp_copy)
             bundle.sources.append(
-                OntologySource(label=path.name, path=path, working_dir=path.parent)
+                OntologySource(
+                    label=path.name,
+                    path=tmp_copy,
+                    working_dir=tmp_copy.parent,
+                )
             )
         else:
             raise ValueError(

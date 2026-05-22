@@ -91,7 +91,16 @@ def test_isa_indexes_have_correct_edges() -> None:
     assert children_of["ex:Animal"] == {"ex:Mammal", "ex:Bird"}
 
 
-def test_full_hierarchy_includes_all_ancestors_and_all_descendants() -> None:
+def test_full_hierarchy_includes_all_ancestors_and_seed_descendants_only() -> None:
+    """Seeding on Beagle:
+      - keeps the seed.
+      - keeps Beagle's ancestors transitively (Dog, Mammal, Animal).
+      - keeps Beagle's descendants transitively (none -- Beagle is a leaf).
+
+    Crucially does NOT keep siblings of Beagle (Labrador, ChocolateLab) or
+    siblings of ancestors (Bird, sibling of Mammal under Animal). Otherwise
+    an ontology with a single common root explodes back to its full size.
+    """
     keep = collect_full_class_hierarchy(CLASSES, ["ex:Beagle"])
 
     # Seed.
@@ -100,25 +109,36 @@ def test_full_hierarchy_includes_all_ancestors_and_all_descendants() -> None:
     assert "ex:Dog" in keep
     assert "ex:Mammal" in keep
     assert "ex:Animal" in keep
-    # ALL descendants from any node in the IS-A connected component reachable
-    # from the seed: Beagle has none, but its sibling Labrador (and its
-    # grandchild ChocolateLab) become reachable once we walk up to Dog and
-    # back down.
-    assert "ex:Labrador" in keep
-    assert "ex:ChocolateLab" in keep
-    # Bird is an Animal but not in the Dog->Mammal->Animal IS-A path's
-    # downward closure from Mammal -- only Mammal's descendants matter when
-    # walking down from Mammal, and Bird is a sibling, not a descendant.
-    # However, our BFS WILL reach Bird via the up-down walk from Beagle:
-    # Beagle -> Dog -> Mammal -> Animal, then Animal -> Bird (descendant).
-    # That is the EXPECTED behavior -- siblings reachable via a common
-    # ancestor ARE kept because they're part of the IS-A closure.
-    assert "ex:Bird" in keep
-    # Person/Habitat/Seed are not in the IS-A tree of Beagle; not kept by
-    # this helper alone (relationship partners come from the next step).
+
+    # Beagle's siblings + their descendants must NOT come along just
+    # because they share a parent with Beagle.
+    assert "ex:Labrador" not in keep
+    assert "ex:ChocolateLab" not in keep
+    # Bird shares an ancestor (Animal) with Beagle but is not an
+    # ancestor OR descendant of Beagle. Must NOT be kept.
+    assert "ex:Bird" not in keep
+
+    # Person/Habitat/Seed are not in the IS-A tree of Beagle.
     assert "ex:Person" not in keep
     assert "ex:Habitat" not in keep
     assert "ex:Seed" not in keep
+
+
+def test_full_hierarchy_with_internal_seed_includes_descendants() -> None:
+    """Seeding on Dog (an internal node) keeps:
+      - the seed.
+      - all Dog's ancestors (Mammal, Animal).
+      - all Dog's descendants (Beagle, Labrador, ChocolateLab).
+    But NOT Bird (Mammal sibling)."""
+    keep = collect_full_class_hierarchy(CLASSES, ["ex:Dog"])
+    assert "ex:Dog" in keep
+    assert "ex:Mammal" in keep
+    assert "ex:Animal" in keep
+    assert "ex:Beagle" in keep
+    assert "ex:Labrador" in keep
+    assert "ex:ChocolateLab" in keep
+    # Sibling of an ancestor must NOT be kept.
+    assert "ex:Bird" not in keep
 
 
 def test_relationship_partners_pull_in_other_endpoints() -> None:
@@ -129,9 +149,9 @@ def test_relationship_partners_pull_in_other_endpoints() -> None:
     assert "ex:Person" in augmented
     # livesIn: domain=Mammal ∈ keep -> Habitat comes in.
     assert "ex:Habitat" in augmented
-    # eatsFood touches Bird; Bird is in keep (via IS-A from the up-down
-    # walk through Animal), so Seed is pulled in.
-    assert "ex:Seed" in augmented
+    # eatsFood touches Bird only; Bird is NOT in keep (sibling of Mammal
+    # under Animal, not on Beagle's IS-A chain). So Seed must NOT come in.
+    assert "ex:Seed" not in augmented
 
 
 def test_unrelated_relationship_partners_not_pulled_in() -> None:
@@ -170,15 +190,20 @@ def test_unrelated_relationship_partners_not_pulled_in() -> None:
             "range": [{"kind": "entity", "iri": "ex:Region"}],  # not in classes_dict
         },
     }
-    keep = collect_full_class_hierarchy(sub_classes, ["ex:Tree"])
+    # Seed on Flower (NOT Tree) so the relationship endpoint we care
+    # about (Flower) is actually in keep. Tree's IS-A closure under the
+    # ancestors-and-descendants-of-seed rule is just {Tree, Plant}
+    # because Tree is a leaf -- Flower is a SIBLING of Tree, not an
+    # ancestor or descendant.
+    keep = collect_full_class_hierarchy(sub_classes, ["ex:Flower"])
     augmented = expand_with_relationship_partners(keep, sub_obj_props, {})
-    # Tree's IS-A closure: {Tree, Plant, Flower}.
-    assert {"ex:Tree", "ex:Plant", "ex:Flower"} <= augmented
-    # grownIn touches Flower (in keep) so Country gets pulled in.
+    assert {"ex:Flower", "ex:Plant"} <= augmented
+    # Tree is a sibling of Flower -- must NOT come in.
+    assert "ex:Tree" not in augmented
+    # grownIn has domain=Flower (in keep) so Country is a relationship
+    # partner.
     assert "ex:Country" in augmented
     # capitalOf doesn't touch anything in keep -> nothing extra.
-    # (City/Region weren't even in classes_dict so they wouldn't be valid
-    # anyway, but the property itself shouldn't trigger inclusions.)
 
 
 def test_apply_prune_end_to_end_preserves_full_hierarchy_and_relationships() -> None:
@@ -194,25 +219,24 @@ def test_apply_prune_end_to_end_preserves_full_hierarchy_and_relationships() -> 
     }
     pruned, keep = _apply_prune(loaded, ["ex:Beagle"])
 
-    # Same set as the helper test above plus the relationship partners.
+    # Beagle's strict ancestor chain (Dog -> Mammal -> Animal) plus the
+    # seed itself plus relationship partners reachable from that chain.
+    # ownedBy: domain=Dog (in keep) -> Person added.
+    # livesIn: domain=Mammal (in keep) -> Habitat added.
+    # eatsFood touches Bird only; Bird is NOT in keep (sibling of Mammal
+    # under Animal) so this property and Seed must not appear.
     expected = {
         "ex:Beagle",
         "ex:Dog",
         "ex:Mammal",
         "ex:Animal",
-        "ex:Labrador",
-        "ex:ChocolateLab",
-        "ex:Bird",
         "ex:Person",
         "ex:Habitat",
-        "ex:Seed",
     }
-    assert keep == expected
+    assert keep == expected, sorted(keep)
     assert set(pruned["classes_dict"].keys()) == expected
-    # All three relationships survive (each one touches the keep-set).
-    assert set(pruned["object_properties_dict"].keys()) == {
-        "ex:ownedBy", "ex:livesIn", "ex:eatsFood",
-    }
+    # Only relationships whose endpoints stay in the keep-set survive.
+    assert set(pruned["object_properties_dict"].keys()) == {"ex:ownedBy", "ex:livesIn"}
     # Critically: the OTHER endpoint is also kept (no orphan `range=[]`).
     owned = pruned["object_properties_dict"]["ex:ownedBy"]
     assert any(d.get("iri") == "ex:Dog" for d in owned["domain"])
