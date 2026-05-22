@@ -29,7 +29,12 @@ def _stub_chat_factory():
             payload = {
                 "MATCHES FOUND": [],
                 "MATCH NOT FOUND": [
-                    {"LABEL": "MockedNewConcept", "DESCRIPTION": "Mock new class from documents."}
+                    {"LABEL": "MockedNewConcept", "DESCRIPTION": "Mock new class from documents."},
+                    {"LABEL": "MockedSecondConcept", "DESCRIPTION": "Mock target class for the relation."},
+                ],
+                "MATCH NOT FOUND RELATIONS": [
+                    {"LABEL": "mockedRelatesTo", "DESCRIPTION": "Mock relation between the two new classes.",
+                     "DOMAIN": "MockedNewConcept", "RANGE": "MockedSecondConcept"},
                 ],
             }
         elif task == "match_dedup":
@@ -92,3 +97,25 @@ async def test_build_pipeline_mocked(tmp_path: Path, monkeypatch: pytest.MonkeyP
     # The audit log should have at least the dedup record + chunk records.
     audit_lines = (result_dir / "llm_audit.jsonl").read_text().splitlines()
     assert len(audit_lines) >= 1
+
+    # The mocked LLM proposed two classes + one relation; verify both
+    # classes were created AND the relation now lives in the
+    # object_properties_dict with domain/range resolving to those classes.
+    merged = json.loads((result_dir / "merged.json").read_text())
+    classes = merged["classes_dict"]
+    obj_props = merged["object_properties_dict"]
+    mocked_class_iris = [
+        iri for iri, c in classes.items()
+        if any(lbl in ("MockedNewConcept", "MockedSecondConcept") for lbl in c.get("labels", []))
+    ]
+    assert len(mocked_class_iris) == 2, mocked_class_iris
+    mocked_props = [
+        iri for iri, p in obj_props.items()
+        if "mockedRelatesTo" in p.get("labels", [])
+    ]
+    assert len(mocked_props) == 1, mocked_props
+    rel = obj_props[mocked_props[0]]
+    domain_iris = {d.get("iri") for d in rel["domain"]}
+    range_iris = {r.get("iri") for r in rel["range"]}
+    assert domain_iris & set(mocked_class_iris)
+    assert range_iris & set(mocked_class_iris)

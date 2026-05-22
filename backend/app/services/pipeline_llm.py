@@ -21,7 +21,10 @@ from typing import Any
 from backend.app.core.config import get_settings
 from backend.app.helpers.ontology_pruning import (
     add_new_classes_from_match_not_found,
+    add_new_relations_from_match_results,
+    collect_full_class_hierarchy,
     collect_related_class_iris,
+    expand_with_relationship_partners,
     extract_detected_iris,
     extract_json_from_output,
     merge_llm_jsons_recursive,
@@ -181,22 +184,41 @@ async def _dedup(router: LLMRouter, merged_results: dict[str, Any]) -> dict[str,
 def _apply_prune(
     loaded_ontology: dict[str, Any],
     detected_iris: list[str],
-    max_hops: int,
 ) -> tuple[dict[str, Any], set[str]]:
-    """Pure Python: BFS expand detected IRIs by `max_hops` hops, then drop
-    classes/properties/instances outside that set."""
+    """Pure Python: build the keep-set as
+        detected ∪ full IS-A hierarchy of detected ∪ relationship partners
+    then drop everything else.
+
+    Keep-set construction in order:
+      1. Start with the detected (LLM-matched) class IRIs.
+      2. Expand to the FULL ancestor + descendant transitive closure via
+         subClassOf (collect_full_class_hierarchy). Not N-hop -- the entire
+         IS-A neighborhood is preserved so every kept class's place in the
+         taxonomy is unambiguous.
+      3. Add the other-endpoint classes of every object/data property whose
+         domain or range touches the keep-set so far
+         (expand_with_relationship_partners). This keeps relationships
+         intact end-to-end instead of leaving them with `range=[]` when the
+         range class was outside the original hierarchy.
+
+    The `max_hops` argument that used to drive an undirected N-hop BFS here
+    has been removed -- it still drives Stage 2's slice-of-the-ontology
+    sent to the LLM, but Stage 4 prune now uses the unbounded IS-A closure
+    described above.
+    """
     classes = loaded_ontology.get("classes_dict", {})
     if not detected_iris:
         return loaded_ontology, set()
-    keep_iris = collect_related_class_iris(classes, list(detected_iris), max_hops=max_hops)
+    obj_props = loaded_ontology.get("object_properties_dict", {})
+    data_props = loaded_ontology.get("data_properties_dict", {})
+
+    keep_iris = collect_full_class_hierarchy(classes, list(detected_iris))
+    keep_iris = expand_with_relationship_partners(keep_iris, obj_props, data_props)
+
     pruned: dict[str, Any] = {
         "classes_dict": prune_classes_dict(classes, keep_iris),
-        "object_properties_dict": prune_object_properties_dict(
-            loaded_ontology.get("object_properties_dict", {}), keep_iris
-        ),
-        "data_properties_dict": prune_data_properties_dict(
-            loaded_ontology.get("data_properties_dict", {}), keep_iris
-        ),
+        "object_properties_dict": prune_object_properties_dict(obj_props, keep_iris),
+        "data_properties_dict": prune_data_properties_dict(data_props, keep_iris),
         "instances_dict": prune_instances_dict(loaded_ontology.get("instances_dict", {}), keep_iris),
     }
     return pruned, keep_iris
@@ -207,15 +229,29 @@ def _apply_expand(
     match_results: dict[str, Any],
     base_iri: str,
     default_parent_iri: str | None,
-) -> tuple[dict[str, Any], list[str]]:
-    """Wrap the existing helper to add proposed classes from MATCH NOT FOUND."""
-    extended, created = add_new_classes_from_match_not_found(
+) -> tuple[dict[str, Any], list[str], list[str], list[dict]]:
+    """Add proposed classes from MATCH NOT FOUND, then add proposed
+    object-property relations from MATCH NOT FOUND RELATIONS.
+
+    Order matters: classes go in first so the relation-injection step can
+    resolve a DOMAIN/RANGE label that refers to a class proposed in the
+    same LLM run.
+
+    Returns:
+      (extended_ontology, created_class_iris, created_property_iris, skipped_relations)
+    """
+    extended, created_classes = add_new_classes_from_match_not_found(
         loaded_ontology=loaded_ontology,
         match_results=match_results,
         new_class_base_iri=base_iri,
         default_parent_iri=default_parent_iri,
     )
-    return extended, list(created)
+    extended, created_props, skipped = add_new_relations_from_match_results(
+        loaded_ontology=extended,
+        match_results=match_results,
+        new_property_base_iri=base_iri,
+    )
+    return extended, list(created_classes), list(created_props), skipped
 
 
 # ---------- LLM stage orchestration shared by prune / expand / both ----------
@@ -259,7 +295,7 @@ async def _run_llm_stages(
 
     if dry_run:
         print("[llm] --dry-run: stopping before any LLM calls")
-        return {"MATCHES FOUND": [], "MATCH NOT FOUND": []}
+        return {"MATCHES FOUND": [], "MATCH NOT FOUND": [], "MATCH NOT FOUND RELATIONS": []}
 
     expansion_cfg = app_cfg.get("expansion", {}) or {}
     concurrency = int(expansion_cfg.get("max_concurrent_llm_calls", 8))
@@ -299,10 +335,11 @@ async def _run_llm_stages(
             "Re-run with --max-cost-usd N to lift the cap."
         )
 
-    merged = merge_llm_jsons_recursive(valid) if valid else {"MATCHES FOUND": [], "MATCH NOT FOUND": []}
+    merged = merge_llm_jsons_recursive(valid) if valid else {"MATCHES FOUND": [], "MATCH NOT FOUND": [], "MATCH NOT FOUND RELATIONS": []}
     print(
         f"[stage3] merging+dedup: {len(merged.get('MATCHES FOUND', []))} matches, "
-        f"{len(merged.get('MATCH NOT FOUND', []))} proposals"
+        f"{len(merged.get('MATCH NOT FOUND', []))} new class proposals, "
+        f"{len(merged.get('MATCH NOT FOUND RELATIONS', []))} new relation proposals"
     )
     deduped = await _dedup(router, merged)
     _append_audit(audit_path, -1, "match_dedup", None, deduped)
@@ -474,15 +511,27 @@ async def _run(
     created: list[str] = []
 
     if operation in ("prune", "prune-expand", "build"):
-        out_ontology, keep = _apply_prune(out_ontology, detected, effective_hops)
-        print(f"[stage4] pruned to {len(keep)} kept classes (max_hops={effective_hops})")
+        out_ontology, keep = _apply_prune(out_ontology, detected)
+        print(
+            f"[stage4] pruned to {len(keep)} kept classes "
+            "(full IS-A hierarchy of detected + relationship partners)"
+        )
 
     if operation in ("expand", "prune-expand", "build"):
         ontology_cfg = app_cfg.get("ontology", {}) or {}
         base_iri = ontology_cfg.get("default_base_iri") or "http://your-personal-ontologist.local/ontology/"
         parent_iri = ontology_cfg.get("default_parent_iri")
-        out_ontology, created = _apply_expand(out_ontology, deduped, base_iri, parent_iri)
-        print(f"[stage4] created {len(created)} new classes from MATCH NOT FOUND")
+        out_ontology, created, created_props, skipped_rels = _apply_expand(
+            out_ontology, deduped, base_iri, parent_iri
+        )
+        print(
+            f"[stage4] created {len(created)} new classes from MATCH NOT FOUND, "
+            f"{len(created_props)} new relations from MATCH NOT FOUND RELATIONS, "
+            f"{len(skipped_rels)} relation(s) skipped (unresolved endpoints)"
+        )
+        if skipped_rels:
+            for s in skipped_rels:
+                print(f"[stage4]   skipped relation: {s.get('reason')} -> {s.get('relation')}")
 
     counts_after = folder_io.count_entities(out_ontology)
     print(f"[{operation}] entity counts: before={counts_before}, after={counts_after}")

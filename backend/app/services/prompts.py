@@ -72,9 +72,15 @@ def class_identification_and_expansion(
         "DATA_CLASSES dict.\n"
         "  2. For every distinct concept in the TEXT that has NO matching "
         "existing class, propose a new class with a clear LABEL and "
-        "DESCRIPTION.\n\n"
-        "Review thoroughly — do not stop after a few matches. Prefer accurate "
-        "matches over speculative ones.\n\n"
+        "DESCRIPTION.\n"
+        "  3. Identify RELATIONS between classes that the TEXT asserts or "
+        "implies. Both endpoints may be existing classes (use their LABEL or "
+        "the local name from their IRI) OR classes you just proposed in step "
+        "2 (use the same LABEL you gave them). Skip relations whose endpoints "
+        "you can't identify -- do not invent classes here.\n\n"
+        "Review thoroughly -- do not stop after a few matches. Prefer accurate "
+        "matches over speculative ones. Prefer concrete, asserted relations "
+        "over speculative ones.\n\n"
         "Output strict JSON in the shape:\n"
         "{\n"
         '  "MATCHES FOUND": ['
@@ -82,6 +88,12 @@ def class_identification_and_expansion(
         "  ],\n"
         '  "MATCH NOT FOUND": ['
         '    {"LABEL": "<short label>", "DESCRIPTION": "<one or two sentences>"}, ...'
+        "  ],\n"
+        '  "MATCH NOT FOUND RELATIONS": ['
+        '    {"LABEL": "<verb-phrase relation name, e.g. treats>",'
+        ' "DESCRIPTION": "<one-sentence statement of the relation>",'
+        ' "DOMAIN": "<label or IRI of the source class>",'
+        ' "RANGE": "<label or IRI of the target class>"}, ...'
         "  ]\n"
         "}\n"
         "No prose. No comments. Only the JSON object."
@@ -91,7 +103,8 @@ def class_identification_and_expansion(
     user = (
         f"DATA_CLASSES:\n{ontology_repr}\n\n"
         f"TEXT TO EVALUATE:\n{text_chunk}\n\n"
-        'Return JSON: {"MATCHES FOUND": [...], "MATCH NOT FOUND": [...]}'
+        'Return JSON: {"MATCHES FOUND": [...], "MATCH NOT FOUND": [...], '
+        '"MATCH NOT FOUND RELATIONS": [...]}'
     )
     return system, user
 
@@ -99,23 +112,30 @@ def class_identification_and_expansion(
 def match_dedup(merged_match_results: dict[str, Any]) -> tuple[str, str]:
     """Stage 3: after merging Stage-2 outputs from many chunks, collapse
     duplicate `MATCH NOT FOUND` proposals (same concept with slightly
-    different labels) and drop proposals that turn out to overlap with
-    existing `MATCHES FOUND` entries."""
+    different labels), dedupe `MATCH NOT FOUND RELATIONS`, and drop
+    proposals that turn out to overlap with existing `MATCHES FOUND`."""
     system = (
-        "You are deduplicating proposed ontology classes. You will receive a "
-        "JSON object with two keys: \"MATCHES FOUND\" (matches against the "
-        "existing ontology — DO NOT modify these) and \"MATCH NOT FOUND\" "
-        "(proposed new classes that may contain duplicates and overlaps with "
-        "MATCHES FOUND).\n\n"
+        "You are deduplicating proposed ontology classes and relations. "
+        "You will receive a JSON object with three keys:\n"
+        "  - \"MATCHES FOUND\": matches against the existing ontology -- "
+        "DO NOT modify these.\n"
+        "  - \"MATCH NOT FOUND\": proposed new classes that may contain "
+        "duplicates and overlaps with MATCHES FOUND.\n"
+        "  - \"MATCH NOT FOUND RELATIONS\": proposed new object-property "
+        "relations (LABEL + DOMAIN + RANGE) that may contain duplicates.\n\n"
         "Your tasks:\n"
         "  1. From MATCH NOT FOUND, remove any entry whose concept already "
         "exists in MATCHES FOUND (same idea, even if labeled differently).\n"
         "  2. From MATCH NOT FOUND, collapse entries that propose the same "
         "concept under different labels into a single entry (pick the "
         "clearest label; merge descriptions concisely).\n"
-        "  3. Do NOT add new entries to MATCH NOT FOUND.\n"
-        "  4. Do NOT modify any MATCHES FOUND entries.\n\n"
-        "Output strict JSON with the same two keys, no prose, no comments."
+        "  3. From MATCH NOT FOUND RELATIONS, collapse entries that propose "
+        "the same relation (same LABEL + same DOMAIN + same RANGE, or "
+        "trivially-paraphrased verb labels) into a single entry. Different "
+        "DOMAIN/RANGE pairs are NOT duplicates even with the same LABEL.\n"
+        "  4. Do NOT add new entries to any list.\n"
+        "  5. Do NOT modify any MATCHES FOUND entries.\n\n"
+        "Output strict JSON with the same three keys, no prose, no comments."
     )
     user = (
         "INPUT:\n"

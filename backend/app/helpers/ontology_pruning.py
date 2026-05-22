@@ -652,6 +652,102 @@ def collect_related_class_iris(
     return keep
 
 
+def _build_isa_indexes(classes_dict: dict) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    """Build (parent_of, children_of) indexes over the IS-A (subClassOf) edges.
+
+    parent_of[iri]   = set of IRIs that are direct parents of `iri`.
+    children_of[iri] = set of IRIs that are direct subclasses of `iri`.
+
+    Only includes edges where both endpoints exist in `classes_dict`
+    (skips dangling references to external IRIs).
+    """
+    parent_of: dict[str, set[str]] = {iri: set() for iri in classes_dict}
+    children_of: dict[str, set[str]] = {iri: set() for iri in classes_dict}
+    for iri, data in classes_dict.items():
+        for sc in data.get("superclasses", []):
+            sc_iri = safe_get_iri(sc)
+            if sc_iri and sc_iri in classes_dict:
+                parent_of[iri].add(sc_iri)
+                children_of[sc_iri].add(iri)
+    return parent_of, children_of
+
+
+def collect_full_class_hierarchy(
+    classes_dict: dict,
+    seed_iris: list[str],
+) -> set[str]:
+    """For each seed IRI, return seeds plus ALL ancestors plus ALL
+    descendants via the IS-A (subClassOf) hierarchy.
+
+    Unlike `collect_related_class_iris`, this walks ONLY the subClassOf
+    relation (not the undirected restriction graph), and the walk is
+    UNBOUNDED -- the full ancestor + descendant transitive closure.
+
+    Use this when you want to preserve the complete IS-A context of a
+    set of classes (e.g. the prune step preserves enough hierarchy that
+    every kept class's place in the taxonomy is unambiguous).
+    """
+    parent_of, children_of = _build_isa_indexes(classes_dict)
+    keep: set[str] = set()
+    queue: deque[str] = deque()
+    for iri in seed_iris:
+        if iri in classes_dict and iri not in keep:
+            keep.add(iri)
+            queue.append(iri)
+    # Walk up to ancestors AND down to descendants in one pass: parent_of
+    # and children_of together describe every IS-A neighbor, so a BFS over
+    # their union from each seed visits the full connected IS-A component
+    # reachable from that seed.
+    while queue:
+        cur = queue.popleft()
+        for nxt in parent_of.get(cur, ()):
+            if nxt not in keep:
+                keep.add(nxt)
+                queue.append(nxt)
+        for nxt in children_of.get(cur, ()):
+            if nxt not in keep:
+                keep.add(nxt)
+                queue.append(nxt)
+    return keep
+
+
+def expand_with_relationship_partners(
+    keep: set[str],
+    object_properties_dict: dict,
+    data_properties_dict: dict,
+) -> set[str]:
+    """Augment `keep` with every class that appears as the OTHER endpoint
+    of an object/data property whose domain or range already touches
+    `keep`.
+
+    Rationale: if class A is being kept and there's a property `worksFor`
+    with domain=[A], range=[B], then keeping the property alone (with
+    range pruned to []) loses the relationship's meaning. Adding B to
+    `keep` preserves it intact.
+
+    Note: this is a single-step extension -- we do NOT recursively walk
+    the IS-A hierarchy of newly-added partner classes. Combine with
+    `collect_full_class_hierarchy` first if you want hierarchy + relationships.
+    """
+    extra: set[str] = set()
+    for props in (object_properties_dict, data_properties_dict):
+        for prop_data in props.values():
+            domain_iris = [safe_get_iri(d) for d in prop_data.get("domain", [])]
+            range_iris = [safe_get_iri(r) for r in prop_data.get("range", [])]
+            touches_keep = any(
+                d in keep for d in domain_iris if d
+            ) or any(r in keep for r in range_iris if r)
+            if not touches_keep:
+                continue
+            for d in domain_iris:
+                if d:
+                    extra.add(d)
+            for r in range_iris:
+                if r:
+                    extra.add(r)
+    return keep | extra
+
+
 # ============================================================
 # PRUNING CLASSES
 # ============================================================
@@ -907,6 +1003,185 @@ def add_new_classes_from_match_not_found(
             created_iris.append(new_iri)
 
     return result, created_iris
+
+
+def make_property_iri(base_iri: str, label: str) -> str:
+    """
+    Create an object-property IRI from base IRI + label.
+    Mirrors `make_class_iri` so proposed properties live in the same
+    user-controlled namespace as proposed classes.
+    """
+    base_iri = normalize_namespace(base_iri)
+    return f"{base_iri}{slugify(label)}"
+
+
+def create_new_object_property_entry(
+    label: str,
+    description: str,
+    domain_iri: str,
+    range_iri: str,
+    new_property_base_iri: str,
+) -> tuple[str, dict]:
+    """
+    Create a new object-property entry in the same shape as
+    object_properties_dict values. Counterpart to
+    `create_new_class_entry`.
+    """
+    new_iri = make_property_iri(new_property_base_iri, label)
+
+    entry = {
+        "name": safe_name_from_iri(new_iri),
+        "iri": new_iri,
+        "namespace": normalize_namespace(new_property_base_iri),
+        "labels": [label],
+        "comments": [],
+        "descriptions": [description] if description else [],
+        "annotations": {
+            "generated": [True],
+            "review_status": ["proposed"],
+        },
+        "property_kind": "object_property",
+        "superproperties": [],
+        "property_constructs": [],
+        "domain": [{
+            "kind": "entity",
+            "name": safe_name_from_iri(domain_iri),
+            "iri": domain_iri,
+            "python_name": None,
+            "type": "ThingClass",
+        }],
+        "range": [{
+            "kind": "entity",
+            "name": safe_name_from_iri(range_iri),
+            "iri": range_iri,
+            "python_name": None,
+            "type": "ThingClass",
+        }],
+        "inverse_property": None,
+        "characteristics": [],
+        "python_name": None,
+        "disjoints": [],
+        "raw_axiom_triples": [],
+    }
+    return new_iri, entry
+
+
+def _build_label_to_iri_index(classes_dict: dict) -> dict[str, str]:
+    """Return a case-insensitive {label_or_name: iri} index over the
+    current classes_dict. The FIRST entry wins on collisions (rare; if it
+    happens the user can pin a specific IRI via the prompt instead).
+
+    Used to resolve LLM-proposed DOMAIN/RANGE labels to actual class IRIs
+    when adding new relations.
+    """
+    index: dict[str, str] = {}
+    for iri, data in classes_dict.items():
+        # Index every label.
+        for lab in data.get("labels", []) or []:
+            if isinstance(lab, str) and lab.strip():
+                index.setdefault(lab.strip().lower(), iri)
+            elif isinstance(lab, dict):
+                v = lab.get("value")
+                if isinstance(v, str) and v.strip():
+                    index.setdefault(v.strip().lower(), iri)
+        # Index the local name (e.g. "Person" from "ex:Person").
+        name = data.get("name") or safe_name_from_iri(iri)
+        if isinstance(name, str) and name.strip():
+            index.setdefault(name.strip().lower(), iri)
+    return index
+
+
+def add_new_relations_from_match_results(
+    loaded_ontology: dict,
+    match_results: dict,
+    new_property_base_iri: str,
+) -> tuple[dict, list[str], list[dict]]:
+    """
+    Add LLM-proposed object properties from `MATCH NOT FOUND RELATIONS`
+    into object_properties_dict. Each entry is expected to look like:
+
+        {
+            "LABEL": "treats",
+            "DESCRIPTION": "A Drug treats a Disease.",
+            "DOMAIN": "Drug",           # IRI or label of a class
+            "RANGE": "Disease"          # IRI or label of a class
+        }
+
+    Resolution order for DOMAIN/RANGE:
+      1. If the value is already a known class IRI (key of classes_dict),
+         use it directly.
+      2. Otherwise, look the value up case-insensitively in the
+         label/name index built over classes_dict.
+      3. If still unresolved, the relation is skipped and added to the
+         returned `skipped` list with a `reason` so the caller can
+         surface it for review.
+
+    IMPORTANT: call this AFTER `add_new_classes_from_match_not_found` so
+    classes proposed by the same LLM run are already in classes_dict and
+    can be referenced as DOMAIN/RANGE by their label.
+
+    Returns:
+      (extended_ontology, created_property_iris, skipped_relations)
+    """
+    result = deepcopy(loaded_ontology)
+    classes_dict = result.get("classes_dict", {})
+    obj_props_dict = result.setdefault("object_properties_dict", {})
+    label_index = _build_label_to_iri_index(classes_dict)
+
+    def _resolve(value: Any) -> tuple[str | None, str | None]:
+        """Return (resolved_iri, reason_if_unresolved)."""
+        text = normalize_to_string(value)
+        if not text:
+            return None, "empty"
+        if text in classes_dict:
+            return text, None
+        hit = label_index.get(text.lower())
+        if hit:
+            return hit, None
+        return None, f"could not resolve '{text}' to a class IRI"
+
+    created: list[str] = []
+    skipped: list[dict] = []
+
+    for item in match_results.get("MATCH NOT FOUND RELATIONS", []):
+        if not isinstance(item, dict):
+            continue
+        label = normalize_to_string(item.get("LABEL"))
+        description = normalize_to_string(item.get("DESCRIPTION"))
+        if not label:
+            skipped.append({"relation": item, "reason": "missing LABEL"})
+            continue
+        d_iri, d_reason = _resolve(item.get("DOMAIN"))
+        r_iri, r_reason = _resolve(item.get("RANGE"))
+        if not d_iri or not r_iri:
+            skipped.append({
+                "relation": item,
+                "reason": d_reason or r_reason or "unresolved DOMAIN/RANGE",
+            })
+            continue
+
+        new_iri, entry = create_new_object_property_entry(
+            label=label,
+            description=description,
+            domain_iri=d_iri,
+            range_iri=r_iri,
+            new_property_base_iri=new_property_base_iri,
+        )
+        if new_iri in obj_props_dict:
+            # Property with this slugged IRI already exists. Merge domain/range
+            # in case the LLM produced multiple chunks each contributing one
+            # endpoint pair for the same property.
+            existing = obj_props_dict[new_iri]
+            for end in ("domain", "range"):
+                seen = {safe_get_iri(d) for d in existing.get(end, [])}
+                for d in entry.get(end, []):
+                    if safe_get_iri(d) not in seen:
+                        existing.setdefault(end, []).append(d)
+            continue
+        obj_props_dict[new_iri] = entry
+        created.append(new_iri)
+
+    return result, created, skipped
 
 
 # ============================================================

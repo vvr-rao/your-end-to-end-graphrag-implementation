@@ -105,5 +105,9 @@ def merge_suggestions_into_results(
     merged = {
         "MATCHES FOUND": list(match_results.get("MATCHES FOUND", [])),
         "MATCH NOT FOUND": list(match_results.get("MATCH NOT FOUND", [])) + new_entries,
+        # Pass through any LLM-proposed relations untouched -- user
+        # suggestions don't currently include relations (the JSON file
+        # format is class-only), so there's nothing to merge here.
+        "MATCH NOT FOUND RELATIONS": list(match_results.get("MATCH NOT FOUND RELATIONS", [])),
     }
     return merged
