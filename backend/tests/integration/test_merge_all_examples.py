@@ -23,17 +23,26 @@ SAMPLES_DIR = REPO_ROOT / "source_ontologies"
 
 
 def _candidates() -> list[Path]:
-    """Test samples that are loadable on their own. Skips:
-      - DRON/HP giants (parser stress, slow).
-      - The FIBO zip (~100 .rdf files, slow even with root-files heuristic).
-      - The OntoCAPE zip (~64 files, slow).
-      - Individual OntoCAPE module files (they reference siblings that aren't
-        loadable without the zip's local IRI map).
+    """Test samples that are loadable on their own.
+
+    Includes HP/FIBO/OntoCAPE giants now that the per-file owlready2 World
+    isolation + HTTP-import stripping keeps multi-file merges from hanging
+    on the shared default_world or on network fetches to external IRIs.
+
+    Skips:
+      - dron.owl: 670MB single file. owlready2 needs ~3GB RAM to parse it;
+        will OOM-kill the test process on machines with <4GB available
+        memory (e.g. dev laptops, free-tier CI). Manually verifiable on
+        larger hardware via the CLI.
+      - Individual OntoCAPE module .owl files extracted under the OntoCAPE
+        tree -- they reference siblings that aren't loadable without the
+        parent zip's local IRI map. The zip itself (OntoCAPE_domain+ontology.zip)
+        IS exercised.
     """
-    skip_names = {"dron.owl", "hp.owl"}
     out: list[Path] = []
     if not SAMPLES_DIR.exists():
         return out
+    skip_names = {"dron.owl"}
     for p in SAMPLES_DIR.rglob("*"):
         if not p.is_file():
             continue
@@ -42,13 +51,10 @@ def _candidates() -> list[Path]:
         suffix = p.suffix.lower()
         if suffix not in (".owl", ".rdf", ".ttl", ".zip"):
             continue
-        if "finance_ontologies" in p.parts and p.suffix == ".zip":
-            continue
-        if "OntoCAPE_domain+ontology.zip" in p.name:
-            continue
-        # Skip the unzipped OntoCAPE module tree — those files only load
-        # in the context of the parent zip's IRI map.
-        if "OntoCAPE_domain+ontology" in p.parts:
+        # Skip the unzipped OntoCAPE module tree -- those files only load
+        # in the context of the parent zip's IRI map. The zip itself
+        # (OntoCAPE_domain+ontology.zip) IS exercised.
+        if "OntoCAPE_domain+ontology" in p.parts and p.suffix != ".zip":
             continue
         out.append(p)
     return sorted(out)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 
 from os.path import realpath
-from owlready2 import PREDEFINED_ONTOLOGIES, get_ontology, default_world, Thing, onto_path
+from owlready2 import PREDEFINED_ONTOLOGIES, World, get_ontology, default_world, Thing, onto_path
 
 from typing import Any, Dict, List, Optional
 from owlready2 import *
@@ -442,7 +442,7 @@ def extract_instance(ind: Any, rdf_graph) -> Dict[str, Any]:
 
 
 
-def register_local_iri_map(iri_map: Dict[str, str]) -> None:
+def register_local_iri_map(iri_map: Dict[str, str], verbose: bool = False) -> None:
     """
     Register IRI -> local filesystem path mappings with Owlready2.
 
@@ -454,19 +454,31 @@ def register_local_iri_map(iri_map: Dict[str, str]) -> None:
         {
             "http://purl.org/net/OCRe/statistics.owl": "/abs/path/to/statistics.owl"
         }
+
+    Quiet by default -- emits a single one-line summary. Pass verbose=True
+    to see each mapping. With large ontologies like FIBO (thousands of
+    catalog entries), per-entry logging dominated wall time.
     """
+    registered = 0
+    skipped = 0
     for iri, local_path in iri_map.items():
         abs_path = os.path.abspath(local_path)
         iri_no_hash = iri.rstrip("#")
 
         if not os.path.exists(abs_path):
-            print(f"Warning: mapped file does not exist for {iri_no_hash}: {abs_path}")
+            if verbose:
+                print(f"Warning: mapped file does not exist for {iri_no_hash}: {abs_path}")
+            skipped += 1
             continue
 
         PREDEFINED_ONTOLOGIES[iri_no_hash] = abs_path
         PREDEFINED_ONTOLOGIES[iri_no_hash + "#"] = abs_path
+        registered += 1
 
-        print(f"Registered local mapping: {iri_no_hash} -> {abs_path}")
+        if verbose:
+            print(f"Registered local mapping: {iri_no_hash} -> {abs_path}")
+
+    print(f"[register_local_iri_map] registered {registered} mapping(s), skipped {skipped} missing file(s)")
 
 
 def build_local_iri_map_from_folder(
@@ -505,6 +517,7 @@ def extract_ontology_to_dicts(
     local_only: bool = False,
     local_ontology_dir: Optional[str] = None,
     iri_map: Optional[Dict[str, str]] = None,
+    world: Optional[World] = None,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
     """
     Load an ontology with Owlready2 and extract 4 dictionaries:
@@ -520,7 +533,13 @@ def extract_ontology_to_dicts(
       - respects local_only for both root ontology and imports
       - prints unresolved dependencies
       - recursively loads imported ontologies
+
+    Pass an isolated `world` (owlready2.World) to keep this load's triples
+    out of the global default_world. Required when extracting many files in
+    one process so the rdf_graph snapshot stays bounded per file.
     """
+
+    w = world if world is not None else default_world
 
     # ------------------------------------------------------------
     # 1) Configure local ontology search directory
@@ -555,7 +574,7 @@ def extract_ontology_to_dicts(
     # ------------------------------------------------------------
     # 4) Load root ontology
     # ------------------------------------------------------------
-    onto = get_ontology(owl_source).load(only_local=local_only)
+    onto = w.get_ontology(owl_source).load(only_local=local_only)
     print(f"Ontology loaded from: {onto.base_iri}")
 
     resolved_imports: Set[str] = set()
@@ -591,7 +610,7 @@ def extract_ontology_to_dicts(
     # ------------------------------------------------------------
     # 6) Owlready2 RDF graph
     # ------------------------------------------------------------
-    rdf_graph = default_world.as_rdflib_graph()
+    rdf_graph = w.as_rdflib_graph()
 
     classes_dict: Dict[str, Dict[str, Any]] = {}
     object_properties_dict: Dict[str, Dict[str, Any]] = {}
@@ -1042,36 +1061,107 @@ def merge_dicts_recursive(d1, d2):
 
     return result
 
-def import_ontologies(owl_dict):
-  imported_ontologies = {}
-  for key, value in owl_dict.items():
-    print(f"Processing: {key}")
-    if value["local_only"]:
-        ontology = extract_ontology_to_dicts(value["filename"], 
-                                         load_imported=value["load_imported"],
-                                         local_only=value["local_only"],
-                                         local_ontology_dir=value["local_ontology_dir"],
-                                         iri_map=value["iri_map"])
-    else:
-        ontology = extract_ontology_to_dicts(value["filename"], 
-                                         load_imported=value["load_imported"],
-                                         local_only=value["local_only"])
+def import_ontologies(owl_dict, stamp_provenance: bool = False):
+  """Load each ontology file in its own owlready2.World() so triples stay
+  bounded per file. Without this, large multi-file merges (FIBO 100+ .rdf,
+  OntoCAPE 64 .owl) accumulate triples in the global default_world and the
+  per-file rdf_graph snapshot grows linearly -- making total extraction
+  work O(N^2) and effectively hanging.
 
-    
+  Per-file failures (malformed XML, unresolvable imports, etc.) are logged
+  and skipped so one defective file in a 64-file zip doesn't abort the
+  whole merge. Returns the merged dicts from every file that loaded
+  successfully.
+
+  Progress is logged per file with index, name, elapsed seconds, and
+  cumulative class count so long multi-file merges (FIBO/OntoCAPE) are
+  visibly making progress.
+
+  When `stamp_provenance=True`, each entity in the merged result is tagged
+  with a `sources` list naming which file(s) declared it. This eliminates
+  the per-source reload in ontology_merge.py for large multi-file merges
+  like FIBO (222 sources) where re-running load_ontology_files per source
+  costs hundreds of seconds in catalog/strip overhead.
+  """
+  import gc
+  import time
+
+  imported_ontologies = {}
+  skipped: list[tuple[str, str]] = []
+  total = len(owl_dict)
+  batch_start = time.monotonic()
+  for idx, (key, value) in enumerate(owl_dict.items(), start=1):
+    file_start = time.monotonic()
+    print(f"[import_ontologies {idx}/{total}] processing: {key}")
+    w = World()
+    ontology = None
+    try:
+      if value["local_only"]:
+          ontology = extract_ontology_to_dicts(value["filename"],
+                                           load_imported=value["load_imported"],
+                                           local_only=value["local_only"],
+                                           local_ontology_dir=value["local_ontology_dir"],
+                                           iri_map=value["iri_map"],
+                                           world=w)
+      else:
+          ontology = extract_ontology_to_dicts(value["filename"],
+                                           load_imported=value["load_imported"],
+                                           local_only=value["local_only"],
+                                           world=w)
+    except Exception as e:
+      reason = f"{type(e).__name__}: {e}"
+      elapsed = time.monotonic() - file_start
+      print(f"[import_ontologies {idx}/{total}] SKIPPED ({elapsed:.1f}s) {key}: {reason}")
+      skipped.append((key, reason))
+    finally:
+      # owlready2 Worlds hold a SQLite-backed quadstore. Drop the reference
+      # and force a GC pass so a 234-file merge doesn't balloon RSS.
+      try:
+        w.close()
+      except Exception:
+        pass
+      del w
+      gc.collect()
+
+    if ontology is None:
+      continue
+
+    file_classes = len(ontology.get("classes_dict", {}))
+    file_obj_props = len(ontology.get("object_properties_dict", {}))
+
+    if stamp_provenance:
+      for dname in ("classes_dict", "object_properties_dict", "data_properties_dict", "instances_dict"):
+        for entity in ontology.get(dname, {}).values():
+          existing = entity.get("sources")
+          if isinstance(existing, list):
+            if key not in existing:
+              existing.append(key)
+          else:
+            entity["sources"] = [key]
+
     if len(imported_ontologies.keys()) == 0:
       imported_ontologies = ontology
     else:
       imported_ontologies = merge_dicts_recursive(imported_ontologies, ontology)
-      classes_dict = imported_ontologies["classes_dict"]
-      object_properties_dict = imported_ontologies["object_properties_dict"]
-      data_properties_dict = imported_ontologies["data_properties_dict"]
-      instances_dict = imported_ontologies["instances_dict"]
 
-      print(f"Classes: {len(classes_dict)}")
-      print(f"Object properties: {len(object_properties_dict)}")
-      print(f"Data properties: {len(data_properties_dict)}")
-      print(f"Instances: {len(instances_dict)}")
-  
+    total_classes = len(imported_ontologies.get("classes_dict", {}))
+    elapsed = time.monotonic() - file_start
+    print(
+      f"[import_ontologies {idx}/{total}] OK ({elapsed:.1f}s) "
+      f"file: +{file_classes} classes, +{file_obj_props} obj-props "
+      f"| cumulative: {total_classes} classes"
+    )
+
+  total_elapsed = time.monotonic() - batch_start
+  print(
+    f"[import_ontologies] DONE: {total - len(skipped)}/{total} files loaded in {total_elapsed:.1f}s, "
+    f"{len(skipped)} skipped"
+  )
+  if skipped:
+    print("[import_ontologies] skipped files:")
+    for key, reason in skipped:
+      print(f"  - {key}: {reason}")
+
   return imported_ontologies
 
 def get_labels_only_from_classes(classes_dict):

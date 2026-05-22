@@ -18,6 +18,8 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from owlready2 import PREDEFINED_ONTOLOGIES
+
 from backend.app.helpers.ontology_parsing import (
     build_local_iri_map_from_folder,
     import_ontologies,
@@ -83,7 +85,7 @@ def _discover_imports_in_text(text: str) -> list[str]:
     return imports
 
 
-ONTOLOGY_SUFFIXES = (".owl", ".rdf", ".ttl", ".xml")
+ONTOLOGY_SUFFIXES = (".owl", ".rdf", ".ttl")
 
 
 @dataclass
@@ -175,6 +177,20 @@ def _basename_index(paths: list[Path]) -> dict[str, Path]:
     return out
 
 
+def _read_file_header(path: Path, max_bytes: int = 262144) -> str:
+    """Read at most `max_bytes` from the start of a file. owl:imports and
+    XML <!ENTITY> declarations always live in the file header (before the
+    class definitions), so a few hundred KB is enough. Avoids OOM-killing
+    the process when sniffing imports across huge files like DRON (670MB)
+    or HP (73MB)."""
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(max_bytes)
+    except OSError:
+        return ""
+    return data.decode("utf-8", errors="replace")
+
+
 def _build_import_url_map(working_files: list[Path]) -> dict[str, str]:
     """Sniff every ontology file for fully-expanded import URLs and map each
     one to a local file with a matching basename.
@@ -182,13 +198,16 @@ def _build_import_url_map(working_files: list[Path]) -> dict[str, str]:
     Handles OntoCAPE-style ontologies that bake absolute Windows paths into
     their owl:imports via XML entity declarations, plus simpler ontologies
     that use HTTP IRIs directly.
+
+    Only the file header is read (256 KB) -- imports are always declared
+    near the top, and reading multi-hundred-MB files like DRON in full
+    would OOM-kill the parser.
     """
     basename_to_path = _basename_index(working_files)
     discovered: dict[str, str] = {}
     for f in working_files:
-        try:
-            text = f.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        text = _read_file_header(f)
+        if not text:
             continue
         for url in _discover_imports_in_text(text):
             basename = url.rsplit("/", 1)[-1].lower()
@@ -200,17 +219,30 @@ def _build_import_url_map(working_files: list[Path]) -> dict[str, str]:
 
 def _strip_unresolved_imports(working_files: list[Path], resolvable_urls: set[str]) -> int:
     """Rewrite each .owl/.rdf file in place to remove `<owl:imports>` elements
-    whose targets are `file:` URLs that don't exist locally.
+    that would trigger a network fetch by owlready2.
 
-    Conservative scope:
-      - Only `file:` URLs are eligible for stripping. HTTP(S) imports are
-        left alone — owlready2 typically handles those gracefully (or our
-        IRI map already redirects them).
-      - Real-world ontologies often reference sibling-package files we don't
-        ship (e.g. OntoCAPE's main package imports `meta_model.owl` from a
-        separate package). owlready2 hard-fails on those `file:/...` paths;
-        stripping them lets the rest of the load succeed.
+    Why this matters: owlready2's `Ontology.load()` ALWAYS recursively loads
+    imported ontologies (namespace.py line 1053), and the `only_local` flag
+    is NOT propagated to those nested loads. So any `<owl:imports>` element
+    pointing at an HTTP(S) URL not in PREDEFINED_ONTOLOGIES will hang the
+    parse on a TCP SYN to the IRI's host (FIBO -> omg.org / edmcouncil.org).
 
+    Stripping rules:
+      - file:/// URLs that aren't in `resolvable_urls`: stripped (sibling
+        packages we don't ship, e.g. OntoCAPE's meta_model.owl).
+      - HTTP(S) URLs that aren't in PREDEFINED_ONTOLOGIES AND aren't in
+        `resolvable_urls`: stripped (FIBO/external imports).
+      - Anything found in PREDEFINED_ONTOLOGIES or `resolvable_urls`: kept
+        (owlready2's built-in W3C schemas, our OASIS catalog mappings,
+        our XML-entity-derived local mappings).
+
+    Real-world cases this handles:
+      - OntoCAPE imports `file:/C:/.../meta_model.owl` we don't ship: dropped.
+      - OCRe imports `http://www.w3.org/2002/07/owl`: kept (W3C built-in).
+      - FIBO imports `https://www.omg.org/spec/Commons/...`: dropped (avoids
+        network hang on Cloudflare SYN).
+
+    Only modifies files passed in; never touches user sources outside temp dirs.
     Returns the number of imports stripped across all files.
     """
     import_block_re = re.compile(
@@ -234,13 +266,31 @@ def _strip_unresolved_imports(working_files: list[Path], resolvable_urls: set[st
                 return _entities.get(ref, m.group(0))
 
             expanded = _ENTITY_REF_RE.sub(_sub, raw_url)
-            # Only consider stripping local file: URLs. Leave HTTP(S) alone.
-            if not expanded.lower().startswith("file:"):
-                return match.group(0)
+            # Kept if we can resolve it ourselves (local IRI map / catalog).
             if expanded in resolvable_urls or raw_url in resolvable_urls:
                 return match.group(0)
-            stripped += 1
-            return "<!-- import stripped (unresolvable): " + raw_url + " -->"
+            lower = expanded.lower()
+            # file:// imports without a local resolution: strip.
+            if lower.startswith("file:"):
+                stripped += 1
+                return "<!-- import stripped (file: unresolvable): " + raw_url + " -->"
+            # HTTP(S) imports: strip unless owlready2 has a built-in mapping
+            # (PREDEFINED_ONTOLOGIES is populated with W3C schemas + whatever
+            # we registered via register_local_iri_map). This avoids hanging
+            # on TCP SYN to external hosts like omg.org / edmcouncil.org.
+            if lower.startswith(("http:", "https:")):
+                stripped_iri = expanded.rstrip("#").rstrip("/")
+                if (
+                    expanded in PREDEFINED_ONTOLOGIES
+                    or stripped_iri in PREDEFINED_ONTOLOGIES
+                    or (stripped_iri + "#") in PREDEFINED_ONTOLOGIES
+                    or (stripped_iri + "/") in PREDEFINED_ONTOLOGIES
+                ):
+                    return match.group(0)
+                stripped += 1
+                return "<!-- import stripped (http: unresolvable): " + raw_url + " -->"
+            # Other URI schemes: leave alone (shouldn't occur in practice).
+            return match.group(0)
 
         new_text = import_block_re.sub(_maybe_strip, text)
         if new_text != text:
@@ -249,6 +299,41 @@ def _strip_unresolved_imports(working_files: list[Path], resolvable_urls: set[st
             except OSError:
                 continue
     return stripped
+
+
+# OASIS XML catalog parser. Many ontologies (FIBO is the big one) ship with
+# `catalog-v001.xml` files that explicitly map ontology IRIs to relative
+# local-file paths. Parsing them gives a precise IRI map without guessing.
+_CATALOG_URI_RE = re.compile(
+    r'<uri\s+name\s*=\s*"([^"]+)"\s+uri\s*=\s*"([^"]+)"\s*/>',
+    re.IGNORECASE,
+)
+
+
+def _build_iri_map_from_oasis_catalogs(temp_root: Path) -> dict[str, str]:
+    """Walk `temp_root` for OASIS `catalog-v*.xml` files and convert each
+    `<uri name=... uri=.../>` entry into an IRI -> absolute-local-path
+    mapping. Relative `uri=` values are resolved against the catalog file's
+    directory.
+    """
+    mapping: dict[str, str] = {}
+    for catalog in temp_root.rglob("catalog-v*.xml"):
+        try:
+            text = catalog.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        catalog_dir = catalog.parent
+        for match in _CATALOG_URI_RE.finditer(text):
+            iri, rel_path = match.group(1).strip(), match.group(2).strip()
+            if not iri or not rel_path:
+                continue
+            target = (catalog_dir / rel_path).resolve()
+            if target.exists():
+                mapping[iri] = str(target)
+                # Also map IRI variant with trailing slash dropped, since
+                # owlready2 looks up both forms.
+                mapping[iri.rstrip("/")] = str(target)
+    return mapping
 
 
 def _find_root_files(working_files: list[Path]) -> list[Path]:
@@ -279,7 +364,10 @@ def _find_root_files(working_files: list[Path]) -> list[Path]:
     return roots
 
 
-def load_ontology_files(sources: list[OntologySource]) -> dict[str, dict]:
+def load_ontology_files(
+    sources: list[OntologySource],
+    stamp_provenance: bool = False,
+) -> dict[str, dict]:
     """Run the existing extract_ontology_to_dicts() against each source,
     registering local IRI maps so cross-file imports resolve to the unzipped
     siblings rather than network URLs or hardcoded Windows paths.
@@ -287,8 +375,13 @@ def load_ontology_files(sources: list[OntologySource]) -> dict[str, dict]:
     Returns the canonical loaded ontology dict-of-dicts:
         {classes_dict, object_properties_dict, data_properties_dict, instances_dict}
     """
+    import time
+
     if not sources:
         raise ValueError("No sources to load")
+
+    print(f"[ontology_io] load_ontology_files: {len(sources)} source file(s)")
+    t0 = time.monotonic()
 
     # Base IRI map: filename-based aliases inside each working dir for HTTP-style
     # imports (covers OCRe-style http://purl.org/net/OCRe/<filename>.owl).
@@ -299,51 +392,104 @@ def load_ontology_files(sources: list[OntologySource]) -> dict[str, dict]:
             full_iri_map.update(build_local_iri_map_from_folder(str(d)))
         except FileNotFoundError:
             pass
+    print(
+        f"[ontology_io] folder-based IRI map: {len(full_iri_map)} entry(ies) "
+        f"({time.monotonic() - t0:.1f}s)"
+    )
 
     # Extra: sniff hardcoded file:/... import URLs (OntoCAPE-style) and add to
     # the map. These won't be discovered by build_local_iri_map_from_folder.
+    t1 = time.monotonic()
     all_files = [s.path for s in sources]
+    before = len(full_iri_map)
     full_iri_map.update(_build_import_url_map(all_files))
+    print(
+        f"[ontology_io] import-URL sniff added {len(full_iri_map) - before} entry(ies) "
+        f"({time.monotonic() - t1:.1f}s)"
+    )
+
+    # Extra: OASIS catalog files (FIBO ships catalog-v001.xml in each subdir
+    # that maps every IRI -> local file). Walking these gives an exact map
+    # for ontology packages that use catalogs.
+    t2 = time.monotonic()
+    before = len(full_iri_map)
+    catalog_roots = {s.working_dir for s in sources if s.is_from_zip}
+    # Walk one level up from each file's dir to catch catalogs that live in
+    # ancestor directories (FIBO's catalogs sit at FBC/, IND/, etc. — siblings
+    # of the .rdf files we extracted).
+    for d in list(catalog_roots):
+        catalog_roots.add(d.parent)
+    for catalog_root in catalog_roots:
+        if catalog_root.exists():
+            full_iri_map.update(_build_iri_map_from_oasis_catalogs(catalog_root))
+    print(
+        f"[ontology_io] OASIS catalog parse added {len(full_iri_map) - before} entry(ies) "
+        f"({time.monotonic() - t2:.1f}s)"
+    )
 
     if full_iri_map:
+        t3 = time.monotonic()
         register_local_iri_map(full_iri_map)
+        print(f"[ontology_io] global IRI-map registration ({time.monotonic() - t3:.1f}s)")
 
     # Strip imports that reference files outside the local set (sibling
     # packages we don't have copies of). owlready2 hard-fails on missing
     # imports; this makes the load resilient. Only modifies temp-extracted
     # files — never touches user sources.
+    t4 = time.monotonic()
     files_in_temp = [
         s.path for s in sources if s.is_from_zip or str(s.path).startswith(tempfile.gettempdir())
     ]
     if files_in_temp:
         n_stripped = _strip_unresolved_imports(files_in_temp, set(full_iri_map.keys()))
-        if n_stripped:
-            print(f"[ontology_io] stripped {n_stripped} unresolvable import(s) from extracted files")
-
-    # When sources come from a zip with many cross-imports (e.g. OntoCAPE's 64
-    # files), loading every file individually is O(N²) because each load
-    # transitively re-parses imports. Identify root files (not imported by any
-    # other source in the same set) and only load those — owlready2's import
-    # walker pulls in the rest in a single pass per root.
-    root_paths = set(_find_root_files(all_files))
-    effective_sources = [s for s in sources if s.path in root_paths]
-    if len(effective_sources) < len(sources):
         print(
-            f"[ontology_io] loading {len(effective_sources)} root files "
-            f"(out of {len(sources)} total — others pulled in transitively)"
+            f"[ontology_io] stripped {n_stripped} unresolvable import(s) "
+            f"from {len(files_in_temp)} extracted file(s) ({time.monotonic() - t4:.1f}s)"
         )
 
-    # Compose the dict that import_ontologies() expects.
+    # Decide how aggressively owlready2 should follow imports.
+    # - Multi-source case (zip with many .owl files, or user passed several
+    #   --ontology flags): we already enumerate every sibling, so do NOT have
+    #   owlready2 re-walk the import graph during each load. With 234 files
+    #   in FIBO and dense cross-imports, walking would re-parse the same
+    #   low-level files dozens of times (effectively O(N²)). Loading each
+    #   file standalone and merging the dicts is O(N) and produces the same
+    #   result because every class definition is visited at least once.
+    # - Single-source case (one .owl on disk, no siblings to load
+    #   explicitly): keep load_imported=True so transitive deps still get
+    #   followed via the IRI map / HTTP.
+    has_siblings = any(s.is_from_zip for s in sources) or len(sources) > 1
+    follow_imports = not has_siblings
+
+    if follow_imports:
+        # Single isolated file: keep the root-files heuristic (no-op here
+        # since there's only one source) and let owlready2 walk imports.
+        effective_sources = list(sources)
+    else:
+        # Multi-source: load EVERY file. `_find_root_files` is no longer a
+        # win because each load is now cheap; dropping non-roots would miss
+        # classes that are only declared in imported-only files.
+        effective_sources = list(sources)
+        print(
+            f"[ontology_io] multi-source load: {len(effective_sources)} file(s), "
+            f"load_imported=False (each file parsed standalone, then merged)"
+        )
+
+    # Compose the dict that import_ontologies() expects. The iri_map is
+    # intentionally NOT passed per file: it has already been registered
+    # globally above via register_local_iri_map(full_iri_map). Re-registering
+    # the same thousands of FIBO catalog entries on each of 100+ files
+    # dominates wall time (the print statements alone) for no benefit.
     owl_dict = {}
     for s in effective_sources:
         owl_dict[s.label] = {
             "filename": str(s.path),
-            "load_imported": True,
+            "load_imported": follow_imports,
             "local_only": True,
             "local_ontology_dir": str(s.working_dir),
-            "iri_map": full_iri_map,
+            "iri_map": None,
         }
-    return import_ontologies(owl_dict)
+    return import_ontologies(owl_dict, stamp_provenance=stamp_provenance)
 
 
 def iter_documents(documents_dir: Path) -> Iterator[Path]:
