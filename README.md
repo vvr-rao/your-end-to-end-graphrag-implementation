@@ -125,6 +125,58 @@ Features:
 - Files larger than 200 MB (DRON) display a "too large to load" message instead of trying to parse.
 - Each file is loaded in its own owlready2 `World()` so switching between two files in one session can't leak entities across them.
 
+## Source-document downloaders
+
+Three standalone CLI utilities live in `source_documents/` for grabbing input documents from free public sources. Each accepts the same `--search` / `--output` / `--max` interface and writes to a destination folder (default: `source_documents/<tool>_<slug-of-search>/`).
+
+### 1) DailyMed — drug Patient-Information PDFs
+
+Searches [DailyMed](https://dailymed.nlm.nih.gov/) (NLM) for drug labels matching a condition and downloads each match's Patient-Information PDF.
+
+```bash
+uv run python source_documents/dailymed_download.py \
+  --search "diabetes" \
+  --output source_documents/pharma_documents \
+  --max 10
+```
+
+### 2) Web search — top-N pages as plain text
+
+Hits DuckDuckGo's HTML SERP (`https://duckduckgo.com/html/?q=...`), takes the top `--max` results, fetches each page, extracts visible text via BeautifulSoup, and writes one `.txt` per result plus an `_index.json` manifest.
+
+```bash
+uv run python source_documents/websearch_download.py \
+  --search "GraphRAG ontology techniques" \
+  --max 5
+```
+
+### 3) SEC EDGAR — financial-report PDFs
+
+Searches SEC EDGAR full-text index for filings matching a company name or ticker (forms `10-K`, `10-Q`, `20-F`, `40-F`, `8-K` by default; override with `--forms`). For each matching filing, walks the filing's index for documents with a `.pdf` extension and downloads them.
+
+Most US 10-Ks ship as iXBRL only — they contain no `.pdf` attachments. Pass `--allow-html` to fall back to the primary HTML 10-K body and convert it to PDF via [WeasyPrint](https://weasyprint.org/) when no native PDF exists. If conversion fails (malformed markup, missing font), the raw `.htm` is written instead so the filing content is preserved.
+
+```bash
+# PDF-only (may yield zero files for iXBRL-only issuers):
+uv run python source_documents/financial_report_download.py \
+  --search "Apple Inc" --max 5
+
+# Permissive: PDFs when available, HTML→PDF conversion otherwise:
+uv run python source_documents/financial_report_download.py \
+  --search "Apple Inc" --max 5 --allow-html
+```
+
+### Shared flags
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `--search` / `-q` | string | *required* | Search term (condition / company / query). |
+| `--output` / `-o` | path | per-tool slug | Destination folder. |
+| `--max` / `-n` | int | `10` | Cap on matches. |
+| `--overwrite` | flag | off | Redownload even if the destination file already exists. |
+
+EDGAR-only: `--allow-html` (see above), `--forms <CSV>` (default `10-K,10-Q,20-F,40-F,8-K`).
+
 ## LLM providers
 
 | Task | Provider | Default model |

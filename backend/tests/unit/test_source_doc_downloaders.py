@@ -183,3 +183,18 @@ def test_edgar_filing_doc_url_path_shape() -> None:
         cik="0000320193", adsh="0000320193-23-000106", doc_name="aapl-20231230.htm"
     )
     assert url == "https://www.sec.gov/Archives/edgar/data/320193/000032019323000106/aapl-20231230.htm"
+
+
+def test_edgar_html_to_pdf_returns_pdf_bytes() -> None:
+    """Smoke the HTML->PDF helper on a tiny synthetic doc. Confirms
+    weasyprint is installed AND that our wrapper returns valid PDF
+    bytes (magic-header + non-trivial size)."""
+    html = (
+        "<!doctype html><html><head><title>Test</title></head>"
+        "<body><h1>Test Heading</h1><p>Hello world.</p>"
+        "<p>This is a second paragraph.</p></body></html>"
+    )
+    pdf = edgar_mod._html_to_pdf_bytes(html)
+    assert isinstance(pdf, bytes)
+    assert pdf.startswith(b"%PDF-"), pdf[:16]
+    assert len(pdf) > 500

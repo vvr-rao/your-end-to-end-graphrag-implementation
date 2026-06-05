@@ -9,9 +9,11 @@ PDF attachments are the EXCEPTION (smaller issuers, some 8-Ks, proxy
 statements, foreign 20-F filers occasionally). The tool prints a
 per-filing line so you know which ones had PDFs vs. didn't.
 
-For filings without any PDF, pass `--allow-html` to also download the
-primary HTML 10-K (i.e. the financial report itself, just in HTML
-format). The default keeps the PDF-only contract.
+For filings without any PDF, pass `--allow-html` to download the
+primary HTML 10-K body and convert it to PDF via WeasyPrint. The
+result is still a `.pdf` file; on conversion failure the raw `.htm`
+is written instead so you always get the filing content. The default
+keeps the PDF-only contract (no HTML fetch, no conversion).
 
 Usage:
     # PDF-only (may yield zero files for big iXBRL-only issuers):
@@ -155,6 +157,21 @@ def _filing_doc_url(cik: str, adsh: str, doc_name: str) -> str:
     return f"{EDGAR_ARCHIVE_BASE}/{cik_int}/{accession_no_dashes}/{doc_name}"
 
 
+def _html_to_pdf_bytes(html_text: str, base_url: str | None = None) -> bytes:
+    """Render an HTML string to PDF bytes via WeasyPrint.
+
+    `base_url` is the URL the HTML was originally served from, so
+    relative `<img>` / `<link href="...">` references inside the
+    filing's HTML can resolve against EDGAR's archive (otherwise
+    WeasyPrint emits warnings and the rendered PDF is missing inline
+    assets). Lazy-imported so the unit tests for slug/URL helpers don't
+    pay weasyprint's startup cost.
+    """
+    import weasyprint  # heavy: brings in cairo/pango via cffi
+
+    return weasyprint.HTML(string=html_text, base_url=base_url).write_pdf()
+
+
 def _company_label(filing: dict) -> str:
     names = filing.get("names") or []
     if names:
@@ -224,16 +241,42 @@ def search_and_download(
                 name = primary["name"]
                 url = _filing_doc_url(filing["cik"], adsh, name)
                 slug = safe_filename(name, max_len=80)
-                dest = output / f"{fidx:03d}_{company}_{form}_{date}_HTML_{slug}"
-                if not dest.name.lower().endswith((".htm", ".html")):
-                    dest = dest.with_suffix(".htm")
-                print(f"    HTML (fallback): {name}")
-                saved = download_stream(
-                    session, url, dest, overwrite=overwrite,
-                    expected_content_types=("html", "text/html"),
-                )
-                if saved is not None:
+                base = output / f"{fidx:03d}_{company}_{form}_{date}_HTML_{slug}"
+                pdf_dest = base.with_suffix(".pdf")
+                htm_dest = base.with_suffix(".htm")
+                if pdf_dest.exists() and not overwrite:
+                    print(f"    skip (exists): {pdf_dest.name}")
                     htmls_downloaded += 1
+                    time.sleep(DEFAULT_SLEEP_SECONDS)
+                    continue
+                print(f"    HTML (fallback, converting to PDF): {name}")
+                # Fetch + convert. download_stream is bypassed here
+                # because weasyprint needs the bytes in memory anyway.
+                resp = None
+                try:
+                    resp = session.get(url, timeout=60)
+                    resp.raise_for_status()
+                    pdf_bytes = _html_to_pdf_bytes(resp.text, base_url=url)
+                    pdf_dest.parent.mkdir(parents=True, exist_ok=True)
+                    pdf_dest.write_bytes(pdf_bytes)
+                    htmls_downloaded += 1
+                    print(f"      -> {pdf_dest.name} ({len(pdf_bytes):,} bytes)")
+                except Exception as e:  # noqa: BLE001
+                    raw = resp.content if resp is not None else b""
+                    if raw:
+                        htm_dest.parent.mkdir(parents=True, exist_ok=True)
+                        htm_dest.write_bytes(raw)
+                        htmls_downloaded += 1
+                        print(
+                            f"      -> weasyprint conversion failed "
+                            f"({type(e).__name__}: {e}); saved raw "
+                            f"{htm_dest.name} ({len(raw):,} bytes) instead"
+                        )
+                    else:
+                        print(
+                            f"      -> fetch failed ({type(e).__name__}: {e}); "
+                            "skipped"
+                        )
                 time.sleep(DEFAULT_SLEEP_SECONDS)
         else:
             print("    -> no PDF in this filing (rerun with --allow-html for HTML); skipping")
@@ -270,9 +313,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--forms", default=DEFAULT_FORMS,
                    help=f"Comma-separated EDGAR forms to search (default: {DEFAULT_FORMS}).")
     p.add_argument("--allow-html", action="store_true", dest="allow_html",
-                   help="If a filing has no PDF attachment, fall back to "
-                        "downloading the primary HTML 10-K body (most US 10-Ks "
-                        "are iXBRL-only and only become useful with this flag).")
+                   help="If a filing has no PDF attachment, fetch the primary "
+                        "HTML 10-K body and convert it to PDF via WeasyPrint. "
+                        "Most US 10-Ks are iXBRL-only and only produce a "
+                        "useful file with this flag. On conversion failure "
+                        "the raw .htm is written instead.")
     p.add_argument("--overwrite", action="store_true",
                    help="Redownload even if the destination file already exists.")
     return p.parse_args(argv)

@@ -42,6 +42,7 @@ dependencies = [
     "groq>=0.15",
     "requests>=2.33.1",
     "beautifulsoup4>=4.12",   # source_documents/* downloaders
+    "weasyprint>=60",         # HTML -> PDF rendering for SEC EDGAR fallback
     # Local Dash visualizer (`uv run python -m visualizer`)
     "dash>=2.18",
     "dash-cytoscape>=1.0",
