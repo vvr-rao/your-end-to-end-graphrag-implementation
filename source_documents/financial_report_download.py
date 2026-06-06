@@ -36,10 +36,14 @@ from __future__ import annotations
 
 import argparse
 import re
+import shutil
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import requests
 from bs4 import BeautifulSoup
 
 from _downloader_common import (
@@ -207,9 +211,23 @@ def _blocking_url_fetcher(url, *_, **__):  # type: ignore[no-untyped-def]
     return {"string": b"", "mime_type": "application/octet-stream"}
 
 
+# WeasyPrint ships cairo/pango via cffi; those C libraries aren't fully
+# thread-safe under concurrent calls (cairo state + pango font fallback
+# both have shared mutable globals that race on render). On top of that,
+# each render of an iXBRL 10-K eats a few hundred MB of RSS, so running
+# N renders in parallel on a 2.7 GiB box exhausts memory anyway. The
+# fix that covers both problems is a module-level lock: network fetches
+# across the thread pool still overlap, but the actual WeasyPrint
+# render is one-at-a-time.
+_PDF_RENDER_LOCK = threading.Lock()
+
+
 def _html_to_pdf_bytes(html_text: str, base_url: str | None = None) -> bytes:
     """Render an HTML string to PDF bytes via WeasyPrint, with iXBRL
     pre-stripping and remote-fetch blocking for speed.
+
+    Serialized via `_PDF_RENDER_LOCK` -- multiple worker threads can
+    fetch HTML in parallel but only one runs WeasyPrint at a time.
 
     `base_url` is still passed so any non-iXBRL relative URLs resolve
     correctly when the cleaned HTML still references them; the custom
@@ -219,11 +237,12 @@ def _html_to_pdf_bytes(html_text: str, base_url: str | None = None) -> bytes:
     import weasyprint  # heavy: brings in cairo/pango via cffi
 
     cleaned = _strip_ixbrl_for_render(html_text)
-    return weasyprint.HTML(
-        string=cleaned,
-        base_url=base_url,
-        url_fetcher=_blocking_url_fetcher,
-    ).write_pdf()
+    with _PDF_RENDER_LOCK:
+        return weasyprint.HTML(
+            string=cleaned,
+            base_url=base_url,
+            url_fetcher=_blocking_url_fetcher,
+        ).write_pdf()
 
 
 def _company_label(filing: dict) -> str:
@@ -235,6 +254,195 @@ def _company_label(filing: dict) -> str:
     return f"CIK{int(filing.get('cik', '0')):010d}"
 
 
+# ----------------------------------------------------------------------------
+# Disk cache for EDGAR downloads + conversions.
+#
+# SEC filings are immutable -- once submitted under an accession number,
+# the documents inside that filing never change. So we can cache them
+# forever: cache key = (accession_no_dashes, doc_name). Two sub-trees:
+#   pdfs/        <- documents downloaded directly from EDGAR as PDFs.
+#   html_to_pdf/ <- PDFs we rendered from the filing's primary HTML.
+# The cache lives in the standard user cache dir; nothing repo-local
+# so different `--output` runs share the same cache transparently.
+# ----------------------------------------------------------------------------
+
+
+def _edgar_cache_dir() -> Path:
+    """Return (and ensure) the user-level cache directory for EDGAR."""
+    root = Path.home() / ".cache" / "your-personal-knowledge-graph-creator" / "edgar"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _cached_pdf_path(accession_no_dashes: str, doc_name: str) -> Path:
+    """Cache path for a directly-downloaded PDF document."""
+    return _edgar_cache_dir() / "pdfs" / accession_no_dashes / doc_name
+
+
+def _cached_html_to_pdf_path(accession_no_dashes: str, doc_name: str) -> Path:
+    """Cache path for a PDF rendered from the filing's primary HTML.
+    Replaces the source filename's `.htm` / `.html` extension with `.pdf`."""
+    stem = Path(doc_name).stem
+    return _edgar_cache_dir() / "html_to_pdf" / accession_no_dashes / f"{stem}.pdf"
+
+
+def _copy_into_place(src: Path, dest: Path) -> None:
+    """Copy `src` to `dest`, creating parent dirs. Used for cache->output
+    handoff so each thread writes a single, atomic file to the output dir."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest)
+
+
+def _process_filing(
+    filing: dict,
+    fidx: int,
+    total: int,
+    output: Path,
+    allow_html: bool,
+    overwrite: bool,
+    use_cache: bool,
+    session: requests.Session,
+) -> dict:
+    """Process ONE filing in a worker thread.
+
+    Each worker:
+      - fetches the filing's index.json,
+      - downloads any PDF attachments (cache-first if `use_cache`),
+      - or, if `allow_html`, fetches+converts the primary HTML 10-K
+        body (cache-first if `use_cache`),
+      - writes everything into `output/` with deterministic filenames.
+
+    Returns a dict with `log` (list of lines to print in main thread,
+    preserving per-filing line ordering), `had_pdf` (bool), `pdfs_saved`,
+    and `htmls_saved` counters.
+    """
+    log: list[str] = []
+    adsh = filing["adsh"]
+    form = filing.get("form") or "?"
+    company = _company_label(filing)
+    date = filing.get("date") or "?"
+    cik = filing["cik"]
+    accession_no_dashes = adsh.replace("-", "")
+    log.append(f"  [{fidx}/{total}] {company} {form} {date} ({adsh})")
+
+    # ---- index fetch -------------------------------------------------------
+    idx_url = _filing_index_url(cik, adsh)
+    try:
+        r = session.get(idx_url, timeout=30)
+        r.raise_for_status()
+        idx = r.json()
+    except Exception as e:  # noqa: BLE001
+        log.append(f"    -> index fetch failed: {type(e).__name__}: {e}")
+        return {"log": log, "had_pdf": False, "pdfs_saved": 0, "htmls_saved": 0}
+
+    pdf_items = _extract_pdfs(idx)
+    pdfs_saved = 0
+    htmls_saved = 0
+
+    # ---- direct PDFs -------------------------------------------------------
+    if pdf_items:
+        for j, item in enumerate(pdf_items, start=1):
+            name = item["name"]
+            url = _filing_doc_url(cik, adsh, name)
+            slug = safe_filename(name, max_len=80)
+            dest = output / f"{fidx:03d}_{company}_{form}_{date}_{j:02d}_{slug}"
+            if not dest.name.lower().endswith(".pdf"):
+                dest = dest.with_suffix(".pdf")
+            if dest.exists() and not overwrite:
+                log.append(f"    skip (exists): {dest.name}")
+                pdfs_saved += 1
+                continue
+            cache_path = _cached_pdf_path(accession_no_dashes, name) if use_cache else None
+            if cache_path is not None and cache_path.exists() and not overwrite:
+                _copy_into_place(cache_path, dest)
+                log.append(f"    PDF (cache hit): {name} -> {dest.name}")
+                pdfs_saved += 1
+                continue
+            log.append(f"    PDF: {name}")
+            try:
+                resp = session.get(url, timeout=60, stream=True)
+                resp.raise_for_status()
+                ct = resp.headers.get("Content-Type", "").lower()
+                if "pdf" not in ct and "octet-stream" not in ct:
+                    log.append(f"      -> skip (content-type {ct!r})")
+                    continue
+                # Write to cache first if enabled, then copy into the
+                # output folder. If caching is disabled, write straight
+                # to dest.
+                write_target = cache_path if cache_path is not None else dest
+                write_target.parent.mkdir(parents=True, exist_ok=True)
+                with write_target.open("wb") as fh:
+                    for chunk in resp.iter_content(chunk_size=65536):
+                        if chunk:
+                            fh.write(chunk)
+                if cache_path is not None:
+                    _copy_into_place(cache_path, dest)
+                log.append(f"      -> {dest.name} ({dest.stat().st_size:,} bytes)")
+                pdfs_saved += 1
+            except Exception as e:  # noqa: BLE001
+                log.append(f"      -> download failed: {type(e).__name__}: {e}")
+            time.sleep(DEFAULT_SLEEP_SECONDS)
+        return {"log": log, "had_pdf": True, "pdfs_saved": pdfs_saved, "htmls_saved": 0}
+
+    # ---- HTML -> PDF fallback ---------------------------------------------
+    if not allow_html:
+        log.append("    -> no PDF in this filing (rerun with --allow-html for HTML); skipping")
+        return {"log": log, "had_pdf": False, "pdfs_saved": 0, "htmls_saved": 0}
+
+    primary = _primary_html_doc(idx)
+    if primary is None:
+        log.append("    -> no PDF AND no primary HTML found; skipping")
+        return {"log": log, "had_pdf": False, "pdfs_saved": 0, "htmls_saved": 0}
+
+    name = primary["name"]
+    url = _filing_doc_url(cik, adsh, name)
+    slug = safe_filename(name, max_len=80)
+    base = output / f"{fidx:03d}_{company}_{form}_{date}_HTML_{slug}"
+    pdf_dest = base.with_suffix(".pdf")
+    htm_dest = base.with_suffix(".htm")
+
+    if pdf_dest.exists() and not overwrite:
+        log.append(f"    skip (exists): {pdf_dest.name}")
+        return {"log": log, "had_pdf": False, "pdfs_saved": 0, "htmls_saved": 1}
+
+    cache_path = (
+        _cached_html_to_pdf_path(accession_no_dashes, name) if use_cache else None
+    )
+    if cache_path is not None and cache_path.exists() and not overwrite:
+        _copy_into_place(cache_path, pdf_dest)
+        log.append(f"    HTML->PDF (cache hit): {name} -> {pdf_dest.name}")
+        return {"log": log, "had_pdf": False, "pdfs_saved": 0, "htmls_saved": 1}
+
+    log.append(f"    HTML (fallback, converting to PDF): {name}")
+    resp = None
+    try:
+        resp = session.get(url, timeout=60)
+        resp.raise_for_status()
+        pdf_bytes = _html_to_pdf_bytes(resp.text, base_url=url)
+        pdf_dest.parent.mkdir(parents=True, exist_ok=True)
+        pdf_dest.write_bytes(pdf_bytes)
+        if cache_path is not None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_bytes(pdf_bytes)
+        log.append(f"      -> {pdf_dest.name} ({len(pdf_bytes):,} bytes)")
+        htmls_saved = 1
+    except Exception as e:  # noqa: BLE001
+        raw = resp.content if resp is not None else b""
+        if raw:
+            htm_dest.parent.mkdir(parents=True, exist_ok=True)
+            htm_dest.write_bytes(raw)
+            htmls_saved = 1
+            log.append(
+                f"      -> weasyprint conversion failed "
+                f"({type(e).__name__}: {e}); saved raw "
+                f"{htm_dest.name} ({len(raw):,} bytes) instead"
+            )
+        else:
+            log.append(f"      -> fetch failed ({type(e).__name__}: {e}); skipped")
+    time.sleep(DEFAULT_SLEEP_SECONDS)
+    return {"log": log, "had_pdf": False, "pdfs_saved": 0, "htmls_saved": htmls_saved}
+
+
 def search_and_download(
     query: str,
     output: Path,
@@ -242,6 +450,8 @@ def search_and_download(
     forms: str,
     overwrite: bool,
     allow_html: bool = False,
+    concurrency: int = 4,
+    use_cache: bool = True,
 ) -> dict:
     output.mkdir(parents=True, exist_ok=True)
     session = polite_session(contact=CONTACT)
@@ -250,104 +460,60 @@ def search_and_download(
         print(f"[edgar] no filings found for {query!r}")
         return {"filings": 0, "with_pdf": 0, "downloaded_pdfs": 0, "downloaded_htmls": 0}
 
-    pdfs_downloaded = 0
-    htmls_downloaded = 0
-    filings_with_pdf = 0
-    for fidx, filing in enumerate(filings, start=1):
-        adsh = filing["adsh"]
-        form = filing.get("form") or "?"
-        company = _company_label(filing)
-        date = filing.get("date") or "?"
-        print(f"  [{fidx}/{len(filings)}] {company} {form} {date} ({adsh})")
-        idx_url = _filing_index_url(filing["cik"], adsh)
-        try:
-            r = session.get(idx_url, timeout=30)
-            r.raise_for_status()
-            idx = r.json()
-        except Exception as e:  # noqa: BLE001
-            print(f"    -> index fetch failed: {type(e).__name__}: {e}")
-            time.sleep(DEFAULT_SLEEP_SECONDS)
-            continue
+    # Cap concurrency to a polite max. Higher than 4 trips SEC EDGAR's
+    # connection throttling (observed: 4 threads stall the cold-cache
+    # run almost completely), and the per-render lock means CPU work
+    # serializes anyway -- so there's no benefit to going higher.
+    workers = max(1, min(int(concurrency), 4))
+    cache_state = "on" if use_cache else "off"
+    print(
+        f"[edgar] processing {len(filings)} filing(s) with "
+        f"concurrency={workers}, cache={cache_state}"
+    )
+    if use_cache:
+        print(f"[edgar] cache dir: {_edgar_cache_dir()}")
 
-        pdf_items = _extract_pdfs(idx)
-        if pdf_items:
-            filings_with_pdf += 1
-            for j, item in enumerate(pdf_items, start=1):
-                name = item["name"]
-                url = _filing_doc_url(filing["cik"], adsh, name)
-                slug = safe_filename(name, max_len=80)
-                dest = output / f"{fidx:03d}_{company}_{form}_{date}_{j:02d}_{slug}"
-                if not dest.name.lower().endswith(".pdf"):
-                    dest = dest.with_suffix(".pdf")
-                print(f"    PDF: {name}")
-                saved = download_stream(
-                    session, url, dest, overwrite=overwrite,
-                    expected_content_types=("pdf", "octet-stream"),
-                )
-                if saved is not None:
-                    pdfs_downloaded += 1
-                time.sleep(DEFAULT_SLEEP_SECONDS)
-        elif allow_html:
-            primary = _primary_html_doc(idx)
-            if primary is None:
-                print("    -> no PDF AND no primary HTML found; skipping")
-            else:
-                name = primary["name"]
-                url = _filing_doc_url(filing["cik"], adsh, name)
-                slug = safe_filename(name, max_len=80)
-                base = output / f"{fidx:03d}_{company}_{form}_{date}_HTML_{slug}"
-                pdf_dest = base.with_suffix(".pdf")
-                htm_dest = base.with_suffix(".htm")
-                if pdf_dest.exists() and not overwrite:
-                    print(f"    skip (exists): {pdf_dest.name}")
-                    htmls_downloaded += 1
-                    time.sleep(DEFAULT_SLEEP_SECONDS)
-                    continue
-                print(f"    HTML (fallback, converting to PDF): {name}")
-                # Fetch + convert. download_stream is bypassed here
-                # because weasyprint needs the bytes in memory anyway.
-                resp = None
-                try:
-                    resp = session.get(url, timeout=60)
-                    resp.raise_for_status()
-                    pdf_bytes = _html_to_pdf_bytes(resp.text, base_url=url)
-                    pdf_dest.parent.mkdir(parents=True, exist_ok=True)
-                    pdf_dest.write_bytes(pdf_bytes)
-                    htmls_downloaded += 1
-                    print(f"      -> {pdf_dest.name} ({len(pdf_bytes):,} bytes)")
-                except Exception as e:  # noqa: BLE001
-                    raw = resp.content if resp is not None else b""
-                    if raw:
-                        htm_dest.parent.mkdir(parents=True, exist_ok=True)
-                        htm_dest.write_bytes(raw)
-                        htmls_downloaded += 1
-                        print(
-                            f"      -> weasyprint conversion failed "
-                            f"({type(e).__name__}: {e}); saved raw "
-                            f"{htm_dest.name} ({len(raw):,} bytes) instead"
-                        )
-                    else:
-                        print(
-                            f"      -> fetch failed ({type(e).__name__}: {e}); "
-                            "skipped"
-                        )
-                time.sleep(DEFAULT_SLEEP_SECONDS)
-        else:
-            print("    -> no PDF in this filing (rerun with --allow-html for HTML); skipping")
-            time.sleep(DEFAULT_SLEEP_SECONDS)
+    pdfs_saved_total = 0
+    htmls_saved_total = 0
+    filings_with_pdf = 0
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [
+            ex.submit(
+                _process_filing,
+                filing,
+                fidx,
+                len(filings),
+                output,
+                allow_html,
+                overwrite,
+                use_cache,
+                session,
+            )
+            for fidx, filing in enumerate(filings, start=1)
+        ]
+        for fut in as_completed(futures):
+            result = fut.result()
+            # Print this filing's log lines as one atomic block so the
+            # output stays readable even with N threads.
+            print("\n".join(result["log"]))
+            if result.get("had_pdf"):
+                filings_with_pdf += 1
+            pdfs_saved_total += result.get("pdfs_saved", 0)
+            htmls_saved_total += result.get("htmls_saved", 0)
 
     summary = {
         "filings": len(filings),
         "with_pdf": filings_with_pdf,
-        "downloaded_pdfs": pdfs_downloaded,
-        "downloaded_htmls": htmls_downloaded,
+        "downloaded_pdfs": pdfs_saved_total,
+        "downloaded_htmls": htmls_saved_total,
     }
     msg = (
-        f"[edgar] done: {pdfs_downloaded} PDF(s) across {filings_with_pdf}/"
+        f"[edgar] done: {pdfs_saved_total} PDF(s) across {filings_with_pdf}/"
         f"{len(filings)} filings"
     )
     if allow_html:
-        msg += f" + {htmls_downloaded} primary HTML 10-K(s) (fallback)"
+        msg += f" + {htmls_saved_total} primary HTML 10-K(s) (fallback)"
     msg += f" saved to {output}"
     print(msg)
     return summary
@@ -372,6 +538,21 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "Most US 10-Ks are iXBRL-only and only produce a "
                         "useful file with this flag. On conversion failure "
                         "the raw .htm is written instead.")
+    p.add_argument("--concurrency", "-j", type=int, default=2,
+                   help="Number of filings to process in parallel via a "
+                        "ThreadPoolExecutor (default: 2, capped at 4). "
+                        "Higher values trigger SEC EDGAR throttling and "
+                        "don't help anyway -- the WeasyPrint render is "
+                        "serialized with a module lock since cairo/pango "
+                        "aren't thread-safe and each render takes a few "
+                        "hundred MB of RSS.")
+    p.add_argument("--no-cache", action="store_true", dest="no_cache",
+                   help="Bypass the disk cache. Default: cache on at "
+                        "~/.cache/your-personal-knowledge-graph-creator/edgar/. "
+                        "SEC filings are immutable per accession+document, "
+                        "so the cache stays valid forever -- re-runs against "
+                        "the same filings skip both download and HTML->PDF "
+                        "conversion.")
     p.add_argument("--overwrite", action="store_true",
                    help="Redownload even if the destination file already exists.")
     return p.parse_args(argv)
@@ -389,6 +570,8 @@ def main(argv: list[str] | None = None) -> int:
         forms=args.forms,
         overwrite=args.overwrite,
         allow_html=args.allow_html,
+        concurrency=args.concurrency,
+        use_cache=not args.no_cache,
     )
     return 0
 

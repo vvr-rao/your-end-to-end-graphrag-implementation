@@ -213,6 +213,29 @@ def test_edgar_strip_ixbrl_unwraps_namespace_tags_keeps_text() -> None:
     assert ".xsd" not in cleaned
 
 
+def test_edgar_cache_paths_have_expected_shape(monkeypatch, tmp_path) -> None:
+    """Cache lives under the user's HOME/.cache; pin HOME to tmp_path so
+    the test doesn't touch the real cache. Verifies the two cache sub-
+    directories produce the right paths for direct PDFs vs. HTML->PDF."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    root = edgar_mod._edgar_cache_dir()
+    assert root == tmp_path / ".cache" / "your-personal-knowledge-graph-creator" / "edgar"
+    assert root.is_dir()  # _edgar_cache_dir() creates the root
+    direct = edgar_mod._cached_pdf_path("000032019324000123", "ex23-1.pdf")
+    assert direct == root / "pdfs" / "000032019324000123" / "ex23-1.pdf"
+    converted = edgar_mod._cached_html_to_pdf_path(
+        "000032019324000123", "aapl-20240928.htm"
+    )
+    # The .htm extension is replaced by .pdf for the cache key.
+    assert converted == root / "html_to_pdf" / "000032019324000123" / "aapl-20240928.pdf"
+
+
+def test_edgar_cache_html_to_pdf_strips_html_extension_too(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    p = edgar_mod._cached_html_to_pdf_path("0001234567", "foo.html")
+    assert p.name == "foo.pdf"
+
+
 def test_edgar_blocking_url_fetcher_returns_empty_for_remote() -> None:
     """The url_fetcher callback returns empty bytes for any http(s)
     URL so WeasyPrint doesn't round-trip the network during render."""
