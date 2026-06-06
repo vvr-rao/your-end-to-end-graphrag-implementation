@@ -185,6 +185,43 @@ def test_edgar_filing_doc_url_path_shape() -> None:
     assert url == "https://www.sec.gov/Archives/edgar/data/320193/000032019323000106/aapl-20231230.htm"
 
 
+def test_edgar_strip_ixbrl_unwraps_namespace_tags_keeps_text() -> None:
+    """The pre-render strip unwraps every `<ix:*>` wrapper (keeping its
+    inner text), removes hidden iXBRL containers, and drops XSD
+    schema links. The visible body text survives."""
+    html = (
+        "<html><body>"
+        "<p>Revenue: "
+        '<ix:nonFraction contextRef="c1" name="us-gaap:Revenues" unitRef="USD">'
+        "100"
+        "</ix:nonFraction>"
+        "</p>"
+        '<div style="display:none">'
+        "<ix:nonFraction>hidden_fact</ix:nonFraction>"
+        "</div>"
+        '<link href="aapl-20240928.xsd" rel="schemaRef"/>'
+        "</body></html>"
+    )
+    cleaned = edgar_mod._strip_ixbrl_for_render(html)
+    # iXBRL wrappers are gone but their text content is preserved.
+    assert "<ix:" not in cleaned
+    assert "Revenue:" in cleaned
+    assert "100" in cleaned
+    # display:none block is fully decomposed (its inner text too).
+    assert "hidden_fact" not in cleaned
+    # XSD schema link is dropped.
+    assert ".xsd" not in cleaned
+
+
+def test_edgar_blocking_url_fetcher_returns_empty_for_remote() -> None:
+    """The url_fetcher callback returns empty bytes for any http(s)
+    URL so WeasyPrint doesn't round-trip the network during render."""
+    result = edgar_mod._blocking_url_fetcher("https://example.com/logo.png")
+    assert result == {"string": b"", "mime_type": "application/octet-stream"}
+    result2 = edgar_mod._blocking_url_fetcher("http://example.com/foo.css")
+    assert result2["string"] == b""
+
+
 def test_edgar_html_to_pdf_returns_pdf_bytes() -> None:
     """Smoke the HTML->PDF helper on a tiny synthetic doc. Confirms
     weasyprint is installed AND that our wrapper returns valid PDF
