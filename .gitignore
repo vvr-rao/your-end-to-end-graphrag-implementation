@@ -55,6 +55,9 @@ Thumbs.db
 
 # Ontology folders: keep top-level (notes.md tracked) but ignore subdirectories where actual .owl content lives
 source_ontologies/*/
+# Whitelist core_ontologies/ specifically (user-curated core ontologies meant to ship with the repo).
+!source_ontologies/core_ontologies/
+!source_ontologies/core_ontologies/**
 output_ontologies/*/
 
 # Source documents: only the top-level notes.md + the bundled downloader

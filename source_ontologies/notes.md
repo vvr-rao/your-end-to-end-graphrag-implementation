@@ -16,6 +16,7 @@ These ontologies provide core semantic standards, metadata, provenance, taxonomy
 | FOAF | People, organizations, social relationships | ~500 triples | http://xmlns.com/foaf/spec/ |
 | SKOS | Taxonomies and controlled vocabularies | ~1K triples | https://www.w3.org/TR/skos-reference/ |
 | PROV-O | Provenance and lineage tracking | ~2K triples | https://www.w3.org/TR/prov-o/ |
+| Time| Dates, time intervals, temporal events | empty ontology | https://www.w3.org/2006/time |
 | OWL Time | Dates, time intervals, temporal events | ~1K triples | https://www.w3.org/TR/owl-time/ |
 | WGS84 Geo Vocabulary | Geography and coordinate modeling | ~500 triples | https://www.w3.org/2003/01/geo/ |
 | DBpedia Ontology | General-purpose knowledge graph ontology | ~100K+ triples | https://downloads.dbpedia.org/repo/dbpedia.org/ontology--DEV/ |

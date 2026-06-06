@@ -1,0 +1,300 @@
+VIAO - Veerla Intelligence Artifact Ontology
+================================================
+
+Ontology name:
+Veerla Intelligence Artifact Ontology (VIAO)
+
+Ontology IRI:
+https://veerla-ramrao.ai/ontology/intelligence-artifact
+
+Preferred namespace:
+https://veerla-ramrao.ai/ontology/intelligence-artifact#
+
+Preferred prefix:
+viao
+
+Purpose
+-------
+VIAO is a lightweight ontology for representing documents, chunks, and generated
+intelligence artifacts in a GraphRAG, document intelligence, or knowledge
+management system.
+
+The ontology separates raw evidence from generated intelligence:
+
+1. Information sources
+   - Document
+   - Chunk
+
+2. Intelligence artifacts
+   - Summary
+   - Assertion
+     - Fact
+     - Claim
+     - Observation
+   - Insight
+     - Finding
+     - Conclusion
+     - Risk
+   - Recommendation
+
+Namespace convention
+--------------------
+Use /ontology/ IRIs for ontology terms such as classes and properties.
+
+Example:
+https://veerla-ramrao.ai/ontology/intelligence-artifact#Document
+https://veerla-ramrao.ai/ontology/intelligence-artifact#Chunk
+https://veerla-ramrao.ai/ontology/intelligence-artifact#Recommendation
+
+Use /resource/ IRIs for runtime instances.
+
+Examples:
+https://veerla-ramrao.ai/resource/document/apple-10k-2025
+https://veerla-ramrao.ai/resource/chunk/apple-10k-2025-chunk-001
+https://veerla-ramrao.ai/resource/fact/apple-revenue-fact-001
+https://veerla-ramrao.ai/resource/risk/apple-supply-chain-risk-001
+https://veerla-ramrao.ai/resource/recommendation/apple-investment-rec-001
+
+Core class hierarchy
+--------------------
+owl:Thing
+|
+|-- InformationSource
+|   |-- Document
+|   |-- Chunk
+|
+|-- IntelligenceArtifact
+    |-- Summary
+    |-- Assertion
+    |   |-- Fact
+    |   |-- Claim
+    |   |-- Observation
+    |
+    |-- Insight
+    |   |-- Finding
+    |   |-- Conclusion
+    |   |-- Risk
+    |
+    |-- Recommendation
+
+How to model documents and chunks
+---------------------------------
+A Document represents an ingested source such as a PDF, Word document, slide deck,
+HTML page, annual report, transcript, filing, article, policy document, or other
+source material.
+
+A Chunk represents a segment of a document created during ingestion. Chunks are
+useful for vector search, citations, provenance, LLM prompts, retrieval, and
+traceability.
+
+Recommended pattern:
+
+document instance:
+https://veerla-ramrao.ai/resource/document/apple-10k-2025
+
+chunk instance:
+https://veerla-ramrao.ai/resource/chunk/apple-10k-2025-chunk-001
+
+relationship:
+document viao:hasChunk chunk
+chunk viao:chunkOf document
+
+How to model intelligence artifacts
+-----------------------------------
+An IntelligenceArtifact is a generated or curated knowledge object derived from
+one or more documents or chunks.
+
+Examples:
+- A Summary summarizes a document or chunk.
+- A Fact is a verifiable assertion supported by evidence.
+- A Claim is an assertion that may require validation.
+- An Observation is a noted signal, event, statement, or pattern.
+- An Insight is a higher-level interpretation.
+- A Finding is an analytical result.
+- A Conclusion is a reasoned judgment.
+- A Risk is an adverse scenario, exposure, vulnerability, or uncertainty.
+- A Recommendation is a proposed action or decision.
+
+Recommended provenance pattern:
+
+artifact viao:derivedFromDocument document
+artifact viao:derivedFromChunk chunk
+artifact viao:referencesChunk chunk
+
+Example flow
+------------
+1. Ingest a document.
+2. Split the document into chunks.
+3. Create Document and Chunk instances.
+4. Link the document to its chunks using viao:hasChunk.
+5. Generate facts, claims, observations, summaries, findings, risks, conclusions,
+   and recommendations.
+6. Link generated artifacts back to supporting chunks using
+   viao:derivedFromChunk or viao:referencesChunk.
+7. Link higher-level artifacts to lower-level artifacts where useful.
+
+Example:
+Document: Apple 10-K 2025
+Chunk: Apple 10-K 2025, chunk 001
+Fact: Apple reported revenue of X
+Risk: Apple faces supply chain concentration risk
+Recommendation: Monitor supplier exposure and regional disruption risk
+
+Suggested relationships:
+Document viao:hasChunk Chunk
+Fact viao:derivedFromChunk Chunk
+Risk viao:insightBasedOn Fact
+Recommendation viao:recommendationBasedOn Risk
+
+Core object properties
+----------------------
+hasChunk
+- Domain: Document
+- Range: Chunk
+- Meaning: a document contains a chunk
+
+chunkOf
+- Domain: Chunk
+- Range: Document
+- Meaning: a chunk belongs to a document
+- Inverse of: hasChunk
+
+hasIntelligenceArtifact
+- Domain: InformationSource
+- Range: IntelligenceArtifact
+- Meaning: a source has a generated or associated intelligence artifact
+
+derivedFrom
+- Domain: IntelligenceArtifact
+- Range: InformationSource
+- Meaning: a generated artifact is derived from a source
+
+derivedFromDocument
+- Subproperty of: derivedFrom
+- Domain: IntelligenceArtifact
+- Range: Document
+- Meaning: an artifact is derived from a document
+
+derivedFromChunk
+- Subproperty of: derivedFrom
+- Domain: IntelligenceArtifact
+- Range: Chunk
+- Meaning: an artifact is derived from a specific chunk
+
+referencesChunk
+- Domain: IntelligenceArtifact
+- Range: Chunk
+- Meaning: an artifact cites or references a chunk
+
+referencesArtifact
+- Domain: IntelligenceArtifact
+- Range: IntelligenceArtifact
+- Meaning: one generated artifact refers to another generated artifact
+
+summarizes
+- Domain: Summary
+- Range: InformationSource
+- Meaning: a summary summarizes a document or chunk
+
+assertsAbout
+- Domain: Assertion
+- Range: owl:Thing
+- Meaning: an assertion is about an entity, concept, metric, event, or subject
+
+insightBasedOn
+- Domain: Insight
+- Range: Assertion
+- Meaning: an insight is supported by one or more assertions
+
+recommendationBasedOn
+- Domain: Recommendation
+- Range: Insight
+- Meaning: a recommendation is motivated by an insight, conclusion, finding, or risk
+
+Core data properties
+--------------------
+content
+- Domain: InformationSource or IntelligenceArtifact
+- Range: xsd:string
+- Meaning: text content of a source, chunk, or artifact
+
+confidenceScore
+- Domain: IntelligenceArtifact
+- Range: xsd:decimal
+- Meaning: confidence score for a generated artifact, usually 0 to 1
+
+sourceUri
+- Domain: Document
+- Range: xsd:anyURI
+- Meaning: source locator, file path, URL, or system identifier
+
+chunkIndex
+- Domain: Chunk
+- Range: xsd:integer
+- Meaning: ordinal position of a chunk within a document
+
+Recommended usage in GraphRAG
+-----------------------------
+Use VIAO as the core ontology for your document intelligence layer.
+
+A practical architecture would store:
+- document metadata in a document table
+- chunk metadata and embeddings in a chunk table
+- intelligence artifacts in an artifact table
+- RDF triples or graph edges for relationships
+- domain ontology mappings separately, for example to SKOS, FIBO, OCRe, or a custom ontology
+
+VIAO should not replace domain ontologies. Instead, it describes the document
+and intelligence artifact layer. Domain ontologies describe the business,
+scientific, clinical, financial, or manufacturing concepts mentioned in the
+documents.
+
+Recommended extensions
+----------------------
+For future versions, consider importing or aligning with:
+
+- PROV-O for detailed provenance
+- SKOS for controlled vocabularies and business concepts
+- OWL-Time for time periods and temporal reasoning
+- WGS84 or GeoSPARQL for geography
+- FIBO for finance
+- OCRe or other biomedical ontologies for clinical research
+
+Versioning guidance
+-------------------
+Use owl:versionInfo in the OWL file.
+
+Recommended versioning:
+0.1.0 - initial ontology
+0.2.0 - add provenance and review workflow terms
+0.3.0 - add artifact lifecycle states
+1.0.0 - stable public release
+
+Suggested lifecycle extensions
+------------------------------
+Future data properties or classes may include:
+- createdBy
+- generatedByModel
+- reviewedBy
+- reviewStatus
+- approvalStatus
+- extractionPrompt
+- extractionRunId
+- modelName
+- modelVersion
+- tokenCount
+- evidenceSpanStart
+- evidenceSpanEnd
+
+Validation notes
+----------------
+The OWL file is intentionally lightweight. It defines classes, hierarchy,
+object properties, and data properties. It does not enforce all business rules.
+
+For stricter validation, use SHACL shapes in a separate file. For example, SHACL
+could enforce:
+- every Chunk must have exactly one chunkOf Document
+- every IntelligenceArtifact must have at least one derivedFrom source
+- every Recommendation must be recommendationBasedOn at least one Insight
+- every confidenceScore must be between 0 and 1
+

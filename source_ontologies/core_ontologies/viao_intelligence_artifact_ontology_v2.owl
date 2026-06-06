@@ -1,0 +1,242 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rdf:RDF
+    xmlns="https://veerla-ramrao.ai/ontology/intelligence-artifact#"
+    xml:base="https://veerla-ramrao.ai/ontology/intelligence-artifact"
+    xmlns:viao="https://veerla-ramrao.ai/ontology/intelligence-artifact#"
+    xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+    xmlns:rdfs="http://www.w3.org/2000/01/rdf-schema#"
+    xmlns:owl="http://www.w3.org/2002/07/owl#"
+    xmlns:xsd="http://www.w3.org/2001/XMLSchema#"
+    xmlns:dcterms="http://purl.org/dc/terms/"
+    xmlns:vann="http://purl.org/vocab/vann/"
+    xmlns:skos="http://www.w3.org/2004/02/skos/core#">
+
+    <owl:Ontology rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact">
+        <rdfs:label xml:lang="en">Veerla Intelligence Artifact Ontology (VIAO)</rdfs:label>
+        <dcterms:title xml:lang="en">Veerla Intelligence Artifact Ontology</dcterms:title>
+        <dcterms:alternative xml:lang="en">VIAO</dcterms:alternative>
+        <dcterms:creator xml:lang="en">Venkat Ram Rao / Veerla Ram Rao</dcterms:creator>
+        <dcterms:publisher xml:lang="en">Veerla Ram Rao</dcterms:publisher>
+        <dcterms:created rdf:datatype="http://www.w3.org/2001/XMLSchema#date">2026-06-06</dcterms:created>
+        <dcterms:modified rdf:datatype="http://www.w3.org/2001/XMLSchema#date">2026-06-06</dcterms:modified>
+        <owl:versionInfo>0.1.0</owl:versionInfo>
+        <dcterms:description xml:lang="en">
+            VIAO is a lightweight ontology for representing source documents, text chunks, and generated intelligence artifacts in GraphRAG, document intelligence, and knowledge management systems. It distinguishes raw information sources from derived intelligence artifacts such as summaries, assertions, facts, claims, observations, insights, findings, conclusions, risks, and recommendations.
+        </dcterms:description>
+        <rdfs:comment xml:lang="en">
+            Namespace convention: use https://veerla-ramrao.ai/ontology/intelligence-artifact# for ontology terms such as classes and properties. Runtime instances should generally use https://veerla-ramrao.ai/resource/ or a project-specific resource namespace. Example ontology term: https://veerla-ramrao.ai/ontology/intelligence-artifact#Document. Example resource instance: https://veerla-ramrao.ai/resource/document/apple-10k-2025.
+        </rdfs:comment>
+        <vann:preferredNamespacePrefix>viao</vann:preferredNamespacePrefix>
+        <vann:preferredNamespaceUri>https://veerla-ramrao.ai/ontology/intelligence-artifact#</vann:preferredNamespaceUri>
+        <dcterms:identifier>https://veerla-ramrao.ai/ontology/intelligence-artifact</dcterms:identifier>
+        <dcterms:subject xml:lang="en">GraphRAG</dcterms:subject>
+        <dcterms:subject xml:lang="en">Document Intelligence</dcterms:subject>
+        <dcterms:subject xml:lang="en">Knowledge Management</dcterms:subject>
+        <dcterms:subject xml:lang="en">Ontology</dcterms:subject>
+    </owl:Ontology>
+
+    <!-- Classes -->
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#InformationSource">
+        <rdfs:label xml:lang="en">Information Source</rdfs:label>
+        <rdfs:comment xml:lang="en">A raw or semi-raw source of information from which intelligence artifacts may be derived.</rdfs:comment>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#Document">
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#InformationSource"/>
+        <rdfs:label xml:lang="en">Document</rdfs:label>
+        <rdfs:comment xml:lang="en">A source document, such as a PDF, Word file, slide deck, web page, annual report, transcript, policy document, article, or other ingested source.</rdfs:comment>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#Chunk">
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#InformationSource"/>
+        <rdfs:label xml:lang="en">Chunk</rdfs:label>
+        <rdfs:comment xml:lang="en">A segment of a document created for retrieval, embedding, indexing, citation, summarization, or evidence tracking.</rdfs:comment>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#IntelligenceArtifact">
+        <rdfs:label xml:lang="en">Intelligence Artifact</rdfs:label>
+        <rdfs:comment xml:lang="en">A generated or curated knowledge object derived from one or more information sources, such as a summary, assertion, insight, or recommendation.</rdfs:comment>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#Summary">
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#IntelligenceArtifact"/>
+        <rdfs:label xml:lang="en">Summary</rdfs:label>
+        <rdfs:comment xml:lang="en">A condensed representation of one or more documents, chunks, or intelligence artifacts.</rdfs:comment>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#Assertion">
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#IntelligenceArtifact"/>
+        <rdfs:label xml:lang="en">Assertion</rdfs:label>
+        <rdfs:comment xml:lang="en">A statement made about a source, entity, concept, event, metric, or situation. Assertions may include facts, claims, or observations.</rdfs:comment>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#Fact">
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#Assertion"/>
+        <rdfs:label xml:lang="en">Fact</rdfs:label>
+        <rdfs:comment xml:lang="en">An assertion presented as verifiable or directly supported by evidence.</rdfs:comment>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#Claim">
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#Assertion"/>
+        <rdfs:label xml:lang="en">Claim</rdfs:label>
+        <rdfs:comment xml:lang="en">An assertion that may require validation, interpretation, corroboration, or confidence scoring.</rdfs:comment>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#Observation">
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#Assertion"/>
+        <rdfs:label xml:lang="en">Observation</rdfs:label>
+        <rdfs:comment xml:lang="en">A noted pattern, statement, condition, event, signal, or data point observed in source material.</rdfs:comment>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#Insight">
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#IntelligenceArtifact"/>
+        <rdfs:label xml:lang="en">Insight</rdfs:label>
+        <rdfs:comment xml:lang="en">A higher-level interpretation derived from assertions, observations, evidence, or analysis.</rdfs:comment>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#Finding">
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#Insight"/>
+        <rdfs:label xml:lang="en">Finding</rdfs:label>
+        <rdfs:comment xml:lang="en">An analytical result or discovered pattern derived from source material or assertions.</rdfs:comment>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#Conclusion">
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#Insight"/>
+        <rdfs:label xml:lang="en">Conclusion</rdfs:label>
+        <rdfs:comment xml:lang="en">A reasoned judgment or synthesized interpretation derived from evidence and analysis.</rdfs:comment>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#Risk">
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#Insight"/>
+        <rdfs:label xml:lang="en">Risk</rdfs:label>
+        <rdfs:comment xml:lang="en">An insight describing a possible adverse event, uncertainty, exposure, vulnerability, or downside scenario.</rdfs:comment>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#Recommendation">
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#IntelligenceArtifact"/>
+        <rdfs:label xml:lang="en">Recommendation</rdfs:label>
+        <rdfs:comment xml:lang="en">A proposed action, decision, mitigation, next step, or strategic suggestion derived from sources, assertions, or insights.</rdfs:comment>
+    </owl:Class>
+
+    <!-- Object Properties -->
+
+    <owl:ObjectProperty rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#hasChunk">
+        <rdfs:domain rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#Document"/>
+        <rdfs:range rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#Chunk"/>
+        <owl:inverseOf rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#chunkOf"/>
+        <rdfs:label xml:lang="en">has chunk</rdfs:label>
+        <rdfs:comment xml:lang="en">Connects a document to a chunk derived from that document.</rdfs:comment>
+    </owl:ObjectProperty>
+
+    <owl:ObjectProperty rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#chunkOf">
+        <rdfs:domain rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#Chunk"/>
+        <rdfs:range rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#Document"/>
+        <rdfs:label xml:lang="en">chunk of</rdfs:label>
+        <rdfs:comment xml:lang="en">Connects a chunk back to its source document.</rdfs:comment>
+    </owl:ObjectProperty>
+
+    <owl:ObjectProperty rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#hasIntelligenceArtifact">
+        <rdfs:domain rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#InformationSource"/>
+        <rdfs:range rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#IntelligenceArtifact"/>
+        <rdfs:label xml:lang="en">has intelligence artifact</rdfs:label>
+        <rdfs:comment xml:lang="en">Connects an information source to an intelligence artifact generated from or associated with it.</rdfs:comment>
+    </owl:ObjectProperty>
+
+    <owl:ObjectProperty rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#derivedFrom">
+        <rdfs:domain rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#IntelligenceArtifact"/>
+        <rdfs:range rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#InformationSource"/>
+        <rdfs:label xml:lang="en">derived from</rdfs:label>
+        <rdfs:comment xml:lang="en">Indicates that an intelligence artifact was derived from an information source such as a document or chunk.</rdfs:comment>
+    </owl:ObjectProperty>
+
+    <owl:ObjectProperty rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#derivedFromDocument">
+        <rdfs:subPropertyOf rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#derivedFrom"/>
+        <rdfs:domain rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#IntelligenceArtifact"/>
+        <rdfs:range rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#Document"/>
+        <rdfs:label xml:lang="en">derived from document</rdfs:label>
+        <rdfs:comment xml:lang="en">Indicates that an intelligence artifact was derived from a source document.</rdfs:comment>
+    </owl:ObjectProperty>
+
+    <owl:ObjectProperty rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#derivedFromChunk">
+        <rdfs:subPropertyOf rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#derivedFrom"/>
+        <rdfs:domain rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#IntelligenceArtifact"/>
+        <rdfs:range rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#Chunk"/>
+        <rdfs:label xml:lang="en">derived from chunk</rdfs:label>
+        <rdfs:comment xml:lang="en">Indicates that an intelligence artifact was derived from a specific text chunk.</rdfs:comment>
+    </owl:ObjectProperty>
+
+    <owl:ObjectProperty rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#referencesChunk">
+        <rdfs:domain rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#IntelligenceArtifact"/>
+        <rdfs:range rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#Chunk"/>
+        <rdfs:label xml:lang="en">references chunk</rdfs:label>
+        <rdfs:comment xml:lang="en">Links an intelligence artifact to a chunk that supports, explains, or is cited by it.</rdfs:comment>
+    </owl:ObjectProperty>
+
+    <owl:ObjectProperty rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#referencesArtifact">
+        <rdfs:domain rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#IntelligenceArtifact"/>
+        <rdfs:range rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#IntelligenceArtifact"/>
+        <rdfs:label xml:lang="en">references artifact</rdfs:label>
+        <rdfs:comment xml:lang="en">Links one intelligence artifact to another intelligence artifact.</rdfs:comment>
+    </owl:ObjectProperty>
+
+    <owl:ObjectProperty rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#summarizes">
+        <rdfs:domain rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#Summary"/>
+        <rdfs:range rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#InformationSource"/>
+        <rdfs:label xml:lang="en">summarizes</rdfs:label>
+        <rdfs:comment xml:lang="en">Indicates that a summary summarizes a document, chunk, or other information source.</rdfs:comment>
+    </owl:ObjectProperty>
+
+    <owl:ObjectProperty rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#assertsAbout">
+        <rdfs:domain rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#Assertion"/>
+        <rdfs:range rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:label xml:lang="en">asserts about</rdfs:label>
+        <rdfs:comment xml:lang="en">Connects an assertion to the entity, concept, event, metric, source, or subject it is about.</rdfs:comment>
+    </owl:ObjectProperty>
+
+    <owl:ObjectProperty rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#insightBasedOn">
+        <rdfs:domain rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#Insight"/>
+        <rdfs:range rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#Assertion"/>
+        <rdfs:label xml:lang="en">insight based on</rdfs:label>
+        <rdfs:comment xml:lang="en">Connects an insight to one or more assertions that support it.</rdfs:comment>
+    </owl:ObjectProperty>
+
+    <owl:ObjectProperty rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#recommendationBasedOn">
+        <rdfs:domain rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#Recommendation"/>
+        <rdfs:range rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#Insight"/>
+        <rdfs:label xml:lang="en">recommendation based on</rdfs:label>
+        <rdfs:comment xml:lang="en">Connects a recommendation to the insight or risk that motivates it.</rdfs:comment>
+    </owl:ObjectProperty>
+
+    <!-- Data Properties -->
+
+    <owl:DatatypeProperty rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#content">
+        <rdfs:domain rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#InformationSource"/>
+        <rdfs:domain rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#IntelligenceArtifact"/>
+        <rdfs:range rdf:resource="http://www.w3.org/2001/XMLSchema#string"/>
+        <rdfs:label xml:lang="en">content</rdfs:label>
+        <rdfs:comment xml:lang="en">Textual content of a source, chunk, or intelligence artifact.</rdfs:comment>
+    </owl:DatatypeProperty>
+
+    <owl:DatatypeProperty rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#confidenceScore">
+        <rdfs:domain rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#IntelligenceArtifact"/>
+        <rdfs:range rdf:resource="http://www.w3.org/2001/XMLSchema#decimal"/>
+        <rdfs:label xml:lang="en">confidence score</rdfs:label>
+        <rdfs:comment xml:lang="en">Numeric confidence value assigned to an intelligence artifact, typically between 0 and 1.</rdfs:comment>
+    </owl:DatatypeProperty>
+
+    <owl:DatatypeProperty rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#sourceUri">
+        <rdfs:domain rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#Document"/>
+        <rdfs:range rdf:resource="http://www.w3.org/2001/XMLSchema#anyURI"/>
+        <rdfs:label xml:lang="en">source URI</rdfs:label>
+        <rdfs:comment xml:lang="en">URI, file path, or external locator for a source document.</rdfs:comment>
+    </owl:DatatypeProperty>
+
+    <owl:DatatypeProperty rdf:about="https://veerla-ramrao.ai/ontology/intelligence-artifact#chunkIndex">
+        <rdfs:domain rdf:resource="https://veerla-ramrao.ai/ontology/intelligence-artifact#Chunk"/>
+        <rdfs:range rdf:resource="http://www.w3.org/2001/XMLSchema#integer"/>
+        <rdfs:label xml:lang="en">chunk index</rdfs:label>
+        <rdfs:comment xml:lang="en">Ordinal position of a chunk within its source document.</rdfs:comment>
+    </owl:DatatypeProperty>
+
+</rdf:RDF>
