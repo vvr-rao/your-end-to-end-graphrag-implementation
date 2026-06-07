@@ -421,3 +421,347 @@ def test_top_level_branches_excludes_owl_thing_and_surfaces_thing_children() -> 
     # owl:Thing itself is excluded -- pointless to ask Stage 1 to classify
     # against the universal type.
     assert OWL_THING not in root_iris
+
+
+# ============================================================================
+# Layer C / D / E tests: smarter class placement, fuzzy dedup, auto-mint,
+# stem-based relation inference.
+# ============================================================================
+
+
+def _geo_class(local: str, parent_local: str | None = None) -> tuple[str, dict]:
+    iri = f"https://veerla-ramrao.ai/ontology/geography#{local}"
+    supers = []
+    if parent_local:
+        supers.append({
+            "kind": "entity",
+            "iri": f"https://veerla-ramrao.ai/ontology/geography#{parent_local}",
+        })
+    return iri, {
+        "iri": iri,
+        "name": local,
+        "labels": [local],
+        "superclasses": supers,
+        "restrictions_and_class_constructs": [],
+    }
+
+
+def test_add_classes_places_in_parent_namespace_when_resolved() -> None:
+    """When PARENT_LABEL resolves to an existing class in the geography
+    namespace, the new class's IRI lands in the geography namespace too
+    (not in default_base_iri)."""
+    from backend.app.helpers.ontology_pruning import add_new_classes_from_match_not_found
+
+    classes = dict([
+        _geo_class("GeographicEntity"),
+        _geo_class("Country", "GeographicEntity"),
+    ])
+    ontology = {
+        "classes_dict": classes,
+        "object_properties_dict": {},
+        "data_properties_dict": {},
+        "instances_dict": {},
+    }
+    results = {
+        "MATCH NOT FOUND": [
+            {"LABEL": "Washington", "DESCRIPTION": "US capital.",
+             "PARENT_LABEL": "Country"},
+        ]
+    }
+    extended, created = add_new_classes_from_match_not_found(
+        ontology, results,
+        new_class_base_iri="http://default.example/ontology/",
+        default_parent_iri="http://www.w3.org/2002/07/owl#Thing",
+    )
+    assert len(created) == 1
+    washington_iri = created[0]
+    # IRI is in the geography namespace, NOT default.
+    assert washington_iri.startswith("https://veerla-ramrao.ai/ontology/geography#")
+    assert "default.example" not in washington_iri
+    # Parent IRI is geography:Country.
+    record = extended["classes_dict"][washington_iri]
+    parent_iri = record["superclasses"][0]["iri"]
+    assert parent_iri == "https://veerla-ramrao.ai/ontology/geography#Country"
+
+
+def test_add_classes_fuzzy_dedups_token_variants() -> None:
+    """'Washington DC' and 'Washington D.C.' tokenize to the same set
+    {washington, dc}; the second proposal reuses the first's IRI."""
+    from backend.app.helpers.ontology_pruning import add_new_classes_from_match_not_found
+
+    ontology = {
+        "classes_dict": dict([_geo_class("Country")]),
+        "object_properties_dict": {},
+        "data_properties_dict": {},
+        "instances_dict": {},
+    }
+    results = {
+        "MATCH NOT FOUND": [
+            {"LABEL": "Washington DC", "DESCRIPTION": "Capital.",
+             "PARENT_LABEL": "Country"},
+            {"LABEL": "Washington D.C.", "DESCRIPTION": "Same place.",
+             "PARENT_LABEL": "Country"},
+        ]
+    }
+    extended, created = add_new_classes_from_match_not_found(
+        ontology, results,
+        new_class_base_iri="http://default.example/ontology/",
+        default_parent_iri=None,
+    )
+    # Exactly ONE new class minted -- the second proposal got deduped in.
+    assert len(created) == 1
+    survivor = extended["classes_dict"][created[0]]
+    # Both descriptions are preserved.
+    descs = survivor.get("descriptions", [])
+    assert any("Capital." in d for d in descs)
+    assert any("Same place." in d for d in descs)
+
+
+def test_add_classes_fuzzy_dedups_substring_with_same_parent() -> None:
+    """'Washington' (Country parent) and 'Washington DC' (Country parent)
+    => ONE class. But 'Washington' (Country) and 'Washington Bridge'
+    (different parent) => TWO."""
+    from backend.app.helpers.ontology_pruning import add_new_classes_from_match_not_found
+
+    bridge_iri = "https://veerla-ramrao.ai/ontology/geography#Bridge"
+    classes = dict([
+        _geo_class("Country"),
+        (bridge_iri, {
+            "iri": bridge_iri,
+            "name": "Bridge",
+            "labels": ["Bridge"],
+            "superclasses": [],
+            "restrictions_and_class_constructs": [],
+        }),
+    ])
+    ontology = {
+        "classes_dict": classes,
+        "object_properties_dict": {},
+        "data_properties_dict": {},
+        "instances_dict": {},
+    }
+    # Same-parent case (both Country) -- expect ONE class.
+    results_same_parent = {
+        "MATCH NOT FOUND": [
+            {"LABEL": "Washington", "DESCRIPTION": "", "PARENT_LABEL": "Country"},
+            {"LABEL": "Washington DC", "DESCRIPTION": "", "PARENT_LABEL": "Country"},
+        ]
+    }
+    _, created = add_new_classes_from_match_not_found(
+        ontology, results_same_parent,
+        new_class_base_iri="http://default.example/ontology/",
+        default_parent_iri=None,
+    )
+    assert len(created) == 1
+
+    # Different-parent case -- expect TWO classes (no conflation).
+    results_diff_parent = {
+        "MATCH NOT FOUND": [
+            {"LABEL": "Washington", "DESCRIPTION": "", "PARENT_LABEL": "Country"},
+            {"LABEL": "Washington Bridge", "DESCRIPTION": "", "PARENT_LABEL": "Bridge"},
+        ]
+    }
+    _, created_diff = add_new_classes_from_match_not_found(
+        ontology, results_diff_parent,
+        new_class_base_iri="http://default.example/ontology/",
+        default_parent_iri=None,
+    )
+    assert len(created_diff) == 2
+
+
+def test_add_relations_auto_mints_unresolved_endpoints() -> None:
+    """Both DOMAIN and RANGE unresolved -> auto-mint both classes, then
+    create the relation. Nothing in `skipped`."""
+    from backend.app.helpers.ontology_pruning import add_new_relations_from_match_results
+
+    ontology = {
+        "classes_dict": {},
+        "object_properties_dict": {},
+        "data_properties_dict": {},
+        "instances_dict": {},
+    }
+    results = {
+        "MATCH NOT FOUND RELATIONS": [
+            {"LABEL": "targets", "DESCRIPTION": "A potential move.",
+             "DOMAIN": "Washington", "RANGE": "Kharg Island"},
+        ]
+    }
+    extended, created_rels, skipped, auto_minted = add_new_relations_from_match_results(
+        ontology, results,
+        new_property_base_iri="http://default.example/ontology/",
+        new_class_base_iri="http://default.example/ontology/",
+        default_parent_iri="http://www.w3.org/2002/07/owl#Thing",
+    )
+    assert len(created_rels) == 1
+    assert len(auto_minted) == 2
+    assert not skipped
+    # Both endpoints exist as classes.
+    rel = extended["object_properties_dict"][created_rels[0]]
+    domain_iri = rel["domain"][0]["iri"]
+    range_iri = rel["range"][0]["iri"]
+    assert domain_iri in extended["classes_dict"]
+    assert range_iri in extended["classes_dict"]
+    # Both classes carry the audit annotation.
+    for iri in auto_minted:
+        ann = extended["classes_dict"][iri].get("annotations", {})
+        assert ann.get("auto_created_from_relation") == ["targets"]
+
+
+def test_add_relations_auto_mint_inherits_parent_from_other_endpoint() -> None:
+    """When DOMAIN resolves to a class with a non-Thing parent, an
+    unresolved RANGE auto-mints UNDER the same parent and into the same
+    namespace. So 'Washington' next to a `Kharg Island` parented at
+    `GeographicEntity` lands in geography namespace too."""
+    from backend.app.helpers.ontology_pruning import add_new_relations_from_match_results
+
+    geo_iri, geo_rec = _geo_class("GeographicEntity")
+    kharg_iri = "https://veerla-ramrao.ai/ontology/geography#KhargIsland"
+    classes = {
+        geo_iri: geo_rec,
+        kharg_iri: {
+            "iri": kharg_iri,
+            "name": "KhargIsland",
+            "labels": ["Kharg Island"],
+            "superclasses": [{"kind": "entity", "iri": geo_iri}],
+            "restrictions_and_class_constructs": [],
+        },
+    }
+    ontology = {
+        "classes_dict": classes,
+        "object_properties_dict": {},
+        "data_properties_dict": {},
+        "instances_dict": {},
+    }
+    results = {
+        "MATCH NOT FOUND RELATIONS": [
+            {"LABEL": "targets", "DESCRIPTION": "",
+             "DOMAIN": "Washington", "RANGE": "Kharg Island"},
+        ]
+    }
+    extended, _, skipped, auto_minted = add_new_relations_from_match_results(
+        ontology, results,
+        new_property_base_iri="http://default.example/ontology/",
+        new_class_base_iri="http://default.example/ontology/",
+        default_parent_iri="http://www.w3.org/2002/07/owl#Thing",
+    )
+    assert not skipped
+    assert len(auto_minted) == 1
+    washington_iri = auto_minted[0]
+    # Washington lands in geography namespace, NOT default.
+    assert washington_iri.startswith("https://veerla-ramrao.ai/ontology/geography#")
+    # Parent is GeographicEntity (inherited from Kharg Island).
+    parent = extended["classes_dict"][washington_iri]["superclasses"][0]["iri"]
+    assert parent == geo_iri
+
+
+def test_add_relations_still_skips_garbage_endpoints() -> None:
+    """Empty endpoints, sentence-length endpoints (>80 chars), and
+    newline-containing endpoints all still skip. Auto-mint isn't a
+    free-for-all."""
+    from backend.app.helpers.ontology_pruning import add_new_relations_from_match_results
+
+    ontology = {
+        "classes_dict": {},
+        "object_properties_dict": {},
+        "data_properties_dict": {},
+        "instances_dict": {},
+    }
+    results = {
+        "MATCH NOT FOUND RELATIONS": [
+            {"LABEL": "rel1", "DOMAIN": "", "RANGE": "X"},
+            {"LABEL": "rel2", "DOMAIN": "X",
+             "RANGE": "platforms and mechanisms that supervise the safety status of electric vehicles in regulated urban environments per chapter 12"},
+            {"LABEL": "rel3", "DOMAIN": "good", "RANGE": "has\nnewline"},
+        ]
+    }
+    _, _, skipped, _ = add_new_relations_from_match_results(
+        ontology, results,
+        new_property_base_iri="http://default.example/ontology/",
+        new_class_base_iri="http://default.example/ontology/",
+        default_parent_iri=None,
+    )
+    assert len(skipped) == 3
+
+
+def test_stem_relation_inference_creates_has_x_properties() -> None:
+    """helium / helium_market / helium_supply / helium_price all share
+    namespace -> infer `helium has_market helium_market` etc."""
+    from backend.app.helpers.ontology_pruning import infer_stem_relations
+
+    ns = "http://example.com/onto/"
+    classes = {
+        ns + "helium": {"iri": ns + "helium", "name": "helium",
+                        "labels": ["helium"], "superclasses": []},
+        ns + "helium_market": {"iri": ns + "helium_market", "name": "helium_market",
+                                "labels": ["helium_market"], "superclasses": []},
+        ns + "helium_supply": {"iri": ns + "helium_supply", "name": "helium_supply",
+                                "labels": ["helium_supply"], "superclasses": []},
+        ns + "helium_price": {"iri": ns + "helium_price", "name": "helium_price",
+                               "labels": ["helium_price"], "superclasses": []},
+    }
+    obj_props: dict = {}
+    _, created = infer_stem_relations(classes, obj_props, new_property_base_iri=ns)
+    assert len(created) == 3
+    # Find the has_market property.
+    market_prop = next(
+        (p for p in created if "has_market" in p), None
+    )
+    assert market_prop is not None
+    rec = obj_props[market_prop]
+    domain_iris = {d["iri"] for d in rec["domain"]}
+    range_iris = {r["iri"] for r in rec["range"]}
+    assert ns + "helium" in domain_iris
+    assert ns + "helium_market" in range_iris
+    assert rec["annotations"]["auto_created_via"] == ["stem_inference"]
+
+
+def test_stem_relation_inference_skips_when_property_exists() -> None:
+    """If `helium has_market helium_market` already exists with the same
+    endpoints, the inference pass leaves it alone."""
+    from backend.app.helpers.ontology_pruning import infer_stem_relations, make_property_iri
+
+    ns = "http://example.com/onto/"
+    classes = {
+        ns + "helium": {"iri": ns + "helium", "name": "helium",
+                        "labels": ["helium"], "superclasses": []},
+        ns + "helium_market": {"iri": ns + "helium_market", "name": "helium_market",
+                                "labels": ["helium_market"], "superclasses": []},
+    }
+    existing_iri = make_property_iri(ns, "has_market")
+    obj_props = {
+        existing_iri: {
+            "iri": existing_iri,
+            "name": "has_market",
+            "labels": ["has_market"],
+            "domain": [{"kind": "entity", "iri": ns + "helium"}],
+            "range": [{"kind": "entity", "iri": ns + "helium_market"}],
+            "annotations": {"existing": True},
+        }
+    }
+    _, created = infer_stem_relations(classes, obj_props, new_property_base_iri=ns)
+    # No new property created (existing one already covers this pair).
+    assert created == []
+    # Existing annotation untouched.
+    assert obj_props[existing_iri]["annotations"] == {"existing": True}
+
+
+def test_stem_relation_inference_respects_namespace_boundary() -> None:
+    """If helium is in geography ns and helium_market is in default ns,
+    NO relation is inferred (they belong to different ontologies)."""
+    from backend.app.helpers.ontology_pruning import infer_stem_relations
+
+    classes = {
+        "http://geo.example/#helium": {
+            "iri": "http://geo.example/#helium", "name": "helium",
+            "labels": ["helium"], "superclasses": [],
+        },
+        "http://default.example/onto/helium_market": {
+            "iri": "http://default.example/onto/helium_market",
+            "name": "helium_market", "labels": ["helium_market"],
+            "superclasses": [],
+        },
+    }
+    obj_props: dict = {}
+    _, created = infer_stem_relations(classes, obj_props,
+                                       new_property_base_iri="http://default.example/onto/")
+    assert created == []

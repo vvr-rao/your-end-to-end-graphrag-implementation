@@ -989,35 +989,258 @@ def normalize_to_string(value):
 
     return str(value).strip()
 
+_OWL_THING_IRI = "http://www.w3.org/2002/07/owl#Thing"
+
+
+def _derive_namespace_from_parent_iri(parent_iri: str | None, default_base_iri: str) -> str:
+    """If `parent_iri` lives in a real domain ontology (anything other than
+    owl:Thing or unset), derive the namespace prefix from it so a new
+    sibling class lands in the same ontology. Otherwise fall back to
+    `default_base_iri`.
+
+    Hash-IRIs:  https://x/ontology/geography#Country -> https://x/ontology/geography#
+    Path-IRIs:  https://x/ontology/cars/BMW         -> https://x/ontology/cars/
+    """
+    if not parent_iri or parent_iri == _OWL_THING_IRI:
+        return default_base_iri
+    if "#" in parent_iri:
+        return parent_iri.rsplit("#", 1)[0] + "#"
+    return parent_iri.rsplit("/", 1)[0] + "/"
+
+
+_STOPWORD_TOKENS = frozenset({"the", "a", "an", "of", "and", "or"})
+
+
+def _tokenize_label(label: str) -> frozenset[str]:
+    """Lowercase + collapse periods + strip remaining punctuation + drop
+    stopwords + return token set. Used for fuzzy class-label dedup so
+    'Washington DC' and 'Washington D.C.' produce the same key
+    {washington, dc}. Periods are stripped FIRST (not replaced with space)
+    so 'D.C.' collapses to 'DC' before tokenization, not to 'D C' (two
+    single-letter tokens that wouldn't match 'DC')."""
+    if not label:
+        return frozenset()
+    s = label.lower().replace(".", "")
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    tokens = {t for t in s.split() if t and t not in _STOPWORD_TOKENS}
+    return frozenset(tokens)
+
+
+def _fuzzy_lookup_class(
+    label: str,
+    parent_iri: str | None,
+    classes_dict: dict,
+    label_index: dict[str, str],
+    token_index: dict[frozenset[str], str],
+) -> str | None:
+    """Try to find an existing class IRI that matches `label`. Returns the
+    matched IRI or None.
+
+    Order:
+      1. Exact case-insensitive label/name match (via label_index).
+      2. Token-set exact match (via token_index) -- catches 'Washington DC'
+         vs 'Washington D.C.'.
+      3. Substring containment + same parent -- catches 'Washington' vs
+         'Washington DC' only when both share the same resolved parent
+         (so 'Washington Bridge' doesn't conflate with 'Washington').
+    """
+    key = label.strip().lower()
+    if not key:
+        return None
+
+    # 1. Exact case-insensitive.
+    hit = label_index.get(key)
+    if hit:
+        return hit
+
+    # 2. Token-set exact.
+    tokens = _tokenize_label(label)
+    if tokens:
+        hit = token_index.get(tokens)
+        if hit:
+            return hit
+
+        # 3. Substring + same-parent containment.
+        for existing_tokens, existing_iri in token_index.items():
+            if not existing_tokens:
+                continue
+            # One is a strict subset of the other (e.g. {Washington} subset
+            # of {Washington, DC}).
+            if tokens < existing_tokens or existing_tokens < tokens:
+                existing = classes_dict.get(existing_iri) or {}
+                existing_parent = _first_super_iri(existing)
+                if existing_parent == parent_iri:
+                    return existing_iri
+    return None
+
+
+def _first_super_iri(class_record: dict) -> str | None:
+    supers = class_record.get("superclasses") or []
+    for s in supers:
+        if isinstance(s, dict):
+            iri = s.get("iri")
+            if isinstance(iri, str) and iri:
+                return iri
+        elif isinstance(s, str) and s:
+            return s
+    return None
+
+
+def _build_token_index(classes_dict: dict) -> dict[frozenset[str], str]:
+    """Build a token-set -> IRI index over current classes (FIRST entry
+    wins on collisions). Companion to `_build_label_to_iri_index` for
+    multi-word variant dedup."""
+    index: dict[frozenset[str], str] = {}
+    for iri, data in classes_dict.items():
+        for label_source in (data.get("labels") or []):
+            text = None
+            if isinstance(label_source, str):
+                text = label_source
+            elif isinstance(label_source, dict):
+                v = label_source.get("value")
+                if isinstance(v, str):
+                    text = v
+            if text:
+                toks = _tokenize_label(text)
+                if toks:
+                    index.setdefault(toks, iri)
+        name = data.get("name") or safe_name_from_iri(iri)
+        if isinstance(name, str):
+            toks = _tokenize_label(name)
+            if toks:
+                index.setdefault(toks, iri)
+    return index
+
+
 def add_new_classes_from_match_not_found(
     loaded_ontology: dict,
     match_results: dict,
     new_class_base_iri: str,
     default_parent_iri: str | None = None
 ) -> tuple[dict, list[str]]:
-    """
-    Add new proposed classes from MATCH NOT FOUND into classes_dict.
+    """Add new proposed classes from MATCH NOT FOUND into classes_dict.
+
+    For each entry:
+      - Resolve PARENT_LABEL to an existing class IRI when possible (via
+        the same label index as relation resolution).
+      - Derive the new class's IRI namespace from the resolved parent
+        (so 'Washington' parented at geography:Country lands at
+        geography:Washington, not at default:washington).
+      - Fuzzy-dedup the proposal's label against existing + just-added
+        classes (exact, tokenized, substring+same-parent). Match -> reuse
+        existing IRI; fold the proposal's description into the survivor
+        rather than minting a duplicate.
+
+    Two-pass design: pass 1 mints every entry whose PARENT_LABEL resolves
+    to something in DATA_CLASSES (or is NONE / owl:Thing). Pass 2 re-runs
+    for entries whose PARENT_LABEL is the LABEL of an entry minted in
+    pass 1 (handles the chain-rule case where the LLM proposes a parent
+    class in the same response). Convergence in at most `len(entries)`
+    passes; in practice 2-3 passes suffice.
     """
     result = deepcopy(loaded_ontology)
-    created_iris = []
+    classes_dict = result.setdefault("classes_dict", {})
+    created_iris: list[str] = []
 
-    for item in match_results.get("MATCH NOT FOUND", []):
-        label = normalize_to_string(item.get("LABEL"))
-        description = normalize_to_string(item.get("DESCRIPTION"))
+    entries = list(match_results.get("MATCH NOT FOUND", []))
+    pending = entries[:]  # entries whose parent isn't yet resolved
+    max_passes = max(len(entries) + 1, 2)
 
-        if not label:
-            continue
+    for _ in range(max_passes):
+        if not pending:
+            break
+        still_pending: list[dict] = []
+        progressed = False
 
-        new_iri, entry = create_new_class_entry(
-            label=label,
-            description=description,
-            new_class_base_iri=new_class_base_iri,
-            default_parent_iri=default_parent_iri
-        )
+        for item in pending:
+            if not isinstance(item, dict):
+                continue
+            label = normalize_to_string(item.get("LABEL"))
+            description = normalize_to_string(item.get("DESCRIPTION"))
+            parent_label = normalize_to_string(item.get("PARENT_LABEL") or item.get("PARENT") or "")
 
-        if new_iri not in result["classes_dict"]:
-            result["classes_dict"][new_iri] = entry
-            created_iris.append(new_iri)
+            if not label:
+                continue
+
+            # Build indexes per-item -- they need to reflect classes minted
+            # earlier in THIS pass (e.g. when "Washington" is minted first,
+            # then "Washington DC" needs to see it for fuzzy dedup).
+            label_index = _build_label_to_iri_index(classes_dict)
+            token_index = _build_token_index(classes_dict)
+
+            # Resolve parent. "NONE", empty, or unresolved -> default_parent_iri.
+            parent_iri = default_parent_iri
+            if parent_label and parent_label.upper() != "NONE":
+                if parent_label in classes_dict:
+                    parent_iri = parent_label
+                else:
+                    hit = label_index.get(parent_label.strip().lower())
+                    if hit:
+                        parent_iri = hit
+                    else:
+                        # Parent not yet resolvable -- defer to next pass.
+                        still_pending.append(item)
+                        continue
+
+            # Fuzzy dedup against existing classes.
+            existing_iri = _fuzzy_lookup_class(
+                label, parent_iri, classes_dict, label_index, token_index
+            )
+            if existing_iri:
+                existing_rec = classes_dict[existing_iri]
+                if description:
+                    descs = existing_rec.setdefault("descriptions", [])
+                    if description not in descs:
+                        descs.append(description)
+                progressed = True
+                continue
+
+            base = _derive_namespace_from_parent_iri(parent_iri, new_class_base_iri)
+            new_iri, entry = create_new_class_entry(
+                label=label,
+                description=description,
+                new_class_base_iri=base,
+                default_parent_iri=parent_iri,
+            )
+            if new_iri not in classes_dict:
+                classes_dict[new_iri] = entry
+                created_iris.append(new_iri)
+                progressed = True
+
+        pending = still_pending
+        if not progressed:
+            # Force-flush the unresolvable rest with default_parent_iri so
+            # we never lose data; just lose the chain-rule placement.
+            for item in pending:
+                if not isinstance(item, dict):
+                    continue
+                label = normalize_to_string(item.get("LABEL"))
+                description = normalize_to_string(item.get("DESCRIPTION"))
+                if not label:
+                    continue
+                label_index = _build_label_to_iri_index(classes_dict)
+                token_index = _build_token_index(classes_dict)
+                existing_iri = _fuzzy_lookup_class(
+                    label, default_parent_iri, classes_dict, label_index, token_index
+                )
+                if existing_iri:
+                    existing_rec = classes_dict[existing_iri]
+                    if description:
+                        descs = existing_rec.setdefault("descriptions", [])
+                        if description not in descs:
+                            descs.append(description)
+                    continue
+                base = _derive_namespace_from_parent_iri(default_parent_iri, new_class_base_iri)
+                new_iri, entry = create_new_class_entry(
+                    label=label,
+                    description=description,
+                    new_class_base_iri=base,
+                    default_parent_iri=default_parent_iri,
+                )
+                if new_iri not in classes_dict:
+                    classes_dict[new_iri] = entry
+                    created_iris.append(new_iri)
+            break
 
     return result, created_iris
 
@@ -1108,57 +1331,233 @@ def _build_label_to_iri_index(classes_dict: dict) -> dict[str, str]:
     return index
 
 
+_MAX_AUTOMINT_LABEL_LEN = 80
+
+
+def _local_name(iri: str) -> str:
+    """Return the fragment after # or the last path segment."""
+    if "#" in iri:
+        return iri.rsplit("#", 1)[1]
+    return iri.rsplit("/", 1)[-1]
+
+
+def _namespace_of(iri: str) -> str:
+    if "#" in iri:
+        return iri.rsplit("#", 1)[0] + "#"
+    return iri.rsplit("/", 1)[0] + "/"
+
+
+def infer_stem_relations(
+    classes_dict: dict,
+    obj_props_dict: dict,
+    new_property_base_iri: str,
+) -> tuple[dict, list[str]]:
+    """Deterministic relation enrichment based on shared local-name stems.
+
+    For each pair of classes (A, B) in `classes_dict` where:
+      - `slugify(local_name(B))` starts with `slugify(local_name(A)) + "_"`
+        (A is a strict underscore-delimited prefix of B), AND
+      - A and B live in the same IRI namespace (so we don't conflate
+        helium-the-element with helium_market-the-default-namespace
+        proposal that just happens to share a label stem),
+    propose a `has_<suffix>` relation A -> B (e.g.
+    `helium has_market helium_market`, `helium has_supply helium_supply`).
+
+    Skips when a property with the same name + domain + range already
+    exists (no double-adds). Annotates new properties with
+    `auto_created_via: ["stem_inference"]` for traceability.
+
+    Returns the updated `obj_props_dict` (modified in place; same object
+    returned for convenience) and a list of newly-created property IRIs.
+    """
+    created: list[str] = []
+    # Index classes by namespace -> list of (slug, iri) for O(N log N) lookup
+    # of stem-prefix candidates (instead of N^2 over the full dict).
+    by_namespace: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for iri in classes_dict:
+        ns = _namespace_of(iri)
+        slug = slugify(_local_name(iri))
+        if slug and slug != "unnamed_class":
+            by_namespace[ns].append((slug, iri))
+
+    for ns, items in by_namespace.items():
+        # Sort by slug length ascending — shorter slugs are likely prefixes.
+        items.sort(key=lambda x: (len(x[0]), x[0]))
+        slug_to_iri = {s: i for s, i in items}
+        for short_slug, short_iri in items:
+            # Find all (long_slug, long_iri) where long_slug starts with
+            # short_slug + "_".
+            prefix = short_slug + "_"
+            for long_slug, long_iri in items:
+                if long_slug == short_slug:
+                    continue
+                if not long_slug.startswith(prefix):
+                    continue
+                suffix = long_slug[len(prefix):]
+                if not suffix:
+                    continue
+                # Property name: has_<suffix>.
+                prop_label = f"has_{suffix}"
+                prop_iri = make_property_iri(new_property_base_iri, prop_label)
+
+                # Skip if an existing property of this name already covers
+                # this exact domain->range pair.
+                existing = obj_props_dict.get(prop_iri)
+                if existing:
+                    existing_domain_iris = {safe_get_iri(d) for d in existing.get("domain") or []}
+                    existing_range_iris = {safe_get_iri(r) for r in existing.get("range") or []}
+                    if short_iri in existing_domain_iris and long_iri in existing_range_iris:
+                        continue
+                    # Merge into existing property.
+                    if short_iri not in existing_domain_iris:
+                        existing.setdefault("domain", []).append({
+                            "kind": "entity",
+                            "name": safe_name_from_iri(short_iri),
+                            "iri": short_iri,
+                            "python_name": None,
+                            "type": "ThingClass",
+                        })
+                    if long_iri not in existing_range_iris:
+                        existing.setdefault("range", []).append({
+                            "kind": "entity",
+                            "name": safe_name_from_iri(long_iri),
+                            "iri": long_iri,
+                            "python_name": None,
+                            "type": "ThingClass",
+                        })
+                    continue
+
+                _, entry = create_new_object_property_entry(
+                    label=prop_label,
+                    description=(
+                        f"Inferred relation: {_local_name(short_iri)} "
+                        f"has a {suffix} ({_local_name(long_iri)})."
+                    ),
+                    domain_iri=short_iri,
+                    range_iri=long_iri,
+                    new_property_base_iri=new_property_base_iri,
+                )
+                entry.setdefault("annotations", {})["auto_created_via"] = ["stem_inference"]
+                obj_props_dict[prop_iri] = entry
+                created.append(prop_iri)
+
+    return obj_props_dict, created
+
+
+def _is_garbage_endpoint(text: str) -> bool:
+    """An endpoint label too long to be a class name (probably a sentence)
+    or containing newlines is treated as garbage -- skip the relation."""
+    if not text:
+        return True
+    if "\n" in text or "\r" in text:
+        return True
+    if len(text) > _MAX_AUTOMINT_LABEL_LEN:
+        return True
+    return False
+
+
+def _automint_endpoint_class(
+    label: str,
+    classes_dict: dict,
+    rel_label: str,
+    rel_description: str,
+    inferred_parent_iri: str | None,
+    default_parent_iri: str | None,
+    new_class_base_iri: str,
+    created_iris: list[str],
+) -> str:
+    """Mint a new class for an unresolved relation endpoint. Uses the
+    inferred parent (from the other endpoint) when available, else
+    default_parent_iri. Returns the new class's IRI and appends it to
+    `created_iris`.
+
+    Caller is responsible for having already done the fuzzy-dedup lookup
+    (label_index / token_index). This helper is the "create" half of
+    "look up or create."
+    """
+    parent_iri = inferred_parent_iri or default_parent_iri
+    base = _derive_namespace_from_parent_iri(parent_iri, new_class_base_iri)
+    new_iri, entry = create_new_class_entry(
+        label=label,
+        description=(
+            f"Auto-created from relation '{rel_label}'"
+            + (f" ({rel_description})" if rel_description else "")
+        ),
+        new_class_base_iri=base,
+        default_parent_iri=parent_iri,
+    )
+    entry.setdefault("annotations", {})["auto_created_from_relation"] = [rel_label]
+    if new_iri not in classes_dict:
+        classes_dict[new_iri] = entry
+        created_iris.append(new_iri)
+    return new_iri
+
+
 def add_new_relations_from_match_results(
     loaded_ontology: dict,
     match_results: dict,
     new_property_base_iri: str,
-) -> tuple[dict, list[str], list[dict]]:
-    """
-    Add LLM-proposed object properties from `MATCH NOT FOUND RELATIONS`
+    default_parent_iri: str | None = None,
+    new_class_base_iri: str | None = None,
+) -> tuple[dict, list[str], list[dict], list[str]]:
+    """Add LLM-proposed object properties from `MATCH NOT FOUND RELATIONS`
     into object_properties_dict. Each entry is expected to look like:
 
         {
             "LABEL": "treats",
             "DESCRIPTION": "A Drug treats a Disease.",
-            "DOMAIN": "Drug",           # IRI or label of a class
-            "RANGE": "Disease"          # IRI or label of a class
+            "DOMAIN": "Drug",
+            "RANGE": "Disease"
         }
 
     Resolution order for DOMAIN/RANGE:
       1. If the value is already a known class IRI (key of classes_dict),
          use it directly.
-      2. Otherwise, look the value up case-insensitively in the
-         label/name index built over classes_dict.
-      3. If still unresolved, the relation is skipped and added to the
-         returned `skipped` list with a `reason` so the caller can
-         surface it for review.
+      2. Look it up case-insensitively in the label/name index.
+      3. Try the fuzzy lookup (tokenized + substring + same-parent).
+      4. AUTO-MINT a new class for the unresolved endpoint:
+         - Inherit the OTHER endpoint's parent if it has a non-owl:Thing
+           parent (so 'Washington' next to 'Kharg Island' parented at
+           GeographicEntity also lands under GeographicEntity, in the same
+           namespace).
+         - Otherwise use default_parent_iri / default namespace.
+         - Annotate with `auto_created_from_relation: [<rel_label>]`.
+      5. Skip the relation only if the endpoint is genuinely garbage
+         (empty, >80 chars, or contains newlines).
 
     IMPORTANT: call this AFTER `add_new_classes_from_match_not_found` so
-    classes proposed by the same LLM run are already in classes_dict and
-    can be referenced as DOMAIN/RANGE by their label.
+    classes proposed by the same LLM run are already in classes_dict.
 
     Returns:
-      (extended_ontology, created_property_iris, skipped_relations)
+      (extended_ontology, created_property_iris, skipped_relations,
+       auto_minted_class_iris)
     """
     result = deepcopy(loaded_ontology)
-    classes_dict = result.get("classes_dict", {})
+    classes_dict = result.setdefault("classes_dict", {})
     obj_props_dict = result.setdefault("object_properties_dict", {})
-    label_index = _build_label_to_iri_index(classes_dict)
 
-    def _resolve(value: Any) -> tuple[str | None, str | None]:
-        """Return (resolved_iri, reason_if_unresolved)."""
+    created_props: list[str] = []
+    auto_minted_classes: list[str] = []
+    skipped: list[dict] = []
+    base_iri = new_class_base_iri or new_property_base_iri
+
+    def _try_resolve(value: Any) -> tuple[str | None, str | None, str | None]:
+        """Return (resolved_iri, normalized_text, reason_if_unresolved).
+        Uses both the exact label index and the fuzzy token-based lookup."""
         text = normalize_to_string(value)
         if not text:
-            return None, "empty"
+            return None, text, "empty"
         if text in classes_dict:
-            return text, None
+            return text, text, None
+        label_index = _build_label_to_iri_index(classes_dict)
         hit = label_index.get(text.lower())
         if hit:
-            return hit, None
-        return None, f"could not resolve '{text}' to a class IRI"
-
-    created: list[str] = []
-    skipped: list[dict] = []
+            return hit, text, None
+        token_index = _build_token_index(classes_dict)
+        hit = _fuzzy_lookup_class(text, None, classes_dict, label_index, token_index)
+        if hit:
+            return hit, text, None
+        return None, text, f"could not resolve '{text}' to a class IRI"
 
     for item in match_results.get("MATCH NOT FOUND RELATIONS", []):
         if not isinstance(item, dict):
@@ -1168,14 +1567,44 @@ def add_new_relations_from_match_results(
         if not label:
             skipped.append({"relation": item, "reason": "missing LABEL"})
             continue
-        d_iri, d_reason = _resolve(item.get("DOMAIN"))
-        r_iri, r_reason = _resolve(item.get("RANGE"))
-        if not d_iri or not r_iri:
-            skipped.append({
-                "relation": item,
-                "reason": d_reason or r_reason or "unresolved DOMAIN/RANGE",
-            })
-            continue
+
+        d_iri, d_text, _ = _try_resolve(item.get("DOMAIN"))
+        r_iri, r_text, _ = _try_resolve(item.get("RANGE"))
+
+        # If RANGE is unresolved but DOMAIN resolved, infer parent from DOMAIN
+        # (and vice versa) so auto-minted endpoint inherits the right ontology.
+        d_parent = _first_super_iri(classes_dict.get(d_iri, {})) if d_iri else None
+        r_parent = _first_super_iri(classes_dict.get(r_iri, {})) if r_iri else None
+
+        if d_iri is None:
+            if _is_garbage_endpoint(d_text):
+                skipped.append({"relation": item, "reason": f"DOMAIN garbage: '{d_text}'"})
+                continue
+            d_iri = _automint_endpoint_class(
+                label=d_text,
+                classes_dict=classes_dict,
+                rel_label=label,
+                rel_description=description,
+                inferred_parent_iri=r_parent,
+                default_parent_iri=default_parent_iri,
+                new_class_base_iri=base_iri,
+                created_iris=auto_minted_classes,
+            )
+
+        if r_iri is None:
+            if _is_garbage_endpoint(r_text):
+                skipped.append({"relation": item, "reason": f"RANGE garbage: '{r_text}'"})
+                continue
+            r_iri = _automint_endpoint_class(
+                label=r_text,
+                classes_dict=classes_dict,
+                rel_label=label,
+                rel_description=description,
+                inferred_parent_iri=d_parent or _first_super_iri(classes_dict.get(d_iri, {})),
+                default_parent_iri=default_parent_iri,
+                new_class_base_iri=base_iri,
+                created_iris=auto_minted_classes,
+            )
 
         new_iri, entry = create_new_object_property_entry(
             label=label,
@@ -1185,9 +1614,6 @@ def add_new_relations_from_match_results(
             new_property_base_iri=new_property_base_iri,
         )
         if new_iri in obj_props_dict:
-            # Property with this slugged IRI already exists. Merge domain/range
-            # in case the LLM produced multiple chunks each contributing one
-            # endpoint pair for the same property.
             existing = obj_props_dict[new_iri]
             for end in ("domain", "range"):
                 seen = {safe_get_iri(d) for d in existing.get(end, [])}
@@ -1196,9 +1622,9 @@ def add_new_relations_from_match_results(
                         existing.setdefault(end, []).append(d)
             continue
         obj_props_dict[new_iri] = entry
-        created.append(new_iri)
+        created_props.append(new_iri)
 
-    return result, created, skipped
+    return result, created_props, skipped, auto_minted_classes
 
 
 # ============================================================

@@ -28,6 +28,7 @@ from backend.app.helpers.ontology_pruning import (
     expand_with_relationship_partners,
     extract_detected_iris,
     extract_json_from_output,
+    infer_stem_relations,
     merge_llm_jsons_recursive,
     prune_classes_dict,
     prune_data_properties_dict,
@@ -322,12 +323,27 @@ def _apply_expand(
         new_class_base_iri=base_iri,
         default_parent_iri=default_parent_iri,
     )
-    extended, created_props, skipped = add_new_relations_from_match_results(
+    extended, created_props, skipped, auto_minted = add_new_relations_from_match_results(
         loaded_ontology=extended,
         match_results=match_results,
         new_property_base_iri=base_iri,
+        default_parent_iri=default_parent_iri,
+        new_class_base_iri=base_iri,
     )
-    return extended, list(created_classes), list(created_props), skipped
+    # Auto-minted classes from unresolved relation endpoints count as
+    # created_classes from the caller's perspective.
+    created_classes = list(created_classes) + list(auto_minted)
+
+    # Layer E: deterministic stem-based relation enrichment. Catches
+    # `helium has_market helium_market`-style relations that the LLM didn't
+    # propose across chunks. Modifies obj_props_dict in place.
+    _, stem_props = infer_stem_relations(
+        classes_dict=extended.get("classes_dict", {}),
+        obj_props_dict=extended.setdefault("object_properties_dict", {}),
+        new_property_base_iri=base_iri,
+    )
+    created_props = list(created_props) + list(stem_props)
+    return extended, created_classes, list(created_props), skipped
 
 
 # ---------- LLM stage orchestration shared by prune / expand / both ----------

@@ -81,7 +81,7 @@ def test_resolves_endpoint_by_iri_and_by_label() -> None:
              "DOMAIN": "DISEASE", "RANGE": "drug"},
         ]
     }
-    extended, created, skipped = add_new_relations_from_match_results(
+    extended, created, skipped, _auto_minted = add_new_relations_from_match_results(
         ontology, results, new_property_base_iri=BASE_IRI
     )
     assert len(created) == 2, (created, skipped)
@@ -126,7 +126,10 @@ def test_resolves_endpoint_against_just_proposed_classes_via_apply_expand() -> N
     assert range_iri in extended["classes_dict"]
 
 
-def test_unresolved_endpoints_get_skipped_with_reason() -> None:
+def test_unresolved_endpoints_get_auto_minted() -> None:
+    """Updated behavior: unresolved endpoints get AUTO-MINTED as new
+    classes (with `auto_created_from_relation` annotation) rather than
+    skipped. The relation always lands."""
     classes = dict([_cls("http://example.org/Drug", "Drug")])
     ontology = {
         "classes_dict": classes,
@@ -137,16 +140,25 @@ def test_unresolved_endpoints_get_skipped_with_reason() -> None:
     results = {
         "MATCH NOT FOUND RELATIONS": [
             {"LABEL": "treats", "DESCRIPTION": "",
-             "DOMAIN": "Drug", "RANGE": "Unobtainium"},  # unknown
+             "DOMAIN": "Drug", "RANGE": "Unobtainium"},
         ]
     }
-    extended, created, skipped = add_new_relations_from_match_results(
-        ontology, results, new_property_base_iri=BASE_IRI
+    extended, created, skipped, auto_minted = add_new_relations_from_match_results(
+        ontology, results,
+        new_property_base_iri=BASE_IRI,
+        new_class_base_iri=BASE_IRI,
     )
-    assert created == []
-    assert len(skipped) == 1
-    assert "Unobtainium" in skipped[0]["reason"]
-    assert not extended["object_properties_dict"]
+    # Relation lands.
+    assert len(created) == 1
+    # No skips for unresolvable endpoints (only genuine garbage skips now).
+    assert not skipped
+    # Unobtainium got auto-minted as a class.
+    assert len(auto_minted) == 1
+    assert any("unobtainium" in iri.lower() for iri in auto_minted)
+    # The minted class carries the audit annotation.
+    auto_iri = auto_minted[0]
+    auto_rec = extended["classes_dict"][auto_iri]
+    assert auto_rec["annotations"].get("auto_created_from_relation") == ["treats"]
 
 
 def test_duplicate_proposed_relation_merges_domain_range() -> None:
@@ -173,7 +185,7 @@ def test_duplicate_proposed_relation_merges_domain_range() -> None:
              "DOMAIN": "AlternativeTherapy", "RANGE": "Symptom"},
         ]
     }
-    extended, created, skipped = add_new_relations_from_match_results(
+    extended, created, skipped, _auto_minted = add_new_relations_from_match_results(
         ontology, results, new_property_base_iri=BASE_IRI
     )
     # Only ONE property IRI -- the slug "treats" collapses to the same
@@ -195,7 +207,7 @@ def test_missing_relations_section_is_a_noop() -> None:
         "data_properties_dict": {},
         "instances_dict": {},
     }
-    extended, created, skipped = add_new_relations_from_match_results(
+    extended, created, skipped, _auto_minted = add_new_relations_from_match_results(
         ontology, {"MATCH NOT FOUND": []}, new_property_base_iri=BASE_IRI
     )
     assert created == []
