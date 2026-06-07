@@ -88,6 +88,34 @@ def _discover_imports_in_text(text: str) -> list[str]:
 ONTOLOGY_SUFFIXES = (".owl", ".rdf", ".ttl")
 
 
+def _convert_ttl_to_rdfxml_bytes(ttl_path: Path) -> bytes:
+    """Read a Turtle (.ttl) ontology file and return its RDF/XML
+    serialization as bytes via rdflib.
+
+    Why: owlready2's built-in Turtle reader is fragile. On the W3C
+    `time.ttl` (OWL Time ontology) it raises `OwlReadyOntologyParsingError:
+    NTriples parsing error (or unrecognized file format)`. rdflib's
+    Turtle parser handles the same file cleanly; converting to RDF/XML
+    up-front lets owlready2 consume the file via its much more robust
+    RDF/XML backend.
+
+    rdflib.Graph holds onto significant RAM that doesn't release back
+    to the OS automatically; on tight memory budgets (the user's 2.7 GiB
+    dev box) every MB matters, so we explicitly drop the Graph and
+    force a GC pass before returning.
+    """
+    import gc
+
+    import rdflib
+
+    g = rdflib.Graph()
+    g.parse(str(ttl_path), format="turtle")
+    out = g.serialize(format="xml", encoding="utf-8")
+    del g
+    gc.collect()
+    return out
+
+
 @dataclass
 class OntologySource:
     """One ontology file ready to be parsed.
@@ -162,8 +190,17 @@ def enumerate_inputs(inputs: list[Path]) -> OntologyInputs:
             tmp = bundle._exit_stack.enter_context(
                 tempfile.TemporaryDirectory(prefix="onto_src_")
             )
-            tmp_copy = Path(tmp) / path.name
-            shutil.copy2(path, tmp_copy)
+            if path.suffix.lower() == ".ttl":
+                # owlready2's built-in Turtle reader is fragile (it raises
+                # `NTriples parsing error` on the W3C `time` ontology even
+                # though the file is valid Turtle). rdflib's parser is
+                # robust; convert to RDF/XML up-front and let owlready2
+                # consume the .rdf instead.
+                tmp_copy = Path(tmp) / (path.stem + ".rdf")
+                tmp_copy.write_bytes(_convert_ttl_to_rdfxml_bytes(path))
+            else:
+                tmp_copy = Path(tmp) / path.name
+                shutil.copy2(path, tmp_copy)
             bundle.sources.append(
                 OntologySource(
                     label=path.name,
