@@ -29,6 +29,7 @@ from backend.app.helpers.ontology_pruning import (
     expand_with_relationship_partners,
     extract_detected_iris,
     extract_json_from_output,
+    infer_geographic_placement,
     infer_stem_relations,
     merge_llm_jsons_recursive,
     prune_classes_dict,
@@ -367,6 +368,20 @@ def _apply_expand(
         new_property_base_iri=base_iri,
     )
     created_props = list(created_props) + list(stem_props)
+
+    # Layer F: geographic-entity inference. Re-homes classes that the LLM
+    # left at owl:Thing in the default namespace but are clearly geographic
+    # entities (named landforms detected by keyword OR class is reached via
+    # a located_in/part_of-style predicate to an existing geography class).
+    # Mutates all four dicts in place.
+    geo_audit = infer_geographic_placement(
+        classes_dict=extended.get("classes_dict", {}),
+        obj_props_dict=extended.setdefault("object_properties_dict", {}),
+        data_props_dict=extended.setdefault("data_properties_dict", {}),
+        instances_dict=extended.setdefault("instances_dict", {}),
+    )
+    if geo_audit:
+        print(f"[stage4] geographic-inference re-homed {len(geo_audit)} class(es)")
     return extended, created_classes, list(created_props), skipped, list(created_instances)
 
 

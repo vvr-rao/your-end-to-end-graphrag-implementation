@@ -1600,6 +1600,345 @@ def infer_stem_relations(
     return obj_props_dict, created
 
 
+# ---------------------------------------------------------------------------
+# Geographic-entity inference (Stage 4 post-pass).
+#
+# Goal: after class minting + relation minting, find classes the LLM left
+# parented at owl:Thing in the default namespace that are CLEARLY geographic
+# entities (named landforms, named places) and re-home them under the
+# appropriate geography class. This catches cases like "Strait of Hormuz"
+# and "Kharg Island" where the LLM didn't propose a geography parent
+# because the surrounding text discussed them in a non-geographic context
+# (shipping, oil exports).
+#
+# Two independent signal sources (a class triggers if EITHER fires):
+#   1. Label / local-name contains a generic landform keyword
+#      ("strait", "island", "peninsula", "river", "sea", ...).
+#   2. Class is the DOMAIN or RANGE of a "located-in"-style relation
+#      pointing to a class already in the geography namespace.
+#
+# When a match fires:
+#   - Find the most-specific geography class to re-parent under (the one
+#     whose local name matches the triggering keyword, if any; fall back
+#     to a generic root like GeographicEntity / Place / SpatialThing).
+#   - Move the class's IRI into the parent's namespace (so "Strait of
+#     Hormuz" goes from default:strait_of_hormuz to
+#     geography#strait_of_hormuz).
+#   - Rewrite every reference to the old IRI in classes_dict (other
+#     superclasses), obj_props_dict (domain/range), data_props_dict
+#     (domain), and instances_dict (types/direct_types).
+#   - Annotate the moved class with `inferred_geographic: true` for audit.
+# ---------------------------------------------------------------------------
+
+
+# Generic landform / place-type vocabulary. Single words only -- multi-word
+# checks are done by splitting the candidate's local-name on underscores and
+# splitting labels on whitespace. Avoids ambiguous terms like "state"
+# (administrative AND non-geographic meaning) and "country" / "region" /
+# "province" (the LLM already handles named countries via Stage 2, and these
+# tokens appear in many non-geographic contexts).
+_LANDFORM_KEYWORDS: frozenset[str] = frozenset({
+    "strait", "island", "islands", "peninsula", "mountain", "mountains",
+    "river", "sea", "gulf", "bay", "lake", "channel", "ocean", "continent",
+    "archipelago", "delta", "cape", "isthmus", "basin", "valley", "plateau",
+    "desert", "harbor", "harbour", "fjord", "coast", "coastline", "shore",
+    "shoreline", "atoll", "reef", "lagoon", "estuary", "tributary",
+})
+
+# Object-property labels (case-insensitive substrings) that, when present,
+# indicate the SUBJECT is a geographic entity inside the OBJECT. The list
+# is intentionally short; if the LLM proposed any of these AND the object
+# resolves to a class in the geography namespace, the subject is treated
+# as geographic too.
+_GEOGRAPHIC_PREDICATE_HINTS: frozenset[str] = frozenset({
+    "located_in", "located in", "locatedin",
+    "is_part_of", "part_of", "is part of", "partof",
+    "borders", "borders_on", "borders on",
+    "within", "is_within", "is within",
+    "in_the_country", "in_country",
+})
+
+
+# Generic geographic root labels we'll look up if no specific landform class
+# matches. First hit wins.
+_GENERIC_GEO_ROOT_LABELS: tuple[str, ...] = (
+    "geographicentity", "geographicfeature", "geographic_entity",
+    "geographic feature", "place", "spatialthing", "spatial thing",
+    "location", "geographicarea", "geographic area",
+)
+
+
+def _candidate_tokens(class_record: dict, iri: str) -> set[str]:
+    """Tokens worth scanning for landform keywords: local-name split on
+    underscores, plus each label split on whitespace."""
+    tokens: set[str] = set()
+    local = _local_name(iri)
+    tokens.update(t for t in re.split(r"[_\s]+", local.lower()) if t)
+    for label in (class_record.get("labels") or []):
+        if isinstance(label, str):
+            text = label
+        elif isinstance(label, dict):
+            text = label.get("value") or ""
+        else:
+            text = ""
+        text = re.sub(r"[^a-z0-9 ]+", " ", text.lower())
+        tokens.update(t for t in text.split() if t)
+    return tokens
+
+
+def _rewrite_iri_references(
+    old_iri: str,
+    new_iri: str,
+    new_name: str,
+    classes_dict: dict,
+    obj_props_dict: dict,
+    data_props_dict: dict,
+    instances_dict: dict,
+) -> None:
+    """In-place rewrite of every reference to old_iri across the four
+    dicts. Updates superclasses on other classes, domain/range on
+    properties, types/direct_types on instances. The class record itself
+    is moved from old_iri key to new_iri key by the caller."""
+
+    def _rewrite_entity_ref(ref: Any) -> bool:
+        """If ref is a dict with iri==old_iri, mutate it to new_iri and
+        return True. Otherwise no-op return False."""
+        if isinstance(ref, dict) and ref.get("iri") == old_iri:
+            ref["iri"] = new_iri
+            if "name" in ref:
+                ref["name"] = new_name
+            return True
+        return False
+
+    # Other classes' superclasses + restrictions.
+    for rec in classes_dict.values():
+        for supr in rec.get("superclasses") or []:
+            _rewrite_entity_ref(supr)
+        for eq in rec.get("equivalent_to") or []:
+            _rewrite_entity_ref(eq)
+
+    # Object properties' domain + range.
+    for prop in obj_props_dict.values():
+        for end in ("domain", "range"):
+            for ref in prop.get(end) or []:
+                _rewrite_entity_ref(ref)
+
+    # Data properties' domain.
+    for prop in data_props_dict.values():
+        for ref in prop.get("domain") or []:
+            _rewrite_entity_ref(ref)
+
+    # Instances' types + direct_types.
+    for inst in instances_dict.values():
+        for end in ("types", "direct_types"):
+            for ref in inst.get(end) or []:
+                _rewrite_entity_ref(ref)
+
+
+def infer_geographic_placement(
+    classes_dict: dict,
+    obj_props_dict: dict,
+    data_props_dict: dict,
+    instances_dict: dict,
+) -> list[dict]:
+    """Stage-4 post-pass that detects geographic-entity classes by context
+    and re-homes them under the geography ontology.
+
+    Mutates all four dicts in place. Returns a list of audit records, one
+    per re-homed class, each shaped as:
+        {"old_iri": ..., "new_iri": ..., "matched_parent": ...,
+         "signal": "landform_keyword:<kw>" or "relation:<predicate>"}
+
+    A class is considered for re-homing when ALL of:
+      - Its current namespace is NOT one of the "real" ontology
+        namespaces (so it currently lives in `default_base_iri` /
+        the synthesized space).
+      - Its current parent IS owl:Thing OR not set.
+
+    From the candidate set, the class is re-homed when EITHER:
+      - One of its tokens (local-name + labels) is in
+        _LANDFORM_KEYWORDS. The matched keyword is then used to look up
+        an existing class with that keyword as its local name (e.g.
+        "Strait") inside any namespace. First match wins. If no specific
+        match, fall back to a generic geographic root.
+      - The class appears as the DOMAIN or RANGE of an object property
+        whose label is in _GEOGRAPHIC_PREDICATE_HINTS, and the OTHER
+        endpoint of that property is in a namespace that contains the
+        word "geography". Then use the OTHER endpoint's parent (or
+        itself) as the target geography parent.
+    """
+    audit: list[dict] = []
+
+    # Build a {token -> existing_class_iri} index restricted to classes
+    # whose local-name IS one of the landform keywords or in
+    # _GENERIC_GEO_ROOT_LABELS. We don't want random classes that happen
+    # to contain "river" in their label (like "river_basin_management")
+    # to be matched as candidate parents.
+    parent_by_keyword: dict[str, str] = {}
+    generic_geo_iri: str | None = None
+    for iri, rec in classes_dict.items():
+        local = _local_name(iri).lower()
+        # Specific landform match: local name IS a keyword (singular or plural).
+        if local in _LANDFORM_KEYWORDS:
+            parent_by_keyword.setdefault(local, iri)
+            # Also index the singular form if local is plural.
+            if local.endswith("s") and local[:-1] in _LANDFORM_KEYWORDS:
+                parent_by_keyword.setdefault(local[:-1], iri)
+        # Generic geographic root by label / local-name.
+        if not generic_geo_iri:
+            label_keys = {local.replace("_", "")}
+            for lab in (rec.get("labels") or []):
+                if isinstance(lab, str):
+                    label_keys.add(lab.lower().replace(" ", ""))
+            if any(k in _GENERIC_GEO_ROOT_LABELS for k in label_keys):
+                generic_geo_iri = iri
+
+    # Build {class_iri -> set of (predicate_label, other_endpoint_iri)} for
+    # the relation-based signal.
+    related_partners: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for prop in obj_props_dict.values():
+        labels = prop.get("labels") or [prop.get("name") or ""]
+        primary_label = (
+            labels[0] if isinstance(labels[0], str) else ""
+        ) if labels else ""
+        primary_label = primary_label.lower()
+        is_geo_predicate = any(
+            hint in primary_label for hint in _GEOGRAPHIC_PREDICATE_HINTS
+        )
+        if not is_geo_predicate:
+            continue
+        domains = [safe_get_iri(d) for d in prop.get("domain") or []]
+        ranges = [safe_get_iri(r) for r in prop.get("range") or []]
+        for d in domains:
+            for r in ranges:
+                if d and r:
+                    related_partners[d].append((primary_label, r))
+
+    # Iterate candidates and re-home.
+    for iri in list(classes_dict.keys()):
+        rec = classes_dict.get(iri)
+        if rec is None:
+            continue
+        # Skip classes already in a "real" domain namespace -- only the
+        # default-namespace and other-namespace synthesized classes are
+        # candidates. We detect "real" by checking if the namespace
+        # contains one of the source-ontology hostnames.
+        ns = _namespace_of(iri).lower()
+        if "geography" in ns or "ontocape" in ns or "intelligence-artifact" in ns:
+            continue
+        if "w3.org/2006/time" in ns:
+            continue
+        # Skip if already has a non-Thing parent.
+        cur_parent = _first_super_iri(rec)
+        if cur_parent and cur_parent != _OWL_THING_IRI:
+            continue
+
+        # Try landform-keyword signal first.
+        tokens = _candidate_tokens(rec, iri)
+        matched_keyword: str | None = None
+        target_parent: str | None = None
+        signal: str | None = None
+        for tok in tokens:
+            if tok in _LANDFORM_KEYWORDS:
+                matched_keyword = tok
+                # Prefer a specific landform class with this keyword as local name.
+                specific = parent_by_keyword.get(tok) or parent_by_keyword.get(
+                    tok[:-1] if tok.endswith("s") else tok
+                )
+                if specific:
+                    target_parent = specific
+                    signal = f"landform_keyword:{tok}"
+                else:
+                    target_parent = generic_geo_iri
+                    signal = f"landform_keyword:{tok}"
+                break
+
+        # If no landform match, try relation-based signal.
+        if target_parent is None and iri in related_partners:
+            for pred, other_iri in related_partners[iri]:
+                other_ns = _namespace_of(other_iri).lower()
+                if "geography" in other_ns:
+                    # Use the other endpoint's parent (or itself) as our target.
+                    other_rec = classes_dict.get(other_iri) or {}
+                    candidate = _first_super_iri(other_rec)
+                    if candidate and candidate in classes_dict:
+                        target_parent = candidate
+                    else:
+                        target_parent = other_iri
+                    signal = f"relation:{pred}"
+                    break
+
+        if target_parent is None:
+            continue
+
+        # Compute new IRI in the target parent's namespace, preserving the
+        # current local-name slug.
+        old_local = _local_name(iri)
+        target_ns = _namespace_of(target_parent)
+        new_iri = target_ns + old_local
+        if new_iri == iri:
+            # Same namespace already -- just re-parent in place without IRI move.
+            rec["superclasses"] = [{
+                "kind": "entity",
+                "name": _local_name(target_parent),
+                "iri": target_parent,
+                "python_name": None,
+                "type": "ThingClass",
+            }]
+            rec.setdefault("annotations", {})["inferred_geographic"] = [True]
+            rec.setdefault("annotations", {})["inferred_geographic_signal"] = [signal]
+            audit.append({
+                "old_iri": iri, "new_iri": iri,
+                "matched_parent": target_parent, "signal": signal,
+            })
+            continue
+        if new_iri in classes_dict:
+            # Conflict: a class with the target IRI already exists.
+            # Re-parent in place without moving IRI (avoid clobbering).
+            rec["superclasses"] = [{
+                "kind": "entity",
+                "name": _local_name(target_parent),
+                "iri": target_parent,
+                "python_name": None,
+                "type": "ThingClass",
+            }]
+            rec.setdefault("annotations", {})["inferred_geographic"] = [True]
+            rec.setdefault("annotations", {})["inferred_geographic_signal"] = [signal]
+            audit.append({
+                "old_iri": iri, "new_iri": iri,
+                "matched_parent": target_parent,
+                "signal": signal + " (kept-iri:conflict)",
+            })
+            continue
+
+        # Move the record to the new IRI.
+        new_name = safe_name_from_iri(new_iri)
+        rec["iri"] = new_iri
+        rec["name"] = new_name
+        rec["namespace"] = target_ns
+        rec["superclasses"] = [{
+            "kind": "entity",
+            "name": _local_name(target_parent),
+            "iri": target_parent,
+            "python_name": None,
+            "type": "ThingClass",
+        }]
+        rec.setdefault("annotations", {})["inferred_geographic"] = [True]
+        rec.setdefault("annotations", {})["inferred_geographic_signal"] = [signal]
+        del classes_dict[iri]
+        classes_dict[new_iri] = rec
+        _rewrite_iri_references(
+            iri, new_iri, new_name,
+            classes_dict, obj_props_dict, data_props_dict, instances_dict,
+        )
+        audit.append({
+            "old_iri": iri, "new_iri": new_iri,
+            "matched_parent": target_parent, "signal": signal,
+        })
+
+    return audit
+
+
 def _is_garbage_endpoint(text: str) -> bool:
     """An endpoint label too long to be a class name (probably a sentence)
     or containing newlines is treated as garbage -- skip the relation."""

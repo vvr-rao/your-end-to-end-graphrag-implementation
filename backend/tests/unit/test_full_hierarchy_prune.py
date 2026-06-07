@@ -961,3 +961,231 @@ def test_parse_retry_after_seconds_handles_ms_suffix() -> None:
 
     # Non-rate-limit error -> None.
     assert _parse_retry_after_seconds(_Err("connection refused")) is None
+
+
+# ============================================================================
+# Layer F: deterministic geographic-entity inference + IRI rewriting.
+# ============================================================================
+
+
+GEO_NS = "https://veerla-ramrao.ai/ontology/geography#"
+DEFAULT_NS = "http://default.example/ontology/"
+OWL_THING = "http://www.w3.org/2002/07/owl#Thing"
+
+
+def _make_default_class(local: str, parent_iri: str | None = None,
+                         labels: list[str] | None = None) -> tuple[str, dict]:
+    iri = DEFAULT_NS + local
+    supers = []
+    if parent_iri:
+        supers.append({"kind": "entity", "iri": parent_iri})
+    return iri, {
+        "iri": iri,
+        "name": local,
+        "labels": labels or [local],
+        "superclasses": supers,
+        "restrictions_and_class_constructs": [],
+    }
+
+
+def _make_geo_class(local: str, parent_iri: str | None = None,
+                     labels: list[str] | None = None) -> tuple[str, dict]:
+    iri = GEO_NS + local
+    supers = []
+    if parent_iri:
+        supers.append({"kind": "entity", "iri": parent_iri})
+    return iri, {
+        "iri": iri,
+        "name": local,
+        "labels": labels or [local],
+        "superclasses": supers,
+        "restrictions_and_class_constructs": [],
+    }
+
+
+def test_geo_inference_landform_keyword_in_local_name_rehomes() -> None:
+    """Class 'strait_of_hormuz' in default namespace with parent owl:Thing.
+    The 'strait' token matches an existing Strait class in geography ns.
+    The class IS re-homed into geography ns with Strait as parent."""
+    from backend.app.helpers.ontology_pruning import infer_geographic_placement
+
+    strait_iri, strait_rec = _make_geo_class("Strait", labels=["Strait"])
+    hormuz_iri, hormuz_rec = _make_default_class(
+        "strait_of_hormuz", parent_iri=OWL_THING,
+        labels=["Strait of Hormuz"],
+    )
+    classes_dict = {strait_iri: strait_rec, hormuz_iri: hormuz_rec}
+
+    audit = infer_geographic_placement(
+        classes_dict=classes_dict,
+        obj_props_dict={},
+        data_props_dict={},
+        instances_dict={},
+    )
+
+    assert len(audit) == 1
+    rec = audit[0]
+    new_iri = rec["new_iri"]
+    # IRI moved into geography namespace.
+    assert new_iri.startswith(GEO_NS)
+    assert new_iri.endswith("strait_of_hormuz")
+    # Parent is Strait.
+    assert classes_dict[new_iri]["superclasses"][0]["iri"] == strait_iri
+    # Old IRI removed.
+    assert hormuz_iri not in classes_dict
+    # Audit signal includes the keyword.
+    assert "strait" in rec["signal"]
+
+
+def test_geo_inference_falls_back_to_generic_geo_root_when_no_specific_match() -> None:
+    """If the landform keyword has no specific class (e.g. no Island class
+    exists), but a generic geographic root (GeographicEntity) exists, fall
+    back to it."""
+    from backend.app.helpers.ontology_pruning import infer_geographic_placement
+
+    geo_root_iri, geo_root_rec = _make_geo_class(
+        "GeographicEntity", labels=["GeographicEntity"]
+    )
+    kharg_iri, kharg_rec = _make_default_class(
+        "kharg_island", parent_iri=OWL_THING, labels=["Kharg Island"],
+    )
+    classes_dict = {geo_root_iri: geo_root_rec, kharg_iri: kharg_rec}
+
+    audit = infer_geographic_placement(
+        classes_dict=classes_dict,
+        obj_props_dict={}, data_props_dict={}, instances_dict={},
+    )
+
+    assert len(audit) == 1
+    new_iri = audit[0]["new_iri"]
+    assert new_iri.startswith(GEO_NS)
+    assert classes_dict[new_iri]["superclasses"][0]["iri"] == geo_root_iri
+
+
+def test_geo_inference_skips_non_landform_classes() -> None:
+    """A class like 'us_iran_conflict' has no landform keyword in its
+    local name or labels -- it must NOT be re-homed even though there
+    are geography classes available."""
+    from backend.app.helpers.ontology_pruning import infer_geographic_placement
+
+    geo_root_iri, geo_root_rec = _make_geo_class("GeographicEntity")
+    conflict_iri, conflict_rec = _make_default_class(
+        "us_iran_conflict", parent_iri=OWL_THING,
+        labels=["US-Iran Conflict"],
+    )
+    classes_dict = {geo_root_iri: geo_root_rec, conflict_iri: conflict_rec}
+
+    audit = infer_geographic_placement(
+        classes_dict=classes_dict,
+        obj_props_dict={}, data_props_dict={}, instances_dict={},
+    )
+
+    assert audit == []
+    # conflict class unchanged in its original namespace.
+    assert conflict_iri in classes_dict
+    assert classes_dict[conflict_iri]["superclasses"][0]["iri"] == OWL_THING
+
+
+def test_geo_inference_relation_signal_locatedin_to_geo_class() -> None:
+    """Class has no landform keyword but is the DOMAIN of a 'located_in'
+    relation pointing to a class in the geography namespace. That's
+    enough signal to re-home it under that target's parent class."""
+    from backend.app.helpers.ontology_pruning import infer_geographic_placement
+
+    country_iri, country_rec = _make_geo_class("Country", labels=["Country"])
+    iran_iri, iran_rec = _make_geo_class("Iran", parent_iri=country_iri, labels=["Iran"])
+    abadan_iri, abadan_rec = _make_default_class(
+        "abadan", parent_iri=OWL_THING, labels=["Abadan"],
+    )
+    classes_dict = {country_iri: country_rec, iran_iri: iran_rec, abadan_iri: abadan_rec}
+    obj_props = {
+        "ex:locatedIn": {
+            "iri": "ex:locatedIn",
+            "name": "located_in",
+            "labels": ["located_in"],
+            "domain": [{"kind": "entity", "iri": abadan_iri}],
+            "range": [{"kind": "entity", "iri": iran_iri}],
+        }
+    }
+    audit = infer_geographic_placement(
+        classes_dict=classes_dict,
+        obj_props_dict=obj_props,
+        data_props_dict={}, instances_dict={},
+    )
+    assert len(audit) == 1
+    new_iri = audit[0]["new_iri"]
+    assert new_iri.startswith(GEO_NS)
+    # Re-parented under the other endpoint's parent (Country).
+    assert classes_dict[new_iri]["superclasses"][0]["iri"] == country_iri
+    assert "relation:" in audit[0]["signal"]
+
+
+def test_geo_inference_rewrites_iri_references_in_relations_and_instances() -> None:
+    """When a class's IRI moves from default to geography ns, every
+    reference to the old IRI in obj props, data props, and instances must
+    be rewritten so the graph stays connected."""
+    from backend.app.helpers.ontology_pruning import infer_geographic_placement
+
+    strait_iri, strait_rec = _make_geo_class("Strait")
+    hormuz_iri, hormuz_rec = _make_default_class(
+        "strait_of_hormuz", parent_iri=OWL_THING, labels=["Strait of Hormuz"],
+    )
+    other_iri, other_rec = _make_default_class("oil_export_hub", parent_iri=OWL_THING)
+    classes_dict = {
+        strait_iri: strait_rec,
+        hormuz_iri: hormuz_rec,
+        other_iri: other_rec,
+    }
+    obj_props = {
+        "ex:disrupts": {
+            "iri": "ex:disrupts", "name": "disrupts", "labels": ["disrupts"],
+            "domain": [{"kind": "entity", "iri": hormuz_iri}],
+            "range": [{"kind": "entity", "iri": other_iri}],
+        }
+    }
+    instances = {
+        "ex:closure2025": {
+            "iri": "ex:closure2025", "name": "closure_2025", "labels": ["closure 2025"],
+            "types": [{"kind": "entity", "iri": hormuz_iri}],
+            "direct_types": [{"kind": "entity", "iri": hormuz_iri}],
+        }
+    }
+
+    audit = infer_geographic_placement(
+        classes_dict=classes_dict,
+        obj_props_dict=obj_props,
+        data_props_dict={},
+        instances_dict=instances,
+    )
+    assert len(audit) == 1
+    new_iri = audit[0]["new_iri"]
+    assert new_iri.startswith(GEO_NS)
+
+    # Relation's domain now references the NEW IRI.
+    assert obj_props["ex:disrupts"]["domain"][0]["iri"] == new_iri
+    # Instance's types reference the NEW IRI on both lists.
+    assert instances["ex:closure2025"]["types"][0]["iri"] == new_iri
+    assert instances["ex:closure2025"]["direct_types"][0]["iri"] == new_iri
+    # Other class unaffected.
+    assert other_iri in classes_dict
+
+
+def test_geo_inference_does_not_disturb_classes_already_in_real_namespace() -> None:
+    """A class that's already in geography or another real ontology
+    namespace is never touched, even if it matches a keyword."""
+    from backend.app.helpers.ontology_pruning import infer_geographic_placement
+
+    strait_iri, strait_rec = _make_geo_class("Strait")
+    # This one is already in geography ns -- should be left alone.
+    bering_iri, bering_rec = _make_geo_class(
+        "bering_strait", parent_iri=strait_iri, labels=["Bering Strait"],
+    )
+    classes_dict = {strait_iri: strait_rec, bering_iri: bering_rec}
+
+    audit = infer_geographic_placement(
+        classes_dict=classes_dict,
+        obj_props_dict={}, data_props_dict={}, instances_dict={},
+    )
+    # No re-homing -- bering_strait is already where it belongs.
+    assert audit == []
+    assert bering_iri in classes_dict
