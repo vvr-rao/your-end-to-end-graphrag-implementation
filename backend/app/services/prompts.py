@@ -91,13 +91,40 @@ def class_identification_and_expansion(
         "if the concept genuinely has no natural parent.\n"
         "  3. Identify RELATIONS between classes the TEXT asserts or implies. "
         "Both endpoints may be existing classes (use their LABEL or IRI) or "
-        "classes you just proposed in step 2 (use the same LABEL).\n\n"
+        "classes you just proposed in step 2 (use the same LABEL).\n"
+        "  4. INSTANCES (named individuals). For specific time points / "
+        "time periods (e.g. 'Jan 2004', 'January 2004', 'Jan04', '2030', "
+        "'Q3 2025', 'next decade') and other PROPER-NOUN named individuals "
+        "the text references (specific events, specific documents, named "
+        "incidents that are one-of-a-kind), emit a MATCH NOT FOUND INSTANCES "
+        "entry instead of a MATCH NOT FOUND class entry. Each instance "
+        "entry must carry:\n"
+        "       - LABEL: the surface form as found in the text\n"
+        "       - CANONICAL_FORM: a single canonical form so equivalent "
+        "surface forms ('Jan 2004' / 'Jan04' / 'January 2004') collapse to "
+        "ONE instance. Pick the most readable canonical form (e.g. "
+        "'January 2004').\n"
+        "       - TYPE_LABEL: the most specific class in DATA_CLASSES (or a "
+        "MATCH NOT FOUND label) that this individual is an instance of. "
+        "For time points prefer time classes if available (Year, Month, "
+        "DurationDescription, TemporalEntity, etc.). For named events, "
+        "prefer 'Event' / 'Crisis' / 'Conflict' / etc.\n"
+        "       - DESCRIPTION: a brief sentence of context.\n"
+        "     Rule of thumb: classes are KINDS OF things ('Year', 'Crisis', "
+        "'Country'); instances are SPECIFIC things ('January 2004', 'Iran "
+        "war 2025', 'Kingdom of Saudi Arabia'). Do NOT create a new class "
+        "for each year mentioned in the text -- create instances of Year.\n"
+        "\n"
         "Review thoroughly -- do not stop after a few matches. When in doubt, "
         "INCLUDE the match. Specifically:\n"
-        "  - Geographic mentions (countries, regions, continents, cities) MUST "
+        "  - Geographic mentions (countries, regions, continents, cities) AND "
+        "geographic features (straits, islands, peninsulas, mountains, bays, "
+        "rivers, deserts, gulfs, seas, lakes, isthmuses, archipelagos) MUST "
         "be matched to existing geographic classes if any are present in "
         "DATA_CLASSES. 'China' -> matches Country/Asia; 'ASEAN' -> matches "
-        "Region/SoutheastAsia; etc.\n"
+        "Region/SoutheastAsia; 'Strait of Hormuz' -> matches Strait (or "
+        "GeographicEntity / GeographicFeature if no Strait class exists); "
+        "'Kharg Island' -> matches Island (or GeographicEntity).\n"
         "  - Temporal mentions (years like '2030', durations like 'next "
         "decade', recurring intervals like 'annual', day-of-week references) "
         "MUST be matched to existing temporal classes if any are present.\n"
@@ -141,6 +168,12 @@ def class_identification_and_expansion(
         ' "DESCRIPTION": "<one-sentence statement of the relation>",'
         ' "DOMAIN": "<label or IRI of the source class (must exist or be proposed)>",'
         ' "RANGE": "<label or IRI of the target class (must exist or be proposed)>"}, ...'
+        "  ],\n"
+        '  "MATCH NOT FOUND INSTANCES": ['
+        '    {"LABEL": "<surface form from text>",'
+        ' "CANONICAL_FORM": "<single canonical form>",'
+        ' "TYPE_LABEL": "<label of class this is an instance of, from DATA_CLASSES or MATCH NOT FOUND>",'
+        ' "DESCRIPTION": "<one-sentence context>"}, ...'
         "  ]\n"
         "}\n"
         "No prose. No comments. Only the JSON object."
@@ -151,7 +184,7 @@ def class_identification_and_expansion(
         f"DATA_CLASSES:\n{ontology_repr}\n\n"
         f"TEXT TO EVALUATE:\n{text_chunk}\n\n"
         'Return JSON: {"MATCHES FOUND": [...], "MATCH NOT FOUND": [...], '
-        '"MATCH NOT FOUND RELATIONS": [...]}'
+        '"MATCH NOT FOUND RELATIONS": [...], "MATCH NOT FOUND INSTANCES": [...]}'
     )
     return system, user
 
@@ -170,7 +203,10 @@ def match_dedup(merged_match_results: dict[str, Any]) -> tuple[str, str]:
         "DESCRIPTION, and PARENT_LABEL) that may contain duplicates and "
         "overlaps with MATCHES FOUND.\n"
         "  - \"MATCH NOT FOUND RELATIONS\": proposed new object-property "
-        "relations (LABEL + DOMAIN + RANGE) that may contain duplicates.\n\n"
+        "relations (LABEL + DOMAIN + RANGE) that may contain duplicates.\n"
+        "  - \"MATCH NOT FOUND INSTANCES\" (may be missing): proposed "
+        "named individuals (each carries LABEL, CANONICAL_FORM, TYPE_LABEL, "
+        "DESCRIPTION).\n\n"
         "Your tasks:\n"
         "  1. From MATCH NOT FOUND, remove any entry whose concept already "
         "exists in MATCHES FOUND (same idea, even if labeled differently).\n"
@@ -205,9 +241,16 @@ def match_dedup(merged_match_results: dict[str, Any]) -> tuple[str, str]:
         "     Use this sparingly -- only when the grouping is obvious from "
         "the labels themselves. Do NOT invent parents for groups of 2 or for "
         "weakly-related concepts.\n"
-        "  5. Do NOT modify any MATCHES FOUND entries.\n"
-        "  6. Do NOT add new entries for any reason other than rule 4.\n\n"
-        "Output strict JSON with the same three keys, no prose, no comments."
+        "  5. From MATCH NOT FOUND INSTANCES, collapse entries that share "
+        "the same CANONICAL_FORM (case-insensitive after stripping "
+        "punctuation) into ONE entry. Merge descriptions; pick the most "
+        "specific TYPE_LABEL. Example collapses: 'Jan 2004' / 'Jan04' / "
+        "'January 2004' all share CANONICAL_FORM='January 2004' -> one "
+        "instance.\n"
+        "  6. Do NOT modify any MATCHES FOUND entries.\n"
+        "  7. Do NOT add new entries for any reason other than rule 4.\n\n"
+        "Output strict JSON with all four keys present (use [] if empty), "
+        "no prose, no comments."
     )
     user = (
         "INPUT:\n"

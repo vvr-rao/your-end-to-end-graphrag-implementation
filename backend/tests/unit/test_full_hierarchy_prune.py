@@ -765,3 +765,199 @@ def test_stem_relation_inference_respects_namespace_boundary() -> None:
     _, created = infer_stem_relations(classes, obj_props,
                                        new_property_base_iri="http://default.example/onto/")
     assert created == []
+
+
+# ============================================================================
+# Phase 1 tests: time-as-instances feature (MATCH NOT FOUND INSTANCES).
+# ============================================================================
+
+
+def _time_class(local: str) -> tuple[str, dict]:
+    iri = f"http://www.w3.org/2006/time#{local}"
+    return iri, {
+        "iri": iri,
+        "name": local,
+        "labels": [local],
+        "superclasses": [],
+        "restrictions_and_class_constructs": [],
+    }
+
+
+def test_add_instances_creates_named_individual_with_type() -> None:
+    """Given a Year class and a MATCH NOT FOUND INSTANCES entry with
+    CANONICAL_FORM='January 2004' + TYPE_LABEL='Year', the helper mints
+    a single named individual typed to Year, placed in the time
+    namespace (derived from Year's namespace)."""
+    from backend.app.helpers.ontology_pruning import add_new_instances_from_match_results
+
+    year_iri, year_rec = _time_class("Year")
+    ontology = {
+        "classes_dict": {year_iri: year_rec},
+        "object_properties_dict": {},
+        "data_properties_dict": {},
+        "instances_dict": {},
+    }
+    results = {
+        "MATCH NOT FOUND INSTANCES": [
+            {"LABEL": "Jan 2004", "CANONICAL_FORM": "January 2004",
+             "TYPE_LABEL": "Year",
+             "DESCRIPTION": "Reference month from the corpus."},
+        ]
+    }
+    extended, created = add_new_instances_from_match_results(
+        ontology, results,
+        new_instance_base_iri="http://default.example/onto/",
+        default_type_iri="http://www.w3.org/2002/07/owl#Thing",
+    )
+    assert len(created) == 1
+    iri = created[0]
+    # IRI lands in the time namespace, not default.
+    assert iri.startswith("http://www.w3.org/2006/time#")
+    # Slugged from canonical form, NOT the surface form.
+    assert iri.endswith("january_2004")
+    inst = extended["instances_dict"][iri]
+    # Typed to Year on both `types` and `direct_types`.
+    assert any(t["iri"] == year_iri for t in inst["types"])
+    assert any(t["iri"] == year_iri for t in inst["direct_types"])
+    # Both labels preserved.
+    assert "January 2004" in inst["labels"]
+    assert "Jan 2004" in inst["labels"]
+    # Audit annotation.
+    assert inst["annotations"]["canonical_form"] == ["January 2004"]
+
+
+def test_add_instances_dedups_same_canonical_form() -> None:
+    """Three entries with the SAME CANONICAL_FORM but different surface
+    LABELs produce ONE minted instance. All surface forms get folded
+    into the survivor's labels list."""
+    from backend.app.helpers.ontology_pruning import add_new_instances_from_match_results
+
+    year_iri, year_rec = _time_class("Year")
+    ontology = {
+        "classes_dict": {year_iri: year_rec},
+        "object_properties_dict": {},
+        "data_properties_dict": {},
+        "instances_dict": {},
+    }
+    results = {
+        "MATCH NOT FOUND INSTANCES": [
+            {"LABEL": "Jan 2004", "CANONICAL_FORM": "January 2004",
+             "TYPE_LABEL": "Year", "DESCRIPTION": "First mention."},
+            {"LABEL": "Jan04", "CANONICAL_FORM": "January 2004",
+             "TYPE_LABEL": "Year", "DESCRIPTION": "Abbrev form."},
+            {"LABEL": "January 2004", "CANONICAL_FORM": "January 2004",
+             "TYPE_LABEL": "Year", "DESCRIPTION": "Full form."},
+        ]
+    }
+    extended, created = add_new_instances_from_match_results(
+        ontology, results,
+        new_instance_base_iri="http://default.example/onto/",
+        default_type_iri=None,
+    )
+    assert len(created) == 1
+    inst = extended["instances_dict"][created[0]]
+    # All three surface forms in labels.
+    assert set(inst["labels"]) == {"January 2004", "Jan 2004", "Jan04"}
+    # All three descriptions preserved.
+    assert len(inst["descriptions"]) == 3
+
+
+def test_add_instances_falls_back_to_default_type_when_unresolved() -> None:
+    """TYPE_LABEL that doesn't resolve to any class -> instance is typed
+    at default_type_iri (owl:Thing) and lands in the default namespace."""
+    from backend.app.helpers.ontology_pruning import add_new_instances_from_match_results
+
+    ontology = {
+        "classes_dict": {},
+        "object_properties_dict": {},
+        "data_properties_dict": {},
+        "instances_dict": {},
+    }
+    results = {
+        "MATCH NOT FOUND INSTANCES": [
+            {"LABEL": "Mystery Event", "CANONICAL_FORM": "Mystery Event",
+             "TYPE_LABEL": "Nonexistent Class",
+             "DESCRIPTION": "Unresolvable type."},
+        ]
+    }
+    OWL_THING = "http://www.w3.org/2002/07/owl#Thing"
+    extended, created = add_new_instances_from_match_results(
+        ontology, results,
+        new_instance_base_iri="http://default.example/onto/",
+        default_type_iri=OWL_THING,
+    )
+    assert len(created) == 1
+    iri = created[0]
+    # Lands in default namespace (owl:Thing -> fallback).
+    assert iri.startswith("http://default.example/onto/")
+    inst = extended["instances_dict"][iri]
+    assert inst["types"][0]["iri"] == OWL_THING
+
+
+def test_add_instances_places_in_type_namespace() -> None:
+    """End-to-end: type resolves to time:Year, so instance IRI uses
+    time#... namespace; type resolves to geography:Country, so instance
+    uses geography#... namespace."""
+    from backend.app.helpers.ontology_pruning import add_new_instances_from_match_results
+
+    year_iri, year_rec = _time_class("Year")
+    country_iri = "https://veerla-ramrao.ai/ontology/geography#Country"
+    country_rec = {
+        "iri": country_iri, "name": "Country", "labels": ["Country"],
+        "superclasses": [],
+    }
+    ontology = {
+        "classes_dict": {year_iri: year_rec, country_iri: country_rec},
+        "object_properties_dict": {},
+        "data_properties_dict": {},
+        "instances_dict": {},
+    }
+    results = {
+        "MATCH NOT FOUND INSTANCES": [
+            {"LABEL": "2030", "CANONICAL_FORM": "2030",
+             "TYPE_LABEL": "Year", "DESCRIPTION": ""},
+            {"LABEL": "Kingdom of Saudi Arabia", "CANONICAL_FORM": "Saudi Arabia",
+             "TYPE_LABEL": "Country", "DESCRIPTION": ""},
+        ]
+    }
+    extended, created = add_new_instances_from_match_results(
+        ontology, results,
+        new_instance_base_iri="http://default.example/onto/",
+        default_type_iri=None,
+    )
+    assert len(created) == 2
+    year_inst = next(i for i in created if "time" in i)
+    country_inst = next(i for i in created if "geography" in i)
+    # Each instance is in its TYPE's namespace.
+    assert year_inst.startswith("http://www.w3.org/2006/time#")
+    assert country_inst.startswith("https://veerla-ramrao.ai/ontology/geography#")
+    # Slugs are from canonical forms.
+    assert year_inst.endswith("2030")
+    assert country_inst.endswith("saudi_arabia")
+
+
+# ============================================================================
+# Retry-after parser tests
+# ============================================================================
+
+
+def test_parse_retry_after_seconds_handles_ms_suffix() -> None:
+    """Groq Dev-tier TPM bursts often surface '207.2ms' / '61ms' hints.
+    Our parser was previously matching only second-suffix patterns and
+    silently dropping ms-suffix retries -- now it converts to seconds."""
+    from backend.app.services.pipeline_llm import _parse_retry_after_seconds
+
+    class _Err(Exception):
+        pass
+
+    e1 = _Err("rate_limit_exceeded ... Please try again in 207.2ms.")
+    assert abs(_parse_retry_after_seconds(e1) - 0.2072) < 1e-6
+
+    e2 = _Err("Error code: 429 ... try again in 7.5s.")
+    assert _parse_retry_after_seconds(e2) == 7.5
+
+    e3 = _Err("rate_limit ... try again in 61ms.")
+    assert abs(_parse_retry_after_seconds(e3) - 0.061) < 1e-6
+
+    # Non-rate-limit error -> None.
+    assert _parse_retry_after_seconds(_Err("connection refused")) is None

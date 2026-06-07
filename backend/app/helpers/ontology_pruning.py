@@ -1245,6 +1245,162 @@ def add_new_classes_from_match_not_found(
     return result, created_iris
 
 
+def make_instance_iri(base_iri: str, canonical_label: str) -> str:
+    """Create a named-individual IRI from base IRI + canonical label.
+    Slug is computed from the canonical form, so equivalent surface forms
+    (e.g. 'Jan 2004' / 'Jan04' / 'January 2004') that all share
+    CANONICAL_FORM='January 2004' produce the SAME IRI."""
+    base_iri = normalize_namespace(base_iri)
+    return f"{base_iri}{slugify(canonical_label)}"
+
+
+def create_new_instance_entry(
+    label: str,
+    canonical_label: str,
+    type_iri: str,
+    description: str,
+    new_instance_base_iri: str,
+) -> tuple[str, dict]:
+    """Create a named-individual entry in the same shape as instances_dict
+    values produced by extract_instance(). The instance is typed at
+    type_iri (one entry in both `types` and `direct_types`)."""
+    new_iri = make_instance_iri(new_instance_base_iri, canonical_label)
+    labels = []
+    for s in (canonical_label, label):
+        s = (s or "").strip()
+        if s and s not in labels:
+            labels.append(s)
+
+    type_ref = {
+        "kind": "entity",
+        "name": safe_name_from_iri(type_iri),
+        "iri": type_iri,
+        "python_name": None,
+        "type": "ThingClass",
+    }
+    entry = {
+        "name": safe_name_from_iri(new_iri),
+        "iri": new_iri,
+        "namespace": normalize_namespace(new_instance_base_iri),
+        "labels": labels,
+        "comments": [],
+        "descriptions": [description] if description else [],
+        "annotations": {
+            "generated": [True],
+            "review_status": ["proposed"],
+            "canonical_form": [canonical_label],
+        },
+        "types": [type_ref],
+        "direct_types": [type_ref],
+        "prop_assertions": {},
+        "inverse_assertions": [],
+        "python_name": None,
+        "raw_axiom_triples": [],
+    }
+    return new_iri, entry
+
+
+def add_new_instances_from_match_results(
+    loaded_ontology: dict,
+    match_results: dict,
+    new_instance_base_iri: str,
+    default_type_iri: str | None = None,
+) -> tuple[dict, list[str]]:
+    """Add LLM-proposed named individuals from MATCH NOT FOUND INSTANCES
+    into instances_dict. Each entry is expected to look like:
+
+        {"LABEL": "Jan 2004",
+         "CANONICAL_FORM": "January 2004",
+         "TYPE_LABEL": "Year",
+         "DESCRIPTION": "<context>"}
+
+    Behavior:
+      - Resolve TYPE_LABEL to a class IRI via the label index (exact +
+        fuzzy lookup, same as parent resolution for classes).
+      - Derive the instance's IRI namespace from the resolved type's
+        namespace (so 'January 2004' typed as time:Year lands at
+        http://www.w3.org/2006/time#january_2004, not in default).
+      - Dedup by IRI: if the same canonical form already produced an
+        instance earlier in the same call (or already existed in
+        instances_dict), merge LABELs + descriptions into the existing
+        entry instead of double-creating.
+
+    IMPORTANT: call this AFTER add_new_classes_from_match_not_found so
+    classes proposed by the same LLM run are already in classes_dict and
+    can be referenced as TYPE_LABEL.
+
+    Returns:
+      (extended_ontology, created_instance_iris)
+    """
+    result = deepcopy(loaded_ontology)
+    classes_dict = result.get("classes_dict", {})
+    instances_dict = result.setdefault("instances_dict", {})
+    created_iris: list[str] = []
+
+    fallback_type = default_type_iri or _OWL_THING_IRI
+
+    for item in match_results.get("MATCH NOT FOUND INSTANCES", []):
+        if not isinstance(item, dict):
+            continue
+        label = normalize_to_string(item.get("LABEL"))
+        canonical = normalize_to_string(
+            item.get("CANONICAL_FORM") or item.get("CANONICAL_LABEL") or label
+        )
+        type_label = normalize_to_string(item.get("TYPE_LABEL") or item.get("TYPE") or "")
+        description = normalize_to_string(item.get("DESCRIPTION"))
+
+        if not canonical:
+            continue
+
+        # Resolve type label to an existing class IRI.
+        type_iri = fallback_type
+        if type_label and type_label.upper() != "NONE":
+            if type_label in classes_dict:
+                type_iri = type_label
+            else:
+                label_index = _build_label_to_iri_index(classes_dict)
+                hit = label_index.get(type_label.strip().lower())
+                if not hit:
+                    token_index = _build_token_index(classes_dict)
+                    hit = _fuzzy_lookup_class(
+                        type_label, None, classes_dict, label_index, token_index
+                    )
+                if hit:
+                    type_iri = hit
+
+        # Namespace derived from the resolved type's namespace -- so a Year
+        # in the time ontology produces an instance in the time namespace.
+        instance_base = _derive_namespace_from_parent_iri(type_iri, new_instance_base_iri)
+        new_iri = make_instance_iri(instance_base, canonical)
+
+        if new_iri in instances_dict:
+            existing = instances_dict[new_iri]
+            # Merge labels
+            existing_labels = existing.setdefault("labels", [])
+            for s in (label, canonical):
+                s = (s or "").strip()
+                if s and s not in existing_labels:
+                    existing_labels.append(s)
+            # Merge description
+            if description:
+                descs = existing.setdefault("descriptions", [])
+                if description not in descs:
+                    descs.append(description)
+            continue
+
+        _, entry = create_new_instance_entry(
+            label=label,
+            canonical_label=canonical,
+            type_iri=type_iri,
+            description=description,
+            new_instance_base_iri=instance_base,
+        )
+        instances_dict[new_iri] = entry
+        created_iris.append(new_iri)
+
+    return result, created_iris
+
+
 def make_property_iri(base_iri: str, label: str) -> str:
     """
     Create an object-property IRI from base IRI + label.

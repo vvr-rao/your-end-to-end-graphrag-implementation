@@ -22,6 +22,7 @@ from typing import Any
 from backend.app.core.config import get_settings
 from backend.app.helpers.ontology_pruning import (
     add_new_classes_from_match_not_found,
+    add_new_instances_from_match_results,
     add_new_relations_from_match_results,
     collect_full_class_hierarchy,
     collect_related_class_iris,
@@ -112,12 +113,18 @@ def _first_label(record: dict[str, Any]) -> str | None:
     return None
 
 
-_RETRY_AFTER_RE = re.compile(r"try again in ([0-9]+(?:\.[0-9]+)?)\s*s", re.IGNORECASE)
+# Matches both `try again in 7.5s` and `try again in 200ms` (the latter common on
+# Groq Dev-tier TPM bursts). Returns seconds in both cases.
+_RETRY_AFTER_RE = re.compile(
+    r"try again in ([0-9]+(?:\.[0-9]+)?)\s*(ms|s)\b",
+    re.IGNORECASE,
+)
 
 
 def _parse_retry_after_seconds(exc: BaseException) -> float | None:
-    """Best-effort: pull `Please try again in Xs` out of a Groq/OpenAI 429
-    message. Returns None if not a rate-limit error or if no hint found."""
+    """Best-effort: pull `Please try again in Xs` (or `Xms`) out of a
+    Groq/OpenAI 429 message and return the wait in SECONDS. None if not
+    a rate-limit error or if no hint found."""
     msg = str(exc)
     if "rate_limit" not in msg.lower() and "429" not in msg:
         return None
@@ -125,9 +132,13 @@ def _parse_retry_after_seconds(exc: BaseException) -> float | None:
     if not m:
         return None
     try:
-        return float(m.group(1))
+        val = float(m.group(1))
     except ValueError:
         return None
+    unit = (m.group(2) or "s").lower()
+    if unit == "ms":
+        return val / 1000.0
+    return val
 
 
 async def _classify_chunk(
@@ -306,16 +317,19 @@ def _apply_expand(
     match_results: dict[str, Any],
     base_iri: str,
     default_parent_iri: str | None,
-) -> tuple[dict[str, Any], list[str], list[str], list[dict]]:
-    """Add proposed classes from MATCH NOT FOUND, then add proposed
-    object-property relations from MATCH NOT FOUND RELATIONS.
+) -> tuple[dict[str, Any], list[str], list[str], list[dict], list[str]]:
+    """Add proposed classes from MATCH NOT FOUND, then named individuals
+    from MATCH NOT FOUND INSTANCES, then object-property relations from
+    MATCH NOT FOUND RELATIONS.
 
-    Order matters: classes go in first so the relation-injection step can
-    resolve a DOMAIN/RANGE label that refers to a class proposed in the
-    same LLM run.
+    Order matters: classes go in first so TYPE_LABEL on instances and
+    DOMAIN/RANGE on relations can resolve against classes proposed in
+    the same LLM run. Instances go in before relations so relation
+    endpoints can resolve to a just-minted instance.
 
     Returns:
-      (extended_ontology, created_class_iris, created_property_iris, skipped_relations)
+      (extended_ontology, created_class_iris, created_property_iris,
+       skipped_relations, created_instance_iris)
     """
     extended, created_classes = add_new_classes_from_match_not_found(
         loaded_ontology=loaded_ontology,
@@ -323,6 +337,16 @@ def _apply_expand(
         new_class_base_iri=base_iri,
         default_parent_iri=default_parent_iri,
     )
+
+    # Mint instances next so relations can resolve endpoints that are
+    # named individuals (e.g. "iran_war_2025") rather than classes.
+    extended, created_instances = add_new_instances_from_match_results(
+        loaded_ontology=extended,
+        match_results=match_results,
+        new_instance_base_iri=base_iri,
+        default_type_iri=default_parent_iri,
+    )
+
     extended, created_props, skipped, auto_minted = add_new_relations_from_match_results(
         loaded_ontology=extended,
         match_results=match_results,
@@ -343,7 +367,7 @@ def _apply_expand(
         new_property_base_iri=base_iri,
     )
     created_props = list(created_props) + list(stem_props)
-    return extended, created_classes, list(created_props), skipped
+    return extended, created_classes, list(created_props), skipped, list(created_instances)
 
 
 # ---------- LLM stage orchestration shared by prune / expand / both ----------
@@ -623,11 +647,12 @@ async def _run(
         ontology_cfg = app_cfg.get("ontology", {}) or {}
         base_iri = ontology_cfg.get("default_base_iri") or "http://your-personal-ontologist.local/ontology/"
         parent_iri = ontology_cfg.get("default_parent_iri")
-        out_ontology, created, created_props, skipped_rels = _apply_expand(
+        out_ontology, created, created_props, skipped_rels, created_instances = _apply_expand(
             out_ontology, deduped, base_iri, parent_iri
         )
         print(
             f"[stage4] created {len(created)} new classes from MATCH NOT FOUND, "
+            f"{len(created_instances)} new instances from MATCH NOT FOUND INSTANCES, "
             f"{len(created_props)} new relations from MATCH NOT FOUND RELATIONS, "
             f"{len(skipped_rels)} relation(s) skipped (unresolved endpoints)"
         )

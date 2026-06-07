@@ -112,7 +112,7 @@ def test_resolves_endpoint_against_just_proposed_classes_via_apply_expand() -> N
              "DOMAIN": "Drug", "RANGE": "Disease"},
         ],
     }
-    extended, created_classes, created_props, skipped = _apply_expand(
+    extended, created_classes, created_props, skipped, _created_instances = _apply_expand(
         ontology, results, base_iri=BASE_IRI, default_parent_iri=None,
     )
     assert len(created_classes) == 2
