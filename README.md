@@ -107,6 +107,108 @@ uv run python -m backend.app.cli expand \
   - FIBO `prod.rdf.zip`: 2,237 classes / 222 files, ~254s.
   - DRON.owl (670MB): excluded from automated tests — owlready2 needs ~3GB RAM to parse, which exceeds the 2.7GB ceiling on a typical dev laptop. Verifiable manually on bigger hardware via the CLI.
 
+### How the LLM pipeline works (`prune`, `expand`, `prune-expand`, `build`)
+
+The LLM-driven subcommands all run the same 4-stage pipeline; they differ only in which deterministic transformation Stage 4 applies at the end. Stages 1–3 produce a single `{MATCHES FOUND, MATCH NOT FOUND, MATCH NOT FOUND RELATIONS}` dict; Stage 4 turns that into actual changes on the canonical dict-of-dicts.
+
+Lives in [backend/app/services/pipeline_llm.py](backend/app/services/pipeline_llm.py). The four stages:
+
+#### Stage 1 — `chunk_classification` (Groq · llama-3.3-70b-versatile)
+
+Per doc chunk, asks the model which **top-level ontology branches** (typically 100–250 root classes — one per `subClassOf` tree) the chunk is plausibly relevant to. Returns a short IRI list.
+
+This is the narrowing step. The full `classes_dict` for a mid-size ontology is well over 1M tokens, so Stage 2 can't see it whole on every chunk; Stage 1 picks the slices Stage 2 should actually look at.
+
+The "top-level branch" detection treats `owl:Thing` as outside-the-ontology when checking superclass containment — otherwise domain roots (VIAO `InformationSource`, geography `GeographicEntity`, W3C-time `DayOfWeek`, etc.) that all declare `owl:Thing` as super get filtered out and Stage 1 never sees them. `_top_level_branches` in `pipeline_llm.py` skips a configurable `_GENERIC_TOP_TYPES` set during root detection. Includes a retry-on-429 path that respects Groq's `Please try again in Xs` hint for transient TPM bursts on the Dev tier.
+
+Why Groq + a 70B model: classification is cheap, and the 70B beats the 8B at disambiguating similar branch labels.
+
+#### Stage 2 — `class_proposal` (OpenAI · gpt-4.1)
+
+Per chunk, with the chunk text plus a **sliced sub-ontology** (every class within `max_hops` of any IRI Stage 1 returned, stripped to `name / iri / labels / comments / descriptions / superclasses`), asks the model:
+
+1. Which IRIs from the slice does this chunk talk about? (`MATCHES FOUND`)
+2. What new classes does the chunk need that aren't in the slice? (`MATCH NOT FOUND`, each entry has `LABEL` + `DESCRIPTION`)
+3. What relationships does the chunk assert between classes? (`MATCH NOT FOUND RELATIONS`, each entry has `LABEL` + `DOMAIN` + `RANGE`)
+
+Each `MATCHES FOUND` IRI must be an exact key of the sliced ontology. New-class proposals and relation endpoints may reference labels of other proposals in the same response — Stage 4 resolves them after Stage 3 dedup. The Stage 2 prompt is recall-biased for class matching (geographic + temporal mentions in particular MUST match existing classes when available) and precision-biased for relations (because hallucinated endpoints like `DOMAIN: "Chinese government"` would clutter the ontology and clutter the skip list).
+
+#### Stage 3 — `match_dedup` (OpenAI · gpt-4.1, one call total)
+
+After all Stage 2 outputs are merged, one consolidation pass collapses:
+- `MATCH NOT FOUND` entries that propose the same concept under different labels.
+- `MATCH NOT FOUND` entries that duplicate something already in `MATCHES FOUND`.
+- `MATCH NOT FOUND RELATIONS` entries with the same `LABEL` + `DOMAIN` + `RANGE` or trivially paraphrased verb labels.
+
+`MATCHES FOUND` entries are never modified.
+
+#### Stage 4 — deterministic prune / expand (pure Python, no LLM)
+
+For `prune`, `prune-expand`, and `build`:
+
+Build the **keep-set** as:
+
+1. Detected IRIs from `MATCHES FOUND` (the seed set).
+2. The **full ancestor + descendant transitive closure** of every seed via `subClassOf` (`collect_full_class_hierarchy` in `backend/app/helpers/ontology_pruning.py`). This guarantees every kept class's place in the taxonomy is unambiguous — siblings of seeds are NOT pulled in just because they share a parent.
+3. **Relationship partners**: for every object/data property whose domain or range touches the keep-set, the OTHER endpoint joins the keep-set (no orphan `range=[]`).
+4. **Protected IRI prefixes**: every class whose IRI starts with one of the `ontology.protected_iri_prefixes` strings from `config.yaml` is force-included regardless of detection. See "Protecting ontologies from prune" below.
+
+Then drop every class/property/instance not in the keep-set. Properties also drop if both domain and range are pruned.
+
+For `expand`, `prune-expand`, and `build`:
+
+After prune, the new-class and new-relation proposals are minted:
+
+- New classes get IRIs of the form `<default_base_iri><slug>` (e.g. `http://your-personal-ontologist.local/ontology/electric_vehicle`) and the configured `default_parent_iri` (`owl:Thing` unless overridden) as superclass, unless the LLM proposed a parent label that resolves to another existing or just-proposed class.
+- New relations get fresh property IRIs; their `DOMAIN` and `RANGE` are resolved against existing-class labels and the just-minted classes. A relation is skipped (and logged) if either endpoint can't be resolved — these come from the model proposing junk endpoints like `DOMAIN: "platforms and mechanisms"` that aren't real classes.
+
+#### One-glance flow
+
+```
+docs → chunks (paragraph-first tiktoken split, ~800 tok)
+                        │
+                        ▼
+   Stage 1: per-chunk Groq call (narrowing)
+                        │
+                        ▼
+   _slice_ontology: per-chunk Python (no LLM)
+                        │
+                        ▼
+   Stage 2: per-chunk OpenAI gpt-4.1 call
+                        │ (all chunks merged into one dict)
+                        ▼
+   Stage 3: ONE OpenAI gpt-4.1 dedup call
+                        │
+                        ▼
+   Stage 4: deterministic Python
+            Phase A: prune (keep-set + IS-A closure + partners + protected)
+            Phase B: expand (mint new classes/relations)
+                        │
+                        ▼
+   write merged.json + merged.owl + manifest + stats + llm_audit.jsonl
+```
+
+The Stage 1 → Stage 2 narrowing is the whole reason this scales: without it, every chunk would either need to see the full classes_dict (won't fit even at gpt-4.1's 1M-token context for mid-size ontologies) or have no ontology context at all (which collapses prune/expand into raw generation).
+
+### Protecting ontologies from prune (`protected_iri_prefixes`)
+
+Sometimes you want a particular ontology to **always survive prune**, regardless of whether the document corpus happens to mention it. Configure that in `config/config.yaml`:
+
+```yaml
+ontology:
+  default_base_iri: http://your-personal-ontologist.local/ontology/
+  default_parent_iri: http://www.w3.org/2002/07/owl#Thing
+  # IRI prefixes that prune will NEVER remove. Any class whose IRI starts
+  # with one of these is force-included in the keep-set regardless of
+  # whether the document corpus surfaced it. Property survival follows
+  # automatically: any object/data property whose domain or range touches
+  # a protected class also survives.
+  protected_iri_prefixes:
+    - https://your-domain.example.com/ontology/your-curated-ontology
+```
+
+Useful for in-house ontologies you maintain by hand (e.g. an `intelligence-artifact` schema) that you want preserved across every `prune` and `prune-expand` run. Match is by exact IRI-prefix `startswith` — pick a stable namespace.
+
 ## Visualizer
 
 A local Dash-based browser viewer for any `.owl` / `.rdf` / `.ttl` file — generated merges or industry inputs.

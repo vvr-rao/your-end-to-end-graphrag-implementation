@@ -42,6 +42,16 @@ ontology:
   default_base_iri: http://your-personal-ontologist.local/ontology/
   # Default parent IRI for proposed-but-unparented classes.
   default_parent_iri: http://www.w3.org/2002/07/owl#Thing
+  # IRI prefixes that prune will NEVER remove. Any class whose IRI starts with
+  # one of these prefixes is force-included in the prune keep-set regardless
+  # of whether the document corpus surfaced it. Use this to preserve your own
+  # curated ontologies across prune / prune-expand / build runs.
+  # Property survival follows automatically: any object/data property whose
+  # domain or range touches a protected class also survives.
+  protected_iri_prefixes: []
+  # Example (uncomment and edit):
+  # protected_iri_prefixes:
+  #   - https://your-domain.example.com/ontology/your-curated-ontology
 
 # -----------------------------------------------------------------------------
 # LLM expansion run parameters.

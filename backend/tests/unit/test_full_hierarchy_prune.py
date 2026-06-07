@@ -241,3 +241,183 @@ def test_apply_prune_end_to_end_preserves_full_hierarchy_and_relationships() -> 
     owned = pruned["object_properties_dict"]["ex:ownedBy"]
     assert any(d.get("iri") == "ex:Dog" for d in owned["domain"])
     assert any(r.get("iri") == "ex:Person" for r in owned["range"])
+
+
+def test_apply_prune_protected_iri_prefixes_force_preservation() -> None:
+    """Classes whose IRI starts with a configured protected prefix survive
+    prune even when no detection or IS-A path would otherwise reach them.
+
+    Fixture extends the standard one with a parallel `viao:` namespace
+    that has zero IS-A connection to the Beagle seed. With no protection,
+    seeding on Beagle drops every viao class. With the viao prefix
+    protected, the same prune keeps every viao class regardless.
+
+    Also asserts a property whose domain/range both live in the protected
+    namespace survives -- the standard prune helper already does this for
+    free because it only drops a property when BOTH domain and range fall
+    outside the keep-set.
+    """
+    from backend.app.services.pipeline_llm import _apply_prune
+
+    classes = dict(CLASSES)
+    classes["viao:InformationSource"] = {
+        "iri": "viao:InformationSource",
+        "name": "InformationSource",
+        "superclasses": [],
+        "restrictions_and_class_constructs": [],
+    }
+    classes["viao:Document"] = {
+        "iri": "viao:Document",
+        "name": "Document",
+        "superclasses": [{"kind": "entity", "iri": "viao:InformationSource"}],
+        "restrictions_and_class_constructs": [],
+    }
+    classes["viao:Chunk"] = {
+        "iri": "viao:Chunk",
+        "name": "Chunk",
+        "superclasses": [{"kind": "entity", "iri": "viao:Document"}],
+        "restrictions_and_class_constructs": [],
+    }
+    obj_props = dict(OBJ_PROPS)
+    obj_props["viao:hasChunk"] = {
+        "iri": "viao:hasChunk",
+        "domain": [{"kind": "entity", "iri": "viao:Document"}],
+        "range": [{"kind": "entity", "iri": "viao:Chunk"}],
+    }
+    loaded = {
+        "classes_dict": classes,
+        "object_properties_dict": obj_props,
+        "data_properties_dict": {},
+        "instances_dict": {},
+    }
+
+    # 1. Unprotected baseline: seeding on Beagle drops every viao:* class.
+    pruned_unprotected, _ = _apply_prune(loaded, ["ex:Beagle"])
+    surviving = set(pruned_unprotected["classes_dict"].keys())
+    assert "viao:InformationSource" not in surviving
+    assert "viao:Document" not in surviving
+    assert "viao:Chunk" not in surviving
+    assert "viao:hasChunk" not in pruned_unprotected["object_properties_dict"]
+
+    # 2. With viao: protected, every viao class survives the same prune.
+    pruned_protected, keep = _apply_prune(
+        loaded, ["ex:Beagle"], protected_iri_prefixes=("viao:",)
+    )
+    surviving = set(pruned_protected["classes_dict"].keys())
+    assert "viao:InformationSource" in surviving
+    assert "viao:Document" in surviving
+    assert "viao:Chunk" in surviving
+    # The property whose domain/range live entirely in the protected
+    # namespace also survives (both endpoints now in keep-set).
+    assert "viao:hasChunk" in pruned_protected["object_properties_dict"]
+    # The Beagle/Dog/Mammal/Animal/Person/Habitat keep-set from the
+    # unprotected case is unchanged -- protection adds, never removes.
+    assert {"ex:Beagle", "ex:Dog", "ex:Mammal", "ex:Animal", "ex:Person", "ex:Habitat"} <= keep
+
+
+def test_apply_prune_protected_prefixes_with_no_detection_still_runs() -> None:
+    """When detected_iris is empty but protected_iri_prefixes is set, the
+    function must still execute the prune path (returning only protected
+    classes) -- the early-return short-circuit only fires when BOTH inputs
+    are empty."""
+    from backend.app.services.pipeline_llm import _apply_prune
+
+    classes = {
+        "viao:Document": {
+            "iri": "viao:Document",
+            "name": "Document",
+            "superclasses": [],
+            "restrictions_and_class_constructs": [],
+        },
+        "other:Irrelevant": {
+            "iri": "other:Irrelevant",
+            "name": "Irrelevant",
+            "superclasses": [],
+            "restrictions_and_class_constructs": [],
+        },
+    }
+    loaded = {
+        "classes_dict": classes,
+        "object_properties_dict": {},
+        "data_properties_dict": {},
+        "instances_dict": {},
+    }
+    pruned, keep = _apply_prune(loaded, [], protected_iri_prefixes=("viao:",))
+    assert set(pruned["classes_dict"].keys()) == {"viao:Document"}
+    assert "other:Irrelevant" not in pruned["classes_dict"]
+    assert keep == {"viao:Document"}
+
+
+def test_top_level_branches_excludes_owl_thing_and_surfaces_thing_children() -> None:
+    """Stage 1's root detection used to treat any class with `owl:Thing`
+    as super as non-root, because `owl:Thing` lives in classes_dict
+    alongside the user's domain classes (owlready2 loads it that way).
+    That caused VIAO / geography / W3C-time roots to disappear from the
+    Stage-1 classifier's branch list, since every one of them declares
+    `owl:Thing` as super. After the fix, `owl:Thing` is treated as
+    outside-the-ontology for containment checks, AND `owl:Thing` itself
+    is excluded from the returned root list."""
+    from backend.app.services.pipeline_llm import _top_level_branches
+
+    OWL_THING = "http://www.w3.org/2002/07/owl#Thing"
+    classes = {
+        OWL_THING: {
+            "iri": OWL_THING,
+            "name": "Thing",
+            "labels": [],
+            "superclasses": [],
+        },
+        "viao:InformationSource": {
+            "iri": "viao:InformationSource",
+            "name": "InformationSource",
+            "labels": ["Information Source"],
+            "superclasses": [{"kind": "entity", "iri": OWL_THING}],
+        },
+        "geo:GeographicEntity": {
+            "iri": "geo:GeographicEntity",
+            "name": "GeographicEntity",
+            "labels": ["Geographic Entity"],
+            "superclasses": [{"kind": "entity", "iri": OWL_THING}],
+        },
+        "geo:Country": {
+            "iri": "geo:Country",
+            "name": "Country",
+            "labels": ["Country"],
+            # NOT a root -- has a domain parent inside the dict.
+            "superclasses": [{"kind": "entity", "iri": "geo:GeographicEntity"}],
+        },
+        "time:DayOfWeek": {
+            "iri": "time:DayOfWeek",
+            "name": "DayOfWeek",
+            "labels": ["Day of week"],
+            "superclasses": [{"kind": "entity", "iri": OWL_THING}],
+        },
+        # A class with NO superclass declared at all -- should also surface.
+        "x:Standalone": {
+            "iri": "x:Standalone",
+            "name": "Standalone",
+            "labels": ["Standalone"],
+            "superclasses": [],
+        },
+    }
+    loaded = {
+        "classes_dict": classes,
+        "object_properties_dict": {},
+        "data_properties_dict": {},
+        "instances_dict": {},
+    }
+    roots = _top_level_branches(loaded)
+    root_iris = {r["iri"] for r in roots}
+
+    # Domain roots surface even though their super is owl:Thing.
+    assert "viao:InformationSource" in root_iris
+    assert "geo:GeographicEntity" in root_iris
+    assert "time:DayOfWeek" in root_iris
+    assert "x:Standalone" in root_iris
+
+    # geo:Country is NOT a root -- it has a genuine domain parent in the dict.
+    assert "geo:Country" not in root_iris
+
+    # owl:Thing itself is excluded -- pointless to ask Stage 1 to classify
+    # against the universal type.
+    assert OWL_THING not in root_iris

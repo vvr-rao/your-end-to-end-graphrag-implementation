@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -50,25 +51,45 @@ from backend.app.services.suggestions import (
 # ---------- Stage 1: chunk classification ----------
 
 
-def _top_level_branches(loaded_ontology: dict[str, Any], max_branches: int = 200) -> list[dict[str, Any]]:
+# Generic top-types that owlready2 loads into classes_dict alongside the
+# user's real domain classes. They get declared as the superclass of every
+# domain root (VIAO InformationSource, geography GeographicEntity, time
+# DayOfWeek, ...) which is correct in OWL but masks the domain roots from
+# `_top_level_branches`: the function treats any class whose super is in
+# the dict as "not a root." Treating these IRIs as outside-the-ontology
+# for the containment check lets the real domain roots surface to Stage 1.
+_GENERIC_TOP_TYPES: frozenset[str] = frozenset({
+    "http://www.w3.org/2002/07/owl#Thing",
+})
+
+
+def _top_level_branches(loaded_ontology: dict[str, Any], max_branches: int = 256) -> list[dict[str, Any]]:
     """Return a small summary of top-level classes (those with no named
     superclass inside the ontology) for the Stage-1 classifier.
 
     Cap at `max_branches` so the Groq prompt stays well under the model's
     context. If the ontology has more than that many top-level classes,
     we fall back to a representative sample (alphabetical by label).
+
+    Generic top-types (`owl:Thing`, ...) are treated as outside-the-ontology
+    when checking superclass containment — otherwise every domain root that
+    declares `owl:Thing` as its super gets misclassified as non-root and the
+    Stage-1 branch set collapses to whichever ontologies happen NOT to do
+    that. `owl:Thing` itself is also excluded from the returned roots.
     """
     classes = loaded_ontology.get("classes_dict", {})
     all_iris = set(classes.keys())
     roots: list[dict[str, Any]] = []
     for iri, record in classes.items():
+        if iri in _GENERIC_TOP_TYPES:
+            continue
         supers = record.get("superclasses") or []
         is_root = True
         for s in supers:
             super_iri = (
                 s.get("iri") if isinstance(s, dict) else (s if isinstance(s, str) else None)
             )
-            if super_iri and super_iri in all_iris:
+            if super_iri and super_iri in all_iris and super_iri not in _GENERIC_TOP_TYPES:
                 is_root = False
                 break
         if is_root:
@@ -90,18 +111,57 @@ def _first_label(record: dict[str, Any]) -> str | None:
     return None
 
 
+_RETRY_AFTER_RE = re.compile(r"try again in ([0-9]+(?:\.[0-9]+)?)\s*s", re.IGNORECASE)
+
+
+def _parse_retry_after_seconds(exc: BaseException) -> float | None:
+    """Best-effort: pull `Please try again in Xs` out of a Groq/OpenAI 429
+    message. Returns None if not a rate-limit error or if no hint found."""
+    msg = str(exc)
+    if "rate_limit" not in msg.lower() and "429" not in msg:
+        return None
+    m = _RETRY_AFTER_RE.search(msg)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
 async def _classify_chunk(
     router: LLMRouter,
     branches: list[dict[str, Any]],
     chunk: TextChunk,
+    max_retries: int = 4,
 ) -> list[str]:
-    """Stage 1: return relevant top-level IRIs for one chunk."""
+    """Stage 1: return relevant top-level IRIs for one chunk.
+
+    Retries on Groq's TPM rate-limit (429) up to `max_retries` times,
+    sleeping for the hint Groq embeds in the error message
+    (`Please try again in Xs`) plus a small buffer, or 5s if no hint.
+    Free-tier llama-3.3-70b is capped at 12k TPM, which a doc-classification
+    chunk + 16 top-level branches blows through trivially at concurrency=8.
+    """
     system, user = PROMPTS["chunk_classification"](branches, chunk.text)
-    try:
-        result = await router.chat("chunk_classification", system=system, user=user)
-    except Exception as exc:
-        print(f"[stage1] chunk #{chunk.index} ({chunk.source_name}) failed: {exc}")
-        return []
+    attempt = 0
+    while True:
+        try:
+            result = await router.chat("chunk_classification", system=system, user=user)
+            break
+        except Exception as exc:
+            wait = _parse_retry_after_seconds(exc)
+            if wait is None or attempt >= max_retries:
+                print(f"[stage1] chunk #{chunk.index} ({chunk.source_name}) failed: {exc}")
+                return []
+            attempt += 1
+            # +0.5s buffer so the bucket has time to refill before the retry hits.
+            sleep_s = wait + 0.5
+            print(
+                f"[stage1] chunk #{chunk.index} ({chunk.source_name}) rate-limited; "
+                f"retry {attempt}/{max_retries} after {sleep_s:.1f}s"
+            )
+            await asyncio.sleep(sleep_s)
     data = extract_json_from_output(result.text) or {}
     iris = data.get("relevant_iris") or []
     return [i for i in iris if isinstance(i, str) and i]
@@ -184,9 +244,11 @@ async def _dedup(router: LLMRouter, merged_results: dict[str, Any]) -> dict[str,
 def _apply_prune(
     loaded_ontology: dict[str, Any],
     detected_iris: list[str],
+    protected_iri_prefixes: tuple[str, ...] = (),
 ) -> tuple[dict[str, Any], set[str]]:
     """Pure Python: build the keep-set as
         detected ∪ full IS-A hierarchy of detected ∪ relationship partners
+        ∪ every class IRI whose IRI starts with a protected prefix
     then drop everything else.
 
     Keep-set construction in order:
@@ -200,6 +262,13 @@ def _apply_prune(
          (expand_with_relationship_partners). This keeps relationships
          intact end-to-end instead of leaving them with `range=[]` when the
          range class was outside the original hierarchy.
+      4. Union in every class IRI whose IRI starts with one of
+         `protected_iri_prefixes`. This forces whole-ontology preservation
+         for user-curated ontologies (e.g. VIAO) that the user wants to
+         maintain regardless of document-driven detection. Property
+         survival for protected classes is automatic: any property
+         whose domain or range touches a protected class clears the
+         `new_domain or new_range` filter in prune_*_properties_dict.
 
     The `max_hops` argument that used to drive an undirected N-hop BFS here
     has been removed -- it still drives Stage 2's slice-of-the-ontology
@@ -207,13 +276,20 @@ def _apply_prune(
     described above.
     """
     classes = loaded_ontology.get("classes_dict", {})
-    if not detected_iris:
+    if not detected_iris and not protected_iri_prefixes:
         return loaded_ontology, set()
     obj_props = loaded_ontology.get("object_properties_dict", {})
     data_props = loaded_ontology.get("data_properties_dict", {})
 
     keep_iris = collect_full_class_hierarchy(classes, list(detected_iris))
     keep_iris = expand_with_relationship_partners(keep_iris, obj_props, data_props)
+
+    if protected_iri_prefixes:
+        protected_class_iris = {
+            iri for iri in classes
+            if any(iri.startswith(p) for p in protected_iri_prefixes)
+        }
+        keep_iris = set(keep_iris) | protected_class_iris
 
     pruned: dict[str, Any] = {
         "classes_dict": prune_classes_dict(classes, keep_iris),
@@ -511,10 +587,20 @@ async def _run(
     created: list[str] = []
 
     if operation in ("prune", "prune-expand", "build"):
-        out_ontology, keep = _apply_prune(out_ontology, detected)
+        ontology_cfg = app_cfg.get("ontology", {}) or {}
+        protected_prefixes = tuple(ontology_cfg.get("protected_iri_prefixes") or [])
+        out_ontology, keep = _apply_prune(out_ontology, detected, protected_prefixes)
+        n_protected = sum(
+            1 for iri in out_ontology.get("classes_dict", {})
+            if any(iri.startswith(p) for p in protected_prefixes)
+        ) if protected_prefixes else 0
+        protected_note = (
+            f" ({n_protected} forced by {len(protected_prefixes)} protected prefix(es))"
+            if protected_prefixes else ""
+        )
         print(
             f"[stage4] pruned to {len(keep)} kept classes "
-            "(full IS-A hierarchy of detected + relationship partners)"
+            f"(full IS-A hierarchy of detected + relationship partners){protected_note}"
         )
 
     if operation in ("expand", "prune-expand", "build"):
