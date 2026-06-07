@@ -269,9 +269,64 @@ def match_dedup(merged_match_results: dict[str, Any]) -> tuple[str, str]:
     return system, user
 
 
+def concept_grouping(orphan_classes: list[dict[str, Any]]) -> tuple[str, str]:
+    """Layer G: ONE call per prune-expand. Given a list of orphan classes
+    (no parent except owl:Thing, in the synthesized namespace), propose
+    a small set of high-level concept classes that group them and assign
+    each orphan to one concept.
+
+    Each entry in `orphan_classes` is expected to be `{LABEL, DESCRIPTION}`.
+    The prompt deliberately gives ILLUSTRATIVE concept examples but does
+    not bake in a fixed taxonomy -- the LLM picks whatever buckets fit
+    the actual orphan set.
+    """
+    system = (
+        "You are an ontology curator. You will be given a JSON list of "
+        "orphan classes (each has LABEL and DESCRIPTION). These classes "
+        "currently have no parent and need to be organised under a small "
+        "set of high-level concept classes.\n\n"
+        "Your task:\n"
+        "  1. Propose between 5 and 15 high-level concept classes that "
+        "would together cover the orphan set well. The concept labels "
+        "should be canonical CamelCase nouns describing a KIND of thing. "
+        "Illustrative examples (use as inspiration, NOT as a fixed list): "
+        "Material, NaturalResource, TechnologyConcept, AgricultureConcept, "
+        "SupplyChainConcept, EconomicConcept, Infrastructure, "
+        "PolicyConcept, OrganizationConcept, Event, Process. "
+        "Pick the actual buckets that best fit the corpus content -- "
+        "don't force one of the examples if the data wants different ones.\n"
+        "  2. Assign each orphan to EXACTLY ONE concept. Use the orphan's "
+        "LABEL verbatim (case-insensitive match is fine for resolution).\n"
+        "  3. Skip an orphan only if it genuinely fits none of your "
+        "proposed concepts.\n"
+        "  4. Avoid extremely narrow concepts (one or two orphans each) "
+        "and avoid extremely broad concepts (everything goes to 'Thing'). "
+        "Aim for buckets of 5-100 orphans each.\n\n"
+        "Output strict JSON in the shape:\n"
+        "{\n"
+        '  "TOP_LEVEL_CONCEPTS": ['
+        '    {"LABEL": "<CamelCase concept name>",'
+        ' "DESCRIPTION": "<one-sentence definition>"}, ...'
+        "  ],\n"
+        '  "ASSIGNMENTS": ['
+        '    {"CLASS_LABEL": "<exact orphan LABEL>",'
+        ' "CONCEPT_LABEL": "<a LABEL from TOP_LEVEL_CONCEPTS>"}, ...'
+        "  ]\n"
+        "}\n"
+        "No prose. No comments. Only the JSON object."
+    )
+    user = (
+        "ORPHAN_CLASSES:\n"
+        + json.dumps(orphan_classes, ensure_ascii=False, default=str)
+        + '\n\nReturn JSON: {"TOP_LEVEL_CONCEPTS": [...], "ASSIGNMENTS": [...]}'
+    )
+    return system, user
+
+
 # Public registry so callers can look up a prompt builder by task name.
 PROMPTS = {
     "chunk_classification": chunk_classification,
     "class_proposal": class_identification_and_expansion,
     "match_dedup": match_dedup,
+    "concept_grouping": concept_grouping,
 }

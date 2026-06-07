@@ -21,9 +21,11 @@ from typing import Any
 
 from backend.app.core.config import get_settings
 from backend.app.helpers.ontology_pruning import (
+    _collect_orphan_classes,
     add_new_classes_from_match_not_found,
     add_new_instances_from_match_results,
     add_new_relations_from_match_results,
+    apply_concept_grouping,
     collect_full_class_hierarchy,
     collect_related_class_iris,
     expand_with_relationship_partners,
@@ -249,6 +251,34 @@ async def _dedup(router: LLMRouter, merged_results: dict[str, Any]) -> dict[str,
     if not cleaned:
         return merged_results
     return cleaned
+
+
+# ---------- Layer G: top-level concept grouping (one LLM call) ----------
+
+
+async def _propose_concept_grouping(
+    router: LLMRouter,
+    orphan_classes: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """ONE LLM call per prune-expand. Asks gpt-4.1 to propose 5-15 high-
+    level concept classes that group the orphan-class list, plus an
+    assignment per orphan. Returns the parsed JSON or an empty shape on
+    any failure -- this pass is purely additive; it must never break the
+    pipeline."""
+    empty = {"TOP_LEVEL_CONCEPTS": [], "ASSIGNMENTS": []}
+    if not orphan_classes:
+        return empty
+    system, user = PROMPTS["concept_grouping"](orphan_classes)
+    try:
+        result = await router.chat("concept_grouping", system=system, user=user)
+    except Exception as exc:
+        print(f"[stage4-G] concept_grouping LLM call failed: {exc} — skipping")
+        return empty
+    parsed = extract_json_from_output(result.text)
+    if not isinstance(parsed, dict):
+        print("[stage4-G] concept_grouping response was not parseable JSON — skipping")
+        return empty
+    return parsed
 
 
 # ---------- Stage 4: deterministic prune / extend ----------
@@ -674,6 +704,32 @@ async def _run(
         if skipped_rels:
             for s in skipped_rels:
                 print(f"[stage4]   skipped relation: {s.get('reason')} -> {s.get('relation')}")
+
+        # Layer G: top-level concept grouping (one LLM call). Collects the
+        # remaining orphan classes (still parented at owl:Thing after the
+        # geography pass) and asks the LLM to propose a small set of high-
+        # level concept classes to group them. Purely additive; failures
+        # are logged and ignored.
+        orphan_classes = _collect_orphan_classes(
+            out_ontology.get("classes_dict", {}),
+            base_iri,
+        )
+        if orphan_classes:
+            print(f"[stage4-G] concept_grouping: {len(orphan_classes)} orphan class(es) to group")
+            cg_result = await _propose_concept_grouping(router, orphan_classes)
+            _append_audit(audit_path, -1, "concept_grouping", None, cg_result)
+            concept_iris, cg_audit = apply_concept_grouping(
+                classes_dict=out_ontology.setdefault("classes_dict", {}),
+                default_base_iri=base_iri,
+                llm_result=cg_result,
+                default_parent_iri=parent_iri,
+            )
+            if cg_audit or concept_iris:
+                print(
+                    f"[stage4-G] concept-grouping re-homed {len(cg_audit)} class(es) "
+                    f"under {len(concept_iris)} new concept class(es)"
+                )
+                created.extend(concept_iris)
 
     counts_after = folder_io.count_entities(out_ontology)
     print(f"[{operation}] entity counts: before={counts_before}, after={counts_after}")

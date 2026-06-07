@@ -45,5 +45,10 @@ def test_match_dedup_skips_when_no_proposals_is_not_in_prompt() -> None:
     assert '"MATCHES FOUND"' in user or "MATCHES FOUND" in user
 
 
-def test_prompts_registry_covers_three_tasks() -> None:
-    assert set(PROMPTS) == {"chunk_classification", "class_proposal", "match_dedup"}
+def test_prompts_registry_covers_four_tasks() -> None:
+    assert set(PROMPTS) == {
+        "chunk_classification",
+        "class_proposal",
+        "match_dedup",
+        "concept_grouping",
+    }

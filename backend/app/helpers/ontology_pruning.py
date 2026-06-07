@@ -1645,20 +1645,6 @@ _LANDFORM_KEYWORDS: frozenset[str] = frozenset({
     "shoreline", "atoll", "reef", "lagoon", "estuary", "tributary",
 })
 
-# Object-property labels (case-insensitive substrings) that, when present,
-# indicate the SUBJECT is a geographic entity inside the OBJECT. The list
-# is intentionally short; if the LLM proposed any of these AND the object
-# resolves to a class in the geography namespace, the subject is treated
-# as geographic too.
-_GEOGRAPHIC_PREDICATE_HINTS: frozenset[str] = frozenset({
-    "located_in", "located in", "locatedin",
-    "is_part_of", "part_of", "is part of", "partof",
-    "borders", "borders_on", "borders on",
-    "within", "is_within", "is within",
-    "in_the_country", "in_country",
-})
-
-
 # Generic geographic root labels we'll look up if no specific landform class
 # matches. First hit wins.
 _GENERIC_GEO_ROOT_LABELS: tuple[str, ...] = (
@@ -1741,13 +1727,14 @@ def infer_geographic_placement(
     data_props_dict: dict,
     instances_dict: dict,
 ) -> list[dict]:
-    """Stage-4 post-pass that detects geographic-entity classes by context
-    and re-homes them under the geography ontology.
+    """Stage-4 post-pass that detects geographic-entity classes by their
+    LOCAL-NAME / LABEL tokens and re-homes them under the geography
+    ontology.
 
     Mutates all four dicts in place. Returns a list of audit records, one
     per re-homed class, each shaped as:
         {"old_iri": ..., "new_iri": ..., "matched_parent": ...,
-         "signal": "landform_keyword:<kw>" or "relation:<predicate>"}
+         "signal": "landform_keyword:<kw>"}
 
     A class is considered for re-homing when ALL of:
       - Its current namespace is NOT one of the "real" ontology
@@ -1755,17 +1742,21 @@ def infer_geographic_placement(
         the synthesized space).
       - Its current parent IS owl:Thing OR not set.
 
-    From the candidate set, the class is re-homed when EITHER:
-      - One of its tokens (local-name + labels) is in
-        _LANDFORM_KEYWORDS. The matched keyword is then used to look up
-        an existing class with that keyword as its local name (e.g.
-        "Strait") inside any namespace. First match wins. If no specific
-        match, fall back to a generic geographic root.
-      - The class appears as the DOMAIN or RANGE of an object property
-        whose label is in _GEOGRAPHIC_PREDICATE_HINTS, and the OTHER
-        endpoint of that property is in a namespace that contains the
-        word "geography". Then use the OTHER endpoint's parent (or
-        itself) as the target geography parent.
+    From the candidate set, the class is re-homed when:
+      - One of its tokens (local-name + labels) is in _LANDFORM_KEYWORDS.
+        The matched keyword is then used to look up an existing class
+        with that keyword as its local name (e.g. "Strait") inside any
+        namespace. First match wins. If no specific match, fall back to
+        a generic geographic root (GeographicEntity / Place / ...).
+
+    NOTE: A relation-context signal (`is_part_of` / `within` to a class
+    in the geography namespace) was previously used here but produced
+    cascading false positives -- the LLM uses those predicates non-
+    spatially all the time ("Helium is_part_of Qatar's gas output" was
+    re-homing Helium as geographic). The signal has been removed; only
+    the landform-keyword signal remains. `obj_props_dict` is kept in the
+    function signature so callers don't need to change but is now used
+    only by `_rewrite_iri_references` when an IRI moves.
     """
     audit: list[dict] = []
 
@@ -1792,27 +1783,6 @@ def infer_geographic_placement(
                     label_keys.add(lab.lower().replace(" ", ""))
             if any(k in _GENERIC_GEO_ROOT_LABELS for k in label_keys):
                 generic_geo_iri = iri
-
-    # Build {class_iri -> set of (predicate_label, other_endpoint_iri)} for
-    # the relation-based signal.
-    related_partners: dict[str, list[tuple[str, str]]] = defaultdict(list)
-    for prop in obj_props_dict.values():
-        labels = prop.get("labels") or [prop.get("name") or ""]
-        primary_label = (
-            labels[0] if isinstance(labels[0], str) else ""
-        ) if labels else ""
-        primary_label = primary_label.lower()
-        is_geo_predicate = any(
-            hint in primary_label for hint in _GEOGRAPHIC_PREDICATE_HINTS
-        )
-        if not is_geo_predicate:
-            continue
-        domains = [safe_get_iri(d) for d in prop.get("domain") or []]
-        ranges = [safe_get_iri(r) for r in prop.get("range") or []]
-        for d in domains:
-            for r in ranges:
-                if d and r:
-                    related_partners[d].append((primary_label, r))
 
     # Iterate candidates and re-home.
     for iri in list(classes_dict.keys()):
@@ -1852,21 +1822,6 @@ def infer_geographic_placement(
                     target_parent = generic_geo_iri
                     signal = f"landform_keyword:{tok}"
                 break
-
-        # If no landform match, try relation-based signal.
-        if target_parent is None and iri in related_partners:
-            for pred, other_iri in related_partners[iri]:
-                other_ns = _namespace_of(other_iri).lower()
-                if "geography" in other_ns:
-                    # Use the other endpoint's parent (or itself) as our target.
-                    other_rec = classes_dict.get(other_iri) or {}
-                    candidate = _first_super_iri(other_rec)
-                    if candidate and candidate in classes_dict:
-                        target_parent = candidate
-                    else:
-                        target_parent = other_iri
-                    signal = f"relation:{pred}"
-                    break
 
         if target_parent is None:
             continue
@@ -1937,6 +1892,201 @@ def infer_geographic_placement(
         })
 
     return audit
+
+
+# ---------------------------------------------------------------------------
+# Layer G: top-level concept grouping (LLM-driven).
+#
+# After all Stage-4 sub-steps run, many newly-minted classes still sit at
+# owl:Thing in the synthesized namespace. They'd be more useful organized
+# under a small set of high-level concept classes (Material, Technology
+# Concept, Infrastructure, etc.). Those concept names are chosen BY THE LLM
+# at runtime via a single `concept_grouping` call -- we don't bake a fixed
+# taxonomy into the code.
+#
+# Two helpers here:
+#   - `_collect_orphan_classes` -- pure-Python projector. Builds the
+#     {iri, label, description} list the LLM consumes.
+#   - `apply_concept_grouping` -- pure-Python consumer. Takes the LLM
+#     output (top-level concepts + assignments) and mints concept classes
+#     + re-parents orphans. Skips orphans whose LABEL doesn't resolve.
+#
+# The actual LLM call lives in pipeline_llm.py (`_propose_concept_grouping`).
+# ---------------------------------------------------------------------------
+
+
+def _collect_orphan_classes(
+    classes_dict: dict,
+    default_base_iri: str,
+) -> list[dict]:
+    """Return one `{iri, label, description}` per orphan class.
+
+    A class is an orphan when:
+      - its IRI lives under `default_base_iri` (the synthesized namespace),
+        AND
+      - its first superclass is either missing or owl:Thing.
+    """
+    base = normalize_namespace(default_base_iri)
+    out: list[dict] = []
+    for iri, rec in classes_dict.items():
+        if not iri.startswith(base):
+            continue
+        parent = _first_super_iri(rec)
+        if parent and parent != _OWL_THING_IRI:
+            continue
+        labels = rec.get("labels") or []
+        label = ""
+        if labels:
+            first = labels[0]
+            if isinstance(first, str):
+                label = first.strip()
+            elif isinstance(first, dict):
+                v = first.get("value")
+                if isinstance(v, str):
+                    label = v.strip()
+        if not label:
+            label = (rec.get("name") or _local_name(iri)).strip()
+        descs = rec.get("descriptions") or []
+        description = ""
+        if descs:
+            first = descs[0]
+            if isinstance(first, str):
+                description = first.strip()
+        out.append({"iri": iri, "label": label, "description": description})
+    return out
+
+
+def apply_concept_grouping(
+    classes_dict: dict,
+    default_base_iri: str,
+    llm_result: dict,
+    default_parent_iri: str | None = None,
+) -> tuple[list[str], list[dict]]:
+    """Apply the LLM's `concept_grouping` proposal.
+
+    `llm_result` is expected to have:
+      TOP_LEVEL_CONCEPTS: [{LABEL, DESCRIPTION}, ...]
+      ASSIGNMENTS:        [{CLASS_LABEL, CONCEPT_LABEL}, ...]
+
+    Behavior:
+      - For each proposed concept, mint a class under `default_base_iri`
+        parented at `default_parent_iri` (owl:Thing) -- UNLESS a class
+        with that label already exists in `classes_dict` (resolved via
+        case-insensitive label/name index). Newly-minted concept classes
+        carry `auto_created_via: ['concept_grouping']`.
+      - For each assignment, resolve CLASS_LABEL to an orphan IRI via the
+        label index and CONCEPT_LABEL to the (newly-minted or existing)
+        concept IRI. Re-parent the orphan -- replace its superclasses
+        with a single entry pointing at the concept. Add
+        `inferred_concept_grouping: ['<CONCEPT_LABEL>']` annotation.
+      - Skip assignments where either label fails to resolve.
+
+    Returns (newly_minted_concept_iris, audit_records).
+    """
+    if not isinstance(llm_result, dict):
+        return [], []
+    concepts_input = llm_result.get("TOP_LEVEL_CONCEPTS") or []
+    assignments_input = llm_result.get("ASSIGNMENTS") or []
+    if not concepts_input and not assignments_input:
+        return [], []
+
+    new_concept_iris: list[str] = []
+    # Map: {lower-case concept LABEL -> concept IRI}.
+    concept_by_label: dict[str, str] = {}
+
+    # Build / mint concept classes first so assignments can resolve them.
+    initial_label_index = _build_label_to_iri_index(classes_dict)
+    for entry in concepts_input:
+        if not isinstance(entry, dict):
+            continue
+        concept_label = normalize_to_string(entry.get("LABEL"))
+        if not concept_label:
+            continue
+        concept_description = normalize_to_string(entry.get("DESCRIPTION"))
+        key = concept_label.strip().lower()
+
+        # Reuse an existing class if the label already matches one.
+        existing = initial_label_index.get(key)
+        if existing:
+            concept_by_label[key] = existing
+            continue
+
+        # Mint a new concept class.
+        new_iri, new_entry = create_new_class_entry(
+            label=concept_label,
+            description=concept_description,
+            new_class_base_iri=default_base_iri,
+            default_parent_iri=default_parent_iri,
+        )
+        # Tag with audit annotation.
+        anns = new_entry.setdefault("annotations", {})
+        anns["auto_created_via"] = ["concept_grouping"]
+        if new_iri not in classes_dict:
+            classes_dict[new_iri] = new_entry
+            new_concept_iris.append(new_iri)
+            concept_by_label[key] = new_iri
+        else:
+            concept_by_label[key] = new_iri
+
+    # Build fresh label index after concept minting so assignment resolution
+    # can find them.
+    label_index = _build_label_to_iri_index(classes_dict)
+
+    audit: list[dict] = []
+    for entry in assignments_input:
+        if not isinstance(entry, dict):
+            continue
+        class_label = normalize_to_string(entry.get("CLASS_LABEL"))
+        concept_label = normalize_to_string(entry.get("CONCEPT_LABEL"))
+        if not class_label or not concept_label:
+            continue
+
+        # Resolve orphan class via label index. Skip if it's not actually
+        # in classes_dict (LLM may have hallucinated labels).
+        class_iri = label_index.get(class_label.strip().lower())
+        if not class_iri:
+            continue
+        # Resolve concept via the concept_by_label map first, then fall back
+        # to the label index (covers the case where the concept was already
+        # an existing class).
+        concept_iri = concept_by_label.get(concept_label.strip().lower())
+        if not concept_iri:
+            concept_iri = label_index.get(concept_label.strip().lower())
+        if not concept_iri:
+            continue
+
+        # Skip if the candidate is the concept class itself (self-loop).
+        if class_iri == concept_iri:
+            continue
+
+        rec = classes_dict.get(class_iri)
+        if rec is None:
+            continue
+        # Skip if the class already has a non-Thing parent (e.g. geography
+        # pass already re-homed it -- don't disturb).
+        cur_parent = _first_super_iri(rec)
+        if cur_parent and cur_parent != _OWL_THING_IRI:
+            continue
+        # Skip if the class is the concept class we just minted (don't
+        # re-parent a concept under another concept).
+        if class_iri in new_concept_iris:
+            continue
+
+        rec["superclasses"] = [{
+            "kind": "entity",
+            "name": _local_name(concept_iri),
+            "iri": concept_iri,
+            "python_name": None,
+            "type": "ThingClass",
+        }]
+        rec.setdefault("annotations", {})["inferred_concept_grouping"] = [concept_label]
+        audit.append({
+            "class_iri": class_iri,
+            "concept_iri": concept_iri,
+            "concept_label": concept_label,
+        })
+
+    return new_concept_iris, audit
 
 
 def _is_garbage_endpoint(text: str) -> bool:

@@ -49,6 +49,20 @@ tasks:
     response_format: json_object
 
   # ---------------------------------------------------------------------------
+  # Layer G: top-level concept grouping. ONE call per prune-expand. Takes the
+  # orphan-class list (parent=owl:Thing in the synthesized namespace) and
+  # proposes 5-15 high-level concept classes to group them under, plus an
+  # assignment per orphan. Needs strong reasoning over a large label list.
+  # ---------------------------------------------------------------------------
+  concept_grouping:
+    provider: openai
+    model: gpt-4.1
+    timeout: 240
+    temperature: 0.0
+    max_tokens: 8192
+    response_format: json_object
+
+  # ---------------------------------------------------------------------------
   # Class-level summarization (Phase 2). Cheap, fast, plenty strong.
   # ---------------------------------------------------------------------------
   class_summarization:

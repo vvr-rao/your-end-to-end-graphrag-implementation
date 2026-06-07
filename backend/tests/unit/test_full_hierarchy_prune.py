@@ -1086,25 +1086,36 @@ def test_geo_inference_skips_non_landform_classes() -> None:
     assert classes_dict[conflict_iri]["superclasses"][0]["iri"] == OWL_THING
 
 
-def test_geo_inference_relation_signal_locatedin_to_geo_class() -> None:
-    """Class has no landform keyword but is the DOMAIN of a 'located_in'
-    relation pointing to a class in the geography namespace. That's
-    enough signal to re-home it under that target's parent class."""
+def test_geo_inference_does_not_use_is_part_of_relation_signal() -> None:
+    """Regression / negative test for the Issue-1 fix.
+
+    Prior behavior: a non-landform class like 'helium' would get re-homed
+    into the geography namespace if it was the DOMAIN of an 'is_part_of'
+    (or 'within' / 'partof' / ...) relation whose RANGE was in geography
+    -- because the LLM uses those predicates non-spatially ('Helium
+    is_part_of Qatar's gas output') and the cascading false positives
+    swept in dozens of non-geographic classes (Logic Chips, Foundries,
+    Memory Components, Electronics Supply Chain, etc.).
+
+    Current behavior: the relation-context signal has been removed
+    entirely. Only the landform-keyword signal remains. So 'helium'
+    (no landform keyword) must STAY where it is, even when the relation
+    points to a class in geography ns.
+    """
     from backend.app.helpers.ontology_pruning import infer_geographic_placement
 
-    country_iri, country_rec = _make_geo_class("Country", labels=["Country"])
-    iran_iri, iran_rec = _make_geo_class("Iran", parent_iri=country_iri, labels=["Iran"])
-    abadan_iri, abadan_rec = _make_default_class(
-        "abadan", parent_iri=OWL_THING, labels=["Abadan"],
+    qatar_iri, qatar_rec = _make_geo_class("Qatar", labels=["Qatar"])
+    helium_iri, helium_rec = _make_default_class(
+        "helium", parent_iri=OWL_THING, labels=["Helium"],
     )
-    classes_dict = {country_iri: country_rec, iran_iri: iran_rec, abadan_iri: abadan_rec}
+    classes_dict = {qatar_iri: qatar_rec, helium_iri: helium_rec}
     obj_props = {
-        "ex:locatedIn": {
-            "iri": "ex:locatedIn",
-            "name": "located_in",
-            "labels": ["located_in"],
-            "domain": [{"kind": "entity", "iri": abadan_iri}],
-            "range": [{"kind": "entity", "iri": iran_iri}],
+        "ex:isPartOf": {
+            "iri": "ex:isPartOf",
+            "name": "is_part_of",
+            "labels": ["is_part_of"],
+            "domain": [{"kind": "entity", "iri": helium_iri}],
+            "range": [{"kind": "entity", "iri": qatar_iri}],
         }
     }
     audit = infer_geographic_placement(
@@ -1112,12 +1123,10 @@ def test_geo_inference_relation_signal_locatedin_to_geo_class() -> None:
         obj_props_dict=obj_props,
         data_props_dict={}, instances_dict={},
     )
-    assert len(audit) == 1
-    new_iri = audit[0]["new_iri"]
-    assert new_iri.startswith(GEO_NS)
-    # Re-parented under the other endpoint's parent (Country).
-    assert classes_dict[new_iri]["superclasses"][0]["iri"] == country_iri
-    assert "relation:" in audit[0]["signal"]
+    # Helium is NOT re-homed -- no landform keyword and no Signal 2 path.
+    assert audit == []
+    assert helium_iri in classes_dict
+    assert classes_dict[helium_iri]["superclasses"][0]["iri"] == OWL_THING
 
 
 def test_geo_inference_rewrites_iri_references_in_relations_and_instances() -> None:
@@ -1189,3 +1198,228 @@ def test_geo_inference_does_not_disturb_classes_already_in_real_namespace() -> N
     # No re-homing -- bering_strait is already where it belongs.
     assert audit == []
     assert bering_iri in classes_dict
+
+
+# ============================================================================
+# Layer G: top-level concept grouping (LLM-driven proposals applied
+# deterministically). LLM-side is mocked; these tests assert the apply
+# helper's behavior on synthetic LLM responses.
+# ============================================================================
+
+
+_CG_DEFAULT_BASE = "http://default.example/ontology/"
+
+
+def _make_orphan(local: str, label: str = None,
+                  description: str = "") -> tuple[str, dict]:
+    iri = _CG_DEFAULT_BASE + local
+    return iri, {
+        "iri": iri,
+        "name": local,
+        "labels": [label or local],
+        "descriptions": [description] if description else [],
+        "superclasses": [{"kind": "entity", "iri": OWL_THING}],
+        "restrictions_and_class_constructs": [],
+    }
+
+
+def test_collect_orphan_classes_picks_default_ns_thing_parented() -> None:
+    """Only classes whose IRI lives under default_base_iri AND whose
+    first parent is owl:Thing show up as orphans."""
+    from backend.app.helpers.ontology_pruning import _collect_orphan_classes
+
+    helium_iri, helium_rec = _make_orphan(
+        "helium", label="Helium", description="A noble gas."
+    )
+    chips_iri, chips_rec = _make_orphan("logic_chips", label="Logic Chips")
+    classes = {helium_iri: helium_rec, chips_iri: chips_rec}
+    orphans = _collect_orphan_classes(classes, _CG_DEFAULT_BASE)
+    labels = {o["label"] for o in orphans}
+    assert {"Helium", "Logic Chips"} <= labels
+    helium = next(o for o in orphans if o["label"] == "Helium")
+    assert helium["description"] == "A noble gas."
+    assert helium["iri"] == helium_iri
+
+
+def test_collect_orphan_classes_skips_real_namespace() -> None:
+    """A class in a 'real' ontology namespace (geography, time, OntoCAPE,
+    etc.) is NOT an orphan, even if parented at owl:Thing."""
+    from backend.app.helpers.ontology_pruning import _collect_orphan_classes
+
+    helium_iri, helium_rec = _make_orphan("helium", label="Helium")
+    # Class in geography ns at owl:Thing -- still NOT an orphan.
+    foreign_iri = "https://veerla-ramrao.ai/ontology/geography#Country"
+    foreign_rec = {
+        "iri": foreign_iri,
+        "name": "Country",
+        "labels": ["Country"],
+        "superclasses": [{"kind": "entity", "iri": OWL_THING}],
+    }
+    classes = {helium_iri: helium_rec, foreign_iri: foreign_rec}
+    orphans = _collect_orphan_classes(classes, _CG_DEFAULT_BASE)
+    labels = {o["label"] for o in orphans}
+    assert "Helium" in labels
+    assert "Country" not in labels
+
+
+def test_collect_orphan_classes_skips_non_thing_parent() -> None:
+    """Default-namespace class whose parent is something OTHER than
+    owl:Thing is NOT an orphan."""
+    from backend.app.helpers.ontology_pruning import _collect_orphan_classes
+
+    material_iri, material_rec = _make_orphan("Material")
+    helium_iri = _CG_DEFAULT_BASE + "helium"
+    helium_rec = {
+        "iri": helium_iri, "name": "helium", "labels": ["Helium"],
+        "superclasses": [{"kind": "entity", "iri": material_iri}],
+    }
+    classes = {material_iri: material_rec, helium_iri: helium_rec}
+    orphans = _collect_orphan_classes(classes, _CG_DEFAULT_BASE)
+    labels = {o["label"] for o in orphans}
+    assert "Helium" not in labels
+    # Material itself is still an orphan (owl:Thing parent).
+    assert "Material" in labels
+
+
+def test_apply_concept_grouping_mints_concepts_and_reparents() -> None:
+    """Given a Helium orphan and an LLM result proposing Material + an
+    assignment of Helium->Material, the helper mints `Material` (with the
+    `auto_created_via` annotation) and re-parents Helium under Material."""
+    from backend.app.helpers.ontology_pruning import apply_concept_grouping
+
+    helium_iri, helium_rec = _make_orphan("helium", label="Helium")
+    classes = {helium_iri: helium_rec}
+    llm_result = {
+        "TOP_LEVEL_CONCEPTS": [
+            {"LABEL": "Material", "DESCRIPTION": "A physical substance."},
+        ],
+        "ASSIGNMENTS": [
+            {"CLASS_LABEL": "Helium", "CONCEPT_LABEL": "Material"},
+        ],
+    }
+    concept_iris, audit = apply_concept_grouping(
+        classes_dict=classes,
+        default_base_iri=_CG_DEFAULT_BASE,
+        llm_result=llm_result,
+        default_parent_iri=OWL_THING,
+    )
+    assert len(concept_iris) == 1
+    material_iri = concept_iris[0]
+    assert material_iri.startswith(_CG_DEFAULT_BASE)
+    # Material is in classes_dict with the audit annotation.
+    material_rec = classes[material_iri]
+    assert material_rec["annotations"]["auto_created_via"] == ["concept_grouping"]
+    # Helium is re-parented under Material.
+    assert classes[helium_iri]["superclasses"][0]["iri"] == material_iri
+    # Helium's audit annotation records the concept.
+    assert classes[helium_iri]["annotations"]["inferred_concept_grouping"] == ["Material"]
+    assert len(audit) == 1
+
+
+def test_apply_concept_grouping_reuses_existing_concept() -> None:
+    """If Material already exists as a class (label match), the helper
+    doesn't double-mint -- it just re-parents the orphan to the existing
+    Material IRI."""
+    from backend.app.helpers.ontology_pruning import apply_concept_grouping
+
+    existing_material_iri = _CG_DEFAULT_BASE + "Material"
+    existing_material_rec = {
+        "iri": existing_material_iri, "name": "Material",
+        "labels": ["Material"], "superclasses": [{"kind": "entity", "iri": OWL_THING}],
+    }
+    helium_iri, helium_rec = _make_orphan("helium", label="Helium")
+    classes = {existing_material_iri: existing_material_rec, helium_iri: helium_rec}
+
+    llm_result = {
+        "TOP_LEVEL_CONCEPTS": [
+            {"LABEL": "Material", "DESCRIPTION": "Same as existing."},
+        ],
+        "ASSIGNMENTS": [
+            {"CLASS_LABEL": "Helium", "CONCEPT_LABEL": "Material"},
+        ],
+    }
+    concept_iris, audit = apply_concept_grouping(
+        classes_dict=classes,
+        default_base_iri=_CG_DEFAULT_BASE,
+        llm_result=llm_result,
+        default_parent_iri=OWL_THING,
+    )
+    # No new IRI minted -- the existing Material was reused.
+    assert concept_iris == []
+    # Helium parented under the pre-existing Material.
+    assert classes[helium_iri]["superclasses"][0]["iri"] == existing_material_iri
+
+
+def test_apply_concept_grouping_skips_unresolvable_assignment() -> None:
+    """LLM proposes an assignment for an unknown class label. The helper
+    skips it cleanly with no error / no mutation for that class."""
+    from backend.app.helpers.ontology_pruning import apply_concept_grouping
+
+    helium_iri, helium_rec = _make_orphan("helium", label="Helium")
+    classes = {helium_iri: helium_rec}
+    llm_result = {
+        "TOP_LEVEL_CONCEPTS": [
+            {"LABEL": "Material", "DESCRIPTION": ""},
+        ],
+        "ASSIGNMENTS": [
+            {"CLASS_LABEL": "NonexistentClass", "CONCEPT_LABEL": "Material"},
+            {"CLASS_LABEL": "Helium", "CONCEPT_LABEL": "Material"},
+        ],
+    }
+    concept_iris, audit = apply_concept_grouping(
+        classes_dict=classes,
+        default_base_iri=_CG_DEFAULT_BASE,
+        llm_result=llm_result,
+        default_parent_iri=OWL_THING,
+    )
+    # Material got minted; Helium got re-parented; NonexistentClass skipped.
+    assert len(concept_iris) == 1
+    assert len(audit) == 1
+    assert audit[0]["concept_label"] == "Material"
+
+
+def test_apply_concept_grouping_handles_empty_llm_result() -> None:
+    """An empty LLM result is a no-op (purely additive failure mode)."""
+    from backend.app.helpers.ontology_pruning import apply_concept_grouping
+
+    helium_iri, helium_rec = _make_orphan("helium", label="Helium")
+    classes = {helium_iri: helium_rec}
+    concept_iris, audit = apply_concept_grouping(
+        classes_dict=classes,
+        default_base_iri=_CG_DEFAULT_BASE,
+        llm_result={"TOP_LEVEL_CONCEPTS": [], "ASSIGNMENTS": []},
+        default_parent_iri=OWL_THING,
+    )
+    assert concept_iris == []
+    assert audit == []
+    # Helium's parent unchanged.
+    assert classes[helium_iri]["superclasses"][0]["iri"] == OWL_THING
+
+
+def test_apply_concept_grouping_concept_class_carries_audit_annotation() -> None:
+    """Newly-minted concept class records `auto_created_via:
+    ['concept_grouping']` in annotations -- so post-run audit can
+    distinguish concept classes from regular Stage-2 proposals."""
+    from backend.app.helpers.ontology_pruning import apply_concept_grouping
+
+    helium_iri, helium_rec = _make_orphan("helium")
+    classes = {helium_iri: helium_rec}
+    llm_result = {
+        "TOP_LEVEL_CONCEPTS": [
+            {"LABEL": "Material", "DESCRIPTION": "A physical substance."},
+        ],
+        "ASSIGNMENTS": [
+            {"CLASS_LABEL": "Helium", "CONCEPT_LABEL": "Material"},
+        ],
+    }
+    concept_iris, _ = apply_concept_grouping(
+        classes_dict=classes,
+        default_base_iri=_CG_DEFAULT_BASE,
+        llm_result=llm_result,
+        default_parent_iri=OWL_THING,
+    )
+    rec = classes[concept_iris[0]]
+    assert "auto_created_via" in rec["annotations"]
+    assert rec["annotations"]["auto_created_via"] == ["concept_grouping"]
+    # Description was carried into the concept class.
+    assert "A physical substance." in (rec.get("descriptions") or [])
