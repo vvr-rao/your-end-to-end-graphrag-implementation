@@ -63,6 +63,21 @@ tasks:
     response_format: json_object
 
   # ---------------------------------------------------------------------------
+  # One-time class-metadata compression. Run once after merge to compress each
+  # class's descriptions+comments into a single <=15-word `compact_description`
+  # stored on the class record. Cuts Stage 2's per-class slice footprint by
+  # ~50%. gpt-4o-mini is the cost sweet spot (16x cheaper than gpt-4.1) and
+  # plenty strong for "rewrite this in <=15 words". JSON-mode for reliability.
+  # ---------------------------------------------------------------------------
+  compact_description:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 2048
+    response_format: json_object
+
+  # ---------------------------------------------------------------------------
   # Class-level summarization (Phase 2). Cheap, fast, plenty strong.
   # ---------------------------------------------------------------------------
   class_summarization:

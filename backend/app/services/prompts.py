@@ -332,10 +332,64 @@ def concept_grouping(orphan_classes: list[dict[str, Any]]) -> tuple[str, str]:
     return system, user
 
 
+def compact_description(class_batch: list[dict[str, Any]]) -> tuple[str, str]:
+    """One-time class-metadata compression. Given a small batch of class
+    records (each {iri, name, labels, comments, descriptions}), return a
+    short `compact_description` per class -- the SAME semantic content as
+    the original descriptions+comments but typically 70-85% smaller.
+
+    The output is stored on each class record once (in merged.json) and
+    reused by every subsequent Stage 2 call's `_slice_ontology`, which
+    ships `compact_description` instead of the raw fields. Cuts per-class
+    slice footprint roughly in half.
+
+    The model used is gpt-4o-mini (configured in models.yaml) -- 16x
+    cheaper than gpt-4.1 in/out and plenty strong for "rewrite this in
+    <= 15 words.\""""
+    system = (
+        "You are an ontology curator. For each class in the input batch, "
+        "produce a SHORT description (at most 15 words, one sentence, no "
+        "trailing period needed) that captures what kind of thing the "
+        "class is. Use the existing `descriptions` + `comments` as your "
+        "primary input; the `labels` and `name` are also useful. "
+        "Examples:\n"
+        "  - 'A material stream representing the flow between two unit "
+        "operations in a chemical process system. Used to capture "
+        "intermediate products that pass through reactors, separators, "
+        "or heat exchangers.' -> 'Material stream between two unit "
+        "operations in a chemical process.'\n"
+        "  - 'A country located in the Middle East geopolitical region.' "
+        "-> 'A Middle Eastern country.'\n"
+        "Constraints:\n"
+        "  - <= 15 words per class.\n"
+        "  - Preserve the semantic kind-of relationship if obvious from "
+        "the source text (e.g. 'A country', 'A material stream', 'A "
+        "year').\n"
+        "  - Drop boilerplate like 'Country/country-like geography class. "
+        "Document-parsed mentions of this geography can be...' since it "
+        "adds no semantic info beyond the type.\n"
+        "  - If the source text is empty or trivial, emit a one-word "
+        "compact_description derived from the LABEL (e.g. 'Helium' -> "
+        "'Helium').\n\n"
+        "Output strict JSON in the shape:\n"
+        '{"results": [{"iri": "<exact input iri>", "compact_description": "<short string>"}, ...]}'
+        "\n"
+        "Include exactly one results entry per input class, in the same "
+        "order. No prose, no comments."
+    )
+    user = (
+        "CLASSES:\n"
+        + json.dumps(class_batch, ensure_ascii=False, default=str)
+        + '\n\nReturn JSON: {"results": [{"iri": "...", "compact_description": "..."}, ...]}'
+    )
+    return system, user
+
+
 # Public registry so callers can look up a prompt builder by task name.
 PROMPTS = {
     "chunk_classification": chunk_classification,
     "class_proposal": class_identification_and_expansion,
     "match_dedup": match_dedup,
     "concept_grouping": concept_grouping,
+    "compact_description": compact_description,
 }

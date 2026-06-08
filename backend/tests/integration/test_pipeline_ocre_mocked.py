@@ -24,7 +24,11 @@ def _stub_chat_factory():
 
     async def stub_chat(self, task: str, *, system: str, user: str) -> ChatResult:
         if task == "chunk_classification":
-            payload = {"relevant_iris": []}  # nothing relevant -> stages skip
+            # Return one arbitrary IRI so Stage 2 fires for the chunk.
+            # (After the "skip empty Stage 1" optimization, an empty
+            # relevant_iris list would cause Stage 2 to be skipped, which
+            # this test specifically wants to exercise.)
+            payload = {"relevant_iris": ["http://purl.org/net/OCRe/OCRe.owl#OCREEntity"]}
         elif task == "class_proposal":
             payload = {
                 "MATCHES FOUND": [],

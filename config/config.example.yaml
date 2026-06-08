@@ -13,10 +13,12 @@
 # matches kg_populationv5.ipynb behavior).
 # -----------------------------------------------------------------------------
 chunking:
-  # Target chunk size in tokens (o200k_base encoding).
-  chunk_size: 800
+  # Target chunk size in tokens (o200k_base encoding). gpt-4.1 handles
+  # 2K-token chunks comfortably; the ontology-slice overhead amortizes
+  # over fewer Stage-2 calls.
+  chunk_size: 2000
   # Overlap between adjacent chunks; helps preserve context across splits.
-  chunk_overlap: 120
+  chunk_overlap: 150
   # tiktoken encoding name. o200k_base matches GPT-4o family + recent embedding models.
   encoding: o200k_base
 

@@ -83,3 +83,44 @@ async def run_build(**kwargs: Any) -> Path:
     from backend.app.services.pipeline_llm import build_async
 
     return await build_async(**kwargs)
+
+
+async def run_summarize_descriptions(
+    *,
+    input_folder: Path,
+    max_cost_usd: float = 5.0,
+) -> dict[str, Any]:
+    """`summarize-descriptions` subcommand: walk an existing merge folder,
+    compress each class's descriptions+comments into a one-line
+    compact_description, and overwrite merged.json + merged.owl in place.
+
+    Idempotent: classes that already have a non-empty compact_description
+    field are skipped. So this can be run again after a re-merge to fill
+    in only the new classes.
+    """
+    from backend.app.core.config import get_settings
+    from backend.app.services.llm_router import LLMRouter
+    from backend.app.services.pipeline_llm import summarize_class_descriptions_async
+
+    loaded = folder_io.load_version_folder(input_folder)
+    settings = get_settings()
+    router = LLMRouter(settings)
+    classes_dict = loaded.get("classes_dict", {})
+
+    summary = await summarize_class_descriptions_async(
+        classes_dict=classes_dict,
+        router=router,
+        max_cost_usd=max_cost_usd,
+    )
+
+    # Write the updated dict back into the same folder so downstream
+    # prune-expand runs see compact_description fields.
+    folder_io.write_merged_json(input_folder, loaded)
+    ontology_export.write_owl(loaded, input_folder / folder_io.MERGED_OWL)
+
+    print(
+        f"[compact-desc] DONE: summarized {summary['classes_summarized']} / "
+        f"{summary['classes_total']} classes in {summary['llm_calls']} calls "
+        f"(${summary['cost_usd']:.4f})"
+    )
+    return summary

@@ -144,6 +144,24 @@ def build_parser() -> argparse.ArgumentParser:
     _add_suggestions_flag(p_build)
     p_build.set_defaults(func=_cmd_build)
 
+    p_sd = sub.add_parser(
+        "summarize-descriptions",
+        help=(
+            "One-time compression of class descriptions+comments into a "
+            "compact_description field on each class. Cuts Stage 2's per-"
+            "class slice footprint by ~half for every subsequent prune-"
+            "expand run against the same merge. Idempotent."
+        ),
+    )
+    _add_input_folder(p_sd)
+    p_sd.add_argument(
+        "--max-cost-usd",
+        type=float,
+        default=5.0,
+        help="Hard cost cap for the summarization pass (default $5).",
+    )
+    p_sd.set_defaults(func=_cmd_summarize_descriptions)
+
     return parser
 
 
@@ -227,6 +245,24 @@ def _cmd_build(args: argparse.Namespace) -> int:
         )
     )
     print(f"\nBUILT ontology written to: {version_dir}")
+    return 0
+
+
+def _cmd_summarize_descriptions(args: argparse.Namespace) -> int:
+    from backend.app.services.pipeline import run_summarize_descriptions
+
+    summary = asyncio.run(
+        run_summarize_descriptions(
+            input_folder=args.input,
+            max_cost_usd=args.max_cost_usd,
+        )
+    )
+    print(f"\nSUMMARIZE-DESCRIPTIONS DONE -> {args.input}")
+    print(f"  classes total:       {summary['classes_total']}")
+    print(f"  classes summarized:  {summary['classes_summarized']}")
+    print(f"  classes skipped:     {summary['classes_skipped']}")
+    print(f"  LLM calls:           {summary['llm_calls']}")
+    print(f"  cost:                ${summary['cost_usd']:.4f}")
     return 0
 
 

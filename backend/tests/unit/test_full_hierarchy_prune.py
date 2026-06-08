@@ -1445,6 +1445,133 @@ def test_apply_concept_grouping_concept_class_carries_audit_annotation() -> None
 
 
 # ============================================================================
+# compact_description (one-time class-metadata compression) tests.
+# ============================================================================
+
+
+def test_summarize_class_descriptions_writes_compact_description_field() -> None:
+    """`summarize_class_descriptions_async` should call the LLM (mocked
+    here) and write a `compact_description` field on each candidate
+    class. Classes that already have one are skipped (idempotent)."""
+    import asyncio
+    from backend.app.services.pipeline_llm import (
+        _has_useful_text,
+        summarize_class_descriptions_async,
+    )
+
+    # Sanity check on the helper used by the orchestrator.
+    assert _has_useful_text({"descriptions": ["A long description."]})
+    assert not _has_useful_text({"descriptions": [], "comments": []})
+    assert not _has_useful_text({"descriptions": ["x"]})  # too short
+
+    classes_dict = {
+        "ex:Helium": {
+            "iri": "ex:Helium", "name": "Helium", "labels": ["Helium"],
+            "descriptions": ["A noble gas used as a coolant and lifting gas."],
+        },
+        "ex:Material": {
+            "iri": "ex:Material", "name": "Material", "labels": ["Material"],
+            "descriptions": ["Generic substance class for chemical and physical materials."],
+        },
+        "ex:Trivial": {
+            "iri": "ex:Trivial", "name": "Trivial", "labels": ["Trivial"],
+            "descriptions": [],  # nothing to summarize -> skipped
+        },
+        "ex:AlreadyDone": {
+            "iri": "ex:AlreadyDone", "name": "AlreadyDone",
+            "labels": ["AlreadyDone"],
+            "descriptions": ["Some long description text here."],
+            "compact_description": "Already summarised.",  # skipped
+        },
+    }
+
+    # Build a fake LLM router that returns a deterministic JSON response
+    # containing compact_description for each iri in the batch.
+    class _FakeChatResult:
+        def __init__(self, text: str) -> None:
+            self.text = text
+            self.prompt_tokens = 100
+            self.completion_tokens = 50
+            self.cost_usd = 0.0001
+
+    class _FakeRouter:
+        def __init__(self) -> None:
+            self.calls: list[list[dict]] = []
+            self.total_cost_usd = 0.0
+
+        async def chat(self, task: str, *, system: str, user: str):
+            assert task == "compact_description"
+            # Parse the batch out of the user message (JSON after CLASSES:).
+            import json as _json
+            payload = _json.loads(user.split("CLASSES:\n", 1)[1].split("\n\nReturn JSON:", 1)[0])
+            self.calls.append(payload)
+            results = [
+                {"iri": c["iri"], "compact_description": f"Compact for {c['name']}"}
+                for c in payload
+            ]
+            return _FakeChatResult(_json.dumps({"results": results}))
+
+    router = _FakeRouter()
+    summary = asyncio.run(
+        summarize_class_descriptions_async(
+            classes_dict=classes_dict,
+            router=router,
+            max_cost_usd=1.0,
+            batch_size=10,
+            concurrency=2,
+        )
+    )
+
+    # ex:Helium and ex:Material were summarized.
+    assert classes_dict["ex:Helium"]["compact_description"] == "Compact for Helium"
+    assert classes_dict["ex:Material"]["compact_description"] == "Compact for Material"
+    # ex:Trivial got nothing (skipped on _has_useful_text).
+    assert "compact_description" not in classes_dict["ex:Trivial"]
+    # ex:AlreadyDone untouched.
+    assert classes_dict["ex:AlreadyDone"]["compact_description"] == "Already summarised."
+    # Summary record matches.
+    assert summary["classes_summarized"] == 2
+    assert summary["classes_total"] == 4
+    assert summary["llm_calls"] == 1
+
+
+def test_slice_ontology_uses_compact_description_when_present() -> None:
+    """When a class has `compact_description`, `_slice_ontology` ships
+    it INSTEAD of the verbose descriptions+comments. Without it, falls
+    back to the originals (backward-compatible)."""
+    from backend.app.services.pipeline_llm import _slice_ontology
+
+    classes = {
+        "ex:A": {
+            "iri": "ex:A", "name": "A", "labels": ["A"],
+            "descriptions": ["A long description we want to compress."],
+            "comments": ["Likewise a long comment."],
+            "compact_description": "Short A.",
+            "superclasses": [],
+        },
+        "ex:B": {
+            "iri": "ex:B", "name": "B", "labels": ["B"],
+            "descriptions": ["Verbose for B."],
+            "comments": ["Comment for B."],
+            # no compact_description -- fallback path
+            "superclasses": [],
+        },
+    }
+    loaded = {"classes_dict": classes}
+    sliced = _slice_ontology(loaded, ["ex:A", "ex:B"], max_hops=1)
+
+    # ex:A ships compact_description and NOT the verbose fields.
+    assert sliced["ex:A"]["compact_description"] == "Short A."
+    assert "descriptions" not in sliced["ex:A"]
+    assert "comments" not in sliced["ex:A"]
+
+    # ex:B falls back to the verbose fields (no compact_description).
+    assert sliced["ex:B"]["descriptions"] == ["Verbose for B."]
+    assert sliced["ex:B"]["comments"] == ["Comment for B."]
+    assert "compact_description" not in sliced["ex:B"]
+
+
+# ============================================================================
 # Geographic-parent safety guard (`_is_safe_geo_parent_for`).
 # Prevents non-geographic classes from cascading into the geography
 # namespace via Stage 2's PARENT_LABEL or Layer D's auto-mint inheritance.

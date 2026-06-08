@@ -191,8 +191,20 @@ def _slice_ontology(
     max_hops: int,
 ) -> dict[str, Any]:
     """Return a sub-dict of `classes_dict` covering the detected IRIs and
-    their N-hop neighborhood. Strips heavy fields (raw_axiom_triples) so the
-    Stage-2 prompt stays compact."""
+    their N-hop neighborhood. Strips heavy fields (raw_axiom_triples) so
+    the Stage-2 prompt stays compact.
+
+    Per-class field selection:
+      - If the class has a `compact_description` (produced by the
+        `summarize-descriptions` step), ship that INSTEAD of the verbose
+        `descriptions` + `comments` fields. The compact form is ~15
+        words vs the original 60+; saves ~50% per-class slice
+        metadata.
+      - If no compact_description exists, fall back to the original
+        descriptions + comments. So the pipeline still works on
+        un-summarized merges -- the compact form is an optional
+        optimization the user opts into per merge folder.
+    """
     classes = loaded_ontology.get("classes_dict", {})
     if not detected_iris:
         return {}
@@ -200,12 +212,21 @@ def _slice_ontology(
     # call build_class_graph separately.
     relevant = collect_related_class_iris(classes, list(detected_iris), max_hops=max_hops)
     out: dict[str, Any] = {}
-    keep_fields = ("name", "iri", "labels", "comments", "descriptions", "superclasses")
+    base_fields = ("name", "iri", "labels", "superclasses")
     for iri in relevant:
         rec = classes.get(iri)
         if rec is None:
             continue
-        out[iri] = {k: rec.get(k) for k in keep_fields if k in rec}
+        entry = {k: rec.get(k) for k in base_fields if k in rec}
+        compact = rec.get("compact_description")
+        if isinstance(compact, str) and compact.strip():
+            entry["compact_description"] = compact.strip()
+        else:
+            # Backward-compatible path for un-summarized merges.
+            for k in ("comments", "descriptions"):
+                if k in rec:
+                    entry[k] = rec.get(k)
+        out[iri] = entry
     return out
 
 
@@ -324,6 +345,124 @@ async def _propose_concept_grouping(
     return {
         "TOP_LEVEL_CONCEPTS": list(merged_concepts.values()),
         "ASSIGNMENTS": merged_assignments,
+    }
+
+
+# ---------- One-time class-metadata compression ----------
+
+
+_COMPACT_DESCRIPTION_BATCH_SIZE = 20
+
+
+def _has_useful_text(rec: dict[str, Any]) -> bool:
+    """A class is worth summarizing if it has at least one non-trivial
+    description or comment string. Empty or single-character text isn't
+    worth a round trip."""
+    for field in ("descriptions", "comments"):
+        for v in rec.get(field) or []:
+            if isinstance(v, str) and len(v.strip()) > 3:
+                return True
+    return False
+
+
+async def summarize_class_descriptions_async(
+    classes_dict: dict[str, Any],
+    router: LLMRouter,
+    max_cost_usd: float = 5.0,
+    batch_size: int = _COMPACT_DESCRIPTION_BATCH_SIZE,
+    concurrency: int = 8,
+) -> dict[str, Any]:
+    """One-time class-metadata compression. Iterate `classes_dict`,
+    batch each group of N classes that have non-trivial descriptions or
+    comments, send to gpt-4o-mini for a short rewrite, write the result
+    back as `compact_description` on each class record.
+
+    The pipeline never re-fires for a class that already has a non-empty
+    `compact_description` field (so re-running this is a no-op cost-wise).
+
+    Skips classes whose source text is empty or trivial -- they don't
+    need a compact_description.
+
+    Returns a summary dict {classes_total, classes_summarized,
+    classes_skipped, llm_calls, cost_usd}.
+    """
+    candidates = [
+        (iri, rec) for iri, rec in classes_dict.items()
+        if not (rec.get("compact_description") or "").strip()
+        and _has_useful_text(rec)
+    ]
+    print(
+        f"[compact-desc] {len(candidates)} class(es) to summarize "
+        f"(out of {len(classes_dict)} total; already-summarized + "
+        f"trivial classes skipped)"
+    )
+    if not candidates:
+        return {
+            "classes_total": len(classes_dict),
+            "classes_summarized": 0,
+            "classes_skipped": len(classes_dict),
+            "llm_calls": 0,
+            "cost_usd": 0.0,
+        }
+
+    # Project to lightweight batch records: just the fields the prompt
+    # needs. Keeps each batch under gpt-4o-mini's input limit comfortably.
+    def _projection(iri: str, rec: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "iri": iri,
+            "name": rec.get("name") or "",
+            "labels": rec.get("labels") or [],
+            "descriptions": rec.get("descriptions") or [],
+            "comments": rec.get("comments") or [],
+        }
+
+    batches = [
+        [_projection(iri, rec) for iri, rec in candidates[i : i + batch_size]]
+        for i in range(0, len(candidates), batch_size)
+    ]
+    print(f"[compact-desc] processing {len(batches)} batch(es) of <= {batch_size}")
+
+    sem = asyncio.Semaphore(concurrency)
+    cost_before = router.total_cost_usd
+
+    async def _one_batch(batch_idx: int, batch: list[dict[str, Any]]) -> None:
+        async with sem:
+            # Cost-cap check INSIDE the semaphore so an over-budget batch
+            # doesn't fire before we notice.
+            if router.total_cost_usd - cost_before > max_cost_usd:
+                print(f"[compact-desc] batch {batch_idx+1}: cost cap hit, skipping remaining")
+                return
+            system, user = PROMPTS["compact_description"](batch)
+            try:
+                result = await router.chat("compact_description", system=system, user=user)
+            except Exception as exc:
+                print(f"[compact-desc] batch {batch_idx+1} LLM call failed: {exc}")
+                return
+            parsed = extract_json_from_output(result.text)
+            if not isinstance(parsed, dict):
+                print(f"[compact-desc] batch {batch_idx+1} response not parseable JSON; skipping")
+                return
+            for entry in parsed.get("results") or []:
+                if not isinstance(entry, dict):
+                    continue
+                iri = entry.get("iri")
+                cd = entry.get("compact_description")
+                if isinstance(iri, str) and iri in classes_dict and isinstance(cd, str) and cd.strip():
+                    classes_dict[iri]["compact_description"] = cd.strip()
+
+    await asyncio.gather(*[_one_batch(i, b) for i, b in enumerate(batches)])
+
+    summarized = sum(
+        1 for _, rec in candidates
+        if isinstance(rec.get("compact_description"), str)
+        and rec["compact_description"].strip()
+    )
+    return {
+        "classes_total": len(classes_dict),
+        "classes_summarized": summarized,
+        "classes_skipped": len(classes_dict) - summarized,
+        "llm_calls": len(batches),
+        "cost_usd": round(router.total_cost_usd - cost_before, 6),
     }
 
 
@@ -529,12 +668,30 @@ async def _run_llm_stages(
                 _append_audit(audit_path, idx, "class_proposal", chunk.source_name, res)
             return res
 
-    print(f"[stage2] proposing matches+new for {len(chunks)} chunk(s) (OpenAI)")
+    # Skip Stage 2 for chunks where Stage 1 returned no relevant branches --
+    # the LLM would have no ontology context to anchor against, so the call
+    # produces mostly junk MATCH NOT FOUND proposals (paid at gpt-4.1 rates).
+    skipped_empty = sum(1 for iris in stage1_results if not iris)
+    if skipped_empty:
+        print(
+            f"[stage2] skipping {skipped_empty}/{len(chunks)} chunks "
+            f"where Stage 1 returned no relevant IRIs"
+        )
+
+    print(f"[stage2] proposing matches+new for {len(chunks) - skipped_empty} chunk(s) (OpenAI)")
     stage2_results: list[dict[str, Any] | None] = await asyncio.gather(
-        *[_propose_one(i, c, iris) for i, (c, iris) in enumerate(zip(chunks, stage1_results, strict=False))]
+        *[
+            _propose_one(i, c, iris)
+            for i, (c, iris) in enumerate(zip(chunks, stage1_results, strict=False))
+            if iris  # only fire Stage 2 if Stage 1 found relevant branches
+        ]
     )
     valid = [r for r in stage2_results if r]
-    print(f"[stage2] {len(valid)}/{len(chunks)} chunks produced a usable JSON response")
+    print(
+        f"[stage2] {len(valid)}/{len(chunks) - skipped_empty} chunks produced "
+        f"a usable JSON response (Stage 1 surfaced no branches for "
+        f"{skipped_empty} other chunks; those were skipped)"
+    )
 
     if max_cost_usd is not None and router.total_cost_usd > max_cost_usd:
         raise RuntimeError(
