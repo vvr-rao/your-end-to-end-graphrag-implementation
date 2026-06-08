@@ -469,6 +469,69 @@ async def summarize_class_descriptions_async(
 
 # ---------- Pre-pipeline document summarization (optional) ----------
 
+# Bump this string ONLY when the document_summarize prompt changes
+# meaningfully. The prompt version is mixed into each cache key so old
+# cached summaries are silently invalidated.
+_DOC_SUMMARY_PROMPT_VERSION = "v1"
+
+
+def _doc_summary_cache_dir() -> Path:
+    """Return the on-disk cache root, creating it if missing."""
+    root = Path.home() / ".cache" / "your-personal-knowledge-graph-creator" / "doc_summaries"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _doc_summary_cache_key(text: str, model: str) -> str:
+    """SHA-256 over (doc text + model name + prompt version). Changing
+    any of these invalidates the cache for that doc."""
+    import hashlib
+
+    h = hashlib.sha256()
+    h.update(_DOC_SUMMARY_PROMPT_VERSION.encode("utf-8"))
+    h.update(b"|")
+    h.update(model.encode("utf-8"))
+    h.update(b"|")
+    h.update(text.encode("utf-8"))
+    return h.hexdigest()
+
+
+def _doc_summary_cache_path(cache_dir: Path, key: str) -> Path:
+    return cache_dir / f"{key}.txt"
+
+
+def _doc_summary_cache_load(path: Path) -> str | None:
+    """Return the cached summary if the file exists and is non-empty,
+    else None."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    text = text.strip()
+    return text if text else None
+
+
+def _doc_summary_cache_save(path: Path, text: str) -> None:
+    """Atomic write: write to a per-process temp file then rename. POSIX
+    rename is atomic within a single filesystem, so concurrent workers
+    racing on the same cache key produce a single final file -- no
+    partial writes."""
+    import os
+
+    tmp = path.with_suffix(f".tmp.{os.getpid()}")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:
+        print(f"[summarize-docs] WARN: cache write failed: {exc}")
+        # Clean up the temp file if rename didn't happen.
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
 
 async def summarize_long_documents_async(
     documents: list[LoadedDocument],
@@ -476,6 +539,8 @@ async def summarize_long_documents_async(
     threshold_tokens: int = 2000,
     encoding_name: str = "o200k_base",
     concurrency: int = 4,
+    model_name: str = "gpt-4o-mini",
+    use_cache: bool = True,
 ) -> list[LoadedDocument]:
     """Optional pre-pipeline pass that rewrites long source documents
     into denser entity-preserving summaries before chunking.
@@ -483,14 +548,21 @@ async def summarize_long_documents_async(
     For each document:
       - Count tokens via tiktoken.
       - If token count <= threshold: passed through unchanged.
-      - Otherwise: call gpt-4o-mini with the `document_summarize` prompt
-        and replace the document's text with the returned summary.
+      - If token count > threshold AND `use_cache` is True:
+          - Compute SHA-256 cache key over (doc text + model + prompt version).
+          - If cache hit: load the summary from disk, no LLM call.
+          - If cache miss: call gpt-4o-mini, write result to cache.
+      - If `use_cache` is False: always call the LLM.
 
     Returns a NEW list of LoadedDocument (the input list is not mutated).
 
     Failure mode is purely additive: if a summarization call raises or
     returns empty text, the original document is preserved. The pipeline
     must NEVER fail because of this step -- it's an opt-in optimization.
+
+    Cache lives at ~/.cache/your-personal-knowledge-graph-creator/doc_summaries/.
+    Editing a doc invalidates its cache entry (different hash). Stale entries
+    accumulate; users can clear with `rm -rf` on the cache dir.
 
     Triggered by `chunking.summarization_threshold_tokens` in
     config.yaml. Set the config value to 0 to disable.
@@ -501,6 +573,7 @@ async def summarize_long_documents_async(
         return list(documents)
 
     enc = tiktoken.get_encoding(encoding_name)
+    cache_dir = _doc_summary_cache_dir() if use_cache else None
 
     # Identify which documents are over the threshold.
     plan: list[tuple[int, int]] = []  # (doc_index, token_count)
@@ -513,17 +586,37 @@ async def summarize_long_documents_async(
         print(f"[summarize-docs] all {len(documents)} doc(s) under threshold; skipping")
         return list(documents)
 
+    # First pass: cache lookups (fast, no LLM, no concurrency needed).
+    cache_hits = 0
+    needs_llm: list[tuple[int, int]] = []
+    out: list[LoadedDocument] = list(documents)
+
+    if cache_dir is not None:
+        for idx, original_tokens in plan:
+            doc = documents[idx]
+            key = _doc_summary_cache_key(doc.text, model_name)
+            cached = _doc_summary_cache_load(_doc_summary_cache_path(cache_dir, key))
+            if cached:
+                out[idx] = LoadedDocument(path=doc.path, text=cached)
+                cache_hits += 1
+            else:
+                needs_llm.append((idx, original_tokens))
+    else:
+        needs_llm = list(plan)
+
     print(
         f"[summarize-docs] {len(plan)}/{len(documents)} doc(s) over "
-        f"threshold ({threshold_tokens} tokens); summarizing via "
-        f"gpt-4o-mini at concurrency={concurrency}"
+        f"threshold ({threshold_tokens} tokens): "
+        f"{cache_hits} cache hit(s), {len(needs_llm)} cache miss(es) "
+        f"to summarize via gpt-4o-mini at concurrency={concurrency}"
     )
+
+    if not needs_llm:
+        print("[summarize-docs] DONE: all over-threshold docs served from cache, $0.0000")
+        return out
 
     sem = asyncio.Semaphore(concurrency)
     cost_before = router.total_cost_usd
-    # Build the output list -- copy the input by reference; we'll
-    # replace entries for summarized docs.
-    out: list[LoadedDocument] = list(documents)
 
     async def _one(idx: int, original_tokens: int) -> None:
         async with sem:
@@ -552,11 +645,16 @@ async def summarize_long_documents_async(
             )
             out[idx] = LoadedDocument(path=doc.path, text=text)
 
-    await asyncio.gather(*[_one(i, tok) for i, tok in plan])
+            # Persist to cache for future runs (atomic write).
+            if cache_dir is not None:
+                key = _doc_summary_cache_key(doc.text, model_name)
+                _doc_summary_cache_save(_doc_summary_cache_path(cache_dir, key), text)
+
+    await asyncio.gather(*[_one(i, tok) for i, tok in needs_llm])
 
     cost_delta = router.total_cost_usd - cost_before
     print(
-        f"[summarize-docs] DONE: {len(plan)} doc(s) summarized, "
+        f"[summarize-docs] DONE: {cache_hits} cached, {len(needs_llm)} summarized, "
         f"{len(documents) - len(plan)} doc(s) unchanged, "
         f"cost ${cost_delta:.4f}"
     )
@@ -736,6 +834,7 @@ async def _run_llm_stages(
     # corpora dominated by a few large documents. Set to 0 to disable.
     expansion_cfg_for_concur = app_cfg.get("expansion", {}) or {}
     threshold_tokens = int(chunking_cfg.get("summarization_threshold_tokens", 0))
+    use_cache = bool(chunking_cfg.get("use_summary_cache", True))
     if threshold_tokens > 0:
         docs = await summarize_long_documents_async(
             documents=docs,
@@ -743,6 +842,7 @@ async def _run_llm_stages(
             threshold_tokens=threshold_tokens,
             encoding_name=encoding,
             concurrency=int(expansion_cfg_for_concur.get("max_concurrent_llm_calls", 4)),
+            use_cache=use_cache,
         )
 
     chunks = list(

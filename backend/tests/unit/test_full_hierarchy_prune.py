@@ -1746,6 +1746,7 @@ def test_summarize_long_documents_skips_short_docs() -> None:
             router=router,
             threshold_tokens=2000,
             concurrency=2,
+            use_cache=False,  # tests should not pollute the user cache dir
         )
     )
 
@@ -1788,6 +1789,7 @@ def test_summarize_long_documents_falls_back_on_llm_failure() -> None:
             router=_ExplodingRouter(),
             threshold_tokens=2000,
             concurrency=1,
+            use_cache=False,  # this test must exercise the LLM-failure fallback
         )
     )
     # Original text preserved.
@@ -1820,3 +1822,230 @@ def test_summarize_long_documents_disabled_when_threshold_zero() -> None:
         )
     )
     assert out[0].text == long_text
+
+
+def test_doc_summary_cache_hit_skips_llm_call(monkeypatch, tmp_path) -> None:
+    """When a cache entry exists for a doc's (text, model) hash, the
+    cached summary is returned directly without calling the LLM."""
+    import asyncio
+    from pathlib import Path
+    from backend.app.services import pipeline_llm
+    from backend.app.services.document_io import LoadedDocument
+    from backend.app.services.pipeline_llm import (
+        summarize_long_documents_async,
+        _doc_summary_cache_key,
+        _doc_summary_cache_path,
+        _doc_summary_cache_save,
+    )
+
+    # Redirect the cache to a per-test tmp dir.
+    monkeypatch.setattr(
+        pipeline_llm,
+        "_doc_summary_cache_dir",
+        lambda: tmp_path,
+    )
+
+    long_text = "Long document with entities. " * 800
+    doc = LoadedDocument(path=Path("doc.txt"), text=long_text)
+
+    # Pre-populate the cache with a known summary.
+    key = _doc_summary_cache_key(long_text, "gpt-4o-mini")
+    cache_file = _doc_summary_cache_path(tmp_path, key)
+    _doc_summary_cache_save(cache_file, "CACHED summary text.")
+
+    class _ExplodingRouter:
+        total_cost_usd = 0.0
+
+        async def chat(self, *_args, **_kwargs):  # pragma: no cover
+            raise AssertionError("LLM must not be called on cache hit")
+
+    out = asyncio.run(
+        summarize_long_documents_async(
+            documents=[doc],
+            router=_ExplodingRouter(),
+            threshold_tokens=2000,
+            concurrency=1,
+            use_cache=True,
+        )
+    )
+    assert out[0].text == "CACHED summary text."
+
+
+def test_doc_summary_cache_miss_writes_cache_for_future_runs(
+    monkeypatch, tmp_path,
+) -> None:
+    """A cache miss triggers the LLM, and the response is written to
+    disk under the deterministic hash key."""
+    import asyncio
+    from pathlib import Path
+    from backend.app.services import pipeline_llm
+    from backend.app.services.document_io import LoadedDocument
+    from backend.app.services.pipeline_llm import (
+        summarize_long_documents_async,
+        _doc_summary_cache_key,
+        _doc_summary_cache_path,
+    )
+
+    monkeypatch.setattr(
+        pipeline_llm,
+        "_doc_summary_cache_dir",
+        lambda: tmp_path,
+    )
+
+    long_text = "Long document with named entities and relationships. " * 500
+    doc = LoadedDocument(path=Path("doc.txt"), text=long_text)
+
+    class _FakeResult:
+        def __init__(self, text: str) -> None:
+            self.text = text
+            self.prompt_tokens = 100
+            self.completion_tokens = 50
+            self.cost_usd = 0.0001
+
+    class _FakeRouter:
+        total_cost_usd = 0.0
+        calls = 0
+
+        async def chat(self, task, *, system, user):
+            type(self).calls += 1
+            return _FakeResult("Fresh LLM summary text.")
+
+    out = asyncio.run(
+        summarize_long_documents_async(
+            documents=[doc],
+            router=_FakeRouter(),
+            threshold_tokens=2000,
+            concurrency=1,
+            use_cache=True,
+        )
+    )
+    # The summary made it through.
+    assert out[0].text == "Fresh LLM summary text."
+    # Exactly one LLM call.
+    assert _FakeRouter.calls == 1
+    # The cache file now exists with the summary text.
+    key = _doc_summary_cache_key(long_text, "gpt-4o-mini")
+    cache_file = _doc_summary_cache_path(tmp_path, key)
+    assert cache_file.exists()
+    assert cache_file.read_text(encoding="utf-8").strip() == "Fresh LLM summary text."
+
+
+def test_doc_summary_cache_invalidates_when_text_changes(
+    monkeypatch, tmp_path,
+) -> None:
+    """Editing the doc text changes the hash, so the prior cache entry
+    is NOT used and the LLM is called for the new content."""
+    import asyncio
+    from pathlib import Path
+    from backend.app.services import pipeline_llm
+    from backend.app.services.document_io import LoadedDocument
+    from backend.app.services.pipeline_llm import (
+        summarize_long_documents_async,
+        _doc_summary_cache_key,
+        _doc_summary_cache_path,
+        _doc_summary_cache_save,
+    )
+
+    monkeypatch.setattr(
+        pipeline_llm,
+        "_doc_summary_cache_dir",
+        lambda: tmp_path,
+    )
+
+    original_text = "Original long doc. " * 400
+    edited_text = "Edited long doc with new fact. " * 400
+
+    # Pre-populate cache with the ORIGINAL hash.
+    original_key = _doc_summary_cache_key(original_text, "gpt-4o-mini")
+    _doc_summary_cache_save(
+        _doc_summary_cache_path(tmp_path, original_key),
+        "Stale summary from original text.",
+    )
+
+    doc = LoadedDocument(path=Path("doc.txt"), text=edited_text)
+
+    class _FakeResult:
+        def __init__(self, text):
+            self.text = text
+            self.prompt_tokens = 100
+            self.completion_tokens = 50
+            self.cost_usd = 0.0001
+
+    class _FakeRouter:
+        total_cost_usd = 0.0
+        calls = 0
+
+        async def chat(self, task, *, system, user):
+            type(self).calls += 1
+            return _FakeResult("Fresh summary for edited text.")
+
+    out = asyncio.run(
+        summarize_long_documents_async(
+            documents=[doc],
+            router=_FakeRouter(),
+            threshold_tokens=2000,
+            concurrency=1,
+            use_cache=True,
+        )
+    )
+    # The stale entry was NOT used; the LLM was called fresh.
+    assert out[0].text == "Fresh summary for edited text."
+    assert _FakeRouter.calls == 1
+
+
+def test_doc_summary_cache_disabled_via_use_cache_false(
+    monkeypatch, tmp_path,
+) -> None:
+    """When use_cache=False, neither cache lookup nor cache write
+    happens -- every run hits the LLM and nothing accumulates on disk."""
+    import asyncio
+    from pathlib import Path
+    from backend.app.services import pipeline_llm
+    from backend.app.services.document_io import LoadedDocument
+    from backend.app.services.pipeline_llm import (
+        summarize_long_documents_async,
+        _doc_summary_cache_key,
+        _doc_summary_cache_path,
+        _doc_summary_cache_save,
+    )
+
+    monkeypatch.setattr(
+        pipeline_llm,
+        "_doc_summary_cache_dir",
+        lambda: tmp_path,
+    )
+
+    long_text = "Long doc to summarize. " * 500
+    # Pre-populate cache so we can prove use_cache=False ignores it.
+    key = _doc_summary_cache_key(long_text, "gpt-4o-mini")
+    _doc_summary_cache_save(
+        _doc_summary_cache_path(tmp_path, key),
+        "Existing cached text we should NOT see.",
+    )
+
+    doc = LoadedDocument(path=Path("doc.txt"), text=long_text)
+
+    class _FakeResult:
+        def __init__(self, text):
+            self.text = text
+            self.prompt_tokens = 100
+            self.completion_tokens = 50
+            self.cost_usd = 0.0001
+
+    class _FakeRouter:
+        total_cost_usd = 0.0
+
+        async def chat(self, task, *, system, user):
+            return _FakeResult("Fresh LLM output ignoring cache.")
+
+    out = asyncio.run(
+        summarize_long_documents_async(
+            documents=[doc],
+            router=_FakeRouter(),
+            threshold_tokens=2000,
+            concurrency=1,
+            use_cache=False,
+        )
+    )
+    # Pre-existing cache value was ignored; LLM result used.
+    assert out[0].text == "Fresh LLM output ignoring cache."

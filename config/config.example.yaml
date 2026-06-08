@@ -25,6 +25,13 @@ chunking:
   # Cuts Stage 2 cost dramatically on corpora dominated by a few large
   # documents. Set to 0 to disable; the pipeline then chunks raw text.
   summarization_threshold_tokens: 2000
+  # Persistent disk cache for document summaries at
+  # ~/.cache/your-personal-knowledge-graph-creator/doc_summaries/. Cache
+  # key hashes the doc text + model + prompt version, so editing a doc
+  # or changing the model invalidates that entry automatically. Re-runs
+  # against unchanged docs cost nothing for summarization. Set to false
+  # to force every run to re-call the LLM (debugging only).
+  use_summary_cache: true
   # tiktoken encoding name. o200k_base matches GPT-4o family + recent embedding models.
   encoding: o200k_base
 
