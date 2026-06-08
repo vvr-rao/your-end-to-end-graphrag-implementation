@@ -78,6 +78,21 @@ tasks:
     response_format: json_object
 
   # ---------------------------------------------------------------------------
+  # Pre-pipeline document summarization. Documents above the configured token
+  # threshold (chunking.summarization_threshold_tokens in config.yaml) get
+  # rewritten via gpt-4o-mini into a denser entity-preserving summary BEFORE
+  # chunking. Cuts Stage 2 chunk count + cost dramatically on corpora with a
+  # few large documents. Plain-text response (NOT json) -- the chunker
+  # consumes prose directly.
+  # ---------------------------------------------------------------------------
+  document_summarize:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 120
+    temperature: 0.0
+    max_tokens: 4096
+
+  # ---------------------------------------------------------------------------
   # Class-level summarization (Phase 2). Cheap, fast, plenty strong.
   # ---------------------------------------------------------------------------
   class_summarization:

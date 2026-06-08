@@ -1701,3 +1701,122 @@ def test_geo_parent_guard_in_relation_automint() -> None:
     # Parent is owl:Thing (the guard rejected Country inheritance).
     parent = extended["classes_dict"][subsidy_iri]["superclasses"][0]["iri"]
     assert parent == OWL_THING
+
+
+# ============================================================================
+# Pre-pipeline document summarization (`summarize_long_documents_async`).
+# ============================================================================
+
+
+def test_summarize_long_documents_skips_short_docs() -> None:
+    """Documents under the threshold pass through unchanged; only the
+    over-threshold docs trigger an LLM call."""
+    import asyncio
+    from pathlib import Path
+    from backend.app.services.document_io import LoadedDocument
+    from backend.app.services.pipeline_llm import summarize_long_documents_async
+
+    short = LoadedDocument(path=Path("short.txt"), text="Short doc, just a few words.")
+    long_words = "Long document with many entities. " * 800  # ~5000 tokens
+    long_a = LoadedDocument(path=Path("long_a.txt"), text=long_words)
+    long_b = LoadedDocument(path=Path("long_b.txt"), text=long_words)
+
+    class _FakeResult:
+        def __init__(self, text: str) -> None:
+            self.text = text
+            self.prompt_tokens = 100
+            self.completion_tokens = 50
+            self.cost_usd = 0.0001
+
+    class _FakeRouter:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self.total_cost_usd = 0.0
+
+        async def chat(self, task: str, *, system: str, user: str):
+            assert task == "document_summarize"
+            self.calls.append(user)
+            # Return a much shorter summary.
+            return _FakeResult("Summarized text mentioning the entities.")
+
+    router = _FakeRouter()
+    out = asyncio.run(
+        summarize_long_documents_async(
+            documents=[short, long_a, long_b],
+            router=router,
+            threshold_tokens=2000,
+            concurrency=2,
+        )
+    )
+
+    # Order preserved.
+    assert out[0].path.name == "short.txt"
+    assert out[1].path.name == "long_a.txt"
+    assert out[2].path.name == "long_b.txt"
+
+    # Short doc unchanged.
+    assert out[0].text == "Short doc, just a few words."
+
+    # Long docs replaced by the summary.
+    assert out[1].text == "Summarized text mentioning the entities."
+    assert out[2].text == "Summarized text mentioning the entities."
+
+    # Exactly TWO LLM calls fired (one per long doc; short skipped).
+    assert len(router.calls) == 2
+
+
+def test_summarize_long_documents_falls_back_on_llm_failure() -> None:
+    """A failed summarization call preserves the original document text
+    (purely additive failure mode -- pipeline never breaks)."""
+    import asyncio
+    from pathlib import Path
+    from backend.app.services.document_io import LoadedDocument
+    from backend.app.services.pipeline_llm import summarize_long_documents_async
+
+    long_text = "Long document with many entities. " * 800  # ~5000 tokens
+    doc = LoadedDocument(path=Path("doc.txt"), text=long_text)
+
+    class _ExplodingRouter:
+        total_cost_usd = 0.0
+
+        async def chat(self, task: str, *, system: str, user: str):
+            raise RuntimeError("simulated provider failure")
+
+    out = asyncio.run(
+        summarize_long_documents_async(
+            documents=[doc],
+            router=_ExplodingRouter(),
+            threshold_tokens=2000,
+            concurrency=1,
+        )
+    )
+    # Original text preserved.
+    assert out[0].text == long_text
+
+
+def test_summarize_long_documents_disabled_when_threshold_zero() -> None:
+    """threshold_tokens <= 0 short-circuits the entire pass: no
+    LLM calls, no list mutation."""
+    import asyncio
+    from pathlib import Path
+    from backend.app.services.document_io import LoadedDocument
+    from backend.app.services.pipeline_llm import summarize_long_documents_async
+
+    long_text = "x " * 5000
+    docs = [LoadedDocument(path=Path("a.txt"), text=long_text)]
+
+    class _NoChat:
+        total_cost_usd = 0.0
+
+        async def chat(self, *_args, **_kwargs):  # pragma: no cover
+            raise AssertionError("must not be called when threshold is 0")
+
+    out = asyncio.run(
+        summarize_long_documents_async(
+            documents=docs,
+            router=_NoChat(),
+            threshold_tokens=0,
+            concurrency=1,
+        )
+    )
+    assert out[0].text == long_text

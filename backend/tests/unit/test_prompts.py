@@ -45,11 +45,44 @@ def test_match_dedup_skips_when_no_proposals_is_not_in_prompt() -> None:
     assert '"MATCHES FOUND"' in user or "MATCHES FOUND" in user
 
 
-def test_prompts_registry_covers_five_tasks() -> None:
+def test_prompts_registry_covers_six_tasks() -> None:
     assert set(PROMPTS) == {
         "chunk_classification",
         "class_proposal",
         "match_dedup",
         "concept_grouping",
         "compact_description",
+        "document_summarize",
     }
+
+
+def test_document_summarize_prompt_shape() -> None:
+    """The document_summarize prompt builder returns non-empty (system,
+    user); system mentions entities + relationships; user contains the
+    input text. NOT JSON-mode; the downstream chunker eats raw prose."""
+    from backend.app.services.prompts import document_summarize
+
+    sys_, user = document_summarize("Iran exports oil through the Strait of Hormuz.")
+    assert isinstance(sys_, str) and sys_
+    assert isinstance(user, str) and user
+    # The system prompt covers the key things we want preserved.
+    sys_lower = sys_.lower()
+    assert "entit" in sys_lower      # 'entities' / 'entity'
+    assert "relationship" in sys_lower
+    assert "do not use bullet" in sys_lower
+    # The user message includes the source text.
+    assert "Iran exports oil through the Strait of Hormuz." in user
+
+
+def test_concept_grouping_prompt_mentions_industry_and_domainconcept() -> None:
+    """Regression check for the user-reported 'Agriculture under
+    Organization' bug. The concept_grouping prompt MUST mention
+    Industry and DomainConcept as buckets and explicitly say
+    Agriculture should NOT land under Organization."""
+    from backend.app.services.prompts import concept_grouping
+
+    sys_, _user = concept_grouping([{"LABEL": "Agriculture", "DESCRIPTION": ""}])
+    assert "Industry" in sys_
+    assert "DomainConcept" in sys_
+    assert "Agriculture" in sys_
+    assert "Organization" in sys_

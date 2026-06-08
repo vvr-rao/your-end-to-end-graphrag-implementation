@@ -19,6 +19,12 @@ chunking:
   chunk_size: 2000
   # Overlap between adjacent chunks; helps preserve context across splits.
   chunk_overlap: 150
+  # Documents above this many tokens are pre-summarized via gpt-4o-mini
+  # before chunking. The summary preserves entities, relationships,
+  # conceptual buckets, and proper nouns -- discards repetitive prose.
+  # Cuts Stage 2 cost dramatically on corpora dominated by a few large
+  # documents. Set to 0 to disable; the pipeline then chunks raw text.
+  summarization_threshold_tokens: 2000
   # tiktoken encoding name. o200k_base matches GPT-4o family + recent embedding models.
   encoding: o200k_base
 

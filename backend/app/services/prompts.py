@@ -298,12 +298,40 @@ def concept_grouping(orphan_classes: list[dict[str, Any]]) -> tuple[str, str]:
         "  1. Propose between 5 and 15 high-level concept classes that "
         "would together cover the orphan set well. The concept labels "
         "should be canonical CamelCase nouns describing a KIND of thing. "
-        "Illustrative examples (use as inspiration, NOT as a fixed list): "
-        "Material, NaturalResource, TechnologyConcept, AgricultureConcept, "
-        "SupplyChainConcept, EconomicConcept, Infrastructure, "
-        "PolicyConcept, OrganizationConcept, Event, Process. "
-        "Pick the actual buckets that best fit the corpus content -- "
-        "don't force one of the examples if the data wants different ones.\n"
+        "Illustrative bucket examples (use as inspiration, NOT as a "
+        "fixed list):\n"
+        "       - Material               (substances, chemicals, "
+        "compounds: helium, fertilizer, oil, urea, polymer)\n"
+        "       - NaturalResource        (extracted natural inputs: "
+        "crude oil, natural gas, ore, timber)\n"
+        "       - TechnologyConcept      (technical artifacts/processes: "
+        "semiconductor, chip, wafer, AI, battery)\n"
+        "       - Industry               (kinds of economic activity: "
+        "Agriculture, Manufacturing, Mining, Healthcare, Energy, "
+        "Transportation, Finance, Aerospace, Tourism, Construction)\n"
+        "       - Infrastructure         (built things: pipeline, port, "
+        "refinery, grid, factory, station, terminal)\n"
+        "       - SupplyChainConcept     (logistics + trade flows: "
+        "supply chain, shipping route, freight corridor)\n"
+        "       - EconomicConcept        (economic phenomena: price, "
+        "market, subsidy, inflation, demand, recession)\n"
+        "       - PolicyConcept          (rules / frameworks: regulation, "
+        "law, treaty, sanction, tariff, policy initiative)\n"
+        "       - Organization           (companies, agencies, "
+        "governments, NGOs, ASSOCIATIONS only -- NOT activity domains: "
+        "FAO, World Bank, BMW, Iran government, OPEC)\n"
+        "       - Person / Role          (named individuals + role types: "
+        "farmer, policymaker, consumer)\n"
+        "       - Event                  (named happenings: Iran war, "
+        "Hormuz crisis, COVID-19 pandemic)\n"
+        "       - Process                (named ongoing activities: "
+        "manufacturing, refining, photosynthesis, decarbonization)\n"
+        "       - DomainConcept          (CATCH-ALL fallback: use this "
+        "for genuinely broad/abstract concepts that don't cleanly fit "
+        "any of the above. Better than forcing a bad placement.)\n"
+        "     Pick the actual buckets that best fit the corpus content -- "
+        "don't force one of the examples if the data wants different "
+        "ones.\n"
         "  2. Assign each orphan to EXACTLY ONE concept. Use the orphan's "
         "LABEL verbatim (case-insensitive match is fine for resolution).\n"
         "  3. Skip an orphan only if it genuinely fits none of your "
@@ -311,6 +339,18 @@ def concept_grouping(orphan_classes: list[dict[str, Any]]) -> tuple[str, str]:
         "  4. Avoid extremely narrow concepts (one or two orphans each) "
         "and avoid extremely broad concepts (everything goes to 'Thing'). "
         "Aim for buckets of 5-100 orphans each.\n\n"
+        "CRITICAL placement rules:\n"
+        "  - Industry vs Organization: an INDUSTRY is a kind of economic "
+        "activity ('Agriculture', 'Mining', 'Healthcare'). An "
+        "ORGANIZATION is a specific entity that operates within an "
+        "industry ('Cargill', 'WHO', 'BMW'). Do NOT place 'Agriculture' "
+        "under Organization -- Agriculture is an Industry.\n"
+        "  - If you find yourself proposing 'OrganizationConcept' as a "
+        "concept that covers many activity domains, you probably want "
+        "'Industry' or 'DomainConcept' instead.\n"
+        "  - Use 'DomainConcept' as the fallback rather than forcing a "
+        "concept into a bucket that doesn't fit. The downstream system "
+        "treats DomainConcept as a legitimate top-level grouping.\n\n"
         "Output strict JSON in the shape:\n"
         "{\n"
         '  "TOP_LEVEL_CONCEPTS": ['
@@ -385,6 +425,56 @@ def compact_description(class_batch: list[dict[str, Any]]) -> tuple[str, str]:
     return system, user
 
 
+def document_summarize(text: str) -> tuple[str, str]:
+    """Pre-pipeline document compression. Given a long source document,
+    rewrite it as a denser summary that preserves the ENTITIES,
+    RELATIONSHIPS, conceptual buckets, and proper-noun content the
+    downstream ontology pipeline cares about. Throws away repetitive
+    prose, anecdotes, and editorial commentary.
+
+    Returns plain prose, NOT JSON, because the downstream chunker
+    consumes plain text and splits on paragraph boundaries."""
+    system = (
+        "You are a research assistant compressing a long document into a "
+        "much shorter summary that preserves the information needed for "
+        "ontology population. Your output will be analyzed by another "
+        "system to extract concepts, entities, and relationships.\n\n"
+        "The summary MUST preserve:\n"
+        "  - Every named entity: countries, regions, cities, places, "
+        "geographic features (straits, islands, oceans, mountains, "
+        "rivers), organizations, companies, brands, products, people, "
+        "studies, reports, regulations, laws, treaties, dates, time "
+        "periods, monetary amounts, measurements.\n"
+        "  - Every conceptual category mentioned: industries, sectors, "
+        "technologies, materials, processes, methods, frameworks.\n"
+        "  - All relationships between entities or concepts (X causes Y, "
+        "X is part of Y, X impacts Y, X depends on Y, X exports Y, X is "
+        "produced in Y, etc.).\n"
+        "  - Numerical specifics tied to a named thing (percentages, "
+        "dates, quantities tied to an entity).\n\n"
+        "What you can drop:\n"
+        "  - Repetitive prose / rephrasings of the same fact.\n"
+        "  - Anecdotes and illustrative examples that don't introduce "
+        "any new entity or relationship.\n"
+        "  - Editorial commentary, opinions, transitions, hedges.\n"
+        "  - Filler ('in conclusion', 'in summary', 'as we have seen').\n\n"
+        "Output the summary as flowing prose paragraphs. Do NOT use "
+        "bullet points or markdown headings -- the downstream chunker "
+        "is paragraph-first and treats bullets as one giant paragraph. "
+        "Use blank lines between paragraphs.\n\n"
+        "Target length: 20-50% of the input. Err on the side of "
+        "preserving entities + relationships even if that means a "
+        "longer summary. Do NOT add anything not in the source text."
+    )
+    user = (
+        "DOCUMENT TO SUMMARIZE:\n\n"
+        + text
+        + "\n\nReturn ONLY the summary as flowing prose paragraphs. No "
+        "preamble, no commentary, no markdown."
+    )
+    return system, user
+
+
 # Public registry so callers can look up a prompt builder by task name.
 PROMPTS = {
     "chunk_classification": chunk_classification,
@@ -392,4 +482,5 @@ PROMPTS = {
     "match_dedup": match_dedup,
     "concept_grouping": concept_grouping,
     "compact_description": compact_description,
+    "document_summarize": document_summarize,
 }

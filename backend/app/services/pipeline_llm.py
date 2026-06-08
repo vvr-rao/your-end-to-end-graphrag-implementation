@@ -46,6 +46,7 @@ from backend.app.services import (
     versioning,
 )
 from backend.app.services.chunking import TextChunk, chunk_documents
+from backend.app.services.document_io import LoadedDocument
 from backend.app.services.llm_router import LLMRouter
 from backend.app.services.prompts import PROMPTS
 from backend.app.services.suggestions import (
@@ -466,6 +467,102 @@ async def summarize_class_descriptions_async(
     }
 
 
+# ---------- Pre-pipeline document summarization (optional) ----------
+
+
+async def summarize_long_documents_async(
+    documents: list[LoadedDocument],
+    router: LLMRouter,
+    threshold_tokens: int = 2000,
+    encoding_name: str = "o200k_base",
+    concurrency: int = 4,
+) -> list[LoadedDocument]:
+    """Optional pre-pipeline pass that rewrites long source documents
+    into denser entity-preserving summaries before chunking.
+
+    For each document:
+      - Count tokens via tiktoken.
+      - If token count <= threshold: passed through unchanged.
+      - Otherwise: call gpt-4o-mini with the `document_summarize` prompt
+        and replace the document's text with the returned summary.
+
+    Returns a NEW list of LoadedDocument (the input list is not mutated).
+
+    Failure mode is purely additive: if a summarization call raises or
+    returns empty text, the original document is preserved. The pipeline
+    must NEVER fail because of this step -- it's an opt-in optimization.
+
+    Triggered by `chunking.summarization_threshold_tokens` in
+    config.yaml. Set the config value to 0 to disable.
+    """
+    import tiktoken  # local import: only when this pass actually runs
+
+    if not documents or threshold_tokens <= 0:
+        return list(documents)
+
+    enc = tiktoken.get_encoding(encoding_name)
+
+    # Identify which documents are over the threshold.
+    plan: list[tuple[int, int]] = []  # (doc_index, token_count)
+    for i, doc in enumerate(documents):
+        tok = len(enc.encode(doc.text))
+        if tok > threshold_tokens:
+            plan.append((i, tok))
+
+    if not plan:
+        print(f"[summarize-docs] all {len(documents)} doc(s) under threshold; skipping")
+        return list(documents)
+
+    print(
+        f"[summarize-docs] {len(plan)}/{len(documents)} doc(s) over "
+        f"threshold ({threshold_tokens} tokens); summarizing via "
+        f"gpt-4o-mini at concurrency={concurrency}"
+    )
+
+    sem = asyncio.Semaphore(concurrency)
+    cost_before = router.total_cost_usd
+    # Build the output list -- copy the input by reference; we'll
+    # replace entries for summarized docs.
+    out: list[LoadedDocument] = list(documents)
+
+    async def _one(idx: int, original_tokens: int) -> None:
+        async with sem:
+            doc = documents[idx]
+            system, user = PROMPTS["document_summarize"](doc.text)
+            try:
+                result = await router.chat("document_summarize", system=system, user=user)
+            except Exception as exc:
+                print(
+                    f"[summarize-docs] doc {idx+1}/{len(documents)} "
+                    f"({doc.name}): LLM failed: {exc} -- keeping original"
+                )
+                return
+            text = (result.text or "").strip()
+            if not text:
+                print(
+                    f"[summarize-docs] doc {idx+1}/{len(documents)} "
+                    f"({doc.name}): empty response -- keeping original"
+                )
+                return
+            new_tokens = len(enc.encode(text))
+            print(
+                f"[summarize-docs] doc {idx+1}/{len(documents)} "
+                f"({doc.name}): {original_tokens} -> {new_tokens} tokens "
+                f"({100 * new_tokens / original_tokens:.0f}%)"
+            )
+            out[idx] = LoadedDocument(path=doc.path, text=text)
+
+    await asyncio.gather(*[_one(i, tok) for i, tok in plan])
+
+    cost_delta = router.total_cost_usd - cost_before
+    print(
+        f"[summarize-docs] DONE: {len(plan)} doc(s) summarized, "
+        f"{len(documents) - len(plan)} doc(s) unchanged, "
+        f"cost ${cost_delta:.4f}"
+    )
+    return out
+
+
 # ---------- Stage 4: deterministic prune / extend ----------
 
 
@@ -632,6 +729,22 @@ async def _run_llm_stages(
     print(f"[llm] loaded {len(docs)} document(s)")
     if not docs:
         raise RuntimeError(f"No PDF/TXT documents found in {documents_dir}")
+
+    # Optional pre-pipeline: documents above the configured token threshold
+    # get rewritten via gpt-4o-mini into a denser entity-preserving summary
+    # before chunking. Cuts Stage 2 chunk count + cost dramatically on
+    # corpora dominated by a few large documents. Set to 0 to disable.
+    expansion_cfg_for_concur = app_cfg.get("expansion", {}) or {}
+    threshold_tokens = int(chunking_cfg.get("summarization_threshold_tokens", 0))
+    if threshold_tokens > 0:
+        docs = await summarize_long_documents_async(
+            documents=docs,
+            router=router,
+            threshold_tokens=threshold_tokens,
+            encoding_name=encoding,
+            concurrency=int(expansion_cfg_for_concur.get("max_concurrent_llm_calls", 4)),
+        )
+
     chunks = list(
         chunk_documents(docs, chunk_size=chunk_size, chunk_overlap=chunk_overlap, encoding_name=encoding)
     )
