@@ -1602,14 +1602,14 @@
   <rdf:Description rdf:about="https://veerla-ramrao.ai/ontology/geography#Iran">
     <rdf:type rdf:resource="http://www.w3.org/2002/07/owl#Class"/>
     <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/geography#Country"/>
-    <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/geography#SouthAsia"/>
+    <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/geography#MiddleEast"/>
     <rdfs:label>Iran</rdfs:label>
     <rdfs:comment>Country/country-like geography class. Document-parsed mentions of this geography can be instantiated as members of this class.</rdfs:comment>
     <viaogeo:isoAlpha2>IR</viaogeo:isoAlpha2>
     <viaogeo:isoAlpha3>IRN</viaogeo:isoAlpha3>
-    <viaogeo:sourceSubregionName>Southern Asia</viaogeo:sourceSubregionName>
+    <viaogeo:sourceSubregionName>Middle East</viaogeo:sourceSubregionName>
     <viaogeo:sourceRegionName>Asia</viaogeo:sourceRegionName>
-    <viaogeo:partOfClass rdf:resource="https://veerla-ramrao.ai/ontology/geography#SouthAsia"/>
+    <viaogeo:partOfClass rdf:resource="https://veerla-ramrao.ai/ontology/geography#MiddleEast"/>
   </rdf:Description>
   <rdf:Description rdf:about="https://veerla-ramrao.ai/ontology/geography#SanMarino">
     <rdf:type rdf:resource="http://www.w3.org/2002/07/owl#Class"/>

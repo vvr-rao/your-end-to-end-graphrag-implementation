@@ -256,29 +256,75 @@ async def _dedup(router: LLMRouter, merged_results: dict[str, Any]) -> dict[str,
 # ---------- Layer G: top-level concept grouping (one LLM call) ----------
 
 
+_CONCEPT_GROUPING_BATCH_SIZE = 150
+
+
 async def _propose_concept_grouping(
     router: LLMRouter,
     orphan_classes: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """ONE LLM call per prune-expand. Asks gpt-4.1 to propose 5-15 high-
-    level concept classes that group the orphan-class list, plus an
-    assignment per orphan. Returns the parsed JSON or an empty shape on
-    any failure -- this pass is purely additive; it must never break the
-    pipeline."""
+    """Ask gpt-4.1 to propose 5-15 high-level concept classes that group
+    the orphan-class list, plus an assignment per orphan.
+
+    BATCHING: each ASSIGNMENT entry in the response is ~30-50 tokens of
+    JSON. With max_tokens=8192 on the LLM, the response cap is ~150-200
+    orphans before responses get truncated mid-JSON. So we chunk the
+    orphans into batches of `_CONCEPT_GROUPING_BATCH_SIZE` each, fire
+    them sequentially (different concept proposals per batch are merged
+    case-insensitively by label), then return a single merged result.
+
+    Returns the parsed + merged JSON or an empty shape on any failure --
+    this pass is purely additive; it must never break the pipeline."""
     empty = {"TOP_LEVEL_CONCEPTS": [], "ASSIGNMENTS": []}
     if not orphan_classes:
         return empty
-    system, user = PROMPTS["concept_grouping"](orphan_classes)
-    try:
-        result = await router.chat("concept_grouping", system=system, user=user)
-    except Exception as exc:
-        print(f"[stage4-G] concept_grouping LLM call failed: {exc} — skipping")
-        return empty
-    parsed = extract_json_from_output(result.text)
-    if not isinstance(parsed, dict):
-        print("[stage4-G] concept_grouping response was not parseable JSON — skipping")
-        return empty
-    return parsed
+
+    # Split into batches.
+    batches = [
+        orphan_classes[i : i + _CONCEPT_GROUPING_BATCH_SIZE]
+        for i in range(0, len(orphan_classes), _CONCEPT_GROUPING_BATCH_SIZE)
+    ]
+    if len(batches) > 1:
+        print(
+            f"[stage4-G] concept_grouping: chunking {len(orphan_classes)} "
+            f"orphans into {len(batches)} batches of <= {_CONCEPT_GROUPING_BATCH_SIZE}"
+        )
+
+    merged_concepts: dict[str, dict[str, Any]] = {}  # lower-case LABEL -> entry
+    merged_assignments: list[dict[str, Any]] = []
+
+    for i, batch in enumerate(batches):
+        system, user = PROMPTS["concept_grouping"](batch)
+        try:
+            result = await router.chat("concept_grouping", system=system, user=user)
+        except Exception as exc:
+            print(f"[stage4-G] batch {i+1}/{len(batches)} LLM call failed: {exc} — skipping batch")
+            continue
+        parsed = extract_json_from_output(result.text)
+        if not isinstance(parsed, dict):
+            print(f"[stage4-G] batch {i+1}/{len(batches)} response was not parseable JSON — skipping batch")
+            continue
+
+        # Merge concepts (case-insensitive dedup by LABEL).
+        for entry in parsed.get("TOP_LEVEL_CONCEPTS") or []:
+            if not isinstance(entry, dict):
+                continue
+            label = str(entry.get("LABEL") or "").strip()
+            if not label:
+                continue
+            key = label.lower()
+            if key not in merged_concepts:
+                merged_concepts[key] = entry
+
+        # Append assignments verbatim.
+        for entry in parsed.get("ASSIGNMENTS") or []:
+            if isinstance(entry, dict):
+                merged_assignments.append(entry)
+
+    return {
+        "TOP_LEVEL_CONCEPTS": list(merged_concepts.values()),
+        "ASSIGNMENTS": merged_assignments,
+    }
 
 
 # ---------- Stage 4: deterministic prune / extend ----------

@@ -992,6 +992,45 @@ def normalize_to_string(value):
 _OWL_THING_IRI = "http://www.w3.org/2002/07/owl#Thing"
 
 
+def _is_safe_geo_parent_for(class_label: str, parent_iri: str) -> bool:
+    """Return True if `parent_iri` is a safe parent for a class with the
+    given LABEL.
+
+    Returns False (UNSAFE -- reject the parent assignment) when ALL of:
+      - parent_iri's namespace contains the substring "ontology/geography"
+        (loose host match for the configured geography ontology), AND
+      - the class label has NO landform-keyword token (strait / island /
+        ...), AND
+      - the parent IRI's local name is itself NOT a landform keyword
+        (so generic geographic parents like Country / GeographicEntity /
+        Region don't get a free pass when the class label gives no
+        positive geographic signal).
+
+    Rationale: when Stage 2 / Layer D pushes a non-geographic concept
+    (EV bus, Subsidy, Trade flow, ...) under a generic geography class,
+    we ignore the parent and let the caller fall back to default ns +
+    owl:Thing. Layer G will then re-parent under a sensible top-level
+    concept. Strict-literal landform classes like Strait or Island
+    still PASS for landform-keyword class labels (Bering Strait under
+    Strait, etc.).
+    """
+    if not parent_iri:
+        return True
+    if "ontology/geography" not in parent_iri.lower():
+        return True
+    # Class label tokens.
+    class_tokens = {
+        t for t in re.split(r"[_\s]+", (class_label or "").lower()) if t
+    }
+    if class_tokens & _LANDFORM_KEYWORDS:
+        return True
+    # Parent local name token.
+    parent_local = _local_name(parent_iri).lower()
+    if parent_local in _LANDFORM_KEYWORDS:
+        return True
+    return False
+
+
 def _derive_namespace_from_parent_iri(parent_iri: str | None, default_base_iri: str) -> str:
     """If `parent_iri` lives in a real domain ontology (anything other than
     owl:Thing or unset), derive the namespace prefix from it so a new
@@ -1181,6 +1220,13 @@ def add_new_classes_from_match_not_found(
                         # Parent not yet resolvable -- defer to next pass.
                         still_pending.append(item)
                         continue
+
+            # Geographic-parent safety guard: if the LLM picked a geography
+            # class as parent for a class whose label has no landform signal,
+            # demote to default ns + default parent. Layer G concept_grouping
+            # will re-parent under a sensible top-level concept later.
+            if not _is_safe_geo_parent_for(label, parent_iri):
+                parent_iri = default_parent_iri
 
             # Fuzzy dedup against existing classes.
             existing_iri = _fuzzy_lookup_class(
@@ -2121,6 +2167,12 @@ def _automint_endpoint_class(
     "look up or create."
     """
     parent_iri = inferred_parent_iri or default_parent_iri
+    # Geographic-parent safety guard: if the OTHER endpoint's parent is in
+    # the geography namespace but this label has no landform signal, the
+    # inherited parent is almost certainly wrong (e.g. 'Subsidy' inheriting
+    # 'Country' from 'Iran'). Fall back to default parent + default ns.
+    if not _is_safe_geo_parent_for(label, parent_iri):
+        parent_iri = default_parent_iri
     base = _derive_namespace_from_parent_iri(parent_iri, new_class_base_iri)
     new_iri, entry = create_new_class_entry(
         label=label,

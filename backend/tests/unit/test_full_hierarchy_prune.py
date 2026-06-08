@@ -446,15 +446,21 @@ def _geo_class(local: str, parent_local: str | None = None) -> tuple[str, dict]:
     }
 
 
-def test_add_classes_places_in_parent_namespace_when_resolved() -> None:
-    """When PARENT_LABEL resolves to an existing class in the geography
-    namespace, the new class's IRI lands in the geography namespace too
-    (not in default_base_iri)."""
+def test_add_classes_places_landform_in_parent_namespace_when_resolved() -> None:
+    """When PARENT_LABEL resolves to a geography class AND the new class
+    carries a landform-keyword signal, the new IRI lands in the geography
+    namespace under that parent. (Use 'Bering Strait' under 'Strait' --
+    'strait' is in landform vocabulary so the safety guard allows it.)
+
+    Note: a class like 'Washington' under 'Country' would now NOT land
+    in geography ns -- the guard rejects geographic parents for class
+    labels with no landform signal. That's by design to prevent the
+    cascade described in the prior session. Layer G concept_grouping
+    handles non-landform place names downstream."""
     from backend.app.helpers.ontology_pruning import add_new_classes_from_match_not_found
 
     classes = dict([
-        _geo_class("GeographicEntity"),
-        _geo_class("Country", "GeographicEntity"),
+        _geo_class("Strait"),
     ])
     ontology = {
         "classes_dict": classes,
@@ -464,8 +470,8 @@ def test_add_classes_places_in_parent_namespace_when_resolved() -> None:
     }
     results = {
         "MATCH NOT FOUND": [
-            {"LABEL": "Washington", "DESCRIPTION": "US capital.",
-             "PARENT_LABEL": "Country"},
+            {"LABEL": "Bering Strait", "DESCRIPTION": "Strait between Russia and Alaska.",
+             "PARENT_LABEL": "Strait"},
         ]
     }
     extended, created = add_new_classes_from_match_not_found(
@@ -474,14 +480,14 @@ def test_add_classes_places_in_parent_namespace_when_resolved() -> None:
         default_parent_iri="http://www.w3.org/2002/07/owl#Thing",
     )
     assert len(created) == 1
-    washington_iri = created[0]
-    # IRI is in the geography namespace, NOT default.
-    assert washington_iri.startswith("https://veerla-ramrao.ai/ontology/geography#")
-    assert "default.example" not in washington_iri
-    # Parent IRI is geography:Country.
-    record = extended["classes_dict"][washington_iri]
+    bering_iri = created[0]
+    # IRI is in the geography namespace.
+    assert bering_iri.startswith("https://veerla-ramrao.ai/ontology/geography#")
+    assert "default.example" not in bering_iri
+    # Parent IRI is geography:Strait.
+    record = extended["classes_dict"][bering_iri]
     parent_iri = record["superclasses"][0]["iri"]
-    assert parent_iri == "https://veerla-ramrao.ai/ontology/geography#Country"
+    assert parent_iri == "https://veerla-ramrao.ai/ontology/geography#Strait"
 
 
 def test_add_classes_fuzzy_dedups_token_variants() -> None:
@@ -518,21 +524,22 @@ def test_add_classes_fuzzy_dedups_token_variants() -> None:
 
 
 def test_add_classes_fuzzy_dedups_substring_with_same_parent() -> None:
-    """'Washington' (Country parent) and 'Washington DC' (Country parent)
-    => ONE class. But 'Washington' (Country) and 'Washington Bridge'
-    (different parent) => TWO."""
+    """Two proposals with overlapping labels and the SAME (post-guard)
+    parent collapse into one class. Two proposals where the labels
+    overlap but the parents differ (one a landform, one not) do not
+    collapse.
+
+    Note: after the geo-parent safety guard, non-landform labels like
+    'Washington' have their geography-class PARENT_LABEL stripped
+    regardless of what the LLM proposed. Use landform labels ('Bering
+    Strait' / 'Bering Strait Channel') under Strait/Channel here to
+    keep both proposals in the geography namespace and exercise the
+    same-parent dedup path."""
     from backend.app.helpers.ontology_pruning import add_new_classes_from_match_not_found
 
-    bridge_iri = "https://veerla-ramrao.ai/ontology/geography#Bridge"
     classes = dict([
-        _geo_class("Country"),
-        (bridge_iri, {
-            "iri": bridge_iri,
-            "name": "Bridge",
-            "labels": ["Bridge"],
-            "superclasses": [],
-            "restrictions_and_class_constructs": [],
-        }),
+        _geo_class("Strait"),
+        _geo_class("Bridge"),
     ])
     ontology = {
         "classes_dict": classes,
@@ -540,11 +547,13 @@ def test_add_classes_fuzzy_dedups_substring_with_same_parent() -> None:
         "data_properties_dict": {},
         "instances_dict": {},
     }
-    # Same-parent case (both Country) -- expect ONE class.
+    # Same-parent case: both proposals share landform-keyword + Strait parent.
     results_same_parent = {
         "MATCH NOT FOUND": [
-            {"LABEL": "Washington", "DESCRIPTION": "", "PARENT_LABEL": "Country"},
-            {"LABEL": "Washington DC", "DESCRIPTION": "", "PARENT_LABEL": "Country"},
+            {"LABEL": "Bering Strait", "DESCRIPTION": "",
+             "PARENT_LABEL": "Strait"},
+            {"LABEL": "Bering Strait NW", "DESCRIPTION": "",
+             "PARENT_LABEL": "Strait"},
         ]
     }
     _, created = add_new_classes_from_match_not_found(
@@ -554,11 +563,14 @@ def test_add_classes_fuzzy_dedups_substring_with_same_parent() -> None:
     )
     assert len(created) == 1
 
-    # Different-parent case -- expect TWO classes (no conflation).
+    # Different-parent case: one strait, one bridge -- expect TWO classes
+    # because the resolved parents differ.
     results_diff_parent = {
         "MATCH NOT FOUND": [
-            {"LABEL": "Washington", "DESCRIPTION": "", "PARENT_LABEL": "Country"},
-            {"LABEL": "Washington Bridge", "DESCRIPTION": "", "PARENT_LABEL": "Bridge"},
+            {"LABEL": "Bering Strait", "DESCRIPTION": "",
+             "PARENT_LABEL": "Strait"},
+            {"LABEL": "Bering Strait Bridge", "DESCRIPTION": "",
+             "PARENT_LABEL": "Bridge"},
         ]
     }
     _, created_diff = add_new_classes_from_match_not_found(
@@ -607,11 +619,17 @@ def test_add_relations_auto_mints_unresolved_endpoints() -> None:
         assert ann.get("auto_created_from_relation") == ["targets"]
 
 
-def test_add_relations_auto_mint_inherits_parent_from_other_endpoint() -> None:
-    """When DOMAIN resolves to a class with a non-Thing parent, an
-    unresolved RANGE auto-mints UNDER the same parent and into the same
-    namespace. So 'Washington' next to a `Kharg Island` parented at
-    `GeographicEntity` lands in geography namespace too."""
+def test_add_relations_auto_mint_inherits_landform_parent_from_other_endpoint() -> None:
+    """When DOMAIN resolves to a class with a non-Thing parent AND the
+    auto-minted RANGE's label carries a landform-keyword signal, the
+    safety guard allows the inherited geography parent. So 'Bering
+    Strait' (with 'strait' in its label) next to `Kharg Island`
+    parented at `GeographicEntity` lands in geography namespace.
+
+    Without a landform signal in the auto-minted label (e.g.
+    'Washington'), the guard would reject the geography inheritance
+    and drop the new class to default ns + owl:Thing -- that path is
+    covered by `test_geo_parent_guard_in_relation_automint`."""
     from backend.app.helpers.ontology_pruning import add_new_relations_from_match_results
 
     geo_iri, geo_rec = _geo_class("GeographicEntity")
@@ -634,8 +652,8 @@ def test_add_relations_auto_mint_inherits_parent_from_other_endpoint() -> None:
     }
     results = {
         "MATCH NOT FOUND RELATIONS": [
-            {"LABEL": "targets", "DESCRIPTION": "",
-             "DOMAIN": "Washington", "RANGE": "Kharg Island"},
+            {"LABEL": "borders", "DESCRIPTION": "",
+             "DOMAIN": "Bering Strait", "RANGE": "Kharg Island"},
         ]
     }
     extended, _, skipped, auto_minted = add_new_relations_from_match_results(
@@ -646,11 +664,12 @@ def test_add_relations_auto_mint_inherits_parent_from_other_endpoint() -> None:
     )
     assert not skipped
     assert len(auto_minted) == 1
-    washington_iri = auto_minted[0]
-    # Washington lands in geography namespace, NOT default.
-    assert washington_iri.startswith("https://veerla-ramrao.ai/ontology/geography#")
+    bering_iri = auto_minted[0]
+    # Bering Strait carries landform signal, so guard allows the
+    # inherited geography parent. Lands in geography ns.
+    assert bering_iri.startswith("https://veerla-ramrao.ai/ontology/geography#")
     # Parent is GeographicEntity (inherited from Kharg Island).
-    parent = extended["classes_dict"][washington_iri]["superclasses"][0]["iri"]
+    parent = extended["classes_dict"][bering_iri]["superclasses"][0]["iri"]
     assert parent == geo_iri
 
 
@@ -1423,3 +1442,135 @@ def test_apply_concept_grouping_concept_class_carries_audit_annotation() -> None
     assert rec["annotations"]["auto_created_via"] == ["concept_grouping"]
     # Description was carried into the concept class.
     assert "A physical substance." in (rec.get("descriptions") or [])
+
+
+# ============================================================================
+# Geographic-parent safety guard (`_is_safe_geo_parent_for`).
+# Prevents non-geographic classes from cascading into the geography
+# namespace via Stage 2's PARENT_LABEL or Layer D's auto-mint inheritance.
+# ============================================================================
+
+
+def test_geo_parent_guard_filters_non_landform_class() -> None:
+    """LLM proposes a non-geographic class (EV bus) with PARENT_LABEL
+    pointing at a geography class (GeographicEntity). The deterministic
+    guard rejects the parent assignment -- EV bus lands in default ns
+    parented at owl:Thing instead of in the geography ns."""
+    from backend.app.helpers.ontology_pruning import add_new_classes_from_match_not_found
+
+    geo_iri = "https://veerla-ramrao.ai/ontology/geography#GeographicEntity"
+    geo_rec = {
+        "iri": geo_iri, "name": "GeographicEntity",
+        "labels": ["GeographicEntity"], "superclasses": [],
+    }
+    ontology = {
+        "classes_dict": {geo_iri: geo_rec},
+        "object_properties_dict": {},
+        "data_properties_dict": {},
+        "instances_dict": {},
+    }
+    results = {
+        "MATCH NOT FOUND": [
+            {"LABEL": "EV bus", "DESCRIPTION": "An electric bus.",
+             "PARENT_LABEL": "GeographicEntity"},
+        ]
+    }
+    extended, created = add_new_classes_from_match_not_found(
+        ontology, results,
+        new_class_base_iri="http://default.example/ontology/",
+        default_parent_iri=OWL_THING,
+    )
+    assert len(created) == 1
+    ev_bus_iri = created[0]
+    # IRI is in DEFAULT namespace -- guard rejected the geography parent.
+    assert ev_bus_iri.startswith("http://default.example/ontology/")
+    assert "geography" not in ev_bus_iri.lower()
+    # Parent is owl:Thing, not GeographicEntity.
+    rec = extended["classes_dict"][ev_bus_iri]
+    parent = rec["superclasses"][0]["iri"]
+    assert parent == OWL_THING
+
+
+def test_geo_parent_guard_allows_landform_class_under_geo_parent() -> None:
+    """LLM proposes a landform class (Bering Strait) with parent Strait.
+    Both the class label AND the parent's local name contain the landform
+    keyword 'strait', so the guard ALLOWS the parent -- Bering Strait
+    lands in the geography ns under Strait."""
+    from backend.app.helpers.ontology_pruning import add_new_classes_from_match_not_found
+
+    strait_iri = "https://veerla-ramrao.ai/ontology/geography#Strait"
+    strait_rec = {
+        "iri": strait_iri, "name": "Strait",
+        "labels": ["Strait"], "superclasses": [],
+    }
+    ontology = {
+        "classes_dict": {strait_iri: strait_rec},
+        "object_properties_dict": {},
+        "data_properties_dict": {},
+        "instances_dict": {},
+    }
+    results = {
+        "MATCH NOT FOUND": [
+            {"LABEL": "Bering Strait", "DESCRIPTION": "A strait between Russia and Alaska.",
+             "PARENT_LABEL": "Strait"},
+        ]
+    }
+    extended, created = add_new_classes_from_match_not_found(
+        ontology, results,
+        new_class_base_iri="http://default.example/ontology/",
+        default_parent_iri=OWL_THING,
+    )
+    assert len(created) == 1
+    bering_iri = created[0]
+    # Lands in geography namespace.
+    assert bering_iri.startswith("https://veerla-ramrao.ai/ontology/geography#")
+    # Parent is Strait.
+    parent = extended["classes_dict"][bering_iri]["superclasses"][0]["iri"]
+    assert parent == strait_iri
+
+
+def test_geo_parent_guard_in_relation_automint() -> None:
+    """Relation 'Subsidy receivedBy Iran' where Iran is in geography ns
+    with parent Country (also in geography ns). Layer D would normally
+    auto-mint Subsidy inheriting Iran's parent -- Subsidy would cascade
+    into geography. The guard rejects that inheritance; Subsidy lands at
+    owl:Thing in the default namespace."""
+    from backend.app.helpers.ontology_pruning import add_new_relations_from_match_results
+
+    country_iri = "https://veerla-ramrao.ai/ontology/geography#Country"
+    country_rec = {
+        "iri": country_iri, "name": "Country",
+        "labels": ["Country"], "superclasses": [],
+    }
+    iran_iri = "https://veerla-ramrao.ai/ontology/geography#Iran"
+    iran_rec = {
+        "iri": iran_iri, "name": "Iran", "labels": ["Iran"],
+        "superclasses": [{"kind": "entity", "iri": country_iri}],
+    }
+    ontology = {
+        "classes_dict": {country_iri: country_rec, iran_iri: iran_rec},
+        "object_properties_dict": {},
+        "data_properties_dict": {},
+        "instances_dict": {},
+    }
+    results = {
+        "MATCH NOT FOUND RELATIONS": [
+            {"LABEL": "received_by", "DESCRIPTION": "Iran receives subsidies.",
+             "DOMAIN": "Subsidy", "RANGE": "Iran"},
+        ]
+    }
+    extended, _, _, auto_minted = add_new_relations_from_match_results(
+        ontology, results,
+        new_property_base_iri="http://default.example/ontology/",
+        new_class_base_iri="http://default.example/ontology/",
+        default_parent_iri=OWL_THING,
+    )
+    # Subsidy was auto-minted.
+    assert len(auto_minted) == 1
+    subsidy_iri = auto_minted[0]
+    # CRITICAL: it landed in DEFAULT ns, NOT geography.
+    assert subsidy_iri.startswith("http://default.example/ontology/")
+    assert "geography" not in subsidy_iri.lower()
+    # Parent is owl:Thing (the guard rejected Country inheritance).
+    parent = extended["classes_dict"][subsidy_iri]["superclasses"][0]["iri"]
+    assert parent == OWL_THING
