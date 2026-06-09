@@ -46,6 +46,12 @@ chunking:
   # the 128K context limit; raise if you want fewer sub-chunks per doc
   # (slightly more compression risk).
   oversize_doc_sub_chunk_tokens: 80000
+  # Number of documents loaded into memory per batch during the
+  # streaming summarize -> chunk pass. 16 keeps peak memory low on tight
+  # RAM budgets (~50 MB on a 2.7 GiB box); raise on machines with more
+  # RAM for slightly faster runs. Set to 0 to fall back to "load
+  # everything at once" (legacy behavior; will OOM on large corpora).
+  streaming_batch_size: 16
   # tiktoken encoding name. o200k_base matches GPT-4o family + recent embedding models.
   encoding: o200k_base
 

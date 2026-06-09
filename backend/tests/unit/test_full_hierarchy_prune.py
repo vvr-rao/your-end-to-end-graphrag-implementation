@@ -2489,3 +2489,153 @@ def test_layer_h_apply_convert_to_instance_moves_to_instances_dict() -> None:
     assert "http://x/putin" in instances
     inst = instances["http://x/putin"]
     assert inst["types"][0]["iri"] == "http://x/person_bucket"
+
+
+# ============================================================================
+# Streaming load+summarize+chunk: memory-bounded pipeline path.
+# ============================================================================
+
+
+def test_stream_summarize_and_chunk_processes_in_batches(monkeypatch, tmp_path) -> None:
+    """50 short docs with batch_size=10 -> the summarizer is called
+    5 times (once per batch). Each batch is independent and the chunks
+    accumulate."""
+    import asyncio
+    from backend.app.services import pipeline_llm
+    from backend.app.services.pipeline_llm import stream_summarize_and_chunk_async
+
+    # Redirect cache to per-test dir so we don't pollute the user cache.
+    monkeypatch.setattr(pipeline_llm, "_doc_summary_cache_dir", lambda: tmp_path)
+
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    # 50 short docs, each ~3000 tokens (> 2000 threshold), so each triggers
+    # a summarization call.
+    for i in range(50):
+        (docs_dir / f"doc_{i:03d}.txt").write_text(
+            "word " * 3000, encoding="utf-8"
+        )
+
+    call_counts = {"summarize": 0, "chat": 0}
+
+    # Patch summarize_long_documents_async to count invocations and
+    # return docs unchanged (so chunking still works).
+    real_summarize = pipeline_llm.summarize_long_documents_async
+
+    async def counting_summarize(*args, **kwargs):
+        call_counts["summarize"] += 1
+        # Don't actually call the LLM. Just return the docs unchanged.
+        return list(kwargs.get("documents") or args[0])
+
+    monkeypatch.setattr(pipeline_llm, "summarize_long_documents_async", counting_summarize)
+
+    class _NoChat:
+        total_cost_usd = 0.0
+
+        async def chat(self, *_args, **_kwargs):
+            raise AssertionError("LLM must not be called via the chat() path here")
+
+    chunks = asyncio.run(stream_summarize_and_chunk_async(
+        documents_dir=docs_dir,
+        router=_NoChat(),
+        chunk_size=2000,
+        chunk_overlap=150,
+        encoding_name="o200k_base",
+        threshold_tokens=2000,
+        max_doc_input_tokens=100_000,
+        oversize_doc_sub_chunk_tokens=80_000,
+        use_cache=False,
+        concurrency=2,
+        batch_size=10,
+    ))
+
+    # 50 docs / batch_size=10 = 5 batches => summarize called 5 times.
+    assert call_counts["summarize"] == 5
+    # Chunks accumulated across all batches; each ~3000-token doc -> 2
+    # chunks at chunk_size=2000 overlap=150 -> ~100 chunks total.
+    assert len(chunks) >= 50
+
+
+def test_stream_summarize_and_chunk_preserves_doc_order(monkeypatch, tmp_path) -> None:
+    """Chunks come out in source-doc filename order (sorted by
+    iter_documents)."""
+    import asyncio
+    from backend.app.services import pipeline_llm
+    from backend.app.services.pipeline_llm import stream_summarize_and_chunk_async
+
+    monkeypatch.setattr(pipeline_llm, "_doc_summary_cache_dir", lambda: tmp_path)
+
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    # Write under-threshold docs so no LLM call is needed and we can
+    # verify chunk source order purely.
+    for i in range(20):
+        (docs_dir / f"doc_{i:02d}.txt").write_text(
+            f"Doc {i:02d}: a small chunk of content. ",
+            encoding="utf-8",
+        )
+
+    class _NoChat:
+        total_cost_usd = 0.0
+
+        async def chat(self, *_args, **_kwargs):
+            raise AssertionError("LLM must not be called for under-threshold docs")
+
+    chunks = asyncio.run(stream_summarize_and_chunk_async(
+        documents_dir=docs_dir,
+        router=_NoChat(),
+        chunk_size=2000,
+        chunk_overlap=150,
+        encoding_name="o200k_base",
+        threshold_tokens=2000,
+        max_doc_input_tokens=100_000,
+        oversize_doc_sub_chunk_tokens=80_000,
+        use_cache=False,
+        concurrency=1,
+        batch_size=5,  # 4 batches
+    ))
+
+    # Each under-threshold doc -> 1 chunk. Source order preserved.
+    sources = [c.source_name for c in chunks]
+    expected = [f"doc_{i:02d}.txt" for i in range(20)]
+    assert sources == expected
+
+
+def test_stream_summarize_and_chunk_falls_back_to_load_all_when_batch_size_zero(
+    monkeypatch, tmp_path,
+) -> None:
+    """batch_size=0 is the legacy 'load everything at once' path.
+    Useful for tests + small-corpus runs on machines with plenty of RAM."""
+    import asyncio
+    from backend.app.services import pipeline_llm
+    from backend.app.services.pipeline_llm import stream_summarize_and_chunk_async
+
+    monkeypatch.setattr(pipeline_llm, "_doc_summary_cache_dir", lambda: tmp_path)
+
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    for i in range(8):
+        (docs_dir / f"doc_{i}.txt").write_text(
+            f"Short doc {i}. ", encoding="utf-8"
+        )
+
+    class _NoChat:
+        total_cost_usd = 0.0
+
+        async def chat(self, *_args, **_kwargs):
+            raise AssertionError("no LLM expected for tiny docs")
+
+    chunks = asyncio.run(stream_summarize_and_chunk_async(
+        documents_dir=docs_dir,
+        router=_NoChat(),
+        chunk_size=2000,
+        chunk_overlap=150,
+        encoding_name="o200k_base",
+        threshold_tokens=2000,
+        max_doc_input_tokens=100_000,
+        oversize_doc_sub_chunk_tokens=80_000,
+        use_cache=False,
+        concurrency=1,
+        batch_size=0,  # legacy "all-at-once"
+    ))
+    assert len(chunks) == 8

@@ -43,6 +43,7 @@ from backend.app.services import (
     document_io,
     folder_io,
     ontology_export,
+    ontology_io,
     versioning,
 )
 from backend.app.services.chunking import TextChunk, chunk_documents
@@ -1226,6 +1227,132 @@ async def summarize_long_documents_async(
     return out
 
 
+# ---------- Streaming load+summarize+chunk (memory-bounded) ----------
+
+
+async def stream_summarize_and_chunk_async(
+    *,
+    documents_dir: Path,
+    router: LLMRouter,
+    chunk_size: int = 2000,
+    chunk_overlap: int = 150,
+    encoding_name: str = "o200k_base",
+    threshold_tokens: int = 2000,
+    max_doc_input_tokens: int = 100_000,
+    oversize_doc_sub_chunk_tokens: int = 80_000,
+    use_cache: bool = True,
+    concurrency: int = 4,
+    batch_size: int = 16,
+) -> list[TextChunk]:
+    """Walk `documents_dir` in fixed-size batches, summarize each batch
+    via `summarize_long_documents_async`, chunk the (possibly
+    summarized) text, and return the accumulated chunks.
+
+    Memory bound: at any moment, only `batch_size` raw doc texts are
+    held in memory. Once a batch is chunked, its LoadedDocuments are
+    released. The returned chunk list is the only persistent state --
+    typically ~10 MB even for a 22M-token corpus because summarization
+    compresses 95% of the volume away.
+
+    Replaces the load-everything-at-once pattern that OOM'd the
+    pipeline on the 348-doc / 22M-token corpus:
+
+        docs = list(document_io.load_documents(...))   # ALL IN MEMORY
+        docs = await summarize_long_documents_async(...)
+        chunks = list(chunk_documents(docs, ...))
+
+    Set `batch_size=0` to fall back to that legacy "load all at once"
+    behaviour (useful for tests or environments with plenty of RAM).
+    """
+    paths = list(ontology_io.iter_documents(documents_dir))
+    if not paths:
+        raise RuntimeError(f"No PDF/TXT documents found in {documents_dir}")
+
+    if batch_size <= 0:
+        # Legacy path: load everything, summarize, chunk in one shot.
+        docs = [document_io.load_document(p) for p in paths]
+        # Filter out empty docs (read failures, scanned PDFs).
+        docs = [d for d in docs if d.text.strip()]
+        if threshold_tokens > 0:
+            docs = await summarize_long_documents_async(
+                documents=docs,
+                router=router,
+                threshold_tokens=threshold_tokens,
+                encoding_name=encoding_name,
+                concurrency=concurrency,
+                use_cache=use_cache,
+                max_doc_input_tokens=max_doc_input_tokens,
+                oversize_doc_sub_chunk_tokens=oversize_doc_sub_chunk_tokens,
+            )
+        chunks = list(chunk_documents(
+            docs,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            encoding_name=encoding_name,
+        ))
+        return chunks
+
+    print(
+        f"[stream-loader] streaming {len(paths)} doc(s) in batches of "
+        f"{batch_size} (peak in-memory docs <= batch_size)"
+    )
+
+    all_chunks: list[TextChunk] = []
+    total_batches = (len(paths) + batch_size - 1) // batch_size
+
+    for batch_idx in range(total_batches):
+        start = batch_idx * batch_size
+        batch_paths = paths[start : start + batch_size]
+
+        # Load this batch.
+        batch_docs: list[LoadedDocument] = []
+        for p in batch_paths:
+            try:
+                doc = document_io.load_document(p)
+            except Exception as exc:
+                print(f"[stream-loader] skipping {p.name}: {exc}")
+                continue
+            if doc.text.strip():
+                batch_docs.append(doc)
+
+        if not batch_docs:
+            continue
+
+        # Summarize this batch (cache reads + writes go through the
+        # existing helper; oversize docs go through hierarchical path).
+        if threshold_tokens > 0:
+            batch_docs = await summarize_long_documents_async(
+                documents=batch_docs,
+                router=router,
+                threshold_tokens=threshold_tokens,
+                encoding_name=encoding_name,
+                concurrency=concurrency,
+                use_cache=use_cache,
+                max_doc_input_tokens=max_doc_input_tokens,
+                oversize_doc_sub_chunk_tokens=oversize_doc_sub_chunk_tokens,
+            )
+
+        # Chunk this batch and append to the master list. Generator is
+        # consumed eagerly here so the LoadedDocument refs can be freed
+        # right after the loop.
+        for chunk in chunk_documents(
+            batch_docs,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            encoding_name=encoding_name,
+        ):
+            all_chunks.append(chunk)
+
+        # Drop refs to this batch's docs so the GC can release the text.
+        del batch_docs
+        print(
+            f"[stream-loader] batch {batch_idx + 1}/{total_batches} done; "
+            f"chunks so far: {len(all_chunks)}"
+        )
+
+    return all_chunks
+
+
 # ---------- Stage 4: deterministic prune / extend ----------
 
 
@@ -1388,34 +1515,29 @@ async def _run_llm_stages(
     chunk_overlap = int(chunking_cfg.get("chunk_overlap", 120))
     encoding = chunking_cfg.get("encoding", "o200k_base")
 
-    docs = list(document_io.load_documents(documents_dir))
-    print(f"[llm] loaded {len(docs)} document(s)")
-    if not docs:
-        raise RuntimeError(f"No PDF/TXT documents found in {documents_dir}")
-
-    # Optional pre-pipeline: documents above the configured token threshold
-    # get rewritten via gpt-4o-mini into a denser entity-preserving summary
-    # before chunking. Cuts Stage 2 chunk count + cost dramatically on
-    # corpora dominated by a few large documents. Set to 0 to disable.
+    # Memory-bounded load-summarize-chunk: paths are walked in batches
+    # of `streaming_batch_size`, so peak memory stays low even for
+    # large corpora (the previous "list(load_documents(...))" pattern
+    # OOM'd at 22M-token / 348-doc scale on a 2.7 GiB box).
     expansion_cfg_for_concur = app_cfg.get("expansion", {}) or {}
     threshold_tokens = int(chunking_cfg.get("summarization_threshold_tokens", 0))
     use_cache = bool(chunking_cfg.get("use_summary_cache", True))
     max_doc_input_tokens = int(chunking_cfg.get("max_doc_input_tokens", 100_000))
     oversize_sub_chunk = int(chunking_cfg.get("oversize_doc_sub_chunk_tokens", 80_000))
-    if threshold_tokens > 0:
-        docs = await summarize_long_documents_async(
-            documents=docs,
-            router=router,
-            threshold_tokens=threshold_tokens,
-            encoding_name=encoding,
-            concurrency=int(expansion_cfg_for_concur.get("max_concurrent_llm_calls", 4)),
-            use_cache=use_cache,
-            max_doc_input_tokens=max_doc_input_tokens,
-            oversize_doc_sub_chunk_tokens=oversize_sub_chunk,
-        )
+    streaming_batch_size = int(chunking_cfg.get("streaming_batch_size", 16))
 
-    chunks = list(
-        chunk_documents(docs, chunk_size=chunk_size, chunk_overlap=chunk_overlap, encoding_name=encoding)
+    chunks = await stream_summarize_and_chunk_async(
+        documents_dir=documents_dir,
+        router=router,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        encoding_name=encoding,
+        threshold_tokens=threshold_tokens,
+        max_doc_input_tokens=max_doc_input_tokens,
+        oversize_doc_sub_chunk_tokens=oversize_sub_chunk,
+        use_cache=use_cache,
+        concurrency=int(expansion_cfg_for_concur.get("max_concurrent_llm_calls", 4)),
+        batch_size=streaming_batch_size,
     )
     print(f"[llm] produced {len(chunks)} chunk(s)")
     if not chunks:
