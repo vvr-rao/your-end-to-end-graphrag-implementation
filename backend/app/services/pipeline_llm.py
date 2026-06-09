@@ -533,6 +533,84 @@ def _doc_summary_cache_save(path: Path, text: str) -> None:
             pass
 
 
+def _split_text_into_sub_chunks(
+    text: str, max_tokens: int, encoder
+) -> list[str]:
+    """Split `text` into sub-chunks each within `max_tokens` (no overlap).
+    Used only for hierarchical summarization of oversize documents."""
+    tokens = encoder.encode(text)
+    if len(tokens) <= max_tokens:
+        return [text]
+    sub_chunks: list[str] = []
+    for start in range(0, len(tokens), max_tokens):
+        piece = tokens[start : start + max_tokens]
+        sub_chunks.append(encoder.decode(piece))
+    return sub_chunks
+
+
+async def _summarize_oversize_doc_async(
+    *,
+    doc: LoadedDocument,
+    router: LLMRouter,
+    sub_chunk_tokens: int,
+    encoder,
+    sem: asyncio.Semaphore,
+) -> str | None:
+    """Hierarchical summarization for a single oversize document.
+
+    Splits the doc text into sub-chunks of `sub_chunk_tokens` tokens,
+    fires gpt-4o-mini against each sub-chunk via the existing
+    document_summarize prompt (in parallel, gated by the shared
+    semaphore), then concatenates the per-sub-chunk summaries with
+    blank-line separators.
+
+    Returns the combined summary text, or None if EVERY sub-chunk
+    failed (caller should keep the doc as empty / unchanged).
+    """
+    sub_texts = _split_text_into_sub_chunks(doc.text, sub_chunk_tokens, encoder)
+    n = len(sub_texts)
+    print(
+        f"[summarize-docs] {doc.name}: splitting into {n} sub-chunk(s) "
+        f"of <={sub_chunk_tokens:,} tokens for hierarchical summarization"
+    )
+
+    results: list[str | None] = [None] * n
+
+    async def _one_sub(i: int, sub_text: str) -> None:
+        async with sem:
+            system, user = PROMPTS["document_summarize"](sub_text)
+            try:
+                result = await router.chat("document_summarize", system=system, user=user)
+            except Exception as exc:
+                print(
+                    f"[summarize-docs] {doc.name}: sub-chunk {i+1}/{n} "
+                    f"LLM failed: {exc} -- omitting from combined summary"
+                )
+                return
+            piece = (result.text or "").strip()
+            if not piece:
+                print(
+                    f"[summarize-docs] {doc.name}: sub-chunk {i+1}/{n} "
+                    f"empty response -- omitting from combined summary"
+                )
+                return
+            results[i] = piece
+
+    await asyncio.gather(*[_one_sub(i, t) for i, t in enumerate(sub_texts)])
+
+    parts = [r for r in results if r]
+    if not parts:
+        return None
+    combined = "\n\n".join(parts)
+    succeeded = len(parts)
+    if succeeded < n:
+        print(
+            f"[summarize-docs] {doc.name}: {succeeded}/{n} sub-chunks "
+            f"succeeded; using partial combined summary"
+        )
+    return combined
+
+
 async def summarize_long_documents_async(
     documents: list[LoadedDocument],
     router: LLMRouter,
@@ -542,6 +620,7 @@ async def summarize_long_documents_async(
     model_name: str = "gpt-4o-mini",
     use_cache: bool = True,
     max_doc_input_tokens: int = 100_000,
+    oversize_doc_sub_chunk_tokens: int = 80_000,
 ) -> list[LoadedDocument]:
     """Optional pre-pipeline pass that rewrites long source documents
     into denser entity-preserving summaries before chunking.
@@ -549,28 +628,31 @@ async def summarize_long_documents_async(
     For each document:
       - Count tokens via tiktoken.
       - If token count <= threshold: passed through unchanged.
-      - If token count > max_doc_input_tokens: DROPPED (text replaced
-        with empty string so the chunker emits zero chunks for it).
-        Documents this large can't fit in gpt-4o-mini's 128K context,
-        and passing them through unchanged would explode Stage 2 cost
-        by hundreds of dollars. Default ceiling 100K tokens leaves
-        headroom for the prompt template.
-      - If threshold < token count <= max_doc_input_tokens AND
-        `use_cache` is True:
-          - Compute SHA-256 cache key over (doc text + model + prompt version).
-          - If cache hit: load the summary from disk, no LLM call.
-          - If cache miss: call gpt-4o-mini, write result to cache.
-      - If `use_cache` is False: always call the LLM.
+      - If threshold < token count <= max_doc_input_tokens: ONE LLM call
+        to gpt-4o-mini with the document_summarize prompt.
+      - If token count > max_doc_input_tokens: HIERARCHICAL
+        summarization -- the doc is split into sub-chunks of
+        `oversize_doc_sub_chunk_tokens` tokens each, every sub-chunk is
+        summarized independently via gpt-4o-mini, and the per-sub-chunk
+        summaries are concatenated (blank-line separated) into the
+        final combined summary. The combined summary is stored as the
+        doc's new text and cached under the original doc's hash key.
+
+    `use_cache` (default True) reads/writes the summary at
+    ~/.cache/your-personal-knowledge-graph-creator/doc_summaries/. Cache
+    key hashes (doc text + model + prompt version), so editing a doc or
+    changing the model invalidates that entry automatically. The cache
+    works the same for hierarchical summaries -- the COMBINED summary
+    is stored under the original doc's hash.
 
     Returns a NEW list of LoadedDocument (the input list is not mutated).
 
-    Failure mode is purely additive: if a summarization call raises or
-    returns empty text, the original document is preserved. The pipeline
-    must NEVER fail because of this step -- it's an opt-in optimization.
+    Failure modes are purely additive:
+      - Single-call doc, LLM raises / returns empty -> original text kept.
+      - Hierarchical doc, SOME sub-chunks fail -> partial combined summary used.
+      - Hierarchical doc, ALL sub-chunks fail -> empty text (chunker emits zero chunks).
 
-    Cache lives at ~/.cache/your-personal-knowledge-graph-creator/doc_summaries/.
-    Editing a doc invalidates its cache entry (different hash). Stale entries
-    accumulate; users can clear with `rm -rf` on the cache dir.
+    The pipeline must NEVER fail because of this step.
 
     Triggered by `chunking.summarization_threshold_tokens` in
     config.yaml. Set the config value to 0 to disable.
@@ -583,53 +665,29 @@ async def summarize_long_documents_async(
     enc = tiktoken.get_encoding(encoding_name)
     cache_dir = _doc_summary_cache_dir() if use_cache else None
 
-    # First, drop any document whose token count exceeds the input
-    # ceiling. These can't fit in gpt-4o-mini's 128K context, would
-    # fail summarization (caught + falls back to original), then the
-    # raw text would flow into the chunker and produce HUNDREDS of
-    # Stage 2 calls per oversize doc -- costing tens to hundreds of
-    # dollars. Hard drop = empty text -> zero chunks -> pipeline
-    # ignores the doc cleanly.
+    # Identify which documents need summarization (over threshold) and
+    # which need the hierarchical path (also over max_doc_input_tokens).
     out: list[LoadedDocument] = list(documents)
-    oversize_count = 0
-    plan: list[tuple[int, int]] = []  # (doc_index, token_count) for over-threshold-AND-under-ceiling docs
+    plan: list[tuple[int, int, bool]] = []  # (idx, tokens, needs_hierarchical)
     for i, doc in enumerate(documents):
         tok = len(enc.encode(doc.text))
-        if tok > max_doc_input_tokens:
-            print(
-                f"[summarize-docs] {doc.name}: {tok:,} tokens exceeds "
-                f"{max_doc_input_tokens:,}-token ceiling -- DROPPING "
-                f"(too big for gpt-4o-mini context; would explode Stage 2 "
-                f"if passed through unchanged). Split this file manually "
-                f"if you need its content."
-            )
-            out[i] = LoadedDocument(path=doc.path, text="")
-            oversize_count += 1
-            continue
         if tok > threshold_tokens:
-            plan.append((i, tok))
-
-    if oversize_count:
-        print(
-            f"[summarize-docs] dropped {oversize_count} oversize doc(s) "
-            f"above {max_doc_input_tokens:,} tokens"
-        )
+            needs_hierarchical = tok > max_doc_input_tokens
+            plan.append((i, tok, needs_hierarchical))
 
     if not plan:
         print(
-            f"[summarize-docs] all {len(documents) - oversize_count} "
-            f"remaining doc(s) under threshold; skipping summarization"
+            f"[summarize-docs] all {len(documents)} doc(s) under threshold; "
+            f"skipping summarization"
         )
         return out
 
     # First pass: cache lookups (fast, no LLM, no concurrency needed).
-    # Note: `out` was initialized earlier (above) with oversize docs
-    # already replaced by empty-text. Don't overwrite that here.
     cache_hits = 0
-    needs_llm: list[tuple[int, int]] = []
+    needs_llm: list[tuple[int, int, bool]] = []
 
     if cache_dir is not None:
-        for idx, original_tokens in plan:
+        for idx, original_tokens, needs_hier in plan:
             doc = documents[idx]
             key = _doc_summary_cache_key(doc.text, model_name)
             cached = _doc_summary_cache_load(_doc_summary_cache_path(cache_dir, key))
@@ -637,15 +695,17 @@ async def summarize_long_documents_async(
                 out[idx] = LoadedDocument(path=doc.path, text=cached)
                 cache_hits += 1
             else:
-                needs_llm.append((idx, original_tokens))
+                needs_llm.append((idx, original_tokens, needs_hier))
     else:
         needs_llm = list(plan)
 
+    oversize_needs_llm = sum(1 for _, _, h in needs_llm if h)
     print(
         f"[summarize-docs] {len(plan)}/{len(documents)} doc(s) over "
         f"threshold ({threshold_tokens} tokens): "
         f"{cache_hits} cache hit(s), {len(needs_llm)} cache miss(es) "
-        f"to summarize via gpt-4o-mini at concurrency={concurrency}"
+        f"({oversize_needs_llm} require hierarchical summarization) "
+        f"via gpt-4o-mini at concurrency={concurrency}"
     )
 
     if not needs_llm:
@@ -655,9 +715,41 @@ async def summarize_long_documents_async(
     sem = asyncio.Semaphore(concurrency)
     cost_before = router.total_cost_usd
 
-    async def _one(idx: int, original_tokens: int) -> None:
+    async def _one(idx: int, original_tokens: int, needs_hier: bool) -> None:
+        doc = documents[idx]
+        if needs_hier:
+            # Hierarchical path: sub-chunk + summarize each + concatenate.
+            # NOTE: gating happens inside _summarize_oversize_doc_async on
+            # each sub-chunk, NOT at the outer level -- otherwise this
+            # single doc would monopolize the semaphore.
+            combined = await _summarize_oversize_doc_async(
+                doc=doc,
+                router=router,
+                sub_chunk_tokens=oversize_doc_sub_chunk_tokens,
+                encoder=enc,
+                sem=sem,
+            )
+            if combined is None:
+                print(
+                    f"[summarize-docs] {doc.name}: all sub-chunks failed -- "
+                    f"keeping doc as empty text"
+                )
+                out[idx] = LoadedDocument(path=doc.path, text="")
+                return
+            new_tokens = len(enc.encode(combined))
+            print(
+                f"[summarize-docs] {doc.name}: hierarchical "
+                f"{original_tokens:,} -> {new_tokens:,} tokens "
+                f"({100 * new_tokens / original_tokens:.1f}%)"
+            )
+            out[idx] = LoadedDocument(path=doc.path, text=combined)
+            if cache_dir is not None:
+                key = _doc_summary_cache_key(doc.text, model_name)
+                _doc_summary_cache_save(_doc_summary_cache_path(cache_dir, key), combined)
+            return
+
+        # Standard single-call path.
         async with sem:
-            doc = documents[idx]
             system, user = PROMPTS["document_summarize"](doc.text)
             try:
                 result = await router.chat("document_summarize", system=system, user=user)
@@ -681,13 +773,11 @@ async def summarize_long_documents_async(
                 f"({100 * new_tokens / original_tokens:.0f}%)"
             )
             out[idx] = LoadedDocument(path=doc.path, text=text)
-
-            # Persist to cache for future runs (atomic write).
             if cache_dir is not None:
                 key = _doc_summary_cache_key(doc.text, model_name)
                 _doc_summary_cache_save(_doc_summary_cache_path(cache_dir, key), text)
 
-    await asyncio.gather(*[_one(i, tok) for i, tok in needs_llm])
+    await asyncio.gather(*[_one(i, tok, h) for i, tok, h in needs_llm])
 
     cost_delta = router.total_cost_usd - cost_before
     print(
@@ -873,6 +963,7 @@ async def _run_llm_stages(
     threshold_tokens = int(chunking_cfg.get("summarization_threshold_tokens", 0))
     use_cache = bool(chunking_cfg.get("use_summary_cache", True))
     max_doc_input_tokens = int(chunking_cfg.get("max_doc_input_tokens", 100_000))
+    oversize_sub_chunk = int(chunking_cfg.get("oversize_doc_sub_chunk_tokens", 80_000))
     if threshold_tokens > 0:
         docs = await summarize_long_documents_async(
             documents=docs,
@@ -882,6 +973,7 @@ async def _run_llm_stages(
             concurrency=int(expansion_cfg_for_concur.get("max_concurrent_llm_calls", 4)),
             use_cache=use_cache,
             max_doc_input_tokens=max_doc_input_tokens,
+            oversize_doc_sub_chunk_tokens=oversize_sub_chunk,
         )
 
     chunks = list(

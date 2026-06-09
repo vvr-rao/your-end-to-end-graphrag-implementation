@@ -32,14 +32,20 @@ chunking:
   # against unchanged docs cost nothing for summarization. Set to false
   # to force every run to re-call the LLM (debugging only).
   use_summary_cache: true
-  # Hard ceiling on doc size BEFORE summarization. Docs above this many
-  # tokens get DROPPED (text replaced with empty string -> chunker emits
-  # zero chunks for them). Default 100K = below gpt-4o-mini's 128K input
-  # context window with headroom for the prompt template. Without this
-  # guard, oversize PDFs would fail summarization, fall back to original
-  # text, then explode Stage 2 cost when the chunker emits hundreds of
-  # chunks per oversize doc. Split such files manually if you need them.
+  # Single-call ceiling for summarization. Docs above this many tokens
+  # trigger HIERARCHICAL summarization: the doc is split into sub-chunks
+  # of `oversize_doc_sub_chunk_tokens` each, each sub-chunk is summarized
+  # via gpt-4o-mini independently, and the per-sub-chunk summaries are
+  # concatenated into the final combined summary. Default 100K = below
+  # gpt-4o-mini's 128K context window with headroom for the prompt
+  # template. Docs at/under this size use a single LLM call (cheaper).
   max_doc_input_tokens: 100000
+  # Sub-chunk size used when a doc exceeds max_doc_input_tokens and
+  # falls into the hierarchical-summarization path. Each sub-chunk gets
+  # its own gpt-4o-mini call. 80K keeps each sub-call comfortably under
+  # the 128K context limit; raise if you want fewer sub-chunks per doc
+  # (slightly more compression risk).
+  oversize_doc_sub_chunk_tokens: 80000
   # tiktoken encoding name. o200k_base matches GPT-4o family + recent embedding models.
   encoding: o200k_base
 

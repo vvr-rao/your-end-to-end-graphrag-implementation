@@ -2058,11 +2058,10 @@ def test_doc_summary_cache_disabled_via_use_cache_false(
 # ============================================================================
 
 
-def test_summarize_skips_oversized_docs(monkeypatch, tmp_path) -> None:
-    """A document over the default 100K-token ceiling must be DROPPED:
-    its text in the output is replaced by empty string, and the LLM is
-    never called for it. Other docs in the same batch still process
-    normally."""
+def test_summarize_oversize_doc_uses_hierarchical_path(monkeypatch, tmp_path) -> None:
+    """A document over the 100K-token ceiling is split into sub-chunks
+    and each sub-chunk gets its own LLM call; the per-sub-chunk
+    summaries are concatenated into a combined summary."""
     import asyncio
     from pathlib import Path
     from backend.app.services import pipeline_llm
@@ -2071,9 +2070,9 @@ def test_summarize_skips_oversized_docs(monkeypatch, tmp_path) -> None:
 
     monkeypatch.setattr(pipeline_llm, "_doc_summary_cache_dir", lambda: tmp_path)
 
-    # ~110K tokens by word count -- safely over the 100K default ceiling.
+    # ~110K-ish tokens to force hierarchical (above 100K ceiling).
     oversize_text = "word " * 110_000
-    normal_text = "Long doc but within ceiling. " * 800  # ~5K tokens
+    normal_text = "Long doc within ceiling. " * 800  # ~5K tokens
 
     oversize = LoadedDocument(path=Path("huge.txt"), text=oversize_text)
     normal = LoadedDocument(path=Path("normal.txt"), text=normal_text)
@@ -2090,33 +2089,41 @@ def test_summarize_skips_oversized_docs(monkeypatch, tmp_path) -> None:
         calls: list[str] = []
 
         async def chat(self, task, *, system, user):
-            type(self).calls.append(user[:80])
-            return _FakeResult("Summarized normal doc.")
+            type(self).calls.append(user[:60])
+            return _FakeResult("SUB-SUMMARY.")
 
     out = asyncio.run(
         summarize_long_documents_async(
             documents=[oversize, normal],
             router=_FakeRouter(),
             threshold_tokens=2000,
-            concurrency=1,
+            concurrency=4,
             use_cache=False,
             max_doc_input_tokens=100_000,
+            oversize_doc_sub_chunk_tokens=80_000,
         )
     )
 
-    # Oversize doc: text replaced with empty string.
-    assert out[0].path.name == "huge.txt"
-    assert out[0].text == ""
-    # Normal doc: summarized via LLM.
+    # Normal doc summarized once with the standard single-call path.
     assert out[1].path.name == "normal.txt"
-    assert out[1].text == "Summarized normal doc."
-    # LLM called EXACTLY once -- for the normal doc, not the oversize one.
-    assert len(_FakeRouter.calls) == 1
+    assert out[1].text == "SUB-SUMMARY."
+
+    # Oversize doc has a COMBINED summary (multiple sub-summaries joined).
+    assert out[0].path.name == "huge.txt"
+    assert "SUB-SUMMARY." in out[0].text
+    # 110K tokens / 80K per sub-chunk = at least 2 sub-chunk calls.
+    # Plus 1 call for the normal doc = at least 3 total.
+    assert len(_FakeRouter.calls) >= 3
+    # The combined summary contains the sub-summary token at least
+    # twice (one per sub-chunk of the oversize doc).
+    assert out[0].text.count("SUB-SUMMARY.") >= 2
 
 
-def test_summarize_respects_configurable_ceiling(monkeypatch, tmp_path) -> None:
-    """Lowering max_doc_input_tokens forces a smaller doc to be skipped.
-    Proves the knob is honored, not hardcoded."""
+def test_summarize_oversize_partial_failure_keeps_what_works(
+    monkeypatch, tmp_path,
+) -> None:
+    """If SOME sub-chunks fail, the combined summary contains only the
+    successful ones. The doc is NOT entirely lost."""
     import asyncio
     from pathlib import Path
     from backend.app.services import pipeline_llm
@@ -2125,29 +2132,117 @@ def test_summarize_respects_configurable_ceiling(monkeypatch, tmp_path) -> None:
 
     monkeypatch.setattr(pipeline_llm, "_doc_summary_cache_dir", lambda: tmp_path)
 
-    # ~5K-token doc -- WAY under the default 100K ceiling, but above a
-    # custom 3000-token ceiling we'll pass in.
-    medium_text = "Document content. " * 1000  # ~3K tokens
-    doc = LoadedDocument(path=Path("medium.txt"), text=medium_text)
+    oversize_text = "word " * 200_000  # forces multiple sub-chunks
+    doc = LoadedDocument(path=Path("huge.txt"), text=oversize_text)
 
-    class _ExplodingRouter:
+    class _FakeResult:
+        def __init__(self, text):
+            self.text = text
+            self.prompt_tokens = 100
+            self.completion_tokens = 50
+            self.cost_usd = 0.0001
+
+    class _FlakyRouter:
         total_cost_usd = 0.0
+        call_n = 0
 
-        async def chat(self, *_args, **_kwargs):
-            raise AssertionError("LLM must not be called when doc is over ceiling")
+        async def chat(self, task, *, system, user):
+            type(self).call_n += 1
+            # Fail every odd-numbered call.
+            if type(self).call_n % 2 == 1:
+                raise RuntimeError("simulated transient failure")
+            return _FakeResult(f"OK-SUMMARY-{type(self).call_n}.")
 
     out = asyncio.run(
         summarize_long_documents_async(
             documents=[doc],
-            router=_ExplodingRouter(),
+            router=_FlakyRouter(),
             threshold_tokens=2000,
             concurrency=1,
             use_cache=False,
-            max_doc_input_tokens=2500,  # custom low ceiling
+            max_doc_input_tokens=100_000,
+            oversize_doc_sub_chunk_tokens=80_000,
         )
     )
-    # Doc dropped because it exceeds the custom ceiling.
-    assert out[0].text == ""
+    # The combined text exists (not empty) and contains at least one
+    # successful sub-summary.
+    assert out[0].text != ""
+    assert "OK-SUMMARY-" in out[0].text
+
+
+def test_summarize_oversize_caches_combined_summary(monkeypatch, tmp_path) -> None:
+    """The combined summary from hierarchical summarization is cached
+    under the ORIGINAL doc text's hash key. A re-run hits the cache and
+    fires zero LLM calls."""
+    import asyncio
+    from pathlib import Path
+    from backend.app.services import pipeline_llm
+    from backend.app.services.document_io import LoadedDocument
+    from backend.app.services.pipeline_llm import (
+        summarize_long_documents_async,
+        _doc_summary_cache_key,
+        _doc_summary_cache_path,
+    )
+
+    monkeypatch.setattr(pipeline_llm, "_doc_summary_cache_dir", lambda: tmp_path)
+
+    oversize_text = "word " * 110_000
+    doc = LoadedDocument(path=Path("huge.txt"), text=oversize_text)
+
+    class _FakeResult:
+        def __init__(self, text):
+            self.text = text
+            self.prompt_tokens = 100
+            self.completion_tokens = 50
+            self.cost_usd = 0.0001
+
+    class _CountingRouter:
+        total_cost_usd = 0.0
+        calls = 0
+
+        async def chat(self, task, *, system, user):
+            type(self).calls += 1
+            return _FakeResult("SUB.")
+
+    # First run: cache empty -> sub-chunks summarized -> combined cached.
+    out1 = asyncio.run(
+        summarize_long_documents_async(
+            documents=[doc],
+            router=_CountingRouter(),
+            threshold_tokens=2000,
+            concurrency=2,
+            use_cache=True,
+            max_doc_input_tokens=100_000,
+            oversize_doc_sub_chunk_tokens=80_000,
+        )
+    )
+    first_call_count = _CountingRouter.calls
+    assert first_call_count >= 2  # at least 2 sub-chunks fired
+
+    # Cache file exists under the original doc's hash.
+    key = _doc_summary_cache_key(oversize_text, "gpt-4o-mini")
+    assert _doc_summary_cache_path(tmp_path, key).exists()
+
+    # Second run with a router that explodes if called: cache hit only.
+    class _ExplodingRouter:
+        total_cost_usd = 0.0
+
+        async def chat(self, *_args, **_kwargs):
+            raise AssertionError("LLM must not be called on warm cache")
+
+    out2 = asyncio.run(
+        summarize_long_documents_async(
+            documents=[doc],
+            router=_ExplodingRouter(),
+            threshold_tokens=2000,
+            concurrency=2,
+            use_cache=True,
+            max_doc_input_tokens=100_000,
+            oversize_doc_sub_chunk_tokens=80_000,
+        )
+    )
+    # Same combined summary served from cache.
+    assert out2[0].text == out1[0].text
 
 
 def test_summarize_default_max_doc_input_tokens_is_100k() -> None:
@@ -2163,3 +2258,15 @@ def test_summarize_default_max_doc_input_tokens_is_100k() -> None:
     assert param.default == 100_000, (
         f"default ceiling should be 100K, got {param.default}"
     )
+
+
+def test_summarize_default_oversize_sub_chunk_is_80k() -> None:
+    """Default sub-chunk size for hierarchical path is 80K tokens --
+    leaves comfortable headroom under gpt-4o-mini's 128K input limit."""
+    import inspect
+    from backend.app.services.pipeline_llm import summarize_long_documents_async
+
+    sig = inspect.signature(summarize_long_documents_async)
+    param = sig.parameters.get("oversize_doc_sub_chunk_tokens")
+    assert param is not None
+    assert param.default == 80_000
