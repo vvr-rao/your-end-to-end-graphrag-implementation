@@ -162,6 +162,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_sd.set_defaults(func=_cmd_summarize_descriptions)
 
+    p_audit = sub.add_parser(
+        "audit-classifications",
+        help=(
+            "Layer H repair: scan an existing prune-expand folder for "
+            "newly-created classes that look misclassified (owl:Thing "
+            "parent, corporate-suffix label not under Organization, "
+            "event-keyword label not under Event, person-name label "
+            "as a class, role label not under Role) and ask gpt-4o-mini "
+            "to KEEP / RE_HOME / CONVERT_TO_INSTANCE each. Modifies "
+            "merged.json + merged.owl in place. Cached -- re-runs are "
+            "free."
+        ),
+    )
+    _add_input_folder(p_audit)
+    p_audit.set_defaults(func=_cmd_audit_classifications)
+
     return parser
 
 
@@ -263,6 +279,13 @@ def _cmd_summarize_descriptions(args: argparse.Namespace) -> int:
     print(f"  classes skipped:     {summary['classes_skipped']}")
     print(f"  LLM calls:           {summary['llm_calls']}")
     print(f"  cost:                ${summary['cost_usd']:.4f}")
+    return 0
+
+
+def _cmd_audit_classifications(args: argparse.Namespace) -> int:
+    from backend.app.services.pipeline import run_audit_classifications
+
+    asyncio.run(run_audit_classifications(input_folder=args.input))
     return 0
 
 

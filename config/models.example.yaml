@@ -93,6 +93,19 @@ tasks:
     max_tokens: 4096
 
   # ---------------------------------------------------------------------------
+  # Layer H (classification audit): post-Stage-4 misclassification pass.
+  # Reviews newly-created classes whose current parent is "suspicious" and
+  # returns KEEP / RE_HOME / CONVERT_TO_INSTANCE decisions.
+  # ---------------------------------------------------------------------------
+  classification_audit:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 90
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+
+  # ---------------------------------------------------------------------------
   # Class-level summarization (Phase 2). Cheap, fast, plenty strong.
   # ---------------------------------------------------------------------------
   class_summarization:

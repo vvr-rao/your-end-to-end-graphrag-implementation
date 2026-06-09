@@ -99,6 +99,18 @@ def _convert_ttl_to_rdfxml_bytes(ttl_path: Path) -> bytes:
     up-front lets owlready2 consume the file via its much more robust
     RDF/XML backend.
 
+    We ALSO strip rdfs:subClassOf / owl:equivalentClass triples whose
+    object is a blank node (anonymous owl:Restriction or
+    owl:intersectionOf expressions). owlready2's `_find_base_classes`
+    machinery raises `TypeError: issubclass() arg 1 must be a class`
+    when one of the "base classes" is an anonymous expression. The
+    W3C ORG ontology (`org.ttl`) trips this on every load. Stripping
+    the offending axioms preserves the NAMED class declarations +
+    labels + comments + named parent IRIs (everything downstream Stage
+    2 needs as a slice anchor) while dropping the equivalence /
+    restriction detail. Acceptable trade-off: the LLM doesn't consume
+    OWL axioms anyway.
+
     rdflib.Graph holds onto significant RAM that doesn't release back
     to the OS automatically; on tight memory budgets (the user's 2.7 GiB
     dev box) every MB matters, so we explicitly drop the Graph and
@@ -107,9 +119,65 @@ def _convert_ttl_to_rdfxml_bytes(ttl_path: Path) -> bytes:
     import gc
 
     import rdflib
+    from rdflib import BNode, OWL, RDFS
 
     g = rdflib.Graph()
     g.parse(str(ttl_path), format="turtle")
+
+    # Drop axiom patterns that owlready2's class loader can't model:
+    #   - rdfs:subClassOf / owl:equivalentClass pointing at a blank
+    #     node (anonymous Restriction / intersection / union).
+    #   - owl:equivalentClass pointing at a NAMED class outside this
+    #     file's namespace (owlready2 can't resolve the cross-onto
+    #     reference at load time and fills it with a non-class
+    #     placeholder, then issubclass() blows up).
+    #   - rdfs:domain / rdfs:range pointing at a blank node (anonymous
+    #     union/intersection of class IRIs).
+    #   - owl:hasKey / owl:propertyChainAxiom (collection-based axioms
+    #     that owlready2 sometimes mishandles).
+    # We preserve the NAMED class declarations + labels + comments +
+    # NAMED-class parent IRIs. The downstream Stage 2 LLM only consumes
+    # those fields for its ontology slice anchor.
+    stripped = 0
+    own_ns = None
+    # Try to identify the file's own namespace from owl:Ontology
+    for s in g.subjects(rdflib.RDF.type, OWL.Ontology):
+        own_ns = str(s).rstrip("#/")
+        break
+
+    for s, p, o in list(g.triples((None, RDFS.subClassOf, None))):
+        if isinstance(o, BNode):
+            g.remove((s, p, o))
+            stripped += 1
+    for s, p, o in list(g.triples((None, OWL.equivalentClass, None))):
+        # Drop ALL equivalentClass triples -- blank-node ones break owlready2
+        # outright, and named-class ones pointing to external vocabularies
+        # (e.g. foaf:Organization) also break it because the placeholder
+        # isn't a class.
+        g.remove((s, p, o))
+        stripped += 1
+    for s, p, o in list(g.triples((None, RDFS.domain, None))):
+        if isinstance(o, BNode):
+            g.remove((s, p, o))
+            stripped += 1
+    for s, p, o in list(g.triples((None, RDFS.range, None))):
+        if isinstance(o, BNode):
+            g.remove((s, p, o))
+            stripped += 1
+    for s, p, o in list(g.triples((None, OWL.hasKey, None))):
+        g.remove((s, p, o))
+        stripped += 1
+    for s, p, o in list(g.triples((None, OWL.propertyChainAxiom, None))):
+        g.remove((s, p, o))
+        stripped += 1
+    if stripped:
+        print(
+            f"[ontology_io] {ttl_path.name}: stripped {stripped} "
+            f"owlready2-incompatible axiom(s) "
+            f"(blank-node restrictions / cross-namespace equivalents / "
+            f"hasKey / propertyChainAxiom)"
+        )
+
     out = g.serialize(format="xml", encoding="utf-8")
     del g
     gc.collect()

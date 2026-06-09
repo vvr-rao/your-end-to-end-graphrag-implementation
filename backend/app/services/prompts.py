@@ -150,6 +150,73 @@ def class_identification_and_expansion(
         "if the text discusses them indirectly.\n"
         "Only emit a MATCH NOT FOUND proposal when NO existing class in "
         "DATA_CLASSES plausibly fits the concept.\n\n"
+        "ENTITY-TYPE RULES (critical -- get these right):\n"
+        "  1. NAMED INDIVIDUAL PEOPLE (politicians, executives, public "
+        "figures, researchers, named officials -- e.g. Donald Trump, "
+        "Vladimir Putin, Xi Jinping, Tim Cook): emit as MATCH NOT FOUND "
+        "INSTANCES.\n"
+        "       - TYPE_LABEL = the foaf:Person class IRI if it appears "
+        "in DATA_CLASSES (look for 'http://xmlns.com/foaf/0.1/Person' "
+        "or any class labeled 'Person' / 'Agent'); else use 'Person' as "
+        "the label and let the deterministic pass anchor it.\n"
+        "       - LABEL = the person's full name as written in the "
+        "text. CANONICAL_FORM = the same name in CamelCase "
+        "(DonaldTrump, VladimirPutin, XiJinping).\n"
+        "       - If the text mentions the person's ROLE (President, "
+        "Prime Minister, CEO, Minister of X, Secretary of Y), emit a "
+        "SEPARATE MATCH NOT FOUND RELATION with LABEL='hasRole', "
+        "DOMAIN=<person canonical form>, RANGE=<role label>.\n"
+        "       - NEVER create a CLASS for a specific individual person. "
+        "NEVER bake the role into the instance label "
+        "('President Donald Trump' is WRONG; emit 'Donald Trump' as the "
+        "instance + a hasRole relation to 'President').\n"
+        "  2. COMPANIES + GOVERNMENT BODIES + NGOS + AGENCIES + "
+        "ASSOCIATIONS. Any entity whose name has a corporate suffix or "
+        "agency pattern (Inc, Ltd, Corp, Corporation, Industries, "
+        "Petrochemicals, Petroleum, Company, Co., Co. Ltd., Group, plc, "
+        "GmbH, S.A., Holdings, Bank, University, Ministry of X, "
+        "Department of X, Bureau of X, NGO, Council, Federation, "
+        "Association, OPEC-style acronym) is an ORGANIZATION.\n"
+        "       - PARENT_LABEL = the foaf:Organization / "
+        "org:Organization class from DATA_CLASSES if present, else "
+        "'Organization'. NEVER under Material, Helium, "
+        "ChemicalProcessSystem, ProcessUnit, Infrastructure, or any "
+        "non-org class.\n"
+        "       - Examples: 'Samsung Electronics' -> Organization. "
+        "'Air Products and Chemicals' -> Organization. 'Saudi Aramco "
+        "Total Refinery & Petrochemicals Co.' -> Organization. 'Sinopec "
+        "Maoming Company' -> Organization.\n"
+        "  3. PHYSICAL FACILITIES (refinery complexes, plants, ports, "
+        "terminals) named after a company or location -- e.g. 'Jamnagar "
+        "Refinery Complex', 'GS-Caltex Yeosu Refinery', 'Hormuz Oil "
+        "Terminal'. These are INFRASTRUCTURE, not process units.\n"
+        "       - PARENT_LABEL = 'Infrastructure'.\n"
+        "       - Emit a MATCH NOT FOUND RELATION linking the facility "
+        "to its owner: LABEL='operatedBy' (or 'owner'), DOMAIN=<facility>, "
+        "RANGE=<organization>.\n"
+        "  4. EVENTS named after a place or entity. Patterns: '<X> "
+        "crisis', '<X> closure', '<X> war', '<X> disruption', '<X> "
+        "shortage', '<X> conflict', '<X> incident', '<X> shutdown', "
+        "'<X> blockage', '<X> attack', '<X> embargo', '<X> escalation', "
+        "'<X> summit'.\n"
+        "       - PARENT_LABEL = 'Event' (or 'Crisis' / 'Conflict' "
+        "subclass if present in DATA_CLASSES). EVEN IF the entity "
+        "contains a geographic name: 'Strait of Hormuz crisis' -> "
+        "Event, NOT Strait. 'Russia-Ukraine war' -> Event, NOT Russia.\n"
+        "  5. ROLE TYPES (kinds of positions): 'President', "
+        "'PrimeMinister', 'CEO', 'Chairman', 'Secretary of <X>', "
+        "'Minister of <Y>', 'Director', 'Founder'.\n"
+        "       - PARENT_LABEL = the org:Role class IRI if present in "
+        "DATA_CLASSES, else 'Role'. Roles are KINDS OF positions; "
+        "specific people HOLD them via hasRole.\n"
+        "       - NEVER conflate a role type with a person. 'President' "
+        "is a role; 'Donald Trump' is the person who holds it. Two "
+        "separate entities.\n"
+        "  6. GEOGRAPHIC FEATURES: a class is a geographic place only "
+        "when its label IS a place name with no event / process / role "
+        "modifier. 'Strait of Hormuz' = yes. 'Strait of Hormuz crisis' "
+        "= no (Event). 'Suez Canal' = yes. 'Suez Canal blockage' = no "
+        "(Event).\n\n"
         "SELF-CONSISTENCY (critical, do NOT skip):\n"
         "  - Every DOMAIN and RANGE label you use in MATCH NOT FOUND "
         "RELATIONS MUST appear either (a) as an exact label/IRI in "
@@ -425,6 +492,98 @@ def compact_description(class_batch: list[dict[str, Any]]) -> tuple[str, str]:
     return system, user
 
 
+def classification_audit(items: list[dict[str, Any]]) -> tuple[str, str]:
+    """Layer H: post-Stage-4 misclassification audit. Given a batch of
+    newly-created classes (each with name, current_parent_label,
+    description), decide for each: KEEP the parent, RE_HOME under a
+    better parent from the allowed bucket list, or CONVERT_TO_INSTANCE
+    when the entity is a specific individual that should be an instance
+    rather than a class.
+
+    Each input item: {LABEL, CURRENT_PARENT, DESCRIPTION}.
+    Output one decision per item.
+    """
+    system = (
+        "You are an ontology curator reviewing a batch of recently-minted "
+        "classes for misclassification. The minting pipeline made best-effort "
+        "guesses; some are wrong. Your job is to spot and fix the bad ones.\n\n"
+        "For each item you will see:\n"
+        "  LABEL          - the class label (a name extracted from documents)\n"
+        "  CURRENT_PARENT - the parent class IRI / label assigned during minting\n"
+        "  DESCRIPTION    - a short description of what the class represents\n\n"
+        "Decide ONE of three actions per item:\n"
+        "  KEEP                  - current parent is semantically correct\n"
+        "  RE_HOME               - propose a better parent (NEW_PARENT)\n"
+        "  CONVERT_TO_INSTANCE   - this entity is a specific INDIVIDUAL, not "
+        "a class. Move it to an instance of NEW_PARENT (which IS a class).\n\n"
+        "Allowed top-level parent buckets (use the exact label):\n"
+        "  Person          - human individuals (only valid as parent for "
+        "CONVERT_TO_INSTANCE actions on people-shaped LABELS)\n"
+        "  Organization    - companies, agencies, NGOs, governments, "
+        "associations. Includes anything with corporate suffix (Inc, Ltd, "
+        "Corp, Industries, Petrochemicals, Co., Group, plc, GmbH).\n"
+        "  Role            - position types (President, CEO, Minister of X)\n"
+        "  Event           - named happenings (X crisis, X war, X closure, "
+        "X disruption, X attack, X conflict, X blockage, X embargo, X summit)\n"
+        "  Process         - ongoing activities (refining, distillation, "
+        "decarbonization)\n"
+        "  Material        - substances (helium, urea, oil, steel)\n"
+        "  NaturalResource - extracted inputs (crude oil, natural gas, ore)\n"
+        "  Infrastructure  - physical facilities (refinery complexes, ports, "
+        "terminals, plants, pipelines)\n"
+        "  Industry        - kinds of economic activity (Agriculture, "
+        "Manufacturing, Mining, Healthcare, Energy)\n"
+        "  TechnologyConcept - artifacts / processes (semiconductor, AI, "
+        "battery, MRI)\n"
+        "  EconomicConcept - market phenomena (price, demand, subsidy, "
+        "tariff, inflation)\n"
+        "  PolicyConcept   - rules / frameworks (regulation, treaty, ban, "
+        "law)\n"
+        "  SupplyChainConcept - logistics + trade flows (route, freight "
+        "corridor)\n"
+        "  GeographicFeature - places named only by location, no event/role "
+        "modifier (Strait of Hormuz YES; Strait of Hormuz crisis NO)\n"
+        "  DomainConcept   - catch-all for genuinely broad/abstract concepts "
+        "that don't fit any other bucket\n\n"
+        "CRITICAL PATTERNS (always apply these):\n"
+        "  - LABEL looks like a named person (FirstName LastName, "
+        "Title + Name) AND CURRENT_PARENT is Person / PersonRole / "
+        "PersonOrRole / Role -> CONVERT_TO_INSTANCE, NEW_PARENT=Person.\n"
+        "  - LABEL has a corporate suffix (Inc, Ltd, Corp, Corporation, "
+        "Industries, Petrochemicals, Co., Group, plc) AND CURRENT_PARENT is "
+        "NOT Organization or a sub-Organization -> RE_HOME under Organization.\n"
+        "  - LABEL contains an event keyword (crisis, closure, war, "
+        "disruption, shortage, conflict, incident, shutdown, blockage, "
+        "attack, sanction, embargo, summit, escalation) AND CURRENT_PARENT "
+        "is NOT Event or a sub-Event -> RE_HOME under Event.\n"
+        "  - LABEL is a refinery / petrochemical complex / oil terminal / "
+        "plant (e.g. 'Jamnagar Refinery Complex') AND CURRENT_PARENT is a "
+        "process unit / material -> RE_HOME under Infrastructure.\n"
+        "  - LABEL is a role TYPE ('President', 'PrimeMinister', 'CEO', "
+        "'Minister of X') AND CURRENT_PARENT is Person / not Role -> "
+        "RE_HOME under Role.\n\n"
+        "Output strict JSON ONLY:\n"
+        "{\n"
+        '  "DECISIONS": [\n'
+        '    {\n'
+        '      "LABEL": "<exact LABEL from input>",\n'
+        '      "ACTION": "KEEP" | "RE_HOME" | "CONVERT_TO_INSTANCE",\n'
+        '      "NEW_PARENT": "<label of new parent if RE_HOME or '
+        'CONVERT_TO_INSTANCE; otherwise omit or set null>",\n'
+        '      "REASON": "<one short phrase explaining the decision>"\n'
+        '    }, ...\n'
+        '  ]\n'
+        "}\n"
+        "No prose. Only the JSON object."
+    )
+    user = (
+        "ITEMS TO REVIEW:\n"
+        + json.dumps(items, ensure_ascii=False, default=str)
+        + '\n\nReturn JSON: {"DECISIONS": [...]}'
+    )
+    return system, user
+
+
 def document_summarize(text: str) -> tuple[str, str]:
     """Pre-pipeline document compression. Given a long source document,
     rewrite it as a denser summary that preserves the ENTITIES,
@@ -483,4 +642,5 @@ PROMPTS = {
     "concept_grouping": concept_grouping,
     "compact_description": compact_description,
     "document_summarize": document_summarize,
+    "classification_audit": classification_audit,
 }

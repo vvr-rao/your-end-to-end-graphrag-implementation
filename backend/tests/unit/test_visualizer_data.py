@@ -38,7 +38,7 @@ def test_discover_owl_files_finds_known_source_fixtures() -> None:
 
 
 def test_load_ontology_skos_has_expected_shape() -> None:
-    skos = SOURCE_ROOT / "general_ontologies" / "skos.rdf"
+    skos = SOURCE_ROOT / "core_ontologies" / "skos.rdf"
     assert skos.exists()
     loaded = load_ontology(skos)
     assert loaded is not None
@@ -61,7 +61,7 @@ def test_load_ontology_isolates_across_calls() -> None:
     """Two separate loads must not share entities (the per-file World is the
     same isolation property tested by test_world_isolation, but exercised
     through the visualizer's cached entry point)."""
-    skos = SOURCE_ROOT / "general_ontologies" / "skos.rdf"
+    skos = SOURCE_ROOT / "core_ontologies" / "skos.rdf"
     index = SOURCE_ROOT / "general_ontologies" / "index.rdf"
     assert skos.exists() and index.exists()
     a = load_ontology(skos)
@@ -92,7 +92,7 @@ def test_resolve_custom_path_validation(tmp_path: Path) -> None:
     plain_txt = tmp_path / "file.txt"
     plain_txt.write_text("hello")
     assert resolve_custom_path(str(plain_txt)) is None  # wrong suffix
-    skos = SOURCE_ROOT / "general_ontologies" / "skos.rdf"
+    skos = SOURCE_ROOT / "core_ontologies" / "skos.rdf"
     if skos.exists():
         resolved = resolve_custom_path(str(skos))
         assert resolved == skos.resolve()

@@ -124,3 +124,59 @@ async def run_summarize_descriptions(
         f"(${summary['cost_usd']:.4f})"
     )
     return summary
+
+
+async def run_audit_classifications(
+    *,
+    input_folder: Path,
+) -> dict[str, Any]:
+    """`audit-classifications` subcommand: walk an existing prune-expand
+    folder, identify newly-created classes that look misclassified
+    (parented under owl:Thing, corporate-suffix label not under
+    Organization, event-keyword label not under Event, person-name
+    label as a class, role label not under Role), and ask gpt-4o-mini
+    to KEEP / RE_HOME / CONVERT_TO_INSTANCE each. Mutates merged.json +
+    merged.owl in place.
+
+    Standalone repair tool: lets the user fix an existing prune-expand
+    output WITHOUT re-running the (expensive) full prune-expand. The
+    same logic also runs automatically at the end of every prune-expand
+    via the `classification_audit_enabled` config knob.
+    """
+    from backend.app.core.config import get_settings
+    from backend.app.services.llm_router import LLMRouter
+    from backend.app.services.pipeline_llm import run_classification_audit_async
+
+    loaded = folder_io.load_version_folder(input_folder)
+    settings = get_settings()
+    router = LLMRouter(settings)
+    app_cfg = settings.app_config
+    base_iri = (app_cfg.get("ontology") or {}).get(
+        "default_base_iri",
+        "http://your-personal-ontologist.local/ontology/",
+    )
+
+    summary = await run_classification_audit_async(
+        classes_dict=loaded.setdefault("classes_dict", {}),
+        instances_dict=loaded.setdefault("instances_dict", {}),
+        router=router,
+        default_base_iri=base_iri,
+        concurrency=int((app_cfg.get("expansion") or {}).get("max_concurrent_llm_calls", 8)),
+        use_cache=True,
+    )
+
+    folder_io.write_merged_json(input_folder, loaded)
+    ontology_export.write_owl(loaded, input_folder / folder_io.MERGED_OWL)
+
+    print(
+        f"\nAUDIT DONE -> {input_folder}\n"
+        f"  suspicious classes: {summary['suspicious']}\n"
+        f"  decisions applied:  {summary['decisions']}\n"
+        f"    kept:        {summary['kept']}\n"
+        f"    rehomed:     {summary['rehomed']}\n"
+        f"    converted:   {summary['converted']}\n"
+        f"    noop:        {summary['noop']}\n"
+        f"  LLM calls: {summary['llm_calls']}\n"
+        f"  cost: ${summary['cost_usd']:.4f}"
+    )
+    return summary

@@ -23,6 +23,20 @@ from rdflib import OWL, RDF, RDFS, XSD, Graph, Literal, Namespace, URIRef
 
 DEFAULT_ONTOLOGY_IRI = "http://your-personal-ontologist.local/ontology/merged"
 
+# XML 1.0 forbids C0 controls (except \t \n \r) and \x7f anywhere in the
+# document, in attribute values or text content. PDF text extraction
+# occasionally emits these (Bol\x13var from a corrupted ASCII range, etc.),
+# and Stage 2 summaries can carry them through into labels / comments. If
+# they reach rdflib's serializer the resulting .owl file looks valid but
+# any XML 1.0 parser (Protégé, lxml, ElementTree) rejects it with
+# "not well-formed (invalid token)". Strip them at the boundary.
+_BAD_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _xml_safe(text: str) -> str:
+    """Strip C0 control characters that XML 1.0 forbids."""
+    return _BAD_CONTROL_CHARS.sub("", text)
+
 
 def _uri(value: str | dict | None) -> URIRef | None:
     """Coerce a string IRI or an entity_ref dict {'iri': ..., 'name': ...} to a URIRef."""
@@ -42,7 +56,7 @@ def _add_literals(graph: Graph, subject: URIRef, predicate: URIRef, values: Any)
     if values is None:
         return
     if isinstance(values, (str, int, float, bool)):
-        text = str(values).strip()
+        text = _xml_safe(str(values)).strip()
         if text:
             graph.add((subject, predicate, Literal(text)))
         return
@@ -64,9 +78,9 @@ def _add_annotations(graph: Graph, subject: URIRef, record: dict[str, Any]) -> N
             value = record[ann_pred]
             if isinstance(value, list):
                 for v in value:
-                    graph.add((subject, pred_uri, Literal(str(v), datatype=XSD.string)))
+                    graph.add((subject, pred_uri, Literal(_xml_safe(str(v)), datatype=XSD.string)))
             else:
-                graph.add((subject, pred_uri, Literal(str(value), datatype=XSD.string)))
+                graph.add((subject, pred_uri, Literal(_xml_safe(str(value)), datatype=XSD.string)))
 
 
 def _add_typed(graph: Graph, subject: URIRef, type_uri: URIRef) -> None:
@@ -162,12 +176,13 @@ def _replay_raw_triples(graph: Graph, subject: URIRef, raw_triples: Any) -> None
                     continue
                 datatype = obj.get("datatype")
                 lang = obj.get("lang")
+                safe_value = _xml_safe(str(value))
                 if datatype:
-                    graph.add((subject, URIRef(pred), Literal(str(value), datatype=URIRef(datatype))))
+                    graph.add((subject, URIRef(pred), Literal(safe_value, datatype=URIRef(datatype))))
                 elif lang:
-                    graph.add((subject, URIRef(pred), Literal(str(value), lang=lang)))
+                    graph.add((subject, URIRef(pred), Literal(safe_value, lang=lang)))
                 else:
-                    graph.add((subject, URIRef(pred), Literal(str(value))))
+                    graph.add((subject, URIRef(pred), Literal(safe_value)))
             elif kind in ("uri", "entity"):
                 iri = obj.get("iri")
                 if iri:
@@ -175,7 +190,7 @@ def _replay_raw_triples(graph: Graph, subject: URIRef, raw_triples: Any) -> None
             # bnode / python_type / repr: skip — not round-trippable as-is.
         elif isinstance(obj, (str, int, float, bool)):
             # Primitive from extract_*; assume literal.
-            text = str(obj).strip()
+            text = _xml_safe(str(obj)).strip()
             if text:
                 graph.add((subject, URIRef(pred), Literal(text)))
 

@@ -349,6 +349,444 @@ async def _propose_concept_grouping(
     }
 
 
+# ---------- Layer H: post-Stage-4 misclassification audit ----------
+
+# Batch size for the classification_audit prompt. Items are ~80-120 tokens
+# of JSON each. With max_tokens=4096 on the LLM, ~50 per batch keeps the
+# response well within the cap.
+_CLASSIFICATION_AUDIT_BATCH_SIZE = 50
+
+# Corporate-suffix patterns. A LABEL containing any of these (case-insensitive,
+# word-boundary respecting) signals the entity is an organization.
+_CORPORATE_SUFFIXES: tuple[str, ...] = (
+    " inc", " inc.", ", inc", " ltd", " ltd.", ", ltd", " corp", " corp.",
+    " corporation", " industries", " petrochemicals", " petroleum",
+    " company", " co.", " co ltd", " group", " plc", " gmbh", " s.a.",
+    " holdings", " bank ", " bank of ", " university", " federation",
+    " association", " council ",
+)
+
+# Event-keyword patterns. A LABEL containing any of these is almost
+# certainly an event named after a place/entity.
+_EVENT_KEYWORDS: tuple[str, ...] = (
+    "crisis", "closure", "war", "disruption", "shortage", "conflict",
+    "incident", "shutdown", "blockage", "attack", "sanctions", "embargo",
+    "dispute", "treaty", "escalation", "mobilization", "summit",
+)
+
+# Role-keyword patterns. A LABEL that matches one of these exactly (after
+# normalisation) is a role type.
+_ROLE_LABELS: frozenset[str] = frozenset({
+    "president", "primeminister", "prime minister", "chancellor",
+    "ceo", "cfo", "cto", "coo", "chairman", "chairwoman", "chairperson",
+    "founder", "director", "minister", "secretary",
+})
+
+
+def _label_of(rec: dict[str, Any]) -> str:
+    """First non-empty label string for a class record."""
+    for lab in (rec.get("labels") or []):
+        if isinstance(lab, str) and lab.strip():
+            return lab.strip()
+        if isinstance(lab, dict):
+            v = lab.get("value")
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    name = rec.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    return ""
+
+
+def _is_newly_created(rec: dict[str, Any]) -> bool:
+    """A class minted from MATCH NOT FOUND in this run is tagged in
+    semantic_role.reasons. Existing classes from source ontologies have
+    no such marker."""
+    sr = rec.get("semantic_role")
+    if not isinstance(sr, dict):
+        return False
+    reasons = sr.get("reasons") or []
+    return any(isinstance(r, str) and "MATCH NOT FOUND" in r for r in reasons)
+
+
+def _has_corporate_suffix(label: str) -> bool:
+    lower = " " + label.lower() + " "
+    return any(s in lower for s in _CORPORATE_SUFFIXES)
+
+
+def _has_event_keyword(label: str) -> bool:
+    lower = label.lower()
+    return any(re.search(rf"\b{re.escape(kw)}\b", lower) for kw in _EVENT_KEYWORDS)
+
+
+def _looks_like_person_name(label: str) -> bool:
+    """Two- or three-word capitalised names with no corporate / event /
+    role tokens. Heuristic; the LLM gives the final verdict."""
+    if _has_corporate_suffix(label) or _has_event_keyword(label):
+        return False
+    parts = label.split()
+    if len(parts) < 2 or len(parts) > 4:
+        return False
+    # All parts start with an uppercase letter, no digits.
+    if not all(p[:1].isupper() and not any(c.isdigit() for c in p) for p in parts):
+        return False
+    # Filter out obvious non-person patterns.
+    blocked = {"of", "the", "and", "in", "on", "for", "to", "at"}
+    if any(p.lower() in blocked for p in parts):
+        return False
+    return True
+
+
+def _first_parent_label(rec: dict[str, Any], classes_dict: dict[str, Any]) -> str:
+    """Return the first superclass's local-name or label (whichever is
+    informative). owl:Thing returns 'owl:Thing'."""
+    for sup in (rec.get("superclasses") or []):
+        if not isinstance(sup, dict):
+            continue
+        iri = sup.get("iri")
+        if not iri:
+            continue
+        if iri.endswith("#Thing") or iri.endswith("/Thing"):
+            return "owl:Thing"
+        parent_rec = classes_dict.get(iri)
+        if parent_rec:
+            lab = _label_of(parent_rec)
+            if lab:
+                return lab
+        # Fall back to local name.
+        return iri.rsplit("#", 1)[-1].rsplit("/", 1)[-1]
+    return "owl:Thing"
+
+
+def _is_suspicious(
+    iri: str,
+    rec: dict[str, Any],
+    classes_dict: dict[str, Any],
+) -> bool:
+    """Quick deterministic filter to decide whether a newly-created class
+    is worth a (paid) LLM audit. Returns True if any of:
+      - parent is owl:Thing
+      - LABEL has corporate suffix but parent isn't Organization-shaped
+      - LABEL has event keyword but parent isn't Event-shaped
+      - LABEL looks like a person name (regardless of parent -- people
+        should be instances, not classes)
+      - LABEL matches a role label but parent isn't Role-shaped
+    """
+    label = _label_of(rec)
+    if not label:
+        return False
+    parent = _first_parent_label(rec, classes_dict).lower()
+
+    if parent == "owl:thing":
+        return True
+
+    if _has_corporate_suffix(label) and "organization" not in parent and "organisation" not in parent:
+        return True
+    if _has_event_keyword(label) and "event" not in parent and "crisis" not in parent and "conflict" not in parent:
+        return True
+    if _looks_like_person_name(label):
+        return True
+    if label.lower().replace(" ", "") in _ROLE_LABELS and "role" not in parent:
+        return True
+    return False
+
+
+def _classification_audit_cache_key(items: list[dict[str, Any]], model: str) -> str:
+    """SHA-256 over the canonical JSON of the audit batch. Same items in
+    the same order produce the same key (deterministic cache hits)."""
+    import hashlib
+    canonical = json.dumps(items, sort_keys=True, ensure_ascii=False)
+    h = hashlib.sha256()
+    h.update(b"audit-v1|")
+    h.update(model.encode("utf-8"))
+    h.update(b"|")
+    h.update(canonical.encode("utf-8"))
+    return h.hexdigest()
+
+
+def _build_audit_items(
+    classes_dict: dict[str, Any],
+) -> list[tuple[str, dict[str, Any]]]:
+    """Find every NEWLY-CREATED class whose current placement is
+    suspicious. Returns (iri, item_dict_for_llm) tuples preserving
+    classes_dict order so audit batches are deterministic."""
+    items: list[tuple[str, dict[str, Any]]] = []
+    for iri, rec in classes_dict.items():
+        if not _is_newly_created(rec):
+            continue
+        if not _is_suspicious(iri, rec, classes_dict):
+            continue
+        label = _label_of(rec)
+        parent_label = _first_parent_label(rec, classes_dict)
+        descr = ""
+        for field in ("descriptions", "compact_description", "comments"):
+            v = rec.get(field)
+            if isinstance(v, str) and v.strip():
+                descr = v.strip()
+                break
+            if isinstance(v, list):
+                for vv in v:
+                    if isinstance(vv, str) and vv.strip():
+                        descr = vv.strip()
+                        break
+                if descr:
+                    break
+        items.append((iri, {
+            "LABEL": label,
+            "CURRENT_PARENT": parent_label,
+            "DESCRIPTION": descr[:300],
+        }))
+    return items
+
+
+def _find_or_synthesize_parent_iri(
+    new_parent_label: str,
+    classes_dict: dict[str, Any],
+    default_base_iri: str,
+) -> str:
+    """Look up `new_parent_label` in classes_dict by label match
+    (case-insensitive). If not found, synthesize a new class at
+    `default_base_iri + slug(label)` and create a minimal record so the
+    re-homed children have a real anchor."""
+    target = new_parent_label.strip().lower()
+    for iri, rec in classes_dict.items():
+        for lab in (rec.get("labels") or []):
+            if isinstance(lab, str) and lab.strip().lower() == target:
+                return iri
+            if isinstance(lab, dict):
+                v = lab.get("value")
+                if isinstance(v, str) and v.strip().lower() == target:
+                    return iri
+        name = rec.get("name")
+        if isinstance(name, str) and name.strip().lower() == target:
+            return iri
+    # Synthesize a new bucket class.
+    slug = re.sub(r"[^a-zA-Z0-9_]+", "_", new_parent_label.strip()).strip("_")
+    if not slug:
+        slug = "auto_bucket"
+    new_iri = default_base_iri.rstrip("/").rstrip("#") + "/" + slug
+    classes_dict[new_iri] = {
+        "iri": new_iri,
+        "name": slug,
+        "labels": [new_parent_label.strip()],
+        "descriptions": [
+            f"Auto-created top-level bucket via Layer H classification audit "
+            f"({new_parent_label.strip()})."
+        ],
+        "superclasses": [{
+            "iri": "http://www.w3.org/2002/07/owl#Thing",
+            "name": "Thing",
+        }],
+        "semantic_role": {
+            "role": "proposed_concept_class",
+            "confidence": "rule_based",
+            "reasons": ["Created from MATCH NOT FOUND (Layer H audit)"],
+            "scores": {},
+        },
+        "auto_created_via": ["classification_audit"],
+    }
+    return new_iri
+
+
+def _apply_audit_decision(
+    iri: str,
+    rec: dict[str, Any],
+    decision: dict[str, Any],
+    classes_dict: dict[str, Any],
+    instances_dict: dict[str, Any],
+    default_base_iri: str,
+) -> str:
+    """Apply ONE decision to the class. Returns the action that was
+    actually applied: 'kept', 'rehomed', 'converted', or 'noop' (if
+    validation failed)."""
+    action = (decision.get("ACTION") or "").strip().upper()
+    new_parent_label = (decision.get("NEW_PARENT") or "").strip()
+
+    if action == "KEEP" or action == "":
+        return "kept"
+
+    if action == "RE_HOME":
+        if not new_parent_label:
+            return "noop"
+        new_parent_iri = _find_or_synthesize_parent_iri(
+            new_parent_label, classes_dict, default_base_iri
+        )
+        rec["superclasses"] = [{
+            "iri": new_parent_iri,
+            "name": classes_dict[new_parent_iri].get("name") or _label_of(classes_dict[new_parent_iri]),
+        }]
+        # Tag for audit.
+        rec.setdefault("auto_created_via", []).append("classification_audit")
+        return "rehomed"
+
+    if action == "CONVERT_TO_INSTANCE":
+        if not new_parent_label:
+            return "noop"
+        type_iri = _find_or_synthesize_parent_iri(
+            new_parent_label, classes_dict, default_base_iri
+        )
+        label = _label_of(rec)
+        # Build the instance record. The instance keeps the class's IRI
+        # so that any existing relations pointing at this entity still
+        # resolve (they'll just point at an instance instead of a class).
+        instances_dict[iri] = {
+            "iri": iri,
+            "name": rec.get("name") or label,
+            "labels": rec.get("labels") or [label],
+            "descriptions": rec.get("descriptions") or [],
+            "comments": rec.get("comments") or [],
+            "types": [{
+                "iri": type_iri,
+                "name": classes_dict[type_iri].get("name") or _label_of(classes_dict[type_iri]),
+            }],
+            "direct_types": [{
+                "iri": type_iri,
+                "name": classes_dict[type_iri].get("name") or _label_of(classes_dict[type_iri]),
+            }],
+            "semantic_role": rec.get("semantic_role"),
+            "auto_created_via": ["classification_audit"],
+        }
+        # Drop the class entry.
+        del classes_dict[iri]
+        return "converted"
+
+    return "noop"
+
+
+async def run_classification_audit_async(
+    classes_dict: dict[str, Any],
+    instances_dict: dict[str, Any],
+    router: LLMRouter,
+    default_base_iri: str = "http://your-personal-ontologist.local/ontology/",
+    concurrency: int = 8,
+    use_cache: bool = True,
+    model_name: str = "gpt-4o-mini",
+) -> dict[str, Any]:
+    """Layer H: run the LLM-based misclassification audit over the
+    newly-created classes in `classes_dict`. Mutates classes_dict and
+    instances_dict in place. Returns a summary dict.
+
+    Caches each batch by SHA-256 of its items at
+    ~/.cache/your-personal-knowledge-graph-creator/doc_summaries/
+    (the same cache directory as document summaries) under a key
+    prefixed with 'audit-v1'. Re-running against the same set of
+    suspicious classes costs nothing for LLM calls.
+    """
+    items = _build_audit_items(classes_dict)
+    if not items:
+        print("[stage4-H] classification_audit: no suspicious classes -- skipping")
+        return {"suspicious": 0, "decisions": 0, "kept": 0, "rehomed": 0,
+                "converted": 0, "noop": 0, "llm_calls": 0,
+                "cost_usd": 0.0, "batches": 0}
+
+    print(
+        f"[stage4-H] classification_audit: {len(items)} suspicious "
+        f"class(es) to review (out of {len(classes_dict)} total)"
+    )
+
+    # Slice into batches.
+    batches: list[list[tuple[str, dict[str, Any]]]] = [
+        items[i : i + _CLASSIFICATION_AUDIT_BATCH_SIZE]
+        for i in range(0, len(items), _CLASSIFICATION_AUDIT_BATCH_SIZE)
+    ]
+    print(f"[stage4-H] processing {len(batches)} batch(es) of <= {_CLASSIFICATION_AUDIT_BATCH_SIZE}")
+
+    cache_dir = _doc_summary_cache_dir() if use_cache else None
+    sem = asyncio.Semaphore(concurrency)
+    cost_before = router.total_cost_usd
+
+    # Each batch is processed independently; results are merged afterwards.
+    batch_decisions: list[list[dict[str, Any]]] = [[] for _ in batches]
+    llm_calls = 0
+    llm_call_lock = asyncio.Lock()
+
+    async def _one_batch(batch_idx: int, batch: list[tuple[str, dict[str, Any]]]) -> None:
+        nonlocal llm_calls
+        # Cache lookup
+        batch_items = [item for _, item in batch]
+        cache_key = _classification_audit_cache_key(batch_items, model_name)
+        if cache_dir is not None:
+            cached = _doc_summary_cache_load(_doc_summary_cache_path(cache_dir, cache_key))
+            if cached:
+                try:
+                    parsed = json.loads(cached)
+                    if isinstance(parsed, dict) and isinstance(parsed.get("DECISIONS"), list):
+                        batch_decisions[batch_idx] = parsed["DECISIONS"]
+                        return
+                except json.JSONDecodeError:
+                    pass  # fall through to fresh LLM call
+        # LLM call
+        async with sem:
+            system, user = PROMPTS["classification_audit"](batch_items)
+            try:
+                result = await router.chat("classification_audit", system=system, user=user)
+            except Exception as exc:
+                print(f"[stage4-H] batch {batch_idx+1}/{len(batches)} LLM call failed: {exc} — skipping")
+                return
+            async with llm_call_lock:
+                llm_calls += 1
+            parsed = extract_json_from_output(result.text)
+            if not isinstance(parsed, dict) or not isinstance(parsed.get("DECISIONS"), list):
+                print(f"[stage4-H] batch {batch_idx+1}/{len(batches)} response unparseable — skipping")
+                return
+            decisions = parsed["DECISIONS"]
+            batch_decisions[batch_idx] = decisions
+            # Cache write
+            if cache_dir is not None:
+                _doc_summary_cache_save(
+                    _doc_summary_cache_path(cache_dir, cache_key),
+                    json.dumps({"DECISIONS": decisions}, ensure_ascii=False),
+                )
+
+    await asyncio.gather(*[_one_batch(i, batch) for i, batch in enumerate(batches)])
+
+    # Apply decisions. Match by exact LABEL (case-insensitive).
+    counters = {"kept": 0, "rehomed": 0, "converted": 0, "noop": 0}
+    total_decisions = 0
+    for batch_idx, batch in enumerate(batches):
+        decisions_by_label: dict[str, dict[str, Any]] = {}
+        for d in batch_decisions[batch_idx]:
+            if not isinstance(d, dict):
+                continue
+            lab = (d.get("LABEL") or "").strip().lower()
+            if lab:
+                decisions_by_label[lab] = d
+        for iri, item in batch:
+            lab = (item.get("LABEL") or "").strip().lower()
+            if not lab or lab not in decisions_by_label:
+                counters["noop"] += 1
+                continue
+            rec = classes_dict.get(iri)
+            if rec is None:  # already converted/deleted by an earlier decision pointing at same iri
+                continue
+            outcome = _apply_audit_decision(
+                iri, rec, decisions_by_label[lab],
+                classes_dict, instances_dict, default_base_iri,
+            )
+            counters[outcome] = counters.get(outcome, 0) + 1
+            total_decisions += 1
+
+    cost_delta = router.total_cost_usd - cost_before
+    print(
+        f"[stage4-H] DONE: {total_decisions} decisions applied "
+        f"(kept={counters['kept']}, rehomed={counters['rehomed']}, "
+        f"converted={counters['converted']}, noop={counters['noop']}), "
+        f"{llm_calls} LLM call(s), cost ${cost_delta:.4f}"
+    )
+
+    return {
+        "suspicious": len(items),
+        "decisions": total_decisions,
+        "kept": counters["kept"],
+        "rehomed": counters["rehomed"],
+        "converted": counters["converted"],
+        "noop": counters["noop"],
+        "llm_calls": llm_calls,
+        "cost_usd": round(cost_delta, 6),
+        "batches": len(batches),
+    }
+
+
 # ---------- One-time class-metadata compression ----------
 
 
@@ -1277,6 +1715,23 @@ async def _run(
                     f"under {len(concept_iris)} new concept class(es)"
                 )
                 created.extend(concept_iris)
+
+        # Layer H: post-Stage-4 misclassification audit. Scans newly-
+        # created classes for label patterns that don't match their
+        # current parent (corporate suffix not under Organization, event
+        # keyword not under Event, person-shape under Person/Role,
+        # owl:Thing parent) and asks gpt-4o-mini to KEEP / RE_HOME /
+        # CONVERT_TO_INSTANCE each. Purely additive.
+        if app_cfg.get("expansion", {}).get("classification_audit_enabled", True):
+            audit_summary = await run_classification_audit_async(
+                classes_dict=out_ontology.setdefault("classes_dict", {}),
+                instances_dict=out_ontology.setdefault("instances_dict", {}),
+                router=router,
+                default_base_iri=base_iri,
+                concurrency=int(app_cfg.get("expansion", {}).get("max_concurrent_llm_calls", 8)),
+                use_cache=True,
+            )
+            _append_audit(audit_path, -1, "classification_audit", None, audit_summary)
 
     counts_after = folder_io.count_entities(out_ontology)
     print(f"[{operation}] entity counts: before={counts_before}, after={counts_after}")

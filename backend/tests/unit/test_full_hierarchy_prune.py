@@ -2270,3 +2270,222 @@ def test_summarize_default_oversize_sub_chunk_is_80k() -> None:
     param = sig.parameters.get("oversize_doc_sub_chunk_tokens")
     assert param is not None
     assert param.default == 80_000
+
+
+# ============================================================================
+# OWL-export control-char sanitizer (XML 1.0 compliance).
+# ============================================================================
+
+
+def test_owl_export_strips_xml_forbidden_control_chars(tmp_path) -> None:
+    """A class label containing \\x13 (Device Control 3) must NOT
+    appear verbatim in the exported OWL -- XML 1.0 forbids it."""
+    import xml.etree.ElementTree as ET
+    from backend.app.services import ontology_export
+
+    loaded = {
+        "classes_dict": {
+            "http://x/A": {
+                "iri": "http://x/A",
+                "name": "Bol\x13var",
+                "labels": ["Bol\x13var fuerte"],
+                "comments": ["Mojibake from PDF\x13 extraction"],
+                "descriptions": [],
+                "superclasses": [],
+            }
+        },
+        "object_properties_dict": {},
+        "data_properties_dict": {},
+        "instances_dict": {},
+    }
+    out_path = tmp_path / "merged.owl"
+    ontology_export.write_owl(loaded, out_path)
+
+    # 1) the file is well-formed XML.
+    tree = ET.parse(out_path)
+    assert tree.getroot().tag.endswith("RDF")
+    # 2) raw \x13 doesn't appear in the file bytes.
+    data = out_path.read_bytes()
+    assert b"\x13" not in data
+
+
+# ============================================================================
+# Layer F geographic-inference stop-words.
+# ============================================================================
+
+
+def test_geo_inference_skips_event_named_after_strait() -> None:
+    """'Strait of Hormuz crisis' must not be parented under Strait --
+    the event keyword overrides the landform substring match."""
+    from backend.app.helpers.ontology_pruning import infer_geographic_placement
+
+    OWL_THING = "http://www.w3.org/2002/07/owl#Thing"
+    classes = {
+        "http://geo/strait": {
+            "iri": "http://geo/strait",
+            "name": "strait",
+            "labels": ["Strait"],
+            "superclasses": [],
+        },
+        "http://default/strait_of_hormuz_crisis": {
+            "iri": "http://default/strait_of_hormuz_crisis",
+            "name": "strait_of_hormuz_crisis",
+            "labels": ["Strait of Hormuz crisis"],
+            "superclasses": [{"iri": OWL_THING, "name": "Thing"}],
+        },
+        "http://default/strait_of_hormuz": {
+            "iri": "http://default/strait_of_hormuz",
+            "name": "strait_of_hormuz",
+            "labels": ["Strait of Hormuz"],
+            "superclasses": [{"iri": OWL_THING, "name": "Thing"}],
+        },
+    }
+    infer_geographic_placement(classes, {}, {}, {})
+
+    # Crisis stays unparented (still owl:Thing); will go to Layer G.
+    crisis = classes.get("http://default/strait_of_hormuz_crisis")
+    assert crisis is not None, "crisis class shouldn't be deleted"
+    crisis_parent = (crisis.get("superclasses") or [{}])[0].get("iri")
+    assert crisis_parent == OWL_THING, (
+        f"crisis class was re-homed under {crisis_parent!r} -- the "
+        f"event keyword should have blocked geo inference"
+    )
+
+    # The pure place (no event modifier) IS re-homed under Strait.
+    # (The re-home moves it to the geo namespace, so look at any
+    # remaining key with 'strait_of_hormuz' as local name.)
+    rehomed = None
+    for k, v in classes.items():
+        if k != "http://geo/strait" and "strait_of_hormuz" in k.lower() and "crisis" not in k.lower():
+            rehomed = v
+            break
+    assert rehomed is not None
+    rehomed_parent = (rehomed.get("superclasses") or [{}])[0].get("iri")
+    assert rehomed_parent == "http://geo/strait"
+
+
+# ============================================================================
+# Layer H classification audit: suspicious-detection + apply logic.
+# ============================================================================
+
+
+def test_layer_h_is_suspicious_flags_corporate_label_under_helium() -> None:
+    """A LABEL like 'Air Products and Chemicals Inc' currently parented
+    under Helium IS suspicious -- corporate suffix + non-Org parent."""
+    from backend.app.services.pipeline_llm import _is_suspicious
+
+    classes = {
+        "http://x/helium": {
+            "iri": "http://x/helium",
+            "name": "Helium",
+            "labels": ["Helium"],
+            "superclasses": [],
+        },
+        "http://x/air_products": {
+            "iri": "http://x/air_products",
+            "name": "air_products",
+            "labels": ["Air Products and Chemicals Inc"],
+            "superclasses": [{"iri": "http://x/helium", "name": "Helium"}],
+            "semantic_role": {"reasons": ["Created from MATCH NOT FOUND"]},
+        },
+    }
+    rec = classes["http://x/air_products"]
+    assert _is_suspicious("http://x/air_products", rec, classes) is True
+
+
+def test_layer_h_is_suspicious_flags_event_label_under_strait() -> None:
+    """'Strait of Hormuz crisis' under Strait is suspicious."""
+    from backend.app.services.pipeline_llm import _is_suspicious
+
+    classes = {
+        "http://x/strait": {
+            "iri": "http://x/strait",
+            "name": "Strait",
+            "labels": ["Strait"],
+            "superclasses": [],
+        },
+        "http://x/crisis": {
+            "iri": "http://x/crisis",
+            "name": "crisis",
+            "labels": ["Strait of Hormuz crisis"],
+            "superclasses": [{"iri": "http://x/strait", "name": "Strait"}],
+            "semantic_role": {"reasons": ["Created from MATCH NOT FOUND"]},
+        },
+    }
+    assert _is_suspicious("http://x/crisis", classes["http://x/crisis"], classes) is True
+
+
+def test_layer_h_apply_rehome_rewrites_superclasses() -> None:
+    """RE_HOME action rewrites the class's superclasses to point at the
+    new parent (looked up by label) and tags the class as
+    'classification_audit'-touched."""
+    from backend.app.services.pipeline_llm import _apply_audit_decision
+
+    classes = {
+        "http://x/helium": {
+            "iri": "http://x/helium",
+            "name": "Helium",
+            "labels": ["Helium"],
+            "superclasses": [],
+        },
+        "http://x/org_bucket": {
+            "iri": "http://x/org_bucket",
+            "name": "Organization",
+            "labels": ["Organization"],
+            "superclasses": [],
+        },
+        "http://x/air_products": {
+            "iri": "http://x/air_products",
+            "name": "air_products",
+            "labels": ["Air Products"],
+            "superclasses": [{"iri": "http://x/helium", "name": "Helium"}],
+        },
+    }
+    rec = classes["http://x/air_products"]
+    instances: dict = {}
+    outcome = _apply_audit_decision(
+        "http://x/air_products", rec,
+        {"LABEL": "Air Products", "ACTION": "RE_HOME", "NEW_PARENT": "Organization"},
+        classes, instances,
+        "http://your-personal-ontologist.local/ontology/",
+    )
+    assert outcome == "rehomed"
+    parent = rec["superclasses"][0]["iri"]
+    assert parent == "http://x/org_bucket"
+    assert "classification_audit" in (rec.get("auto_created_via") or [])
+
+
+def test_layer_h_apply_convert_to_instance_moves_to_instances_dict() -> None:
+    """CONVERT_TO_INSTANCE moves the entity out of classes_dict and
+    creates an instance under the proposed parent class."""
+    from backend.app.services.pipeline_llm import _apply_audit_decision
+
+    classes = {
+        "http://x/person_bucket": {
+            "iri": "http://x/person_bucket",
+            "name": "Person",
+            "labels": ["Person"],
+            "superclasses": [],
+        },
+        "http://x/putin": {
+            "iri": "http://x/putin",
+            "name": "Vladimir_Putin",
+            "labels": ["Vladimir Putin"],
+            "superclasses": [{"iri": "http://x/person_bucket", "name": "Person"}],
+        },
+    }
+    rec = classes["http://x/putin"]
+    instances: dict = {}
+    outcome = _apply_audit_decision(
+        "http://x/putin", rec,
+        {"LABEL": "Vladimir Putin", "ACTION": "CONVERT_TO_INSTANCE",
+         "NEW_PARENT": "Person"},
+        classes, instances,
+        "http://your-personal-ontologist.local/ontology/",
+    )
+    assert outcome == "converted"
+    # Class entry deleted; instance entry created.
+    assert "http://x/putin" not in classes
+    assert "http://x/putin" in instances
+    inst = instances["http://x/putin"]
+    assert inst["types"][0]["iri"] == "http://x/person_bucket"

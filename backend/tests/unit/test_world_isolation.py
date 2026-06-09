@@ -16,7 +16,7 @@ from owlready2 import World
 from backend.app.helpers.ontology_parsing import extract_ontology_to_dicts
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-SKOS = REPO_ROOT / "source_ontologies" / "general_ontologies" / "skos.rdf"
+SKOS = REPO_ROOT / "source_ontologies" / "core_ontologies" / "skos.rdf"
 INDEX = REPO_ROOT / "source_ontologies" / "general_ontologies" / "index.rdf"
 
 

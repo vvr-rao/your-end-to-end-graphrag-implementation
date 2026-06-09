@@ -45,7 +45,7 @@ def test_match_dedup_skips_when_no_proposals_is_not_in_prompt() -> None:
     assert '"MATCHES FOUND"' in user or "MATCHES FOUND" in user
 
 
-def test_prompts_registry_covers_six_tasks() -> None:
+def test_prompts_registry_covers_seven_tasks() -> None:
     assert set(PROMPTS) == {
         "chunk_classification",
         "class_proposal",
@@ -53,7 +53,36 @@ def test_prompts_registry_covers_six_tasks() -> None:
         "concept_grouping",
         "compact_description",
         "document_summarize",
+        "classification_audit",
     }
+
+
+def test_classification_audit_prompt_shape() -> None:
+    """Layer H prompt covers KEEP / RE_HOME / CONVERT_TO_INSTANCE,
+    lists the allowed buckets including Person + Organization + Event +
+    Role, and embeds the items in the user message."""
+    from backend.app.services.prompts import classification_audit
+
+    items = [{"LABEL": "Donald Trump", "CURRENT_PARENT": "Person", "DESCRIPTION": ""}]
+    sys_, user = classification_audit(items)
+    assert "KEEP" in sys_ and "RE_HOME" in sys_ and "CONVERT_TO_INSTANCE" in sys_
+    for bucket in ("Person", "Organization", "Event", "Role", "Infrastructure"):
+        assert bucket in sys_, f"bucket {bucket} missing"
+    assert "DECISIONS" in sys_
+    assert "Donald Trump" in user
+
+
+def test_class_proposal_prompt_has_entity_type_rules() -> None:
+    """Stage 2 prompt explicitly covers the people/org/event rules
+    introduced for the misclassification fix."""
+    from backend.app.services.prompts import class_identification_and_expansion
+
+    sys_, _user = class_identification_and_expansion({}, "some passage")
+    assert "ENTITY-TYPE RULES" in sys_
+    assert "foaf:Person" in sys_ or "Person" in sys_
+    assert "Organization" in sys_
+    assert "Event" in sys_
+    assert "Strait of Hormuz crisis" in sys_  # negative example for geo->event
 
 
 def test_document_summarize_prompt_shape() -> None:

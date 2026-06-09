@@ -81,6 +81,10 @@ ontology:
   # Example (uncomment and edit):
   # protected_iri_prefixes:
   #   - https://your-domain.example.com/ontology/your-curated-ontology
+  #   # FOAF (foaf:Person, foaf:Organization, foaf:Agent, foaf:Group)
+  #   - http://xmlns.com/foaf/0.1/
+  #   # W3C Organization Ontology (org:Organization, org:Role, org:Membership)
+  #   - http://www.w3.org/ns/org#
 
 # -----------------------------------------------------------------------------
 # LLM expansion run parameters.

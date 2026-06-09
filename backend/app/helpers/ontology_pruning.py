@@ -1691,6 +1691,20 @@ _LANDFORM_KEYWORDS: frozenset[str] = frozenset({
     "shoreline", "atoll", "reef", "lagoon", "estuary", "tributary",
 })
 
+# Event-shape tokens. If a candidate class's label/local-name contains
+# ANY of these alongside a landform keyword, the class is an EVENT named
+# after a geographic location, not the location itself. Examples:
+# "Strait of Hormuz crisis", "conflict in the Strait of Hormuz",
+# "Russia-Ukraine war", "Suez Canal blockage". Re-homing them under
+# Strait / Canal / Country would be wrong (they belong under Event in
+# Layer G). Skip geographic-inference for these.
+_EVENT_STOP_WORDS: frozenset[str] = frozenset({
+    "crisis", "closure", "war", "disruption", "shortage", "conflict",
+    "incident", "shutdown", "blockage", "attack", "sanction", "sanctions",
+    "embargo", "dispute", "agreement", "treaty", "ban", "restriction",
+    "restrictions", "escalation", "mobilization", "summit",
+})
+
 # Generic geographic root labels we'll look up if no specific landform class
 # matches. First hit wins.
 _GENERIC_GEO_ROOT_LABELS: tuple[str, ...] = (
@@ -1851,6 +1865,11 @@ def infer_geographic_placement(
 
         # Try landform-keyword signal first.
         tokens = _candidate_tokens(rec, iri)
+        # If the class label looks like an event named after a place
+        # ("Strait of Hormuz crisis", "Russia-Ukraine war"), skip geo
+        # inference. Layer G concept_grouping will route these to Event.
+        if tokens & _EVENT_STOP_WORDS:
+            continue
         matched_keyword: str | None = None
         target_parent: str | None = None
         signal: str | None = None
