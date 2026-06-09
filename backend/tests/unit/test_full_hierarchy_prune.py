@@ -2049,3 +2049,117 @@ def test_doc_summary_cache_disabled_via_use_cache_false(
     )
     # Pre-existing cache value was ignored; LLM result used.
     assert out[0].text == "Fresh LLM output ignoring cache."
+
+
+# ============================================================================
+# Oversize-doc ceiling: docs above max_doc_input_tokens must be DROPPED
+# (text replaced with empty string), not passed through to the LLM or the
+# chunker. Prevents Stage 2 cost explosion on multi-million-token PDFs.
+# ============================================================================
+
+
+def test_summarize_skips_oversized_docs(monkeypatch, tmp_path) -> None:
+    """A document over the default 100K-token ceiling must be DROPPED:
+    its text in the output is replaced by empty string, and the LLM is
+    never called for it. Other docs in the same batch still process
+    normally."""
+    import asyncio
+    from pathlib import Path
+    from backend.app.services import pipeline_llm
+    from backend.app.services.document_io import LoadedDocument
+    from backend.app.services.pipeline_llm import summarize_long_documents_async
+
+    monkeypatch.setattr(pipeline_llm, "_doc_summary_cache_dir", lambda: tmp_path)
+
+    # ~110K tokens by word count -- safely over the 100K default ceiling.
+    oversize_text = "word " * 110_000
+    normal_text = "Long doc but within ceiling. " * 800  # ~5K tokens
+
+    oversize = LoadedDocument(path=Path("huge.txt"), text=oversize_text)
+    normal = LoadedDocument(path=Path("normal.txt"), text=normal_text)
+
+    class _FakeResult:
+        def __init__(self, text):
+            self.text = text
+            self.prompt_tokens = 100
+            self.completion_tokens = 50
+            self.cost_usd = 0.0001
+
+    class _FakeRouter:
+        total_cost_usd = 0.0
+        calls: list[str] = []
+
+        async def chat(self, task, *, system, user):
+            type(self).calls.append(user[:80])
+            return _FakeResult("Summarized normal doc.")
+
+    out = asyncio.run(
+        summarize_long_documents_async(
+            documents=[oversize, normal],
+            router=_FakeRouter(),
+            threshold_tokens=2000,
+            concurrency=1,
+            use_cache=False,
+            max_doc_input_tokens=100_000,
+        )
+    )
+
+    # Oversize doc: text replaced with empty string.
+    assert out[0].path.name == "huge.txt"
+    assert out[0].text == ""
+    # Normal doc: summarized via LLM.
+    assert out[1].path.name == "normal.txt"
+    assert out[1].text == "Summarized normal doc."
+    # LLM called EXACTLY once -- for the normal doc, not the oversize one.
+    assert len(_FakeRouter.calls) == 1
+
+
+def test_summarize_respects_configurable_ceiling(monkeypatch, tmp_path) -> None:
+    """Lowering max_doc_input_tokens forces a smaller doc to be skipped.
+    Proves the knob is honored, not hardcoded."""
+    import asyncio
+    from pathlib import Path
+    from backend.app.services import pipeline_llm
+    from backend.app.services.document_io import LoadedDocument
+    from backend.app.services.pipeline_llm import summarize_long_documents_async
+
+    monkeypatch.setattr(pipeline_llm, "_doc_summary_cache_dir", lambda: tmp_path)
+
+    # ~5K-token doc -- WAY under the default 100K ceiling, but above a
+    # custom 3000-token ceiling we'll pass in.
+    medium_text = "Document content. " * 1000  # ~3K tokens
+    doc = LoadedDocument(path=Path("medium.txt"), text=medium_text)
+
+    class _ExplodingRouter:
+        total_cost_usd = 0.0
+
+        async def chat(self, *_args, **_kwargs):
+            raise AssertionError("LLM must not be called when doc is over ceiling")
+
+    out = asyncio.run(
+        summarize_long_documents_async(
+            documents=[doc],
+            router=_ExplodingRouter(),
+            threshold_tokens=2000,
+            concurrency=1,
+            use_cache=False,
+            max_doc_input_tokens=2500,  # custom low ceiling
+        )
+    )
+    # Doc dropped because it exceeds the custom ceiling.
+    assert out[0].text == ""
+
+
+def test_summarize_default_max_doc_input_tokens_is_100k() -> None:
+    """The function signature exposes max_doc_input_tokens with a default
+    of 100_000 -- below gpt-4o-mini's 128K context, with headroom for
+    the system + user prompt overhead."""
+    import inspect
+    from backend.app.services.pipeline_llm import summarize_long_documents_async
+
+    sig = inspect.signature(summarize_long_documents_async)
+    param = sig.parameters.get("max_doc_input_tokens")
+    assert param is not None, "max_doc_input_tokens parameter missing"
+    assert param.default == 100_000, (
+        f"default ceiling should be 100K, got {param.default}"
+    )

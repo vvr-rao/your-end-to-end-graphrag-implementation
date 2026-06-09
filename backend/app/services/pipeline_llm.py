@@ -541,6 +541,7 @@ async def summarize_long_documents_async(
     concurrency: int = 4,
     model_name: str = "gpt-4o-mini",
     use_cache: bool = True,
+    max_doc_input_tokens: int = 100_000,
 ) -> list[LoadedDocument]:
     """Optional pre-pipeline pass that rewrites long source documents
     into denser entity-preserving summaries before chunking.
@@ -548,7 +549,14 @@ async def summarize_long_documents_async(
     For each document:
       - Count tokens via tiktoken.
       - If token count <= threshold: passed through unchanged.
-      - If token count > threshold AND `use_cache` is True:
+      - If token count > max_doc_input_tokens: DROPPED (text replaced
+        with empty string so the chunker emits zero chunks for it).
+        Documents this large can't fit in gpt-4o-mini's 128K context,
+        and passing them through unchanged would explode Stage 2 cost
+        by hundreds of dollars. Default ceiling 100K tokens leaves
+        headroom for the prompt template.
+      - If threshold < token count <= max_doc_input_tokens AND
+        `use_cache` is True:
           - Compute SHA-256 cache key over (doc text + model + prompt version).
           - If cache hit: load the summary from disk, no LLM call.
           - If cache miss: call gpt-4o-mini, write result to cache.
@@ -575,21 +583,50 @@ async def summarize_long_documents_async(
     enc = tiktoken.get_encoding(encoding_name)
     cache_dir = _doc_summary_cache_dir() if use_cache else None
 
-    # Identify which documents are over the threshold.
-    plan: list[tuple[int, int]] = []  # (doc_index, token_count)
+    # First, drop any document whose token count exceeds the input
+    # ceiling. These can't fit in gpt-4o-mini's 128K context, would
+    # fail summarization (caught + falls back to original), then the
+    # raw text would flow into the chunker and produce HUNDREDS of
+    # Stage 2 calls per oversize doc -- costing tens to hundreds of
+    # dollars. Hard drop = empty text -> zero chunks -> pipeline
+    # ignores the doc cleanly.
+    out: list[LoadedDocument] = list(documents)
+    oversize_count = 0
+    plan: list[tuple[int, int]] = []  # (doc_index, token_count) for over-threshold-AND-under-ceiling docs
     for i, doc in enumerate(documents):
         tok = len(enc.encode(doc.text))
+        if tok > max_doc_input_tokens:
+            print(
+                f"[summarize-docs] {doc.name}: {tok:,} tokens exceeds "
+                f"{max_doc_input_tokens:,}-token ceiling -- DROPPING "
+                f"(too big for gpt-4o-mini context; would explode Stage 2 "
+                f"if passed through unchanged). Split this file manually "
+                f"if you need its content."
+            )
+            out[i] = LoadedDocument(path=doc.path, text="")
+            oversize_count += 1
+            continue
         if tok > threshold_tokens:
             plan.append((i, tok))
 
+    if oversize_count:
+        print(
+            f"[summarize-docs] dropped {oversize_count} oversize doc(s) "
+            f"above {max_doc_input_tokens:,} tokens"
+        )
+
     if not plan:
-        print(f"[summarize-docs] all {len(documents)} doc(s) under threshold; skipping")
-        return list(documents)
+        print(
+            f"[summarize-docs] all {len(documents) - oversize_count} "
+            f"remaining doc(s) under threshold; skipping summarization"
+        )
+        return out
 
     # First pass: cache lookups (fast, no LLM, no concurrency needed).
+    # Note: `out` was initialized earlier (above) with oversize docs
+    # already replaced by empty-text. Don't overwrite that here.
     cache_hits = 0
     needs_llm: list[tuple[int, int]] = []
-    out: list[LoadedDocument] = list(documents)
 
     if cache_dir is not None:
         for idx, original_tokens in plan:
@@ -835,6 +872,7 @@ async def _run_llm_stages(
     expansion_cfg_for_concur = app_cfg.get("expansion", {}) or {}
     threshold_tokens = int(chunking_cfg.get("summarization_threshold_tokens", 0))
     use_cache = bool(chunking_cfg.get("use_summary_cache", True))
+    max_doc_input_tokens = int(chunking_cfg.get("max_doc_input_tokens", 100_000))
     if threshold_tokens > 0:
         docs = await summarize_long_documents_async(
             documents=docs,
@@ -843,6 +881,7 @@ async def _run_llm_stages(
             encoding_name=encoding,
             concurrency=int(expansion_cfg_for_concur.get("max_concurrent_llm_calls", 4)),
             use_cache=use_cache,
+            max_doc_input_tokens=max_doc_input_tokens,
         )
 
     chunks = list(
