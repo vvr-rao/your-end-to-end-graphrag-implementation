@@ -830,8 +830,11 @@ def test_add_instances_creates_named_individual_with_type() -> None:
     )
     assert len(created) == 1
     iri = created[0]
-    # IRI lands in the time namespace, not default.
-    assert iri.startswith("http://www.w3.org/2006/time#")
+    # IRI lands in the default namespace (NOT the W3C `time:` namespace).
+    # Per Fix A: minting new entities into standard upper ontologies
+    # is forbidden -- those namespaces are owned by W3C/FOAF/SKOS.
+    # Instances follow the same rule as classes.
+    assert iri.startswith("http://default.example/onto/")
     # Slugged from canonical form, NOT the surface form.
     assert iri.endswith("january_2004")
     inst = extended["instances_dict"][iri]
@@ -945,10 +948,12 @@ def test_add_instances_places_in_type_namespace() -> None:
         default_type_iri=None,
     )
     assert len(created) == 2
-    year_inst = next(i for i in created if "time" in i)
-    country_inst = next(i for i in created if "geography" in i)
-    # Each instance is in its TYPE's namespace.
-    assert year_inst.startswith("http://www.w3.org/2006/time#")
+    # Year is in the W3C time namespace (a standard upper ontology),
+    # so per Fix A its instances land in default. Country lives in the
+    # user's own geography ontology, so its instances DO inherit.
+    year_inst = next(i for i in created if "year" in i.lower() or "2030" in i)
+    country_inst = next(i for i in created if "saudi" in i.lower())
+    assert year_inst.startswith("http://default.example/onto/")  # NOT time:
     assert country_inst.startswith("https://veerla-ramrao.ai/ontology/geography#")
     # Slugs are from canonical forms.
     assert year_inst.endswith("2030")
@@ -2447,7 +2452,7 @@ def test_layer_h_apply_rehome_rewrites_superclasses() -> None:
         "http://x/air_products", rec,
         {"LABEL": "Air Products", "ACTION": "RE_HOME", "NEW_PARENT": "Organization"},
         classes, instances,
-        "http://your-personal-ontologist.local/ontology/",
+        "https://veerla-ramrao.ai/ontology/merged#",
     )
     assert outcome == "rehomed"
     parent = rec["superclasses"][0]["iri"]
@@ -2481,7 +2486,7 @@ def test_layer_h_apply_convert_to_instance_moves_to_instances_dict() -> None:
         {"LABEL": "Vladimir Putin", "ACTION": "CONVERT_TO_INSTANCE",
          "NEW_PARENT": "Person"},
         classes, instances,
-        "http://your-personal-ontologist.local/ontology/",
+        "https://veerla-ramrao.ai/ontology/merged#",
     )
     assert outcome == "converted"
     # Class entry deleted; instance entry created.
@@ -2639,3 +2644,372 @@ def test_stream_summarize_and_chunk_falls_back_to_load_all_when_batch_size_zero(
         batch_size=0,  # legacy "all-at-once"
     ))
     assert len(chunks) == 8
+
+
+# ============================================================================
+# Bootstrap domain-concepts ontology (Fix B): the .owl file ships with the
+# repo and must parse cleanly into the 12 bucket classes the LLM anchors to.
+# ============================================================================
+
+
+def test_domain_concepts_owl_parses_with_12_buckets() -> None:
+    """source_ontologies/core_ontologies/domain_concepts.owl declares 12
+    owl:Class buckets, each ALSO typed as skos:Concept (OWL Punning), and
+    one skos:ConceptScheme grouping them. The pipeline expects these
+    classes to land in classes_dict via the standard merge path."""
+    from pathlib import Path
+    from rdflib import Graph, RDF, OWL
+    import rdflib
+    SKOS = rdflib.Namespace("http://www.w3.org/2004/02/skos/core#")
+
+    p = Path("source_ontologies/core_ontologies/domain_concepts.owl")
+    assert p.exists(), f"missing bootstrap file: {p}"
+
+    g = Graph()
+    g.parse(p, format="xml")
+
+    owl_classes = list(g.subjects(RDF.type, OWL.Class))
+    skos_concepts = list(g.subjects(RDF.type, SKOS.Concept))
+    schemes = list(g.subjects(RDF.type, SKOS.ConceptScheme))
+
+    assert len(owl_classes) == 12, f"expected 12 owl:Class, got {len(owl_classes)}"
+    assert len(skos_concepts) == 12, (
+        f"expected 12 skos:Concept (dual-typed via OWL Punning), "
+        f"got {len(skos_concepts)}"
+    )
+    assert len(schemes) == 1, f"expected 1 skos:ConceptScheme, got {len(schemes)}"
+
+    # The 12 bucket names the Stage 2 LLM uses as PARENT_LABEL.
+    expected_locals = {
+        "Industry", "EconomicConcept", "PolicyConcept", "Event", "Process",
+        "Material", "NaturalResource", "TechnologyConcept", "Infrastructure",
+        "SupplyChainConcept", "GeographicFeature", "DomainConcept",
+    }
+    got_locals = {str(iri).rsplit("#", 1)[-1] for iri in owl_classes}
+    assert got_locals == expected_locals, (
+        f"missing or extra buckets. expected={expected_locals} got={got_locals}"
+    )
+
+
+# ============================================================================
+# Rebrand regression: the codebase no longer hardcodes the .local placeholder
+# IRI. Catches accidental reintroduction of the old branding.
+# ============================================================================
+
+
+def test_rebrand_default_ontology_iri_uses_veerla_ramrao_ai() -> None:
+    """ontology_export.DEFAULT_ONTOLOGY_IRI is the IRI written into the
+    `<owl:Ontology rdf:about=...>` header of every emitted merged.owl.
+    Must be on the user's domain, not the .local placeholder."""
+    from backend.app.services.ontology_export import DEFAULT_ONTOLOGY_IRI
+
+    assert DEFAULT_ONTOLOGY_IRI == "https://veerla-ramrao.ai/ontology/merged"
+    assert "your-personal-ontologist.local" not in DEFAULT_ONTOLOGY_IRI
+
+
+def test_rebrand_export_emits_veerla_namespace_for_annotations(tmp_path) -> None:
+    """Custom annotation predicates (semantic_role, sources, etc.) must
+    use the veerla-ramrao.ai/ontology/ann# namespace, not the old
+    .local placeholder."""
+    from backend.app.services import ontology_export
+
+    loaded = {
+        "classes_dict": {
+            "https://veerla-ramrao.ai/ontology/merged#TestClass": {
+                "iri": "https://veerla-ramrao.ai/ontology/merged#TestClass",
+                "name": "TestClass",
+                "labels": ["Test Class"],
+                "semantic_role": {"role": "test"},
+                "superclasses": [],
+            }
+        },
+        "object_properties_dict": {},
+        "data_properties_dict": {},
+        "instances_dict": {},
+    }
+    out_path = tmp_path / "merged.owl"
+    ontology_export.write_owl(loaded, out_path)
+
+    data = out_path.read_text(encoding="utf-8")
+    assert "https://veerla-ramrao.ai/ontology/ann#" in data
+    assert "your-personal-ontologist.local" not in data
+
+
+# ============================================================================
+# Fix A: standard-upper-ontology namespace guard in
+# _derive_namespace_from_parent_iri. A class parented under foaf:Organization
+# (or org:Role, skos:Concept, etc.) MUST mint in default_base_iri, not in
+# the upper-ontology's namespace.
+# ============================================================================
+
+
+def test_derive_namespace_skips_foaf_org_skos_namespaces() -> None:
+    """The Fix A guard. Without it, 'Samsung Electronics' parented under
+    foaf:Organization gets the IRI http://xmlns.com/foaf/0.1/samsung_electronics
+    -- polluting FOAF + accidentally protecting the squatter via
+    protected_iri_prefixes. Guard: parent in FOAF/ORG/SKOS/time/OWL/RDFS
+    -> fall back to default_base_iri."""
+    from backend.app.helpers.ontology_pruning import _derive_namespace_from_parent_iri
+
+    base = "https://veerla-ramrao.ai/ontology/merged#"
+
+    # FOAF parent -> base.
+    assert _derive_namespace_from_parent_iri(
+        "http://xmlns.com/foaf/0.1/Organization", base
+    ) == base
+    # ORG parent -> base.
+    assert _derive_namespace_from_parent_iri(
+        "http://www.w3.org/ns/org#Role", base
+    ) == base
+    # SKOS parent -> base.
+    assert _derive_namespace_from_parent_iri(
+        "http://www.w3.org/2004/02/skos/core#Concept", base
+    ) == base
+    # owl:Thing -> base (existing behavior preserved).
+    assert _derive_namespace_from_parent_iri(
+        "http://www.w3.org/2002/07/owl#Thing", base
+    ) == base
+    # Domain ontology (geography) -> inherit parent's namespace.
+    assert _derive_namespace_from_parent_iri(
+        "https://veerla-ramrao.ai/ontology/geography#Country", base
+    ) == "https://veerla-ramrao.ai/ontology/geography#"
+
+
+# ============================================================================
+# Fix C: force-convert person-shape classes parented under
+# Person/PersonRole/Role to instances of foaf:Person, overriding any LLM
+# decision. Catches Elon-Musk-style entities the audit LLM marked KEEP.
+# ============================================================================
+
+
+def test_force_convert_overrides_llm_keep_for_person_under_person_class() -> None:
+    """LLM says KEEP for Elon Musk under Person. The force-convert
+    pre-check overrides to CONVERT_TO_INSTANCE."""
+    from backend.app.services.pipeline_llm import _apply_audit_decision
+
+    classes = {
+        "https://x/Person": {
+            "iri": "https://x/Person",
+            "name": "Person",
+            "labels": ["Person"],
+            "superclasses": [],
+        },
+        "https://x/elon_musk": {
+            "iri": "https://x/elon_musk",
+            "name": "elon_musk",
+            "labels": ["Elon Musk"],
+            "superclasses": [{"iri": "https://x/Person", "name": "Person"}],
+        },
+    }
+    rec = classes["https://x/elon_musk"]
+    instances: dict = {}
+    outcome = _apply_audit_decision(
+        "https://x/elon_musk", rec,
+        # LLM says KEEP -- but the deterministic guard should override.
+        {"LABEL": "Elon Musk", "ACTION": "KEEP"},
+        classes, instances,
+        "https://veerla-ramrao.ai/ontology/merged#",
+        current_parent_label="Person",
+    )
+    assert outcome == "converted"
+    assert "https://x/elon_musk" not in classes
+    assert "https://x/elon_musk" in instances
+
+
+def test_force_convert_under_personorrole_label() -> None:
+    """Same override for entities parented under the awkward
+    'PersonOrRole' label."""
+    from backend.app.services.pipeline_llm import _apply_audit_decision
+
+    classes = {
+        "https://x/personorrole": {
+            "iri": "https://x/personorrole",
+            "name": "PersonOrRole",
+            "labels": ["PersonOrRole"],
+            "superclasses": [],
+        },
+        "https://x/trump": {
+            "iri": "https://x/trump",
+            "name": "trump",
+            "labels": ["Donald Trump"],
+            "superclasses": [{"iri": "https://x/personorrole", "name": "PersonOrRole"}],
+        },
+    }
+    rec = classes["https://x/trump"]
+    instances: dict = {}
+    outcome = _apply_audit_decision(
+        "https://x/trump", rec,
+        {"LABEL": "Donald Trump", "ACTION": "KEEP"},
+        classes, instances,
+        "https://veerla-ramrao.ai/ontology/merged#",
+        current_parent_label="PersonOrRole",
+    )
+    assert outcome == "converted"
+    assert "https://x/trump" in instances
+
+
+def test_force_convert_does_not_fire_for_non_person_parent() -> None:
+    """Person-shape labels under non-person parents (e.g. Organization)
+    are NOT auto-converted -- the LLM verdict stands."""
+    from backend.app.services.pipeline_llm import _apply_audit_decision
+
+    classes = {
+        "https://x/Organization": {
+            "iri": "https://x/Organization",
+            "name": "Organization",
+            "labels": ["Organization"],
+            "superclasses": [],
+        },
+        "https://x/coromandel": {
+            "iri": "https://x/coromandel",
+            "name": "coromandel",
+            "labels": ["Coromandel International"],
+            "superclasses": [{"iri": "https://x/Organization", "name": "Organization"}],
+        },
+    }
+    rec = classes["https://x/coromandel"]
+    instances: dict = {}
+    outcome = _apply_audit_decision(
+        "https://x/coromandel", rec,
+        {"LABEL": "Coromandel International", "ACTION": "KEEP"},
+        classes, instances,
+        "https://veerla-ramrao.ai/ontology/merged#",
+        current_parent_label="Organization",
+    )
+    # Stays a class (KEEP); no force-convert.
+    assert outcome == "kept"
+    assert "https://x/coromandel" in classes
+    assert "https://x/coromandel" not in instances
+
+
+# ============================================================================
+# repair-output deterministic passes: FOAF cleanup + brand rewrite +
+# person-convert. Verifies each pass independently against a tiny fixture.
+# ============================================================================
+
+
+def test_repair_output_moves_foaf_squatters_to_project_namespace(tmp_path) -> None:
+    """A class squatted at http://xmlns.com/foaf/0.1/archerdanielsmidland
+    gets moved to default_base_iri/archerdanielsmidland. Canonical FOAF
+    classes (foaf:Person, foaf:Organization, etc.) are left alone."""
+    import asyncio
+    from backend.app.services.pipeline import run_repair_output
+    from backend.app.services import folder_io
+
+    folder = tmp_path / "v_test"
+    folder.mkdir()
+    loaded = {
+        "classes_dict": {
+            # Canonical FOAF -- must stay.
+            "http://xmlns.com/foaf/0.1/Person": {
+                "iri": "http://xmlns.com/foaf/0.1/Person",
+                "name": "Person",
+                "labels": ["Person"],
+                "superclasses": [],
+            },
+            # Squatter -- must move.
+            "http://xmlns.com/foaf/0.1/archerdanielsmidland": {
+                "iri": "http://xmlns.com/foaf/0.1/archerdanielsmidland",
+                "name": "archerdanielsmidland",
+                "labels": ["Archer Daniels Midland"],
+                "superclasses": [{
+                    "iri": "http://xmlns.com/foaf/0.1/Person",
+                    "name": "Person",
+                }],
+            },
+        },
+        "object_properties_dict": {},
+        "data_properties_dict": {},
+        "instances_dict": {},
+    }
+    folder_io.write_merged_json(folder, loaded)
+    # write_owl needs a target -- use a dummy
+    (folder / "merged.owl").write_text(
+        '<?xml version="1.0"?><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"/>',
+        encoding="utf-8",
+    )
+
+    asyncio.run(run_repair_output(
+        input_folder=folder,
+        do_foaf_cleanup=True,
+        do_rebrand=False,
+        do_person_convert=False,
+    ))
+
+    after = folder_io.load_version_folder(folder)
+    classes = after["classes_dict"]
+    # Canonical FOAF intact.
+    assert "http://xmlns.com/foaf/0.1/Person" in classes
+    # Squatter moved out of FOAF.
+    foaf_squatters = [
+        iri for iri in classes
+        if iri.startswith("http://xmlns.com/foaf/0.1/")
+        and iri.rsplit("/", 1)[-1] not in {
+            "Agent", "Person", "Organization", "Group", "Document", "Image",
+            "OnlineAccount", "OnlineChatAccount", "OnlineEcommerceAccount",
+            "OnlineGamingAccount", "PersonalProfileDocument", "LabelProperty",
+            "Project",
+        }
+    ]
+    assert foaf_squatters == [], (
+        f"FOAF squatters remained after cleanup: {foaf_squatters}"
+    )
+
+
+def test_repair_output_rebrands_local_iris_to_veerla_ramrao_ai(tmp_path) -> None:
+    """Every class IRI starting with the old .local placeholder is
+    rewritten to veerla-ramrao.ai. Cross-references update too."""
+    import asyncio
+    from backend.app.services.pipeline import run_repair_output
+    from backend.app.services import folder_io
+
+    folder = tmp_path / "v_test"
+    folder.mkdir()
+    loaded = {
+        "classes_dict": {
+            "http://your-personal-ontologist.local/ontology/widget": {
+                "iri": "http://your-personal-ontologist.local/ontology/widget",
+                "name": "widget",
+                "labels": ["Widget"],
+                "superclasses": [{
+                    "iri": "http://your-personal-ontologist.local/ontology/thing",
+                    "name": "thing",
+                }],
+            },
+            "http://your-personal-ontologist.local/ontology/thing": {
+                "iri": "http://your-personal-ontologist.local/ontology/thing",
+                "name": "thing",
+                "labels": ["Thing"],
+                "superclasses": [],
+            },
+        },
+        "object_properties_dict": {},
+        "data_properties_dict": {},
+        "instances_dict": {},
+    }
+    folder_io.write_merged_json(folder, loaded)
+    (folder / "merged.owl").write_text(
+        '<?xml version="1.0"?><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"/>',
+        encoding="utf-8",
+    )
+
+    asyncio.run(run_repair_output(
+        input_folder=folder,
+        do_foaf_cleanup=False,
+        do_rebrand=True,
+        do_person_convert=False,
+    ))
+
+    after = folder_io.load_version_folder(folder)
+    classes = after["classes_dict"]
+    # No .local IRIs left.
+    leftover = [iri for iri in classes if "your-personal-ontologist.local" in iri]
+    assert leftover == [], f"leftover .local IRIs: {leftover}"
+    # New IRIs present.
+    veerla_keys = [iri for iri in classes if "veerla-ramrao.ai" in iri]
+    assert len(veerla_keys) == 2
+    # Cross-reference updated (widget's parent points at the new thing IRI).
+    widget_iri = next(iri for iri in classes if iri.endswith("widget"))
+    parent_iri = classes[widget_iri]["superclasses"][0]["iri"]
+    assert "veerla-ramrao.ai" in parent_iri
+    assert "thing" in parent_iri

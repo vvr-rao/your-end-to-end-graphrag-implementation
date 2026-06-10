@@ -21,7 +21,7 @@ from typing import Any
 
 from rdflib import OWL, RDF, RDFS, XSD, Graph, Literal, Namespace, URIRef
 
-DEFAULT_ONTOLOGY_IRI = "http://your-personal-ontologist.local/ontology/merged"
+DEFAULT_ONTOLOGY_IRI = "https://veerla-ramrao.ai/ontology/merged"
 
 # XML 1.0 forbids C0 controls (except \t \n \r) and \x7f anywhere in the
 # document, in attribute values or text content. PDF text extraction
@@ -74,7 +74,7 @@ def _add_annotations(graph: Graph, subject: URIRef, record: dict[str, Any]) -> N
     # Custom annotation properties (e.g. semantic_role, review_status, sources, generated)
     for ann_pred in ("semantic_role", "review_status", "generated", "sources"):
         if ann_pred in record and record[ann_pred] is not None:
-            pred_uri = URIRef(f"http://your-personal-ontologist.local/ann#{ann_pred}")
+            pred_uri = URIRef(f"https://veerla-ramrao.ai/ontology/ann#{ann_pred}")
             value = record[ann_pred]
             if isinstance(value, list):
                 for v in value:

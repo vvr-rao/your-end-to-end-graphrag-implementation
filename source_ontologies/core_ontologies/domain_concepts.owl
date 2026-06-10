@@ -1,0 +1,189 @@
+<?xml version="1.0"?>
+<!--
+    Bootstrap "bucket" classes for the Stage 2 LLM to anchor against.
+
+    The Stage 2 LLM, when proposing new classes, tends to use abstract
+    parent labels like "Industry", "EconomicConcept", "Event", "Material"
+    etc. Without these classes pre-existing in the merged ontology, the
+    chain rule in `add_new_classes_from_match_not_found` synthesizes
+    them as orphans (parent = owl:Thing), inflating Layer G's orphan
+    count by thousands.
+
+    Each bucket is dual-typed: owl:Class AND skos:Concept (OWL Punning,
+    legal in OWL 2 DL). The OWL side keeps the pipeline's existing
+    classes_dict handling unchanged. The SKOS side makes the buckets
+    SPARQL- and tool-friendly as a navigable concept scheme.
+
+    The buckets are organized under a single skos:ConceptScheme
+    (DomainConceptsScheme) so they can be browsed as a top-level facet.
+
+    Namespace: https://veerla-ramrao.ai/ontology/domain-concepts#
+    Protected via the umbrella https://veerla-ramrao.ai/ontology/
+    prefix in config.yaml.
+-->
+<rdf:RDF
+    xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+    xmlns:rdfs="http://www.w3.org/2000/01/rdf-schema#"
+    xmlns:owl="http://www.w3.org/2002/07/owl#"
+    xmlns:skos="http://www.w3.org/2004/02/skos/core#"
+    xmlns:xml="http://www.w3.org/XML/1998/namespace"
+    xmlns="https://veerla-ramrao.ai/ontology/domain-concepts#">
+
+    <owl:Ontology rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts">
+        <rdfs:label>Domain Concepts (bootstrap buckets)</rdfs:label>
+        <rdfs:comment>Top-level bucket classes that anchor newly-minted concept classes in the prune-expand pipeline. Each class is dual-typed as owl:Class (for OWL inference + classes_dict handling) and skos:Concept (for thesaurus-style navigation). Maintained by the curator.</rdfs:comment>
+    </owl:Ontology>
+
+    <!-- ConceptScheme grouping all bootstrap buckets as top concepts. -->
+    <skos:ConceptScheme rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme">
+        <rdfs:label>Domain Concepts Scheme</rdfs:label>
+        <skos:prefLabel xml:lang="en">Domain Concepts</skos:prefLabel>
+        <skos:definition>A top-level concept scheme for organizing newly-minted concept classes by abstract domain.</skos:definition>
+        <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Industry"/>
+        <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#EconomicConcept"/>
+        <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#PolicyConcept"/>
+        <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Event"/>
+        <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Process"/>
+        <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Material"/>
+        <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#NaturalResource"/>
+        <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#TechnologyConcept"/>
+        <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Infrastructure"/>
+        <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#SupplyChainConcept"/>
+        <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#GeographicFeature"/>
+        <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConcept"/>
+    </skos:ConceptScheme>
+
+    <!-- 1. Industry -->
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Industry">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:label>Industry</rdfs:label>
+        <skos:prefLabel xml:lang="en">Industry</skos:prefLabel>
+        <rdfs:comment>A kind of human economic activity. Examples: Agriculture, Manufacturing, Mining, Healthcare, Energy, Transportation, Finance.</rdfs:comment>
+        <skos:definition>A kind of human economic activity (sector / branch of the economy).</skos:definition>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <!-- 2. EconomicConcept -->
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#EconomicConcept">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:label>EconomicConcept</rdfs:label>
+        <skos:prefLabel xml:lang="en">Economic Concept</skos:prefLabel>
+        <rdfs:comment>A market or financial phenomenon. Examples: Price, Demand, Subsidy, Tariff, Inflation, Recession.</rdfs:comment>
+        <skos:definition>A market, monetary, or financial phenomenon.</skos:definition>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <!-- 3. PolicyConcept -->
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#PolicyConcept">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:label>PolicyConcept</rdfs:label>
+        <skos:prefLabel xml:lang="en">Policy Concept</skos:prefLabel>
+        <rdfs:comment>A rule, framework, or governance instrument. Examples: Regulation, Law, Treaty, Sanction, Tariff, Ban, Policy Initiative.</rdfs:comment>
+        <skos:definition>A rule, regulation, treaty, or framework imposed by governments or institutions.</skos:definition>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <!-- 4. Event -->
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Event">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:label>Event</rdfs:label>
+        <skos:prefLabel xml:lang="en">Event</skos:prefLabel>
+        <rdfs:comment>A named happening with a time signature. Examples: Iran-Israel war, Hormuz closure, Helium crisis, COVID-19 pandemic, Suez Canal blockage.</rdfs:comment>
+        <skos:definition>A named happening (war, crisis, closure, summit, attack, treaty signing, etc.).</skos:definition>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <!-- 5. Process -->
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Process">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:label>Process</rdfs:label>
+        <skos:prefLabel xml:lang="en">Process</skos:prefLabel>
+        <rdfs:comment>A named ongoing activity. Examples: Refining, Distillation, Decarbonization, Manufacturing, Cracking.</rdfs:comment>
+        <skos:definition>A named ongoing activity (operational, industrial, or natural).</skos:definition>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <!-- 6. Material -->
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Material">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:label>Material</rdfs:label>
+        <skos:prefLabel xml:lang="en">Material</skos:prefLabel>
+        <rdfs:comment>A physical substance, compound, or commodity. Examples: Helium, Urea, Oil, Steel, Lithium, Polymer.</rdfs:comment>
+        <skos:definition>A physical substance, chemical, or compound.</skos:definition>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <!-- 7. NaturalResource -->
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#NaturalResource">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Material"/>
+        <rdfs:label>NaturalResource</rdfs:label>
+        <skos:prefLabel xml:lang="en">Natural Resource</skos:prefLabel>
+        <rdfs:comment>An extracted natural input. Examples: Crude Oil, Natural Gas, Ore, Timber, Phosphate Rock.</rdfs:comment>
+        <skos:definition>A naturally-occurring material extracted from the environment as an industrial input.</skos:definition>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+        <skos:broader rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Material"/>
+    </owl:Class>
+
+    <!-- 8. TechnologyConcept -->
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#TechnologyConcept">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:label>TechnologyConcept</rdfs:label>
+        <skos:prefLabel xml:lang="en">Technology Concept</skos:prefLabel>
+        <rdfs:comment>A technical artifact, system, or method. Examples: Semiconductor, Wafer, AI, Battery, MRI, Cloud Computing.</rdfs:comment>
+        <skos:definition>A technical artifact, system, technique, or method.</skos:definition>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <!-- 9. Infrastructure -->
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Infrastructure">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:label>Infrastructure</rdfs:label>
+        <skos:prefLabel xml:lang="en">Infrastructure</skos:prefLabel>
+        <rdfs:comment>A physical facility or built structure. Examples: Pipeline, Port, Refinery Complex, Power Grid, Factory, Terminal, Station.</rdfs:comment>
+        <skos:definition>A physical built facility or installation supporting industrial / civic activity.</skos:definition>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <!-- 10. SupplyChainConcept -->
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#SupplyChainConcept">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:label>SupplyChainConcept</rdfs:label>
+        <skos:prefLabel xml:lang="en">Supply Chain Concept</skos:prefLabel>
+        <rdfs:comment>A logistics or trade-flow concept. Examples: Supply Chain, Shipping Route, Freight Corridor, Choke Point.</rdfs:comment>
+        <skos:definition>A logistics, trade-flow, or supply-chain concept.</skos:definition>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <!-- 11. GeographicFeature -->
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#GeographicFeature">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:label>GeographicFeature</rdfs:label>
+        <skos:prefLabel xml:lang="en">Geographic Feature</skos:prefLabel>
+        <rdfs:comment>A place or landform whose label IS a place name with no event/process modifier. Examples: Strait of Hormuz, Kharg Island, Suez Canal, Persian Gulf. See also the geography ontology for finer-grained sub-classes (Country, Sea, Strait, etc.).</rdfs:comment>
+        <skos:definition>A named place or landform — geographic identity only, no event modifier.</skos:definition>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <!-- 12. DomainConcept (catch-all) -->
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConcept">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:label>DomainConcept</rdfs:label>
+        <skos:prefLabel xml:lang="en">Domain Concept</skos:prefLabel>
+        <rdfs:comment>Catch-all top-level fallback for genuinely broad / abstract concepts that don't cleanly fit any of the other buckets. Better than forcing a bad placement.</rdfs:comment>
+        <skos:definition>Catch-all top-level fallback for broad / abstract concepts.</skos:definition>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+</rdf:RDF>

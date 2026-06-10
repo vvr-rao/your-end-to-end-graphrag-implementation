@@ -589,6 +589,31 @@ def _find_or_synthesize_parent_iri(
     return new_iri
 
 
+# Parent labels for which a person-shape LABEL is unambiguously an
+# individual person, not a class. Layer H overrides the LLM's verdict
+# for these cases (force-convert to instance of Person).
+_PERSON_PARENT_LABELS: frozenset[str] = frozenset({
+    "person", "personrole", "personorrole", "role", "agent",
+    "foaf:person", "foaf:agent", "org:role",
+})
+
+
+def _force_convert_person_shape(
+    label: str, current_parent_label: str
+) -> bool:
+    """True when an entity whose LABEL looks like a person name AND
+    is currently parented under a Person/PersonRole/Role-shaped class
+    SHOULD be converted to an instance, regardless of LLM verdict.
+
+    Catches Layer H's blind spots -- the gpt-4o-mini audit sometimes
+    KEEPs entities like "Elon Musk" parented under foaf:Person, even
+    though they are obviously individuals, not subclasses."""
+    if not _looks_like_person_name(label):
+        return False
+    p = (current_parent_label or "").strip().lower()
+    return p in _PERSON_PARENT_LABELS
+
+
 def _apply_audit_decision(
     iri: str,
     rec: dict[str, Any],
@@ -596,10 +621,24 @@ def _apply_audit_decision(
     classes_dict: dict[str, Any],
     instances_dict: dict[str, Any],
     default_base_iri: str,
+    current_parent_label: str = "",
 ) -> str:
     """Apply ONE decision to the class. Returns the action that was
     actually applied: 'kept', 'rehomed', 'converted', or 'noop' (if
-    validation failed)."""
+    validation failed).
+
+    Pre-check: if the entity has a person-name shape AND is parented
+    under Person/PersonRole/Role, force CONVERT_TO_INSTANCE under
+    Person. Overrides any LLM verdict (the LLM sometimes KEEPs these
+    despite the prompt's explicit instruction). `current_parent_label`
+    is the label of `rec`'s current parent (caller passes it in to
+    avoid re-resolving)."""
+    label = _label_of(rec)
+    if _force_convert_person_shape(label, current_parent_label):
+        decision = dict(decision)
+        decision["ACTION"] = "CONVERT_TO_INSTANCE"
+        decision["NEW_PARENT"] = "Person"
+
     action = (decision.get("ACTION") or "").strip().upper()
     new_parent_label = (decision.get("NEW_PARENT") or "").strip()
 
@@ -658,7 +697,7 @@ async def run_classification_audit_async(
     classes_dict: dict[str, Any],
     instances_dict: dict[str, Any],
     router: LLMRouter,
-    default_base_iri: str = "http://your-personal-ontologist.local/ontology/",
+    default_base_iri: str = "https://veerla-ramrao.ai/ontology/merged#",
     concurrency: int = 8,
     use_cache: bool = True,
     model_name: str = "gpt-4o-mini",
@@ -763,6 +802,7 @@ async def run_classification_audit_async(
             outcome = _apply_audit_decision(
                 iri, rec, decisions_by_label[lab],
                 classes_dict, instances_dict, default_base_iri,
+                current_parent_label=item.get("CURRENT_PARENT", ""),
             )
             counters[outcome] = counters.get(outcome, 0) + 1
             total_decisions += 1
@@ -1797,7 +1837,7 @@ async def _run(
 
     if operation in ("expand", "prune-expand", "build"):
         ontology_cfg = app_cfg.get("ontology", {}) or {}
-        base_iri = ontology_cfg.get("default_base_iri") or "http://your-personal-ontologist.local/ontology/"
+        base_iri = ontology_cfg.get("default_base_iri") or "https://veerla-ramrao.ai/ontology/merged#"
         parent_iri = ontology_cfg.get("default_parent_iri")
         out_ontology, created, created_props, skipped_rels, created_instances = _apply_expand(
             out_ontology, deduped, base_iri, parent_iri

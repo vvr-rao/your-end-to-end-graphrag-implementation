@@ -74,7 +74,9 @@ ontology:
   # Generated/exported .owl files land here. Real version control = Postgres `ontology_versions`.
   output_dir: ./output_ontologies
   # Default base IRI for synthetically created classes from "MATCH NOT FOUND" LLM output.
-  default_base_iri: http://your-personal-ontologist.local/ontology/
+  # Set to your own domain so synthesized class IRIs are dereference-able
+  # under your namespace. Hash form is the ontology-modeling convention.
+  default_base_iri: https://example.com/ontology/merged#
   # Default parent IRI for proposed-but-unparented classes.
   default_parent_iri: http://www.w3.org/2002/07/owl#Thing
   # IRI prefixes that prune will NEVER remove. Any class whose IRI starts with

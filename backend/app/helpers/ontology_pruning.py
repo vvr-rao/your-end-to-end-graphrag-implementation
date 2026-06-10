@@ -1031,6 +1031,28 @@ def _is_safe_geo_parent_for(class_label: str, parent_iri: str) -> bool:
     return False
 
 
+# Standard upper ontologies whose namespaces we MUST NOT mint into.
+# Without this guard, new classes parented under foaf:Organization,
+# org:Role, skos:Concept etc. get IRIs in the upper-ontology namespace
+# (e.g. http://xmlns.com/foaf/0.1/archerdanielsmidland) -- polluting a
+# shared vocabulary AND silently force-protecting hundreds of squatted
+# classes from prune (because the protected_iri_prefixes include FOAF).
+# These prefixes catch the parent's namespace BEFORE the per-parent
+# namespace-inheritance rule fires; classes with these parents fall
+# back to `default_base_iri` (the project's own namespace).
+_STANDARD_UPPER_ONTOLOGY_PREFIXES: tuple[str, ...] = (
+    "http://xmlns.com/foaf/",
+    "http://www.w3.org/ns/org",
+    "http://www.w3.org/2004/02/skos/",
+    "http://www.w3.org/2006/time",
+    "http://www.w3.org/2002/07/owl",
+    "http://www.w3.org/2000/01/rdf-schema",
+    "http://www.w3.org/1999/02/22-rdf-syntax-ns",
+    "http://www.w3.org/2001/XMLSchema",
+    "http://purl.org/dc/",
+)
+
+
 def _derive_namespace_from_parent_iri(parent_iri: str | None, default_base_iri: str) -> str:
     """If `parent_iri` lives in a real domain ontology (anything other than
     owl:Thing or unset), derive the namespace prefix from it so a new
@@ -1039,8 +1061,14 @@ def _derive_namespace_from_parent_iri(parent_iri: str | None, default_base_iri: 
 
     Hash-IRIs:  https://x/ontology/geography#Country -> https://x/ontology/geography#
     Path-IRIs:  https://x/ontology/cars/BMW         -> https://x/ontology/cars/
+
+    Exception: standard upper ontologies (FOAF, ORG, SKOS, time, OWL,
+    RDFS, RDF, XSD, DC) are NEVER minted into. A class parented at
+    `foaf:Organization` mints in `default_base_iri`, not in FOAF.
     """
     if not parent_iri or parent_iri == _OWL_THING_IRI:
+        return default_base_iri
+    if any(parent_iri.startswith(p) for p in _STANDARD_UPPER_ONTOLOGY_PREFIXES):
         return default_base_iri
     if "#" in parent_iri:
         return parent_iri.rsplit("#", 1)[0] + "#"

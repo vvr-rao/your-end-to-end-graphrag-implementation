@@ -178,6 +178,34 @@ def build_parser() -> argparse.ArgumentParser:
     _add_input_folder(p_audit)
     p_audit.set_defaults(func=_cmd_audit_classifications)
 
+    p_repair = sub.add_parser(
+        "repair-output",
+        help=(
+            "Deterministic repair of an existing prune-expand folder: "
+            "(1) move classes that squatted into FOAF/ORG/SKOS namespaces "
+            "out to the project namespace; "
+            "(2) rewrite the deprecated your-personal-ontologist.local "
+            "placeholder IRIs to https://veerla-ramrao.ai/ontology/...; "
+            "(3) convert person-name-shaped classes parented under "
+            "Person/PersonRole/Role to instances of foaf:Person. $0 LLM "
+            "cost. Modifies merged.json + merged.owl in place."
+        ),
+    )
+    _add_input_folder(p_repair)
+    p_repair.add_argument(
+        "--skip-foaf-cleanup", action="store_true",
+        help="Skip the FOAF/ORG/SKOS squatter cleanup pass.",
+    )
+    p_repair.add_argument(
+        "--skip-rebrand", action="store_true",
+        help="Skip the brand-rewrite pass.",
+    )
+    p_repair.add_argument(
+        "--skip-person-convert", action="store_true",
+        help="Skip the person-shape force-convert pass.",
+    )
+    p_repair.set_defaults(func=_cmd_repair_output)
+
     return parser
 
 
@@ -286,6 +314,18 @@ def _cmd_audit_classifications(args: argparse.Namespace) -> int:
     from backend.app.services.pipeline import run_audit_classifications
 
     asyncio.run(run_audit_classifications(input_folder=args.input))
+    return 0
+
+
+def _cmd_repair_output(args: argparse.Namespace) -> int:
+    from backend.app.services.pipeline import run_repair_output
+
+    asyncio.run(run_repair_output(
+        input_folder=args.input,
+        do_foaf_cleanup=not args.skip_foaf_cleanup,
+        do_rebrand=not args.skip_rebrand,
+        do_person_convert=not args.skip_person_convert,
+    ))
     return 0
 
 
