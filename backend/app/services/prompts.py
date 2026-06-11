@@ -634,6 +634,74 @@ def document_summarize(text: str) -> tuple[str, str]:
     return system, user
 
 
+def artifact_chunk_extract(text: str) -> tuple[str, str]:
+    """Phase 2 Milestone E: extract Claims + Findings + Observations
+    from one chunk in a single LLM call (3x cheaper than 3 calls).
+
+    Returns JSON: {
+      claims:       [{text, confidence}],
+      findings:     [{text, confidence}],
+      observations: [{text, confidence}]
+    }
+
+    The prompt is corpus-agnostic — it defines each type abstractly
+    so the same instructions work on any domain (legal, financial,
+    scientific, web search, etc.).
+    """
+    system = (
+        "You extract structured intelligence artifacts from text chunks. "
+        "You return ONE JSON object with three keys: claims, findings, "
+        "observations. Each is a list of `{text, confidence}` items.\n\n"
+        "DEFINITIONS:\n"
+        "  - Claim: a factual assertion the text MAKES (e.g. \"X "
+        "owns 30% of Y\"). Specific and verifiable.\n"
+        "  - Finding: an analytical conclusion or insight (e.g. \"the "
+        "trend suggests Z is accelerating\"). Goes beyond raw facts.\n"
+        "  - Observation: a raw factual statement directly visible in "
+        "the text (e.g. \"price rose 5% in March\"). The most concrete "
+        "of the three.\n\n"
+        "GUIDELINES:\n"
+        "  - 0 to 8 of each type per chunk; only include items the "
+        "text actually supports.\n"
+        "  - `text` should be the artifact as a standalone sentence, "
+        "NOT a quote.\n"
+        "  - `confidence` is a float in [0,1] reflecting how directly "
+        "the chunk supports the artifact.\n"
+        "  - Skip claims / findings / observations that are too vague, "
+        "uncertain, or generic to be useful.\n"
+        "  - Return ONLY the JSON object — no preamble, no markdown."
+    )
+    user = (
+        "TEXT CHUNK:\n```\n"
+        + text
+        + "\n```\n\n"
+        "Return the JSON now."
+    )
+    return system, user
+
+
+def artifact_document_summary(chunks_text: str) -> tuple[str, str]:
+    """Phase 2 Milestone E: per-document Summary artifact.
+
+    Given the concatenated chunks of a document (already summarized
+    upstream if oversize), produce a single Summary artifact.
+    Corpus-agnostic prose, no domain-specific framing.
+    """
+    system = (
+        "You write neutral, third-person document summaries. Capture "
+        "the document's main points in 150-250 words. No opinions, no "
+        "editorial framing, no bullet lists — flowing prose only. "
+        "Return ONLY the summary text."
+    )
+    user = (
+        "DOCUMENT CONTENT:\n```\n"
+        + chunks_text
+        + "\n```\n\n"
+        "Write the summary now."
+    )
+    return system, user
+
+
 # Public registry so callers can look up a prompt builder by task name.
 PROMPTS = {
     "chunk_classification": chunk_classification,
@@ -643,4 +711,6 @@ PROMPTS = {
     "compact_description": compact_description,
     "document_summarize": document_summarize,
     "classification_audit": classification_audit,
+    "artifact_chunk_extract": artifact_chunk_extract,
+    "artifact_document_summary": artifact_document_summary,
 }

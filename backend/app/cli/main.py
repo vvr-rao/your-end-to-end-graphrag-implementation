@@ -323,6 +323,144 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_init.set_defaults(func=_cmd_db_init)
 
+    # ---------- Phase 2: Milestone B (ingestion + lifecycle) ----------
+    p_reg = sub.add_parser(
+        "register-documents",
+        help=(
+            "Milestone B: ingest a folder of .pdf/.txt files into the "
+            "graphrag schema. Summarizes oversize docs via the Phase 1 "
+            "disk cache, chunks, embeds, writes chunk-of edges."
+        ),
+    )
+    p_reg.add_argument(
+        "--input", type=Path, required=True,
+        help="Folder of .pdf/.txt files to ingest. Generic: any corpus path.",
+    )
+    p_reg.add_argument(
+        "--limit", type=int, default=None,
+        help="Cap number of docs to process (smoke testing).",
+    )
+    p_reg.add_argument(
+        "--dry-run", action="store_true",
+        help="Report what would be ingested without writing.",
+    )
+    p_reg.add_argument(
+        "--summarization-threshold", type=int, default=2000,
+        help="Token threshold above which a doc gets pre-summarized.",
+    )
+    p_reg.add_argument(
+        "--chunk-size", type=int, default=800,
+        help="Target tokens per chunk.",
+    )
+    p_reg.add_argument(
+        "--chunk-overlap", type=int, default=120,
+        help="Token overlap between adjacent chunks.",
+    )
+    p_reg.add_argument(
+        "--concurrency", type=int, default=4,
+        help="Concurrent LLM calls for summarization.",
+    )
+    p_reg.set_defaults(func=_cmd_register_documents)
+
+    p_del = sub.add_parser(
+        "delete-document",
+        help="Soft-delete (default) or hard-delete a document by IRI.",
+    )
+    p_del.add_argument("--iri", required=True, help="Document IRI.")
+    p_del.add_argument(
+        "--hard", action="store_true",
+        help="Hard delete (removes the row + cascades to chunks).",
+    )
+    p_del.set_defaults(func=_cmd_delete_document)
+
+    p_upd = sub.add_parser(
+        "update-document",
+        help=(
+            "Replace a document's content. No-op if the new file has "
+            "the same sha256 as the existing one."
+        ),
+    )
+    p_upd.add_argument("--iri", required=True, help="Existing document IRI.")
+    p_upd.add_argument(
+        "--path", type=Path, required=True,
+        help="Path to the new file.",
+    )
+    p_upd.set_defaults(func=_cmd_update_document)
+
+    p_list = sub.add_parser(
+        "list-documents",
+        help="List documents in the graphrag schema.",
+    )
+    p_list.add_argument(
+        "--status", choices=("ACTIVE", "STALE", "DELETED"), default=None,
+        help="Filter by status.",
+    )
+    p_list.add_argument(
+        "--limit", type=int, default=None,
+        help="Cap rows returned.",
+    )
+    p_list.set_defaults(func=_cmd_list_documents)
+
+    # ---------- Phase 2: Milestone D (temporal) ----------
+    p_time = sub.add_parser(
+        "enrich-time",
+        help=(
+            "Milestone D: scan chunks for date references, mint "
+            "time_instances + chunk->time edges. No LLM cost."
+        ),
+    )
+    p_time.add_argument(
+        "--limit", type=int, default=None,
+        help="Cap chunks scanned (smoke testing).",
+    )
+    p_time.add_argument(
+        "--highest-level",
+        choices=("year", "quarter", "month"), default="year",
+        help="Top of the time hierarchy to materialize.",
+    )
+    p_time.add_argument(
+        "--lowest-level",
+        choices=("month", "day"), default="month",
+        help="Bottom of the time hierarchy + gap-fill granularity.",
+    )
+    p_time.set_defaults(func=_cmd_enrich_time)
+
+    # ---------- Phase 2: Milestone E (artifacts) ----------
+    p_art = sub.add_parser(
+        "generate-artifacts",
+        help=(
+            "Milestone E: generate intelligence artifacts. Default = "
+            "Claim+Finding+Observation per chunk plus per-doc Summary."
+        ),
+    )
+    p_art.add_argument(
+        "--type",
+        choices=("Claim", "Finding", "Observation", "Summary"),
+        default=None,
+        action="append",
+        help=(
+            "Restrict to specific types (repeatable). Default = all 4. "
+            "Insight + Recommendation are not implemented in v0."
+        ),
+    )
+    p_art.add_argument(
+        "--scope-iri", default=None,
+        help="Restrict to one document IRI.",
+    )
+    p_art.add_argument(
+        "--limit", type=int, default=None,
+        help="Cap chunks/docs processed.",
+    )
+    p_art.add_argument(
+        "--concurrency", type=int, default=4,
+        help="Concurrent LLM calls.",
+    )
+    p_art.add_argument(
+        "--max-cost-usd", type=float, default=5.0,
+        help="Abort if LLM spend exceeds this within the run.",
+    )
+    p_art.set_defaults(func=_cmd_generate_artifacts)
+
     return parser
 
 
@@ -584,6 +722,108 @@ def _cmd_db_init(args: argparse.Namespace) -> int:
     print("DB-INIT: step 4/4 -- report status")
     print("=" * 64)
     asyncio.run(report_db_status())
+    return 0
+
+
+def _cmd_register_documents(args: argparse.Namespace) -> int:
+    from backend.app.services.db_document_ingest import ingest_documents_folder
+
+    asyncio.run(
+        ingest_documents_folder(
+            folder=args.input,
+            limit=args.limit,
+            dry_run=args.dry_run,
+            summarization_threshold=args.summarization_threshold,
+            chunk_size=args.chunk_size,
+            chunk_overlap=args.chunk_overlap,
+            concurrency=args.concurrency,
+        )
+    )
+    return 0
+
+
+def _cmd_delete_document(args: argparse.Namespace) -> int:
+    from backend.app.services.db_document_lifecycle import delete_document
+
+    asyncio.run(delete_document(iri=args.iri, hard=args.hard))
+    return 0
+
+
+def _cmd_update_document(args: argparse.Namespace) -> int:
+    from backend.app.services.db_document_lifecycle import update_document
+
+    result = asyncio.run(update_document(iri=args.iri, new_path=args.path))
+    print(result)
+    return 0
+
+
+def _cmd_list_documents(args: argparse.Namespace) -> int:
+    from backend.app.services.db_document_lifecycle import list_documents
+
+    rows = asyncio.run(list_documents(status=args.status, limit=args.limit))
+    if not rows:
+        print("(no documents)")
+        return 0
+    print(f"{'status':<10} {'v':<3} {'chunks':<7} {'created_at':<26} title")
+    print("-" * 100)
+    for r in rows:
+        print(
+            f"{r['status']:<10} {r['version']:<3} {r['chunks']:<7} "
+            f"{r['created_at']:<26} {r['title']}"
+        )
+    return 0
+
+
+def _cmd_enrich_time(args: argparse.Namespace) -> int:
+    from backend.app.services.db_temporal_enrich import enrich_temporal
+
+    asyncio.run(
+        enrich_temporal(
+            limit=args.limit,
+            highest_level=args.highest_level,
+            lowest_level=args.lowest_level,
+        )
+    )
+    return 0
+
+
+def _cmd_generate_artifacts(args: argparse.Namespace) -> int:
+    from backend.app.db.engine import reset_engine_cache
+    from backend.app.services.db_artifact_gen import (
+        generate_document_summaries,
+        generate_per_chunk_artifacts,
+    )
+
+    types_requested = tuple(args.type) if args.type else (
+        "Claim", "Finding", "Observation", "Summary"
+    )
+    per_chunk = tuple(t for t in types_requested if t in ("Claim", "Finding", "Observation"))
+    do_summary = "Summary" in types_requested
+
+    if per_chunk:
+        asyncio.run(
+            generate_per_chunk_artifacts(
+                scope_document_iri=args.scope_iri,
+                limit=args.limit,
+                types=per_chunk,
+                concurrency=args.concurrency,
+                max_cost_usd=args.max_cost_usd,
+            )
+        )
+        # The above asyncio.run's loop is now dead; drop the cached
+        # engine so the next call builds fresh against its own loop.
+        reset_engine_cache()
+
+    if do_summary:
+        asyncio.run(
+            generate_document_summaries(
+                scope_document_iri=args.scope_iri,
+                limit=args.limit,
+                concurrency=args.concurrency,
+                max_cost_usd=args.max_cost_usd,
+            )
+        )
+
     return 0
 
 

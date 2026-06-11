@@ -23,10 +23,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from backend.app.db.graph_version import bump_version
+from backend.app.db.graph_version import bump_version, current_version
+from backend.app.db.models.graph import GraphRelationship
 from backend.app.db.models.ontology import (
     OntologyClass,
     OntologyDataProperty,
@@ -38,6 +39,9 @@ from backend.app.services.embeddings import Embedder
 
 _VIAO_NAMESPACE = "https://veerla-ramrao.ai/ontology/intelligence-artifact"
 
+_RDFS_SUBCLASS_OF = "http://www.w3.org/2000/01/rdf-schema#subClassOf"
+_OWL_EQUIVALENT_CLASS = "http://www.w3.org/2002/07/owl#equivalentClass"
+
 
 @dataclass
 class ImportSummary:
@@ -48,6 +52,7 @@ class ImportSummary:
     obj_props_total: int = 0
     data_props_total: int = 0
     instances_total: int = 0
+    edges_materialized: int = 0
     cost_usd: float = 0.0
     dry_run: bool = False
 
@@ -267,6 +272,15 @@ async def import_ontology_folder(
             })
         await _upsert_batched(OntologyInstance, payloads, "instances")
 
+    # ---- Materialize ontology edges into graph_relationships ----
+    # Writes subClassOf + equivalentClass rows tagged source='ONTOLOGY'.
+    # Idempotent: deletes existing ONTOLOGY-source rows first so a
+    # re-import doesn't accumulate stale edges. Disjointness is
+    # deferred -- the owlready2 dump represents it as an
+    # AllDisjoint(...) opaque repr which needs a separate parser.
+    edges_written = await _materialize_ontology_edges(classes)
+    summary.edges_materialized = edges_written
+
     # ---- Bump graph_version ----
     async with session_scope() as session:
         new_version = await bump_version(session)
@@ -275,6 +289,114 @@ async def import_ontology_folder(
     summary.cost_usd = embedder.total_cost_usd
     print(
         f"[db-import] DONE: embedded={summary.classes_embedded} class(es), "
+        f"edges={summary.edges_materialized}, "
         f"cost=${summary.cost_usd:.4f}, tokens={embedder.total_tokens:,}"
     )
     return summary
+
+
+async def _materialize_ontology_edges(classes_dict: dict[str, Any]) -> int:
+    """Write rdfs:subClassOf + owl:equivalentClass rows into
+    `graph_relationships` with relationship_source='ONTOLOGY'.
+
+    Only edges where BOTH endpoints exist in `ontology_classes` are
+    written -- external/primitive parents (owl:Thing, classes not
+    loaded) are silently skipped. Existing ONTOLOGY-source rows are
+    deleted first so the import is idempotent.
+
+    Returns the number of edge rows inserted.
+    """
+    # Pull current_id ← iri map for all loaded classes
+    async with session_scope() as session:
+        result = await session.execute(
+            select(OntologyClass.id, OntologyClass.iri)
+        )
+        iri_to_id: dict[str, Any] = {iri: cid for cid, iri in result.all()}
+        gv = await current_version(session)
+
+    print(f"[db-import] materializing ontology edges (iri_to_id={len(iri_to_id):,})")
+
+    payloads: list[dict[str, Any]] = []
+    skipped_external = 0
+    for src_iri, rec in classes_dict.items():
+        src_id = iri_to_id.get(src_iri)
+        if not src_id:
+            continue
+
+        # subClassOf — `superclasses` is a list of {kind, name, iri, type, python_name}
+        for sup in rec.get("superclasses") or []:
+            if not isinstance(sup, dict):
+                continue
+            tgt_iri = sup.get("iri")
+            if not tgt_iri:
+                continue
+            tgt_id = iri_to_id.get(tgt_iri)
+            if not tgt_id:
+                skipped_external += 1
+                continue
+            if src_id == tgt_id:
+                continue  # don't self-link
+            payloads.append({
+                "source_node_type": "ontology_class",
+                "source_node_id": src_id,
+                "target_node_type": "ontology_class",
+                "target_node_id": tgt_id,
+                "predicate_iri": _RDFS_SUBCLASS_OF,
+                "predicate_label": "rdfs:subClassOf",
+                "relationship_type": "subClassOf",
+                "relationship_source": "ONTOLOGY",
+                "is_authoritative": True,
+                "graph_version": gv,
+                "extra_metadata": {},
+            })
+
+        # equivalentClass — `equivalent_to` is a list of entity dicts
+        for eq in rec.get("equivalent_to") or []:
+            if not isinstance(eq, dict):
+                continue
+            tgt_iri = eq.get("iri")
+            if not tgt_iri:
+                continue
+            tgt_id = iri_to_id.get(tgt_iri)
+            if not tgt_id:
+                skipped_external += 1
+                continue
+            if src_id == tgt_id:
+                continue
+            payloads.append({
+                "source_node_type": "ontology_class",
+                "source_node_id": src_id,
+                "target_node_type": "ontology_class",
+                "target_node_id": tgt_id,
+                "predicate_iri": _OWL_EQUIVALENT_CLASS,
+                "predicate_label": "owl:equivalentClass",
+                "relationship_type": "equivalentClass",
+                "relationship_source": "ONTOLOGY",
+                "is_authoritative": True,
+                "graph_version": gv,
+                "extra_metadata": {},
+            })
+
+    print(
+        f"[db-import] {len(payloads):,} ontology edges to write "
+        f"(skipped {skipped_external:,} external/unloaded targets)"
+    )
+
+    # Wipe + bulk-insert
+    BATCH = 500
+    async with session_scope() as session:
+        await session.execute(
+            delete(GraphRelationship).where(
+                GraphRelationship.relationship_source == "ONTOLOGY"
+            )
+        )
+
+    for batch_idx in range(0, len(payloads), BATCH):
+        chunk = payloads[batch_idx : batch_idx + BATCH]
+        async with session_scope() as session:
+            await session.execute(pg_insert(GraphRelationship).values(chunk))
+        done = min(batch_idx + BATCH, len(payloads))
+        if done % (BATCH * 4) == 0 or done == len(payloads):
+            print(f"[db-import] edges: {done}/{len(payloads)} written")
+
+    return len(payloads)

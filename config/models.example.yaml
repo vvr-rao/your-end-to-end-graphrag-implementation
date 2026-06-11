@@ -128,14 +128,38 @@ tasks:
 
   # ---------------------------------------------------------------------------
   # Embeddings — used for chunk_embeddings + class summary embeddings.
-  # text-embedding-3-small (1536 dim) is the default; ~6.5× cheaper than -large
-  # for ~3-5% MTEB lift. Schema's `model` column lets us re-embed later.
+  # Phase 2 uses 1024 dim (33% storage saving vs default 1536, negligible
+  # retrieval-quality cost). Schema's `model` column lets us re-embed later.
   # ---------------------------------------------------------------------------
   embeddings:
     provider: openai
     model: text-embedding-3-small
-    dim: 1536
+    dim: 1024
     batch_size: 100
+
+  # ---------------------------------------------------------------------------
+  # Phase 2 Milestone E: per-chunk Claim+Finding+Observation extraction.
+  # One LLM call returns all three types per chunk (3× cheaper than splitting).
+  # gpt-4o-mini is plenty for structured extraction; high volume = cost matters.
+  # ---------------------------------------------------------------------------
+  artifact_chunk_extract:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 2048
+    response_format: json_object
+
+  # ---------------------------------------------------------------------------
+  # Phase 2 Milestone E: per-document Summary artifact. Plain-text output.
+  # gpt-4o-mini suffices — this is rewrite, not synthesis.
+  # ---------------------------------------------------------------------------
+  artifact_document_summary:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 90
+    temperature: 0.2
+    max_tokens: 1024
 
 # =============================================================================
 # Retry / backoff defaults (applied by the router via tenacity unless overridden
