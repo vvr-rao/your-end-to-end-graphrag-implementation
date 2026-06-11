@@ -277,6 +277,52 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_status.set_defaults(func=_cmd_db_status)
 
+    # ---------- Phase 2: one-shot init (migrate + optional import + status) ----------
+    p_init = sub.add_parser(
+        "db-init",
+        help=(
+            "One-shot Phase 2 setup. Runs db-migrate to create/upgrade "
+            "the graphrag schema, optionally imports a Phase-1 "
+            "merge/prune-expand folder via --input, then reports "
+            "db-status. Idempotent: safe to re-run; upserts existing rows."
+        ),
+    )
+    p_init.add_argument(
+        "--input", type=Path, default=None,
+        help=(
+            "(Optional) Phase-1 version folder containing merged.json "
+            "(e.g. output_ontologies/v...-prune-expand/). When set, "
+            "imports the ontology after the migration step."
+        ),
+    )
+    p_init.add_argument(
+        "--mode", choices=("upsert", "replace"), default="upsert",
+        help=(
+            "How to apply the import (default: upsert). "
+            "'upsert' = insert new rows + update existing rows by IRI, "
+            "leave any rows whose IRI is no longer in the new ontology "
+            "untouched (additive). "
+            "'replace' = wipe ontology_classes + properties + instances "
+            "first, then import. Use this when re-importing an ontology "
+            "you've modified and want to drop classes that no longer "
+            "exist. Refuses to run if dependent tables (entities, "
+            "relationships, etc.) have rows -- delete documents first."
+        ),
+    )
+    p_init.add_argument(
+        "--limit", type=int, default=None,
+        help="Cap how many of each entity kind to import (smoke testing).",
+    )
+    p_init.add_argument(
+        "--dry-run", action="store_true",
+        help="Migrate + report only; skip the import even if --input is set.",
+    )
+    p_init.add_argument(
+        "--yes", action="store_true",
+        help="Skip the interactive confirmation prompt for --mode replace.",
+    )
+    p_init.set_defaults(func=_cmd_db_init)
+
     return parser
 
 
@@ -454,6 +500,89 @@ def _cmd_db_downgrade(args: argparse.Namespace) -> int:
 def _cmd_db_status(args: argparse.Namespace) -> int:
     from backend.app.services.db_status import report_db_status
 
+    asyncio.run(report_db_status())
+    return 0
+
+
+def _cmd_db_init(args: argparse.Namespace) -> int:
+    """One-shot: migrate -> (optional) wipe -> (optional) import -> status.
+
+    Idempotent. Safe to re-run -- the migration is no-op if already
+    applied; default mode 'upsert' inserts new + updates existing rows.
+    Use --mode replace to wipe ontology tables before reimporting (when
+    you've modified the ontology and want stale rows removed).
+    """
+    from alembic import command
+    from alembic.config import Config as AlembicConfig
+
+    from backend.app.db.engine import reset_engine_cache
+    from backend.app.services.db_status import report_db_status
+
+    print("=" * 64)
+    print("DB-INIT: step 1/4 -- migrate (alembic upgrade head)")
+    print("=" * 64)
+    cfg = AlembicConfig("alembic.ini")
+    command.upgrade(cfg, "head")
+    print("[db-init] migrate DONE")
+    print()
+
+    # Alembic ran its own asyncio loop; that loop is now closed. Drop
+    # the cached engine so the next get_engine() builds fresh against
+    # the new loop. Can't await dispose_engine() here -- it would try
+    # to close connections bound to the dead loop.
+    reset_engine_cache()
+
+    # ---- Optional wipe (--mode replace) ----
+    if args.input is not None and args.mode == "replace" and not args.dry_run:
+        print("=" * 64)
+        print("DB-INIT: step 2/4 -- wipe ontology tables (--mode replace)")
+        print("=" * 64)
+
+        from backend.app.services.db_ontology_wipe import wipe_ontology_tables
+
+        try:
+            asyncio.run(wipe_ontology_tables(confirm=args.yes))
+            reset_engine_cache()
+        except RuntimeError as exc:
+            print(f"\n[db-init] WIPE REFUSED: {exc}")
+            print("[db-init] Either delete the dependent rows first, "
+                  "or use --mode upsert.")
+            return 1
+        print()
+    else:
+        if args.input is not None and not args.dry_run:
+            print("=" * 64)
+            print("DB-INIT: step 2/4 -- mode=upsert, no wipe needed")
+            print("=" * 64)
+            print()
+
+    if args.input is not None and not args.dry_run:
+        from backend.app.services.db_ontology_import import import_ontology_folder
+        print("=" * 64)
+        print(f"DB-INIT: step 3/4 -- import from {args.input}")
+        print("=" * 64)
+        summary = asyncio.run(import_ontology_folder(
+            input_folder=args.input,
+            limit=args.limit,
+            dry_run=False,
+        ))
+        print()
+        reset_engine_cache()
+    elif args.input is not None and args.dry_run:
+        print("=" * 64)
+        print("DB-INIT: step 3/4 -- import SKIPPED (--dry-run set)")
+        print("=" * 64)
+        print(f"  would have imported: {args.input}")
+        print()
+    else:
+        print("=" * 64)
+        print("DB-INIT: step 3/4 -- no --input given, skipping import")
+        print("=" * 64)
+        print()
+
+    print("=" * 64)
+    print("DB-INIT: step 4/4 -- report status")
+    print("=" * 64)
     asyncio.run(report_db_status())
     return 0
 

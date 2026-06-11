@@ -85,8 +85,24 @@ def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
     )
 
 
+def reset_engine_cache() -> None:
+    """Clear the engine + sessionmaker caches so the next get_engine()
+    builds a fresh engine bound to the current event loop.
+
+    Use this BETWEEN asyncio.run() boundaries (e.g. multi-step CLI
+    commands that interleave Alembic with async ops). DOES NOT await
+    engine.dispose() -- the old engine's loop is already closed at
+    that point, and trying to await on it raises 'Event loop is
+    closed'. Underlying asyncpg connections leak briefly but the
+    Supabase pooler reclaims them via idle timeout."""
+    get_engine.cache_clear()
+    get_sessionmaker.cache_clear()
+
+
 async def dispose_engine() -> None:
-    """Tear down the global engine (test fixtures + graceful shutdown)."""
+    """Tear down the global engine cleanly (test fixtures + graceful
+    shutdown WITHIN the same event loop). For CLI use that crosses
+    loop boundaries, call `reset_engine_cache()` instead."""
     if get_engine.cache_info().currsize > 0:
         engine = get_engine()
         await engine.dispose()
