@@ -206,6 +206,77 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_repair.set_defaults(func=_cmd_repair_output)
 
+    # ---------- Phase 2: import a merge folder into Postgres ----------
+    p_import = sub.add_parser(
+        "import-ontology",
+        help=(
+            "Phase 2: import a Phase-1 merge folder into the graphrag "
+            "Postgres schema. Upserts classes/properties/instances by "
+            "IRI. Embeds class (label + description) via "
+            "text-embedding-3-small @ 1024 dim. Bumps graph_version on "
+            "success. Use --limit for smoke testing and --dry-run for "
+            "a no-write rehearsal."
+        ),
+    )
+    _add_input_folder(p_import)
+    p_import.add_argument(
+        "--limit", type=int, default=None,
+        help=(
+            "Cap how many of each entity kind to process (classes, "
+            "obj_props, data_props, instances). Use --limit 5 for the "
+            "Milestone A smoke test."
+        ),
+    )
+    p_import.add_argument(
+        "--dry-run", action="store_true",
+        help="Report what would be imported; skip all DB writes and LLM calls.",
+    )
+    p_import.set_defaults(func=_cmd_import_ontology)
+
+    # ---------- Phase 2: monitor DB size (500 MB cap) ----------
+    p_dbsize = sub.add_parser(
+        "db-size",
+        help=(
+            "Report total + per-table Postgres size for the graphrag "
+            "schema. Exit 1 if total > 400 MB (close to the 500 MB cap)."
+        ),
+    )
+    p_dbsize.set_defaults(func=_cmd_db_size)
+
+    # ---------- Phase 2: migrate (wraps `alembic upgrade head`) ----------
+    p_migrate = sub.add_parser(
+        "db-migrate",
+        help=(
+            "Apply outstanding Alembic migrations to the Postgres "
+            "schema (wraps `alembic upgrade head`). Idempotent: safe "
+            "to run repeatedly."
+        ),
+    )
+    p_migrate.add_argument(
+        "--revision", default="head",
+        help="Migration revision to upgrade to (default: head).",
+    )
+    p_migrate.set_defaults(func=_cmd_db_migrate)
+
+    p_downgrade = sub.add_parser(
+        "db-downgrade",
+        help="Roll back Alembic migrations by one or more steps.",
+    )
+    p_downgrade.add_argument(
+        "--revision", default="-1",
+        help="Target revision. Default '-1' rolls back one step; 'base' clears everything.",
+    )
+    p_downgrade.set_defaults(func=_cmd_db_downgrade)
+
+    p_status = sub.add_parser(
+        "db-status",
+        help=(
+            "Report Phase 2 DB status: graph_version, alembic revision, "
+            "per-table row counts."
+        ),
+    )
+    p_status.set_defaults(func=_cmd_db_status)
+
     return parser
 
 
@@ -326,6 +397,64 @@ def _cmd_repair_output(args: argparse.Namespace) -> int:
         do_rebrand=not args.skip_rebrand,
         do_person_convert=not args.skip_person_convert,
     ))
+    return 0
+
+
+def _cmd_import_ontology(args: argparse.Namespace) -> int:
+    from backend.app.services.db_ontology_import import import_ontology_folder
+
+    summary = asyncio.run(import_ontology_folder(
+        input_folder=args.input,
+        limit=args.limit,
+        dry_run=args.dry_run,
+    ))
+    print(f"\nDB-IMPORT SUMMARY -> {args.input}")
+    print(f"  classes seen      : {summary.classes_total}")
+    print(f"  classes embedded  : {summary.classes_embedded}")
+    print(f"  obj_props seen    : {summary.obj_props_total}")
+    print(f"  data_props seen   : {summary.data_props_total}")
+    print(f"  instances seen    : {summary.instances_total}")
+    print(f"  embed cost        : ${summary.cost_usd:.4f}")
+    if summary.dry_run:
+        print(f"  (DRY RUN -- no DB writes happened)")
+    return 0
+
+
+def _cmd_db_size(args: argparse.Namespace) -> int:
+    from backend.app.services.db_size import report_db_size
+
+    asyncio.run(report_db_size())
+    return 0
+
+
+def _cmd_db_migrate(args: argparse.Namespace) -> int:
+    """Wraps `alembic upgrade <revision>`."""
+    from alembic import command
+    from alembic.config import Config as AlembicConfig
+
+    cfg = AlembicConfig("alembic.ini")
+    print(f"[db-migrate] upgrading to revision: {args.revision}")
+    command.upgrade(cfg, args.revision)
+    print(f"[db-migrate] DONE")
+    return 0
+
+
+def _cmd_db_downgrade(args: argparse.Namespace) -> int:
+    """Wraps `alembic downgrade <revision>`."""
+    from alembic import command
+    from alembic.config import Config as AlembicConfig
+
+    cfg = AlembicConfig("alembic.ini")
+    print(f"[db-downgrade] target revision: {args.revision}")
+    command.downgrade(cfg, args.revision)
+    print(f"[db-downgrade] DONE")
+    return 0
+
+
+def _cmd_db_status(args: argparse.Namespace) -> int:
+    from backend.app.services.db_status import report_db_status
+
+    asyncio.run(report_db_status())
     return 0
 
 
