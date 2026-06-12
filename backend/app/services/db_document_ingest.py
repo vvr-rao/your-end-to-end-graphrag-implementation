@@ -37,8 +37,115 @@ from backend.app.services.embeddings import Embedder
 from backend.app.services.llm_router import LLMRouter
 from backend.app.services.pipeline_llm import summarize_long_documents_async
 from backend.app.services.predicates import VIAO_CHUNK_OF
+from backend.app.services.prompts import PROMPTS
 
 _VIAO_NS = "https://veerla-ramrao.ai/ontology/intelligence-artifact"
+
+# Embedding model input cap (OpenAI: 8192 hard; 8000 leaves headroom).
+_EMBED_INPUT_CAP_TOKENS = 8000
+# Per gpt-4o-mini call we never feed more than ~100K tokens (matches
+# Phase 1's `max_doc_input_tokens` in `summarize_long_documents_async`).
+# Above that we split + summarize each half + recurse.
+_LLM_INPUT_SPLIT_THRESHOLD = 100_000
+
+
+async def _compress_summary_for_embed(
+    text: str, router: LLMRouter, *, target_tokens: int = _EMBED_INPUT_CAP_TOKENS
+) -> str:
+    """If a doc summary exceeds the embedding model's input cap, run
+    extra gpt-4o-mini pass(es) to compress it BEFORE the embedding API
+    call. Always preserves the original text -- the caller stores the
+    UNCOMPRESSED summary in documents.text_summary; this output is used
+    only to compute documents.embedding.
+
+    Recursive contract:
+      - Returns the input unchanged if it's already <= target_tokens.
+      - For inputs <= 100K tokens: one gpt-4o-mini compression call
+        (max_tokens=4096 by task config, well under target_tokens).
+      - For inputs > 100K tokens: split in half on a paragraph
+        boundary, compress each half independently, recurse on the
+        concatenation. Bounded by an iteration cap so a pathological
+        case can't loop forever.
+    """
+    try:
+        import tiktoken
+        enc = tiktoken.encoding_for_model("text-embedding-3-small")
+    except (ImportError, KeyError):
+        return text  # let the embedder do hard truncation
+
+    def _tok_count(s: str) -> int:
+        return len(enc.encode(s, disallowed_special=()))
+
+    async def _compress_once(s: str) -> str:
+        """One gpt-4o-mini pass via the existing document_summarize task."""
+        system, user = PROMPTS["document_summarize"](s)
+        try:
+            result = await router.chat(
+                "document_summarize", system=system, user=user
+            )
+        except Exception as exc:
+            print(f"[ingest] compression LLM call failed: {exc}")
+            return s
+        return result.text.strip() or s
+
+    def _split_on_paragraph(s: str) -> tuple[str, str]:
+        """Split near the middle on a blank-line boundary if one exists."""
+        mid = len(s) // 2
+        # Search outwards for a `\n\n` near the midpoint.
+        right = s.find("\n\n", mid)
+        left = s.rfind("\n\n", 0, mid)
+        if right >= 0 and (left < 0 or right - mid <= mid - left):
+            return s[:right], s[right + 2 :]
+        if left >= 0:
+            return s[:left], s[left + 2 :]
+        return s[:mid], s[mid:]
+
+    n = _tok_count(text)
+    if n <= target_tokens:
+        return text
+
+    print(
+        f"[ingest] doc summary {n:,} tokens > {target_tokens} cap; "
+        f"compressing for embed call (full text still kept in DB)"
+    )
+
+    # Iteration cap so we never loop forever on a pathological input.
+    current = text
+    for iteration in range(4):
+        n = _tok_count(current)
+        if n <= target_tokens:
+            return current
+
+        if n <= _LLM_INPUT_SPLIT_THRESHOLD:
+            compressed = await _compress_once(current)
+            n2 = _tok_count(compressed)
+            if n2 >= n:
+                # Model didn't actually compress; bail and let embedder truncate.
+                print(
+                    f"[ingest] compression no-op (out={n2:,} >= in={n:,}); "
+                    "embedder will hard-truncate"
+                )
+                return text
+            print(f"[ingest] compress iter {iteration + 1}: {n:,} -> {n2:,} tokens")
+            current = compressed
+            continue
+
+        # Above split threshold: divide-and-conquer
+        left, right = _split_on_paragraph(current)
+        comp_l = await _compress_once(left) if _tok_count(left) > target_tokens else left
+        comp_r = await _compress_once(right) if _tok_count(right) > target_tokens else right
+        current = comp_l + "\n\n" + comp_r
+        print(
+            f"[ingest] split-and-compress iter {iteration + 1}: "
+            f"{n:,} -> {_tok_count(current):,} tokens"
+        )
+
+    if _tok_count(current) > target_tokens:
+        print(
+            f"[ingest] reached compression iteration cap with "
+            f"{_tok_count(current):,} tokens; embedder will hard-truncate"
+        )
+    return current
 
 
 @dataclass
@@ -186,8 +293,25 @@ async def ingest_documents_folder(
 
     embedder = Embedder()
     chunk_vectors = await embedder.embed(all_chunk_texts)
-    doc_summary_texts = [sd.text for sd in summarized]
-    doc_vectors = await embedder.embed(doc_summary_texts)
+
+    # Doc-level embedding inputs: if any summary exceeds the 8K cap,
+    # recursively compress it for the embedding call ONLY. The full
+    # summary still gets stored in documents.text_summary below.
+    cost_before_compress = router.total_cost_usd
+    doc_embed_inputs: list[str] = []
+    for sd in summarized:
+        doc_embed_inputs.append(
+            await _compress_summary_for_embed(sd.text, router)
+        )
+    compress_cost = router.total_cost_usd - cost_before_compress
+    if compress_cost > 0:
+        print(
+            f"[ingest] oversize-summary compression cost: "
+            f"${compress_cost:.4f}"
+        )
+        summary.summarization_cost_usd += compress_cost
+
+    doc_vectors = await embedder.embed(doc_embed_inputs)
     summary.embedding_cost_usd = embedder.total_cost_usd
     print(f"[ingest] embedding done: ${summary.embedding_cost_usd:.4f}")
 
