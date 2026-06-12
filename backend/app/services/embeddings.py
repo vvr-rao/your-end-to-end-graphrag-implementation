@@ -27,6 +27,41 @@ _DEFAULT_BATCH_SIZE = 100
 # text-embedding-3-small: $0.020 per 1M input tokens.
 _EMBED3_SMALL_USD_PER_M_TOK = 0.020
 
+# text-embedding-3-small + -3-large + ada-002 all share an 8192-token
+# input cap. We truncate at 8000 to leave headroom for any encoder
+# disagreement vs OpenAI's server-side count. Chunks are bounded to
+# 800 tokens by the chunker, but hierarchically-summarized document
+# texts can exceed this. Truncation is a no-op on already-short inputs.
+_EMBED_MAX_INPUT_TOKENS = 8000
+_EMBED_ENCODER = None  # lazy-init
+
+
+def _truncate_to_token_limit(texts: list[str]) -> tuple[list[str], int]:
+    """Truncate each input to <= 8000 tokens for the embedding model.
+    Returns (truncated_texts, num_truncated). No-op if tiktoken is
+    unavailable -- the caller will then surface the OpenAI 400."""
+    global _EMBED_ENCODER
+    try:
+        import tiktoken
+    except ImportError:
+        return texts, 0
+    if _EMBED_ENCODER is None:
+        try:
+            _EMBED_ENCODER = tiktoken.encoding_for_model("text-embedding-3-small")
+        except KeyError:
+            _EMBED_ENCODER = tiktoken.get_encoding("cl100k_base")
+
+    out: list[str] = []
+    truncated = 0
+    for t in texts:
+        toks = _EMBED_ENCODER.encode(t, disallowed_special=())
+        if len(toks) <= _EMBED_MAX_INPUT_TOKENS:
+            out.append(t)
+            continue
+        out.append(_EMBED_ENCODER.decode(toks[:_EMBED_MAX_INPUT_TOKENS]))
+        truncated += 1
+    return out, truncated
+
 
 @dataclass
 class EmbedResult:
@@ -67,6 +102,12 @@ class Embedder:
         if not texts:
             return []
         cleaned = [t if t.strip() else " " for t in texts]
+        cleaned, truncated = _truncate_to_token_limit(cleaned)
+        if truncated:
+            print(
+                f"[embed] {truncated}/{len(cleaned)} input(s) exceeded "
+                f"the {_EMBED_MAX_INPUT_TOKENS}-token cap; truncated"
+            )
 
         batches = [
             cleaned[i : i + self.batch_size]
