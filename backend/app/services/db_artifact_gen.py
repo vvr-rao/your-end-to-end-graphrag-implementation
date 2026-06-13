@@ -165,6 +165,34 @@ async def generate_per_chunk_artifacts(
     results: list[tuple[Any, str, Any, dict[str, Any] | None]] = [None] * len(chunks)  # type: ignore[list-item]
     cost_limit_hit = asyncio.Event()
 
+    # Progress reporting: print a heartbeat every ~5% of work + every
+    # 30s elapsed so the user knows the run is alive on slow APIs.
+    progress_state = {
+        "done": 0,
+        "ok": 0,
+        "fail": 0,
+        "next_pct": 5,
+        "last_print": time.time(),
+        "started": time.time(),
+    }
+    progress_lock = asyncio.Lock()
+    progress_step_pct = 5
+
+    async def _report_progress() -> None:
+        elapsed = time.time() - progress_state["started"]
+        done = progress_state["done"]
+        pct = 100 * done / len(chunks)
+        rate = done / elapsed if elapsed > 0 else 0
+        eta = (len(chunks) - done) / rate if rate > 0 else 0
+        cost_so_far = router.total_cost_usd - cost_before
+        print(
+            f"[generate-artifacts] progress: "
+            f"{done:,}/{len(chunks):,} chunk(s) ({pct:.1f}%), "
+            f"ok={progress_state['ok']:,} fail={progress_state['fail']:,}, "
+            f"cost=${cost_so_far:.4f}, "
+            f"rate={rate:.1f}/s, ETA={eta/60:.1f} min"
+        )
+
     async def _one(idx: int, chunk_id: Any, chunk_iri: str, text: str, doc_id: Any) -> None:
         if cost_limit_hit.is_set():
             return
@@ -177,13 +205,31 @@ async def generate_per_chunk_artifacts(
             except Exception as exc:
                 print(f"[generate-artifacts] chunk {chunk_iri} LLM failed: {exc}")
                 summary.chunks_failed += 1
+                async with progress_lock:
+                    progress_state["done"] += 1
+                    progress_state["fail"] += 1
                 return
             parsed = _extract_json(out.text)
             if not isinstance(parsed, dict):
                 print(f"[generate-artifacts] chunk {chunk_iri} unparseable response")
                 summary.chunks_failed += 1
+                async with progress_lock:
+                    progress_state["done"] += 1
+                    progress_state["fail"] += 1
                 return
             results[idx] = (chunk_id, chunk_iri, doc_id, parsed)
+
+            async with progress_lock:
+                progress_state["done"] += 1
+                progress_state["ok"] += 1
+                pct = 100 * progress_state["done"] / len(chunks)
+                now = time.time()
+                if (pct >= progress_state["next_pct"]
+                        or now - progress_state["last_print"] >= 30):
+                    await _report_progress()
+                    progress_state["last_print"] = now
+                    while progress_state["next_pct"] <= pct:
+                        progress_state["next_pct"] += progress_step_pct
 
             if router.total_cost_usd - cost_before > max_cost_usd:
                 if not cost_limit_hit.is_set():
@@ -422,12 +468,19 @@ async def generate_document_summaries(
     doc_results: list[tuple[Any, str, str, str | None] | None] = [None] * len(docs)
     cost_limit_hit = asyncio.Event()
 
+    progress_state = {
+        "done": 0,
+        "next_pct": 5,
+        "last_print": time.time(),
+        "started": time.time(),
+    }
+    progress_lock = asyncio.Lock()
+
     async def _one(idx: int, doc_id: Any, diri: str, title: str, text_summary: str | None) -> None:
         if cost_limit_hit.is_set():
             return
         body = text_summary or ""
         if not body.strip():
-            # Fall back to chunk concatenation.
             async with session_scope() as session:
                 r = await session.execute(
                     select(Chunk.text).where(
@@ -446,8 +499,31 @@ async def generate_document_summaries(
                 out = await router.chat("artifact_document_summary", system=system, user=user)
             except Exception as exc:
                 print(f"[generate-artifacts] doc {diri} LLM failed: {exc}")
+                async with progress_lock:
+                    progress_state["done"] += 1
                 return
             doc_results[idx] = (doc_id, diri, title, out.text.strip())
+
+            async with progress_lock:
+                progress_state["done"] += 1
+                pct = 100 * progress_state["done"] / len(docs)
+                now = time.time()
+                if (pct >= progress_state["next_pct"]
+                        or now - progress_state["last_print"] >= 30):
+                    elapsed = now - progress_state["started"]
+                    rate = progress_state["done"] / elapsed if elapsed > 0 else 0
+                    eta = (len(docs) - progress_state["done"]) / rate if rate > 0 else 0
+                    cost_so_far = router.total_cost_usd - cost_before
+                    print(
+                        f"[generate-artifacts] Summary progress: "
+                        f"{progress_state['done']:,}/{len(docs):,} doc(s) "
+                        f"({pct:.1f}%), cost=${cost_so_far:.4f}, "
+                        f"ETA={eta/60:.1f} min"
+                    )
+                    progress_state["last_print"] = now
+                    while progress_state["next_pct"] <= pct:
+                        progress_state["next_pct"] += 5
+
             if router.total_cost_usd - cost_before > max_cost_usd:
                 if not cost_limit_hit.is_set():
                     cost_limit_hit.set()
