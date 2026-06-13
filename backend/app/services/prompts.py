@@ -945,15 +945,36 @@ def _format_evidence_block(evidence_items: list[dict]) -> str:
     return "\n".join(lines)
 
 
+_FACTS_FIRST_RULE = (
+    "FACTS-FIRST RULE (mandatory):\n"
+    "  - When the evidence contains specific named entities, numbers, "
+    "dates, percentages, or proper-noun examples, you MUST include "
+    "them in the answer. Do not paraphrase 'frameworks' when "
+    "'FAO Hand-in-Hand Initiative and Zero Hunger 2030' are in the "
+    "evidence. Do not paraphrase 'a major producer' when '16.1 million "
+    "metric tons' is in the evidence.\n"
+    "  - STRUCTURE: lead with the specific facts (with their citations), "
+    "THEN provide any synthesis / analysis / interpretation. If you have "
+    "an opinion or conclusion, state it AFTER the facts it rests on, "
+    "and flag it as your own judgement ('this suggests...', 'on balance...', "
+    "etc.).\n"
+    "  - Cite every fact by its IRI in brackets, e.g. [viao:Chunk_abc...] "
+    "or [viao:Claim_...]. Multiple citations on one fact are fine.\n"
+    "  - If a specific name or figure is NOT in the evidence, do not "
+    "invent one; say what's known and what's missing."
+)
+
+
 def answer_simple_qa(
     question: str, evidence: list[dict]
 ) -> tuple[str, str]:
     """Phase 2 Milestone F simple_qa mode: short factoid answer."""
     system = (
         "You answer questions briefly and accurately using ONLY the evidence "
-        "below. 1-3 sentences. Cite every claim by its IRI in brackets, e.g. "
-        "[viao:Chunk_abc...]. If the evidence doesn't answer the question, "
-        "say so explicitly. Return ONLY the answer text."
+        "below.\n\n"
+        + _FACTS_FIRST_RULE
+        + "\n\nLENGTH: 1-3 sentences. If the evidence doesn't answer the "
+        "question, say so explicitly. Return ONLY the answer text."
     )
     user = (
         f"QUESTION: {question}\n\nEVIDENCE:\n"
@@ -969,9 +990,12 @@ def answer_summarize(
     """Phase 2 Milestone F summarize mode: 2-4 paragraph thematic summary."""
     system = (
         "You synthesize a thematic summary of what the corpus says about the "
-        "question, using ONLY the evidence below. 2-4 paragraphs. Cite every "
-        "specific claim by IRI in brackets. Neutral tone, no opinions. If "
-        "the evidence is thin, say what's missing. Return ONLY the summary."
+        "question, using ONLY the evidence below.\n\n"
+        + _FACTS_FIRST_RULE
+        + "\n\nLENGTH: 2-4 paragraphs. Open with the most specific facts "
+        "(names, numbers, dates) and group them by theme. Save any synthesis "
+        "for the closing paragraph. If the evidence is thin, say what's "
+        "missing. Return ONLY the summary -- no markdown headers."
     )
     user = (
         f"QUESTION: {question}\n\nEVIDENCE:\n"
@@ -987,11 +1011,20 @@ def answer_deep_research(
     """Phase 2 Milestone F deep_research mode: long-form synthesis."""
     system = (
         "You produce a thorough research-style synthesis using ONLY the "
-        "evidence below. Structure: brief framing -> evidence-grounded body "
-        "(compare angles, surface tensions) -> short conclusion. Cite every "
-        "specific claim by IRI in brackets. If the evidence supports "
-        "multiple interpretations, note them. 400-800 words. Return ONLY "
-        "the answer text -- no markdown headers."
+        "evidence below.\n\n"
+        + _FACTS_FIRST_RULE
+        + "\n\nSTRUCTURE:\n"
+        "  1. Brief framing of the question (one paragraph).\n"
+        "  2. EVIDENCE-FIRST BODY: enumerate the specific facts grouped "
+        "by sub-topic. Every claim cited by IRI. Use named entities, "
+        "numbers, and dates verbatim from the evidence -- do not summarize "
+        "them away.\n"
+        "  3. ANALYSIS (clearly separated from the facts): compare angles, "
+        "surface tensions, note where the evidence supports multiple "
+        "interpretations.\n"
+        "  4. SHORT CONCLUSION (one paragraph). Your own judgement, flagged "
+        "as such.\n\n"
+        "400-800 words. Return ONLY the answer text -- no markdown headers."
     )
     user = (
         f"QUESTION: {question}\n\nEVIDENCE:\n"
@@ -1006,12 +1039,16 @@ def answer_insights(
 ) -> tuple[str, str]:
     """Phase 2 Milestone F insights mode: pattern surfacing."""
     system = (
-        "You surface non-obvious INSIGHTS across the evidence below. Group "
-        "claims into 2-5 themes; for each theme, state the insight in 1-2 "
-        "sentences, then list the evidence that grounds it (by IRI). Insights "
-        "must go beyond what any single claim says -- look for cross-cutting "
-        "patterns, contradictions, or emerging trends. Return plain text, "
-        "no markdown."
+        "You surface non-obvious INSIGHTS across the evidence below.\n\n"
+        + _FACTS_FIRST_RULE
+        + "\n\nSTRUCTURE: Group findings into 2-5 themes. For each theme:\n"
+        "  - First: 2-3 specific facts grounding the theme (names, "
+        "numbers, dates verbatim from evidence, each cited).\n"
+        "  - Then: the insight in 1-2 sentences, clearly framed as your "
+        "synthesis ('this pattern suggests...', 'taken together...').\n"
+        "Insights must go beyond what any single claim says -- look for "
+        "cross-cutting patterns, contradictions, or emerging trends. "
+        "Return plain text, no markdown."
     )
     user = (
         f"QUESTION: {question}\n\nEVIDENCE:\n"
@@ -1068,33 +1105,146 @@ def answer_exhaustive_group_caption(
 
 
 def follow_up_resolution(
-    new_question: str, prior_turns: list[tuple[str, str]]
+    new_question: str, prior_turns: list[tuple[str, str, str]]
 ) -> tuple[str, str]:
     """Phase 2 Milestone G: rewrite a conversational follow-up into a
     self-contained question.
 
-    `prior_turns` is a list of (user_question, resolved_question)
-    pairs in chronological order (oldest first).
+    `prior_turns` is a list of (user_question, resolved_question, answer)
+    triples in chronological order (oldest first). The ANSWER from each
+    prior turn is what makes follow-up resolution work for references
+    like 'what frameworks' or 'which of those' -- the rewriter pulls
+    named entities from prior answers into the rewritten question.
     """
     if not prior_turns:
         # caller should skip the LLM call in this case
         return ("", new_question)
-    hist = "\n".join(
-        f"  turn {i+1}:\n    asked: {ask}\n    resolved as: {res}"
-        for i, (ask, res) in enumerate(prior_turns)
-    )
+
+    def _trim(s: str, n: int) -> str:
+        s = (s or "").strip().replace("\n", " ")
+        return (s[:n] + "...") if len(s) > n else s
+
+    hist_blocks = []
+    for i, (ask, res, ans) in enumerate(prior_turns):
+        hist_blocks.append(
+            f"  turn {i+1}:\n"
+            f"    asked:      {_trim(ask, 250)}\n"
+            f"    resolved:   {_trim(res, 250)}\n"
+            f"    answer:     {_trim(ans, 600)}"
+        )
+    hist = "\n".join(hist_blocks)
+
     system = (
         "You rewrite a follow-up user question into a SELF-CONTAINED, "
-        "standalone question that does not depend on the prior conversation. "
-        "Pronouns like 'it', 'they', 'the same' must be replaced with their "
-        "specific referents from the conversation history. If the new "
-        "question already stands alone, return it unchanged. Return ONLY "
-        "the rewritten question -- no preamble, no quotes."
+        "standalone question that fully captures what the user actually "
+        "wants, using the prior CONVERSATION HISTORY.\n\n"
+        "RULES:\n"
+        "  - Replace pronouns ('it', 'they', 'those', 'the same') with "
+        "the specific referents from prior questions OR answers.\n"
+        "  - When the user asks for elaboration on something the prior "
+        "answer mentioned (e.g. 'what frameworks?', 'which of those?', "
+        "'tell me more about that'), the rewritten question MUST name "
+        "the specific entities, frameworks, programs, or concepts the "
+        "prior answer cited. Pull names directly from the prior answer.\n"
+        "  - If the new question already stands alone, return it unchanged.\n"
+        "  - Do NOT answer the question; only rewrite it.\n"
+        "  - Return ONLY the rewritten question -- no preamble, no quotes.\n\n"
+        "EXAMPLES:\n"
+        "  Prior answer: 'Countries are implementing frameworks like the "
+        "FAO Hand-in-Hand Initiative, Zero Hunger 2030, and the Hunger-Free "
+        "World Index.'\n"
+        "  Follow-up: 'What frameworks?'\n"
+        "  Rewrite:   'What are the FAO Hand-in-Hand Initiative, Zero "
+        "Hunger 2030, and the Hunger-Free World Index, and what do they "
+        "do to reduce hunger?'\n\n"
+        "  Prior answer: 'BYD produced 3 million EVs in 2024.'\n"
+        "  Follow-up: 'And how does that compare to Honda?'\n"
+        "  Rewrite:   'How does Honda's 2024 EV production compare to "
+        "BYD's 3 million EVs?'"
     )
     user = (
-        f"CONVERSATION SO FAR:\n{hist}\n\n"
+        f"CONVERSATION HISTORY:\n{hist}\n\n"
         f"NEW USER QUESTION: {new_question}\n\n"
         "Rewrite the question to be self-contained."
+    )
+    return system, user
+
+
+def answer_conversation_turn(
+    resolved_query: str,
+    current_evidence: list[dict],
+    prior_turns: list[tuple[str, str]],
+    base_mode: str = "simple_qa",
+) -> tuple[str, str]:
+    """Phase 2 Milestone G: synthesize a conversation-turn answer with
+    BOTH this turn's retrieved evidence and prior conversation context
+    in scope.
+
+    `prior_turns` items: (user_question, answer). Most recent last.
+    `base_mode` selects the depth/length style:
+       simple_qa | summarize | knowledge_gaps -> short
+       deep_research | insights              -> long
+
+    Falls back to plain answer_simple_qa-style if prior_turns is empty.
+    """
+    if not prior_turns:
+        if base_mode == "deep_research":
+            return answer_deep_research(resolved_query, current_evidence)
+        if base_mode == "insights":
+            return answer_insights(resolved_query, current_evidence)
+        if base_mode == "summarize":
+            return answer_summarize(resolved_query, current_evidence)
+        if base_mode == "knowledge_gaps":
+            # caller computes the sub_questions / found_for lists; fallback simple
+            return answer_simple_qa(resolved_query, current_evidence)
+        return answer_simple_qa(resolved_query, current_evidence)
+
+    def _trim(s: str, n: int) -> str:
+        s = (s or "").strip().replace("\n", " ")
+        return (s[:n] + "...") if len(s) > n else s
+
+    hist = "\n".join(
+        f"  Q{i+1}: {_trim(q, 250)}\n  A{i+1}: {_trim(a, 800)}"
+        for i, (q, a) in enumerate(prior_turns)
+    )
+    is_long = base_mode in ("deep_research", "insights")
+    length = "400-800 words" if is_long else "1-3 paragraphs"
+    style = (
+        "thorough research-style synthesis"
+        if is_long else "concise, grounded answer"
+    )
+
+    system = (
+        f"You produce a {style} for a multi-turn conversation. "
+        "You will see the CONVERSATION HISTORY (prior questions and your "
+        "earlier answers) plus the CURRENT QUESTION and the EVIDENCE "
+        "retrieved for it.\n\n"
+        + _FACTS_FIRST_RULE
+        + "\n\nCONVERSATION RULES:\n"
+        "  - Treat the prior answers as already-established context. "
+        "Do NOT restate them; build on them.\n"
+        "  - If the user is asking for elaboration on specific things "
+        "the prior answer mentioned by name (frameworks, companies, "
+        "policies, numbers), name those SAME things in your new answer "
+        "and pull more detail from the CURRENT EVIDENCE about them.\n"
+        "  - Every NEW claim must come from the CURRENT EVIDENCE, cited "
+        "by its IRI in brackets like [viao:Chunk_abc...].\n"
+        "  - If you reference something from a prior answer, you may say "
+        "'as discussed' or 'building on the prior answer' without "
+        "re-citing it.\n"
+        "  - If the CURRENT EVIDENCE doesn't address the question, say so "
+        "explicitly -- do NOT fabricate.\n\n"
+        "STRUCTURE: lead with the SPECIFIC FACTS the user is asking about "
+        "(names, numbers, dates, with citations), THEN any synthesis or "
+        "interpretation last.\n"
+        f"LENGTH: {length}. Return ONLY the answer text -- no markdown headers."
+    )
+    user = (
+        f"CONVERSATION HISTORY:\n{hist}\n\n"
+        f"CURRENT QUESTION: {resolved_query}\n\n"
+        f"CURRENT EVIDENCE:\n"
+        + _format_evidence_block(current_evidence)
+        + "\n\nAnswer now."
     )
     return system, user
 
@@ -1355,6 +1505,7 @@ PROMPTS = {
     "answer_exhaustive_group_caption": answer_exhaustive_group_caption,
     # Milestone G
     "follow_up_resolution": follow_up_resolution,
+    "answer_conversation_turn": answer_conversation_turn,
     # Insight + Recommendation generation
     "insight_gen": insight_gen,
     "recommendation_gen": recommendation_gen,

@@ -68,10 +68,15 @@ async def start_conversation(
 async def _resolve_follow_up(
     router: LLMRouter,
     new_question: str,
-    prior_turns: list[tuple[str, str]],
+    prior_turns: list[tuple[str, str, str]],
 ) -> tuple[str, bool]:
     """If `prior_turns` is non-empty, ask gpt-4o-mini to rewrite the
-    new question into a standalone form. Returns (resolved, did_call)."""
+    new question into a standalone form. Each prior_turn is
+    (user_question, resolved_question, answer_text). Including the
+    answer is critical -- it's what lets the rewriter pull named
+    entities from prior answers (e.g. 'what frameworks?' -> 'what are
+    the FAO Hand-in-Hand Initiative, Zero Hunger 2030, ...').
+    Returns (resolved, did_call)."""
     if not prior_turns:
         return new_question, False
     system, user = PROMPTS["follow_up_resolution"](new_question, prior_turns)
@@ -87,6 +92,39 @@ async def _resolve_follow_up(
         print(f"[conversation] follow-up resolution failed ({exc}); "
               "using new_question as-is")
         return new_question, False
+
+
+async def _fetch_prior_evidence_iris(
+    conversation_uid: uuid.UUID, history_window: int = 3
+) -> dict[str, list[str]]:
+    """Pull the top evidence IRIs from the last N turns' retrieval_runs.
+    Returns {'chunks': [...], 'artifacts': [...]} -- IRI strings, ranked.
+    Used to seed the current turn's candidate pool so docs the prior
+    answers came from don't fall off the list when the new question
+    is narrower."""
+    async with session_scope() as session:
+        r = await session.execute(
+            sql_text("""
+            SELECT re.evidence_kind, re.evidence_iri, re.rank
+              FROM graphrag.conversation_turns ct
+              JOIN graphrag.retrieval_runs rr ON rr.conversation_turn_id = ct.id
+              JOIN graphrag.retrieval_evidence re ON re.retrieval_run_id = rr.id
+             WHERE ct.conversation_id = :cid
+             ORDER BY ct.turn_index DESC, re.rank
+             LIMIT :lim
+            """),
+            {"cid": conversation_uid, "lim": history_window * 30},
+        )
+        rows = r.all()
+    out: dict[str, list[str]] = {"chunk": [], "artifact": []}
+    seen: set[str] = set()
+    for kind, iri, rank in rows:
+        if not iri or iri in seen:
+            continue
+        seen.add(iri)
+        if kind in out:
+            out[kind].append(iri)
+    return out
 
 
 async def add_turn(
@@ -128,20 +166,23 @@ async def add_turn(
         )
         next_turn_index = int(r.scalar_one())
 
-        # Pull last N (asked, resolved) pairs for follow-up resolution.
+        # Pull last N (asked, resolved, answer) triples for follow-up
+        # resolution + conversation-aware synthesis.
         r = await session.execute(
             sql_text("""
-            SELECT user_question, resolved_question
+            SELECT user_question, resolved_question, answer_text
               FROM graphrag.conversation_turns
              WHERE conversation_id = :id
+               AND answer_text IS NOT NULL
+               AND answer_text <> ''
              ORDER BY turn_index DESC
              LIMIT :n
             """),
             {"id": conv_uid, "n": history_window},
         )
         prior = [
-            (asked, resolved or asked)
-            for asked, resolved in r.all()
+            (asked, resolved or asked, answer or "")
+            for asked, resolved, answer in r.all()
         ]
     prior.reverse()  # oldest first
 
@@ -184,7 +225,7 @@ async def add_turn(
             },
         )
 
-    # 4. Run the F pipeline.
+    # 4. Run the F pipeline (retrieves evidence + draft answer).
     result: RetrievalResult = await retrieve_and_answer(
         question,  # original for any potential UI display
         mode=mode,
@@ -199,7 +240,39 @@ async def add_turn(
         verbose=verbose,
     )
 
-    # 5. Update the turn row with the answer.
+    # 4b. If prior turns exist, re-synthesize the answer with full
+    #     conversation context in scope. The F pipeline only saw THIS
+    #     turn's evidence; we want the synthesizer to also know what
+    #     was asked + answered before so it can build on prior context
+    #     instead of treating each turn as a fresh search.
+    if prior and result.answer is not None and mode != "exhaustive_search":
+        prior_qa: list[tuple[str, str]] = [
+            (resolved or asked, ans)
+            for asked, resolved, ans in prior
+            if ans
+        ]
+        try:
+            sys_p, user_p = PROMPTS["answer_conversation_turn"](
+                resolved_query, result.evidence, prior_qa, base_mode=mode,
+            )
+            out = await router.chat(
+                "answer_conversation_turn", system=sys_p, user=user_p,
+            )
+            convo_answer = (out.text or "").strip()
+            if convo_answer:
+                if verbose:
+                    print(
+                        "[conversation] re-synthesized answer with "
+                        f"{len(prior_qa)} prior turn(s) in scope"
+                    )
+                result.answer = convo_answer
+        except Exception as exc:
+            print(
+                f"[conversation] conv-aware synth failed ({exc}); "
+                "keeping the F-pipeline draft answer"
+            )
+
+    # 5. Update the turn row with the (possibly re-synthesized) answer.
     async with session_scope() as session:
         await session.execute(
             sql_text("""
