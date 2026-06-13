@@ -487,13 +487,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_art.add_argument(
         "--type",
-        choices=("Claim", "Finding", "Observation", "Summary"),
+        choices=("Claim", "Finding", "Observation", "Summary",
+                 "Insight", "Recommendation"),
         default=None,
         action="append",
         help=(
-            "Restrict to specific types (repeatable). Default = all 4. "
-            "Insight + Recommendation are not implemented in v0."
+            "Restrict to specific types (repeatable). Default = the four "
+            "ground-level types (Claim, Finding, Observation, Summary). "
+            "Insight + Recommendation must be opted in explicitly "
+            "(they use gpt-4.1; cost ~$2 for full corpus)."
         ),
+    )
+    p_art.add_argument(
+        "--min-claims-per-class", type=int, default=10,
+        help="Insight only: minimum Claims+Findings per ontology class "
+             "for a cluster to qualify.",
+    )
+    p_art.add_argument(
+        "--top-insights", type=int, default=15,
+        help="Recommendation only: how many top Insights to synthesize from.",
+    )
+    p_art.add_argument(
+        "--theme-label", default="Corpus-wide synthesis",
+        help="Recommendation only: thematic label for the synthesis run.",
     )
     p_art.add_argument(
         "--scope-iri", default=None,
@@ -1036,6 +1052,8 @@ def _cmd_generate_artifacts(args: argparse.Namespace) -> int:
     )
     per_chunk = tuple(t for t in types_requested if t in ("Claim", "Finding", "Observation"))
     do_summary = "Summary" in types_requested
+    do_insight = "Insight" in types_requested
+    do_recommendation = "Recommendation" in types_requested
 
     use_entities = not args.no_entities
     if per_chunk:
@@ -1060,6 +1078,29 @@ def _cmd_generate_artifacts(args: argparse.Namespace) -> int:
                 limit=args.limit,
                 concurrency=args.concurrency,
                 max_cost_usd=args.max_cost_usd,
+            )
+        )
+        reset_engine_cache()
+
+    if do_insight:
+        from backend.app.services.db_insight_gen import generate_insights
+        asyncio.run(
+            generate_insights(
+                min_claims_per_class=args.min_claims_per_class,
+                limit=args.limit,
+                concurrency=args.concurrency,
+                max_cost_usd=args.max_cost_usd,
+            )
+        )
+        reset_engine_cache()
+
+    if do_recommendation:
+        from backend.app.services.db_recommendation_gen import generate_recommendations
+        asyncio.run(
+            generate_recommendations(
+                top_insights=args.top_insights,
+                max_cost_usd=args.max_cost_usd,
+                theme_label=args.theme_label,
             )
         )
 

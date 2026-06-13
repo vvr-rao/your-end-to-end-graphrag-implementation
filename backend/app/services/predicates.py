@@ -47,6 +47,8 @@ VIAO_ASSERTS_ABOUT: Final = f"{VIAO_NS}#assertsAbout"
 VIAO_HAS_INTELLIGENCE_ARTIFACT: Final = f"{VIAO_NS}#hasIntelligenceArtifact"
 VIAO_REFERENCES_CHUNK: Final = f"{VIAO_NS}#referencesChunk"
 VIAO_REFERENCES_ARTIFACT: Final = f"{VIAO_NS}#referencesArtifact"
+VIAO_INSIGHT_BASED_ON: Final = f"{VIAO_NS}#insightBasedOn"
+VIAO_RECOMMENDATION_BASED_ON: Final = f"{VIAO_NS}#recommendationBasedOn"
 
 # ---------- W3C Time (in `ontology_object_properties`) ----------
 TIME_NS = "http://www.w3.org/2006/time"
