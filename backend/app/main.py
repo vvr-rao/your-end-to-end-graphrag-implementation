@@ -19,6 +19,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi_mcp import FastApiMCP
 
+from backend.app.api import browse, conversations as conv_routes, qa, trace
+from backend.app.api.middleware.auth import BearerAuthMiddleware
 from backend.app.core.config import get_settings
 
 
@@ -45,6 +47,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Auth: every route except /health and the OpenAPI docs requires a
+# bearer token matching settings.bearer_token.
+app.add_middleware(BearerAuthMiddleware)
 
 
 @app.get("/health", operation_id="health")
@@ -52,11 +57,11 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-# Phase 1: include API routers here. They'll be auto-exposed via MCP too.
-# from backend.app.api import ontologies, documents, runs, qa
-# app.include_router(ontologies.router)
-# app.include_router(documents.router)
-# ...
+# Phase 2 / Milestone H: GraphRAG routes.
+app.include_router(qa.router)
+app.include_router(conv_routes.router)
+app.include_router(trace.router)
+app.include_router(browse.router)
 
 mcp = FastApiMCP(
     app,
