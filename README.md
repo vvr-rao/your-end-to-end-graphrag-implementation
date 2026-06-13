@@ -15,9 +15,61 @@ backend on Render (see `render.yaml`).
 
 ## Status
 
-**Phase 1 — ontology CLI.** Standalone command-line tool for ontology merge / prune / expand / build. Postgres persistence deferred to a later phase. See `CLAUDE.local.md` for the full project plan.
+- **Phase 1 — Ontology CLI** ✅ shipped. `merge` / `prune` / `expand` / `prune-expand` / `build` produce versioned ontology folders.
+- **Phase 2 — Persistent GraphRAG platform** ✅ shipped. Postgres + pgvector knowledge graph; ingestion → chunking → entity extraction → temporal enrichment → intelligence artifacts (Claim / Finding / Observation / Summary / Insight / Recommendation) → retrieval. FastAPI + MCP routes wrap every CLI op.
+- **Phase 3 — UI + versioning + Render deploy** — pending.
 
-## CLI
+See `CLAUDE.local.md` for the full project plan.
+
+## Phase 2 quick start (retrieval)
+
+The platform supports **two retrieval modes**:
+
+| Mode | What it produces | When to use it |
+|---|---|---|
+| `simple_qa` | Tight 1-3 sentence direct answer with citations. | Direct factoid lookup. |
+| `deep_research` (**default**) | Structured 6-section answer: **SPECIFICS → ANALYSIS → CONTRADICTIONS → KEY CLAIMS (with evidence status) → COVERAGE IMBALANCE → KEY INSIGHTS**. | Comparisons, listings, synthesis, deep-dives. |
+
+```bash
+# One-shot question (default mode = deep_research)
+uv run python -m backend.app.cli query \
+  "What are the regulations around EV production in Asia?"
+
+# Tight factoid answer
+uv run python -m backend.app.cli query \
+  --mode simple_qa \
+  "What is OCI N.V.'s annual nitrogen fertilizer production capacity?"
+
+# Multi-turn conversation with automatic follow-up resolution
+CONV=$(uv run python -m backend.app.cli conversation start | grep '^iri:' | awk '{print $2}')
+uv run python -m backend.app.cli conversation turn --conv "$CONV" \
+  "What does the corpus say about EV production?"
+uv run python -m backend.app.cli conversation turn --conv "$CONV" \
+  "And how does Vietnam compare specifically?"     # 'and how does ... compare' is resolved against the prior turn's answer
+uv run python -m backend.app.cli conversation show --conv "$CONV"
+
+# Build / refresh the corpus (idempotent; safe to re-run)
+uv run python -m backend.app.cli register-documents \
+  --input source_documents/<your-corpus>
+uv run python -m backend.app.cli enrich-time
+uv run python -m backend.app.cli extract-entities
+uv run python -m backend.app.cli generate-artifacts                # Claim / Finding / Observation / Summary
+uv run python -m backend.app.cli generate-artifacts --type Insight  # cross-document synthesis
+uv run python -m backend.app.cli generate-artifacts --type Recommendation
+
+# Evaluate the retrieval quality (5 metrics: comprehensiveness,
+# no_hallucination, consistency, gap_detection, time)
+uv run python -m backend.app.cli evaluate-queries \
+  --questions eval_questions/v1_smoke.txt \
+  --runs-per-question 3 \
+  --output /tmp/eval.json --output-md /tmp/eval.md
+```
+
+See [eval_questions/README.md](eval_questions/README.md) for the
+methodology, retrieval pipeline diagram, per-question cost estimates,
+and what each metric measures.
+
+## Phase 1 — ontology CLI
 
 Five subcommands. Each writes a fresh versioned folder under `output_ontologies/v<UTC-timestamp>-<subcommand>/` containing `merged.owl` (Protégé-readable), `merged.json` (canonical re-loadable form), `manifest.json` (provenance), `stats.json`, and `llm_audit.jsonl`.
 
@@ -281,16 +333,22 @@ EDGAR-only: `--allow-html` (see above), `--forms <CSV>` (default `10-K,10-Q,20-F
 
 ## LLM providers
 
-| Task | Provider | Default model |
-|---|---|---|
-| chunk_classification (document ingestion → existing ontology tagging) | Groq | `llama-3.3-70b-versatile` |
-| class_proposal | OpenAI | `gpt-4.1` |
-| match_dedup | OpenAI | `gpt-4.1` |
-| class_summarization | OpenAI | `gpt-4o-mini` |
-| qa_synthesis | OpenAI | `gpt-4.1` |
-| embeddings | OpenAI | `text-embedding-3-small` (1536 dim) |
+Task → model routing lives in `config/models.yaml`. Phase 1 uses Groq + OpenAI; Phase 2 uses OpenAI exclusively. Defaults:
 
-Both `OPENAI_API_KEY` and `GROQ_API_KEY` are required.
+| Phase | Task | Provider | Model |
+|---|---|---|---|
+| 1 | `chunk_classification` (document → existing-ontology tagging) | Groq | `llama-3.3-70b-versatile` |
+| 1 | `class_proposal` | OpenAI | `gpt-4.1` |
+| 1 | `match_dedup` | OpenAI | `gpt-4.1` |
+| 1+2 | `class_summarization`, `document_summarize`, `compact_description` | OpenAI | `gpt-4o-mini` |
+| 2 | `entity_extract`, `question_parse`, `concept_expansion`, `query_decompose`, `follow_up_resolution` | OpenAI | `gpt-4o-mini` |
+| 2 | `artifact_chunk_extract_with_entities` (Claim / Finding / Observation extraction) | OpenAI | `gpt-4o-mini` |
+| 2 | `answer_simple_qa`, `answer_conversation_turn` | OpenAI | `gpt-4o-mini` |
+| 2 | `answer_deep_research`, `insight_gen`, `recommendation_gen` | OpenAI | `gpt-4.1` |
+| 2 | LLM-as-judge (4 metrics) | OpenAI | `gpt-4.1` (override to `gpt-4o-mini` via `--judge-model`) |
+| 2 | `embeddings` | OpenAI | `text-embedding-3-small` (**1024 dim** — Phase 2 default) |
+
+`OPENAI_API_KEY` is required; `GROQ_API_KEY` is only needed if you run Phase 1 with `chunk_classification` enabled.
 
 ## First-run setup
 
@@ -375,6 +433,6 @@ scripts/
 
 ## Phase plan
 
-- **Phase 1** (in progress) — standalone CLI: merge / prune / expand. Postgres persistence deferred.
-- **Phase 2** — Postgres persistence + class summaries + GraphRAG QA API.
-- **Phase 3** — React UI + graph viz + versioning + retirement + review workflow + Render deploy.
+- **Phase 1** ✅ — standalone CLI: `merge` / `prune` / `expand` / `prune-expand` / `build` with versioned output folders.
+- **Phase 2** ✅ — Postgres + pgvector knowledge graph. Document ingestion, chunking, embeddings, entity extraction with entity-grounded artifact prompts, temporal enrichment, intelligence artifacts (Claim / Finding / Observation / Summary / Insight / Recommendation). Two-mode retrieval (`simple_qa` / `deep_research`) with multi-probe vector rerank, RRF fusion, and conversation-aware QA. LLM-as-judge eval framework. FastAPI routes + MCP exposure at `/mcp`.
+- **Phase 3** (pending) — React UI + graph viz + versioning + retirement + review workflow + Render deploy.

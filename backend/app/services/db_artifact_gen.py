@@ -338,11 +338,26 @@ async def generate_per_chunk_artifacts(
                 except (TypeError, ValueError):
                     conf = None
 
+                # New (2026-06-13): evidence_status / claim_source /
+                # time_scope metadata captured by the updated
+                # artifact_chunk_extract_with_entities prompt. Stored
+                # in extra_metadata JSONB so deep_research can use them
+                # in the KEY CLAIMS + KEY INSIGHTS sections.
+                raw_ev_status = (item.get("evidence_status") or "").strip().lower()
+                if raw_ev_status not in ("backed", "partial", "unbacked"):
+                    raw_ev_status = None  # leave null rather than guess
+                claim_source = (item.get("claim_source") or None)
+                if isinstance(claim_source, str):
+                    claim_source = claim_source.strip() or None
+                time_scope = item.get("time_scope") or None
+                if isinstance(time_scope, str):
+                    time_scope = time_scope.strip() or None
+
                 airi = _artifact_iri(artifact_type)
                 artifact_iris.append(airi)
                 used_entities = bool(chunks_to_entities.get(chunk_id))
                 prompt_version = (
-                    "artifact_chunk_extract_with_entities@v1"
+                    "artifact_chunk_extract_with_entities@v2"
                     if used_entities else "artifact_chunk_extract@v1"
                 )
                 artifact_payloads.append({
@@ -355,7 +370,11 @@ async def generate_per_chunk_artifacts(
                     "prompt_version": prompt_version,
                     "status": "ACTIVE",
                     "graph_version": 0,  # filled in below
-                    "extra_metadata": {},
+                    "extra_metadata": {
+                        "evidence_status": raw_ev_status,
+                        "claim_source": claim_source,
+                        "time_scope": time_scope,
+                    },
                 })
                 artifact_to_chunk.append((airi, chunk_id, doc_id, text))
                 embed_texts.append(text)

@@ -204,6 +204,7 @@ tasks:
     max_tokens: 4096
     response_format: json_object
 
+  # simple_qa: tight 1-3 sentence direct answer.
   answer_simple_qa:
     provider: openai
     model: gpt-4o-mini
@@ -211,40 +212,13 @@ tasks:
     temperature: 0.0
     max_tokens: 1024
 
-  answer_summarize:
-    provider: openai
-    model: gpt-4o-mini
-    timeout: 60
-    temperature: 0.0
-    max_tokens: 1024
-
-  answer_knowledge_gaps:
-    provider: openai
-    model: gpt-4o-mini
-    timeout: 60
-    temperature: 0.0
-    max_tokens: 1024
-
+  # deep_research: structured 6-section output. Default mode.
   answer_deep_research:
     provider: openai
     model: gpt-4.1
     timeout: 180
     temperature: 0.1
     max_tokens: 4096
-
-  answer_insights:
-    provider: openai
-    model: gpt-4.1
-    timeout: 180
-    temperature: 0.1
-    max_tokens: 4096
-
-  answer_exhaustive_group_caption:
-    provider: openai
-    model: gpt-4o-mini
-    timeout: 30
-    temperature: 0.0
-    max_tokens: 256
 
   # =================== Milestone G: conversation ===================
   follow_up_resolution:

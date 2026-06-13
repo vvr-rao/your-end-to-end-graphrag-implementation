@@ -22,12 +22,16 @@ Driver function `retrieve_and_answer(question, mode, ...)` runs the
 
 Persists `retrieval_runs` (1 row) + `retrieval_evidence` (top-K rows).
 
-The 6 modes share the same pipeline up through step 10; they diverge
-at steps 11 + 12 in (a) which candidate kinds get weighted higher,
-(b) which prompt is selected, (c) which model.
+Two modes (2026-06-13 redesign):
+  - simple_qa     -- tight 1-3 sentence direct answer; top_k=20.
+  - deep_research -- structured 6-section output (SPECIFICS / ANALYSIS
+                     / CONTRADICTIONS / KEY CLAIMS / COVERAGE IMBALANCE
+                     / KEY INSIGHTS); top_k=30; default mode.
 
-For `exhaustive_search`, the pipeline diverges at step 8 to a hard
-intersection and skips step 9 entirely.
+The summarize/insights/knowledge_gaps/exhaustive_search modes were
+removed in the redesign in favor of the structured deep_research
+output. The two remaining modes share the same pipeline up through
+step 10; they diverge at steps 11 + 12 only on prompt choice + model.
 """
 from __future__ import annotations
 
@@ -57,10 +61,11 @@ from backend.app.services.retrieval_ranking import rrf_fuse
 from backend.app.services.retrieval_sql import _vec_str
 
 
-_VALID_MODES = (
-    "simple_qa", "summarize", "deep_research", "insights",
-    "knowledge_gaps", "exhaustive_search",
-)
+_VALID_MODES = ("simple_qa", "deep_research")
+# deep_research is the default workhorse mode; simple_qa is the tight
+# direct-answer mode. Other modes (summarize, insights, knowledge_gaps,
+# exhaustive_search) were removed 2026-06-13 in favor of the structured
+# deep_research output. See plan: "QA + artifact redesign: 2-mode ...".
 
 
 @dataclass
@@ -69,7 +74,6 @@ class RetrievalResult:
     mode: str
     resolved_query: str
     evidence: list[dict[str, Any]] = field(default_factory=list)
-    exhaustive_results: list[dict[str, Any]] | None = None
     retrieval_run_id: uuid.UUID | None = None
     parsed: dict[str, Any] = field(default_factory=dict)
     cost_usd: float = 0.0
@@ -80,21 +84,31 @@ class RetrievalResult:
 async def retrieve_and_answer(
     question: str,
     *,
-    mode: str = "simple_qa",
-    top_k: int = 20,
+    mode: str = "deep_research",
+    top_k: int | None = None,
     hops: int = 2,
     max_cost_usd: float = 1.0,
     decompose: bool = True,
     max_probes: int = 5,
-    exhaustive_limit: int = 100,
     conversation_turn_id: uuid.UUID | None = None,
     resolved_query: str | None = None,
     verbose: bool = False,
 ) -> RetrievalResult:
     """Driver. `resolved_query` skips the follow-up resolution step
-    (the caller -- typically Milestone G -- already resolved it)."""
+    (the caller -- typically Milestone G -- already resolved it).
+
+    `top_k` defaults to 30 for deep_research (more breadth for the
+    six-section output) and 20 for simple_qa.
+    """
     if mode not in _VALID_MODES:
-        raise ValueError(f"invalid mode: {mode}; must be in {_VALID_MODES}")
+        raise ValueError(
+            f"invalid mode: {mode}; must be one of {_VALID_MODES}. "
+            "The summarize/insights/knowledge_gaps/exhaustive_search "
+            "modes were removed -- use deep_research for structured "
+            "answers or simple_qa for direct factoids."
+        )
+    if top_k is None:
+        top_k = 30 if mode == "deep_research" else 20
     t0 = time.time()
     router = LLMRouter()
     cost_before = router.total_cost_usd
@@ -118,25 +132,6 @@ async def retrieve_and_answer(
             f"entities={len(matched_entities)} times={len(matched_times)} "
             f"seeds={len(seeds)}"
         )
-
-    # -------- exhaustive_search diverges here --------
-    if mode == "exhaustive_search":
-        result = await _exhaustive_search(
-            resolved_query, parsed, matched_classes, matched_entities,
-            matched_times, hops=hops, limit=exhaustive_limit,
-            max_cost_usd=max_cost_usd, router=router, cost_before=cost_before,
-            verbose=verbose,
-        )
-        result.parsed = parsed
-        result.cost_usd = router.total_cost_usd - cost_before
-        result.wall_seconds = time.time() - t0
-        await _persist_run(
-            result, mode=mode, resolved_query=resolved_query,
-            matched_classes=matched_classes, matched_entities=matched_entities,
-            matched_times=matched_times, graph_hops=hops,
-            conversation_turn_id=conversation_turn_id,
-        )
-        return result
 
     # -------- step 5: concept expansion --------
     expanded_class_ids = await _concept_expansion(
@@ -315,11 +310,7 @@ async def retrieve_and_answer(
 
 _ANSWER_TASK_BY_MODE = {
     "simple_qa": "answer_simple_qa",
-    "summarize": "answer_summarize",
     "deep_research": "answer_deep_research",
-    "insights": "answer_insights",
-    "knowledge_gaps": "answer_knowledge_gaps",
-    # exhaustive_search uses its own path.
 }
 
 
@@ -466,192 +457,6 @@ async def _query_decompose(router: LLMRouter, q: str) -> list[str]:
         return []
     sqs = parsed.get("sub_questions") or []
     return [s for s in sqs if isinstance(s, str) and s.strip()]
-
-
-# --------------- exhaustive_search path ---------------
-
-
-async def _exhaustive_search(
-    query: str,
-    parsed: dict[str, Any],
-    matched_classes: list[dict[str, Any]],
-    matched_entities: list[dict[str, Any]],
-    matched_times: list[dict[str, Any]],
-    *,
-    hops: int,
-    limit: int,
-    max_cost_usd: float,
-    router: LLMRouter,
-    cost_before: float,
-    verbose: bool,
-) -> RetrievalResult:
-    """Find ALL chunks satisfying the intersection of constraint groups,
-    group by document, and 1-sentence-caption each group via gpt-4o-mini.
-    """
-    # Group entities by their class (top-level interpretation):
-    # each parsed entity-term becomes one constraint group. We also
-    # expand each class match via subClassOf to all descendants,
-    # then fetch every entity instance-of those classes.
-    constraint_groups: list[list[uuid.UUID]] = []
-
-    # One group per parsed entity term: collect entities matching it.
-    async with session_scope() as session:
-        for term in parsed.get("entities", [])[:5]:
-            if not term.strip():
-                continue
-            r = await session.execute(
-                sql_text("""
-                SELECT id FROM graphrag.entities
-                 WHERE similarity(normalized_name, lower(:t)) >= 0.4
-                 ORDER BY similarity(normalized_name, lower(:t)) DESC
-                 LIMIT 25
-                """),
-                {"t": term},
-            )
-            ids = [row[0] for row in r.all()]
-            if ids:
-                constraint_groups.append(ids)
-
-        # One group per parsed class term: expand each class via subtree
-        # to all descendants, then collect entities that instanceOf those
-        # classes.
-        for term in parsed.get("classes", [])[:5]:
-            r = await session.execute(
-                sql_text("""
-                SELECT id FROM graphrag.ontology_classes
-                 WHERE label ILIKE :t
-                 ORDER BY similarity(label, :raw) DESC
-                 LIMIT 5
-                """),
-                {"t": f"%{term}%", "raw": term},
-            )
-            class_ids = [row[0] for row in r.all()]
-            if not class_ids:
-                continue
-            subtree = await retrieval_sql.fetch_class_subtree(
-                session, class_ids, max_depth=5
-            )
-            if not subtree:
-                continue
-            # Entities instanceOf those classes.
-            r = await session.execute(
-                sql_text("""
-                SELECT id FROM graphrag.entities
-                 WHERE class_id = ANY(CAST(:cls AS uuid[]))
-                """),
-                {"cls": [str(c) for c in subtree]},
-            )
-            ids = [row[0] for row in r.all()]
-            if ids:
-                constraint_groups.append(ids)
-
-    if verbose:
-        print(
-            f"[query/exhaustive] constraint_groups: "
-            + ", ".join(str(len(g)) for g in constraint_groups)
-        )
-
-    if not constraint_groups:
-        return RetrievalResult(
-            answer=None, mode="exhaustive_search", resolved_query=query,
-            exhaustive_results=[], evidence=[],
-        )
-
-    async with session_scope() as session:
-        pairs = await retrieval_sql.fetch_exhaustive_intersection(
-            session, constraint_groups, limit=2000,
-        )
-    if verbose:
-        print(f"[query/exhaustive] intersection: {len(pairs)} chunks")
-
-    # Group by document.
-    by_doc: dict[uuid.UUID, list[uuid.UUID]] = {}
-    for did, cid in pairs:
-        by_doc.setdefault(did, []).append(cid)
-
-    if not by_doc:
-        return RetrievalResult(
-            answer=None, mode="exhaustive_search", resolved_query=query,
-            exhaustive_results=[], evidence=[],
-        )
-
-    # Fetch doc titles + chunk texts in bulk.
-    async with session_scope() as session:
-        r = await session.execute(
-            sql_text("""
-            SELECT id, document_identifier, title
-              FROM graphrag.documents
-             WHERE id = ANY(CAST(:ids AS uuid[]))
-            """),
-            {"ids": [str(d) for d in by_doc.keys()]},
-        )
-        doc_info = {did: (iri, title) for did, iri, title in r.all()}
-
-        all_chunk_ids = [cid for cs in by_doc.values() for cid in cs]
-        chunk_rows = await retrieval_sql.fetch_chunk_text(session, all_chunk_ids)
-
-    # Sort groups by chunk count (most-relevant first), cap by `limit`.
-    sorted_groups = sorted(
-        by_doc.items(), key=lambda kv: -len(kv[1])
-    )[:limit]
-
-    # Parallel caption calls.
-    cost_limit_hit = asyncio.Event()
-    sem = asyncio.Semaphore(4)
-    captions: dict[uuid.UUID, str] = {}
-
-    async def _caption(did: uuid.UUID, cids: list[uuid.UUID]) -> None:
-        if cost_limit_hit.is_set():
-            return
-        async with sem:
-            if cost_limit_hit.is_set():
-                return
-            diri, title = doc_info.get(did, ("?", "?"))
-            snippets = [
-                chunk_rows[c]["text"][:400] for c in cids[:5] if c in chunk_rows
-            ]
-            sys_p, user_p = PROMPTS["answer_exhaustive_group_caption"](
-                query, title, snippets,
-            )
-            try:
-                out = await router.chat(
-                    "answer_exhaustive_group_caption",
-                    system=sys_p, user=user_p,
-                )
-                captions[did] = out.text.strip()
-            except Exception as exc:
-                captions[did] = f"(caption failed: {exc})"
-            if router.total_cost_usd - cost_before > max_cost_usd:
-                if not cost_limit_hit.is_set():
-                    cost_limit_hit.set()
-
-    await asyncio.gather(*[_caption(did, cids) for did, cids in sorted_groups])
-
-    exhaustive_results = []
-    for did, cids in sorted_groups:
-        diri, title = doc_info.get(did, ("?", "?"))
-        ev = []
-        for c in cids[:5]:
-            info = chunk_rows.get(c)
-            if info is None:
-                continue
-            snippet = info["text"][:300] + ("..." if len(info["text"]) > 300 else "")
-            ev.append({"kind": "chunk", "iri": info["iri"], "snippet": snippet})
-        exhaustive_results.append({
-            "document_iri": diri,
-            "document_title": title,
-            "caption": captions.get(did, ""),
-            "matched_evidence": ev,
-            "match_count": len(cids),
-        })
-
-    return RetrievalResult(
-        answer=None,
-        mode="exhaustive_search",
-        resolved_query=query,
-        evidence=[],
-        exhaustive_results=exhaustive_results,
-    )
 
 
 # --------------- persistence ---------------

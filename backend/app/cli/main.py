@@ -552,15 +552,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_q.add_argument("question", help="The user question, in quotes.")
     p_q.add_argument(
         "--mode",
-        choices=(
-            "simple_qa", "summarize", "deep_research",
-            "insights", "knowledge_gaps", "exhaustive_search",
+        choices=("simple_qa", "deep_research"),
+        default="deep_research",
+        help=(
+            "deep_research (default): structured 6-section output "
+            "(SPECIFICS / ANALYSIS / CONTRADICTIONS / KEY CLAIMS / "
+            "COVERAGE IMBALANCE / KEY INSIGHTS). "
+            "simple_qa: tight 1-3 sentence direct answer."
         ),
-        default="simple_qa",
     )
     p_q.add_argument(
-        "--top-k", type=int, default=20,
-        help="How many candidates to surface as evidence.",
+        "--top-k", type=int, default=None,
+        help="How many candidates to surface as evidence. Defaults to "
+             "30 for deep_research, 20 for simple_qa.",
     )
     p_q.add_argument(
         "--hops", type=int, default=2,
@@ -577,10 +581,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_q.add_argument(
         "--max-probes", type=int, default=5,
         help="Cap on number of vector-search probes (incl. the original query).",
-    )
-    p_q.add_argument(
-        "--exhaustive-limit", type=int, default=100,
-        help="exhaustive_search only: cap on captioned document groups.",
     )
     p_q.add_argument(
         "--json", action="store_true",
@@ -608,9 +608,8 @@ def build_parser() -> argparse.ArgumentParser:
                            "be able to answer.")
     p_ev.add_argument(
         "--mode",
-        choices=("simple_qa", "summarize", "deep_research", "insights",
-                 "knowledge_gaps", "exhaustive_search"),
-        default="simple_qa",
+        choices=("simple_qa", "deep_research"),
+        default="deep_research",
     )
     p_ev.add_argument("--runs-per-question", type=int, default=3)
     p_ev.add_argument(
@@ -659,13 +658,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_conv_turn.add_argument("question", help="The user question in quotes.")
     p_conv_turn.add_argument(
         "--mode",
-        choices=(
-            "simple_qa", "summarize", "deep_research",
-            "insights", "knowledge_gaps", "exhaustive_search",
-        ),
-        default="simple_qa",
+        choices=("simple_qa", "deep_research"),
+        default="deep_research",
     )
-    p_conv_turn.add_argument("--top-k", type=int, default=20)
+    p_conv_turn.add_argument("--top-k", type=int, default=None)
     p_conv_turn.add_argument("--hops", type=int, default=2)
     p_conv_turn.add_argument(
         "--max-cost-usd", type=float, default=0.20,
@@ -1120,7 +1116,6 @@ def _cmd_query(args: argparse.Namespace) -> int:
             max_cost_usd=args.max_cost_usd,
             decompose=not args.no_decompose,
             max_probes=args.max_probes,
-            exhaustive_limit=args.exhaustive_limit,
             verbose=args.verbose,
         )
     )
@@ -1131,7 +1126,6 @@ def _cmd_query(args: argparse.Namespace) -> int:
             "mode": result.mode,
             "resolved_query": result.resolved_query,
             "evidence": result.evidence,
-            "exhaustive_results": result.exhaustive_results,
             "retrieval_run_id": str(result.retrieval_run_id) if result.retrieval_run_id else None,
             "parsed": result.parsed,
             "cost_usd": result.cost_usd,
@@ -1148,15 +1142,6 @@ def _cmd_query(args: argparse.Namespace) -> int:
     print(f"COST:     ${result.cost_usd:.4f}   wall: {result.wall_seconds:.1f}s")
     print(f"RUN_ID:   {result.retrieval_run_id}")
     print("=" * 72)
-
-    if result.exhaustive_results is not None:
-        print(f"FOUND {len(result.exhaustive_results)} matching document(s):")
-        for r in result.exhaustive_results:
-            print()
-            print(f"  [{r['match_count']}x] {r['document_title']}")
-            print(f"      {r['document_iri']}")
-            print(f"      {r['caption']}")
-        return 0
 
     if result.answer:
         print("ANSWER:")
@@ -1244,10 +1229,6 @@ def _cmd_conversation_turn(args: argparse.Namespace) -> int:
     if result.get("answer"):
         print("ANSWER:")
         print(result["answer"])
-    elif result.get("exhaustive_results") is not None:
-        for r in result["exhaustive_results"]:
-            print(f"  [{r['match_count']}x] {r['document_title']}")
-            print(f"      {r['caption']}")
     return 0
 
 

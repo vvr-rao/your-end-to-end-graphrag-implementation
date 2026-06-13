@@ -768,17 +768,46 @@ def artifact_chunk_extract_with_entities(
     entities_block = "\n".join(entity_lines)
 
     system = (
-        "You extract structured intelligence artifacts from text chunks. "
-        "You return ONE JSON object with three keys: claims, findings, "
-        "observations. Each is a list of `{text, confidence}` items.\n\n"
+        "You extract structured intelligence artifacts from text chunks.\n\n"
+        "Return ONE JSON object with three keys: `claims`, `findings`, "
+        "`observations`. Each is a list of items with the SAME shape:\n"
+        "  {\n"
+        "    \"text\": \"<the claim/finding/observation as a standalone sentence>\",\n"
+        "    \"confidence\": <float 0-1>,\n"
+        "    \"evidence_status\": \"backed\" | \"partial\" | \"unbacked\",\n"
+        "    \"claim_source\": \"<who made the claim>\" | null,\n"
+        "    \"time_scope\": \"<time period the claim applies to>\" | null\n"
+        "  }\n\n"
         "DEFINITIONS:\n"
-        "  - Claim: a factual assertion the text MAKES (e.g. \"X "
-        "owns 30% of Y\"). Specific and verifiable.\n"
+        "  - Claim: a factual assertion the text MAKES (e.g. \"X owns "
+        "30% of Y\"). Specific and verifiable.\n"
         "  - Finding: an analytical conclusion or insight (e.g. \"the "
         "trend suggests Z is accelerating\"). Goes beyond raw facts.\n"
         "  - Observation: a raw factual statement directly visible in "
         "the text (e.g. \"price rose 5% in March\").\n\n"
-        "ENTITY NAMING REQUIREMENT (READ CAREFULLY):\n"
+        "EVIDENCE STATUS (READ CAREFULLY):\n"
+        "  - \"backed\"   = the chunk supplies the reasoning, source, "
+        "or data that supports this claim (e.g. a study cited, a "
+        "number with calculation, an authority quoted).\n"
+        "  - \"partial\"  = some support is given but it's incomplete "
+        "(an assertion with a vague reference or partial figures).\n"
+        "  - \"unbacked\" = the chunk asserts the claim WITHOUT any "
+        "reasoning or supporting data (e.g. \"X is significant\" with "
+        "no explanation of why, or \"experts say\" with no expert named).\n"
+        "  Note: this is about whether the SOURCE TEXT supports the "
+        "claim, not whether the claim happens to be true.\n\n"
+        "CLAIM SOURCE (who made the claim, if identifiable):\n"
+        "  - e.g. \"the report itself\", \"BYD's CEO\", \"a 2024 Reuters "
+        "article\", \"the World Bank\", \"the document author\".\n"
+        "  - If the source is just \"the document\" (no named author), "
+        "use \"the document itself\".\n"
+        "  - If you cannot identify who made the claim, set to null.\n\n"
+        "TIME SCOPE (what time period the claim applies to):\n"
+        "  - e.g. \"2024\", \"first half of 2022\", \"Q1 2024\", "
+        "\"2022-2024\", \"since 2020\", \"as of January 2026\".\n"
+        "  - If the claim is time-agnostic (a definition, a structural "
+        "statement), set to null.\n\n"
+        "ENTITY NAMING REQUIREMENT:\n"
         "  - You will be given a list of canonical ENTITIES present in this "
         "chunk. Whenever your Claim / Finding / Observation refers to one of "
         "these entities, you MUST use its EXACT canonical name as listed.\n"
@@ -786,18 +815,17 @@ def artifact_chunk_extract_with_entities(
         "the entity list. Replace \"the company\" with the company's name, "
         "\"the country\" with the country's name, \"the report\" with the "
         "report's title, etc.\n"
-        "  - If multiple entities are involved in one assertion, name all of "
-        "them.\n"
+        "  - If multiple entities are involved in one assertion, name all of them.\n"
         "  - If an assertion is about something NOT in the entity list "
         "(an abstract concept, a generic group), generic phrasing is fine.\n\n"
         "GUIDELINES:\n"
         "  - 0 to 8 of each type per chunk; only include items the "
         "text actually supports.\n"
-        "  - `text` should be the artifact as a standalone sentence.\n"
+        "  - `text` should be the artifact as a standalone sentence "
+        "with specific names, numbers, and dates verbatim from the chunk.\n"
         "  - `confidence` is a float in [0,1] reflecting how directly "
         "the chunk supports the artifact.\n"
-        "  - Skip items that are too vague, uncertain, or generic to be "
-        "useful.\n"
+        "  - Skip items that are too vague to be useful.\n"
         "  - Return ONLY the JSON object -- no preamble, no markdown."
     )
     user = (
@@ -806,7 +834,8 @@ def artifact_chunk_extract_with_entities(
         + "\n\nTEXT CHUNK:\n```\n"
         + chunk_text
         + "\n```\n\n"
-        "Return the JSON now."
+        "Return the JSON now -- each item must include text, confidence, "
+        "evidence_status, claim_source, and time_scope."
     )
     return system, user
 
@@ -968,13 +997,22 @@ _FACTS_FIRST_RULE = (
 def answer_simple_qa(
     question: str, evidence: list[dict]
 ) -> tuple[str, str]:
-    """Phase 2 Milestone F simple_qa mode: short factoid answer."""
+    """Tight one-shot answer. Only the question, nothing more.
+
+    No "this suggests..." closer, no padding analysis, no broader
+    framing. If the evidence does not answer the question, say so.
+    """
     system = (
-        "You answer questions briefly and accurately using ONLY the evidence "
-        "below.\n\n"
+        "You answer the user's question DIRECTLY, in 1-3 sentences, using "
+        "ONLY the evidence below.\n\n"
         + _FACTS_FIRST_RULE
-        + "\n\nLENGTH: 1-3 sentences. If the evidence doesn't answer the "
-        "question, say so explicitly. Return ONLY the answer text."
+        + "\n\nSTRICT SCOPE:\n"
+        "  - Answer ONLY the question asked. Do NOT add context, "
+        "background, broader implications, or a 'this suggests...' "
+        "closer. No multi-paragraph treatment.\n"
+        "  - If the evidence does not contain the answer, say so "
+        "explicitly in one sentence; do NOT speculate.\n"
+        "  - Return ONLY the answer text."
     )
     user = (
         f"QUESTION: {question}\n\nEVIDENCE:\n"
@@ -984,122 +1022,85 @@ def answer_simple_qa(
     return system, user
 
 
-def answer_summarize(
-    question: str, evidence: list[dict]
-) -> tuple[str, str]:
-    """Phase 2 Milestone F summarize mode: 2-4 paragraph thematic summary."""
-    system = (
-        "You synthesize a thematic summary of what the corpus says about the "
-        "question, using ONLY the evidence below.\n\n"
-        + _FACTS_FIRST_RULE
-        + "\n\nLENGTH: 2-4 paragraphs. Open with the most specific facts "
-        "(names, numbers, dates) and group them by theme. Save any synthesis "
-        "for the closing paragraph. If the evidence is thin, say what's "
-        "missing. Return ONLY the summary -- no markdown headers."
-    )
-    user = (
-        f"QUESTION: {question}\n\nEVIDENCE:\n"
-        + _format_evidence_block(evidence)
-        + "\n\nWrite the summary now."
-    )
-    return system, user
+_DEEP_RESEARCH_SECTIONS = (
+    "OUTPUT STRUCTURE -- six labelled sections, always in this order. "
+    "Every section MUST render, even if empty. Use the labels verbatim "
+    "as the only headers; no markdown.\n\n"
+    "SPECIFICS\n"
+    "  Enumerate the named entities, regulations, events, people, "
+    "places, dates, and figures relevant to the question, verbatim "
+    "from the evidence. Each line cited by IRI in brackets.\n"
+    "  - If asked about REGULATIONS or STEPS TAKEN, list each one with "
+    "its name, who passed/implemented it, and when.\n"
+    "  - If asked about COMPANIES / PEOPLE / EVENTS, list each with "
+    "the specific dates, numbers, and details from the evidence.\n"
+    "  - Do not summarize specifics away. Numbers and dates verbatim.\n\n"
+    "ANALYSIS\n"
+    "  Synthesis that connects the SPECIFICS into a coherent picture. "
+    "Pull from Finding and Insight artifacts in the evidence when "
+    "available (cite them). Address what the user actually wants to "
+    "understand, not just what was found.\n\n"
+    "CONTRADICTIONS\n"
+    "  Where two or more sources in the evidence disagree, name them: "
+    "\"[doc X] states A, while [doc Y] states B.\" Use the documents' "
+    "titles or IRIs. If no contradictions found, write exactly: "
+    "\"None identified in the evidence retrieved.\"\n\n"
+    "KEY CLAIMS (with evidence status)\n"
+    "  List the significant claims surfaced for the question. Every "
+    "claim is stated regardless of whether it is backed. Each line "
+    "carries TWO badges: (a) who made the claim, and (b) whether "
+    "the source provided supporting evidence.\n"
+    "  Format: \"<Claim>. [Stated by <source>; evidence: backed/"
+    "partial/unbacked in <doc>]\"\n"
+    "  - Backed = source supplied reasoning/data/citation.\n"
+    "  - Partial = some support; incomplete.\n"
+    "  - Unbacked = stated without reasoning or backing.\n"
+    "  Mix backed and unbacked claims together. Do NOT split them.\n"
+    "  Use the `evidence_status` and `claim_source` metadata on Claim "
+    "artifacts when present in evidence.\n\n"
+    "COVERAGE IMBALANCE\n"
+    "  Anywhere the corpus has substantially more material on one side "
+    "than another. Pick the axes by inspecting the evidence pool: "
+    "could be sub-topics, viewpoints, geographies, time periods, "
+    "organizations, dimensions of an issue, etc.\n"
+    "  Format: \"The corpus contains <N> sources on <topic A> but only "
+    "<M> on <topic B>; <observation about why this matters>.\"\n"
+    "  If coverage is balanced, write \"Coverage appears balanced "
+    "across the dimensions in the evidence.\"\n\n"
+    "KEY INSIGHTS\n"
+    "  1-2 sentence standout patterns. Cross-period trends "
+    "(year-over-year, month-over-month). Geographic / organizational "
+    "patterns. Sudden or unusual changes. Flag each as judgement: "
+    "\"This pattern suggests...\" / \"Taken together this points to...\".\n"
+    "  Pull `time_scope` metadata from Claim artifacts when present to "
+    "support cross-period trends.\n"
+    "  If no insights stand out, write \"No standout patterns identified.\""
+)
 
 
 def answer_deep_research(
     question: str, evidence: list[dict]
 ) -> tuple[str, str]:
-    """Phase 2 Milestone F deep_research mode: long-form synthesis."""
-    system = (
-        "You produce a thorough research-style synthesis using ONLY the "
-        "evidence below.\n\n"
-        + _FACTS_FIRST_RULE
-        + "\n\nSTRUCTURE:\n"
-        "  1. Brief framing of the question (one paragraph).\n"
-        "  2. EVIDENCE-FIRST BODY: enumerate the specific facts grouped "
-        "by sub-topic. Every claim cited by IRI. Use named entities, "
-        "numbers, and dates verbatim from the evidence -- do not summarize "
-        "them away.\n"
-        "  3. ANALYSIS (clearly separated from the facts): compare angles, "
-        "surface tensions, note where the evidence supports multiple "
-        "interpretations.\n"
-        "  4. SHORT CONCLUSION (one paragraph). Your own judgement, flagged "
-        "as such.\n\n"
-        "400-800 words. Return ONLY the answer text -- no markdown headers."
-    )
-    user = (
-        f"QUESTION: {question}\n\nEVIDENCE:\n"
-        + _format_evidence_block(evidence)
-        + "\n\nWrite the synthesis now."
-    )
-    return system, user
+    """deep_research mode: structured 6-section output.
 
-
-def answer_insights(
-    question: str, evidence: list[dict]
-) -> tuple[str, str]:
-    """Phase 2 Milestone F insights mode: pattern surfacing."""
-    system = (
-        "You surface non-obvious INSIGHTS across the evidence below.\n\n"
-        + _FACTS_FIRST_RULE
-        + "\n\nSTRUCTURE: Group findings into 2-5 themes. For each theme:\n"
-        "  - First: 2-3 specific facts grounding the theme (names, "
-        "numbers, dates verbatim from evidence, each cited).\n"
-        "  - Then: the insight in 1-2 sentences, clearly framed as your "
-        "synthesis ('this pattern suggests...', 'taken together...').\n"
-        "Insights must go beyond what any single claim says -- look for "
-        "cross-cutting patterns, contradictions, or emerging trends. "
-        "Return plain text, no markdown."
-    )
-    user = (
-        f"QUESTION: {question}\n\nEVIDENCE:\n"
-        + _format_evidence_block(evidence)
-        + "\n\nProduce the insights now."
-    )
-    return system, user
-
-
-def answer_knowledge_gaps(
-    question: str,
-    sub_questions: list[str],
-    found_for: list[str],
-) -> tuple[str, str]:
-    """Phase 2 Milestone F knowledge_gaps mode: report what's missing."""
-    found_block = "\n".join(f"  - {q}" for q in found_for) or "  (none)"
-    missing = [q for q in sub_questions if q not in found_for]
-    missing_block = "\n".join(f"  - {q}" for q in missing) or "  (none)"
-    system = (
-        "You report knowledge gaps about a question. You're given (a) the "
-        "sub-questions implied by the user's question, (b) which sub-questions "
-        "the corpus DOES have evidence for, and (c) which it does NOT. Write "
-        "2-3 short paragraphs describing the gaps and what kinds of "
-        "additional documents would close them. Return plain text only."
-    )
-    user = (
-        f"QUESTION: {question}\n\n"
-        f"SUB-QUESTIONS COVERED BY CORPUS:\n{found_block}\n\n"
-        f"SUB-QUESTIONS NOT COVERED:\n{missing_block}\n\n"
-        "Write the gap report now."
-    )
-    return system, user
-
-
-def answer_exhaustive_group_caption(
-    question: str, document_title: str, snippets: list[str]
-) -> tuple[str, str]:
-    """Phase 2 Milestone F exhaustive_search: 1-sentence caption per
-    matched document. Run in parallel; no global synthesis.
+    The fixed sections are mandatory and always render, even if empty.
+    Section content uses the new `evidence_status`, `claim_source`,
+    `time_scope` metadata on Claim artifacts in the evidence.
     """
-    snip = "\n".join(f"  - {s[:300]}" for s in snippets[:5])
     system = (
-        "You write a one-sentence caption describing what a document says "
-        "about a user query. The caption is for a list of matches, so be "
-        "specific to THIS document. <= 25 words. No preamble. Plain text."
+        "You produce a thorough, structured research answer using ONLY "
+        "the evidence below. The structure is FIXED and must be followed "
+        "exactly.\n\n"
+        + _FACTS_FIRST_RULE
+        + "\n\n"
+        + _DEEP_RESEARCH_SECTIONS
+        + "\n\nLENGTH: 600-1,200 words across all six sections. "
+        "Return plain text only -- no markdown."
     )
     user = (
-        f"USER QUERY: {question}\n\n"
-        f"DOCUMENT TITLE: {document_title}\n\n"
-        f"MATCHING SNIPPETS:\n{snip}\n\n"
-        "Write the one-sentence caption now."
+        f"QUESTION: {question}\n\nEVIDENCE:\n"
+        + _format_evidence_block(evidence)
+        + "\n\nWrite the six-section answer now."
     )
     return system, user
 
@@ -1174,29 +1175,21 @@ def answer_conversation_turn(
     resolved_query: str,
     current_evidence: list[dict],
     prior_turns: list[tuple[str, str]],
-    base_mode: str = "simple_qa",
+    base_mode: str = "deep_research",
 ) -> tuple[str, str]:
-    """Phase 2 Milestone G: synthesize a conversation-turn answer with
-    BOTH this turn's retrieved evidence and prior conversation context
-    in scope.
+    """Conversation-turn answer with prior Q+A in scope.
 
     `prior_turns` items: (user_question, answer). Most recent last.
-    `base_mode` selects the depth/length style:
-       simple_qa | summarize | knowledge_gaps -> short
-       deep_research | insights              -> long
+    `base_mode` selects style:
+       simple_qa     -> tight 1-3 sentence direct answer
+       deep_research -> 6-section structured answer (same as the
+                        deep_research one-shot, plus prior context).
 
-    Falls back to plain answer_simple_qa-style if prior_turns is empty.
+    Falls back to the relevant one-shot prompt if `prior_turns` is empty.
     """
     if not prior_turns:
         if base_mode == "deep_research":
             return answer_deep_research(resolved_query, current_evidence)
-        if base_mode == "insights":
-            return answer_insights(resolved_query, current_evidence)
-        if base_mode == "summarize":
-            return answer_summarize(resolved_query, current_evidence)
-        if base_mode == "knowledge_gaps":
-            # caller computes the sub_questions / found_for lists; fallback simple
-            return answer_simple_qa(resolved_query, current_evidence)
         return answer_simple_qa(resolved_query, current_evidence)
 
     def _trim(s: str, n: int) -> str:
@@ -1207,38 +1200,47 @@ def answer_conversation_turn(
         f"  Q{i+1}: {_trim(q, 250)}\n  A{i+1}: {_trim(a, 800)}"
         for i, (q, a) in enumerate(prior_turns)
     )
-    is_long = base_mode in ("deep_research", "insights")
-    length = "400-800 words" if is_long else "1-3 paragraphs"
-    style = (
-        "thorough research-style synthesis"
-        if is_long else "concise, grounded answer"
-    )
 
-    system = (
-        f"You produce a {style} for a multi-turn conversation. "
-        "You will see the CONVERSATION HISTORY (prior questions and your "
-        "earlier answers) plus the CURRENT QUESTION and the EVIDENCE "
-        "retrieved for it.\n\n"
-        + _FACTS_FIRST_RULE
-        + "\n\nCONVERSATION RULES:\n"
-        "  - Treat the prior answers as already-established context. "
-        "Do NOT restate them; build on them.\n"
-        "  - If the user is asking for elaboration on specific things "
-        "the prior answer mentioned by name (frameworks, companies, "
-        "policies, numbers), name those SAME things in your new answer "
-        "and pull more detail from the CURRENT EVIDENCE about them.\n"
-        "  - Every NEW claim must come from the CURRENT EVIDENCE, cited "
-        "by its IRI in brackets like [viao:Chunk_abc...].\n"
-        "  - If you reference something from a prior answer, you may say "
-        "'as discussed' or 'building on the prior answer' without "
-        "re-citing it.\n"
-        "  - If the CURRENT EVIDENCE doesn't address the question, say so "
-        "explicitly -- do NOT fabricate.\n\n"
-        "STRUCTURE: lead with the SPECIFIC FACTS the user is asking about "
-        "(names, numbers, dates, with citations), THEN any synthesis or "
-        "interpretation last.\n"
-        f"LENGTH: {length}. Return ONLY the answer text -- no markdown headers."
-    )
+    if base_mode == "deep_research":
+        system = (
+            "You produce a STRUCTURED RESEARCH answer for a multi-turn "
+            "conversation. You will see the CONVERSATION HISTORY (prior "
+            "questions and your earlier answers), the CURRENT QUESTION, "
+            "and the EVIDENCE retrieved for it.\n\n"
+            + _FACTS_FIRST_RULE
+            + "\n\nCONVERSATION RULES:\n"
+            "  - Treat prior answers as already-established context. Do "
+            "NOT restate them in full; build on them.\n"
+            "  - If the user is asking for elaboration on specific things "
+            "named in a prior answer (frameworks, companies, policies, "
+            "numbers), name those SAME things in your new answer and pull "
+            "more detail about them from the CURRENT EVIDENCE.\n"
+            "  - Every NEW claim must come from the CURRENT EVIDENCE, "
+            "cited by IRI.\n\n"
+            + _DEEP_RESEARCH_SECTIONS
+            + "\n\nFOLLOW-UP COMPRESSION:\n"
+            "  - On a tight follow-up (e.g. 'what frameworks?') you MAY "
+            "compress sections that the prior turn already covered to "
+            "1-2 lines or 'See prior turn for full treatment of <X>.' "
+            "But every section header must still appear in order.\n\n"
+            "LENGTH: 400-1,000 words. Return plain text only."
+        )
+    else:
+        system = (
+            "You produce a CONCISE direct answer (1-3 sentences) for a "
+            "multi-turn conversation using ONLY the CURRENT EVIDENCE.\n\n"
+            + _FACTS_FIRST_RULE
+            + "\n\nCONVERSATION RULES:\n"
+            "  - Treat prior answers as already-established context.\n"
+            "  - Answer ONLY the current question. No padding analysis.\n"
+            "  - If the user is asking for elaboration on specific things "
+            "named in a prior answer, name those SAME things and pull "
+            "the specific detail from the CURRENT EVIDENCE.\n"
+            "  - If the CURRENT EVIDENCE doesn't address the question, "
+            "say so explicitly in one sentence.\n"
+            "  - Return ONLY the answer text."
+        )
+
     user = (
         f"CONVERSATION HISTORY:\n{hist}\n\n"
         f"CURRENT QUESTION: {resolved_query}\n\n"
@@ -1498,11 +1500,7 @@ PROMPTS = {
     "query_decompose": query_decompose,
     "chunk_relevance_filter": chunk_relevance_filter,
     "answer_simple_qa": answer_simple_qa,
-    "answer_summarize": answer_summarize,
     "answer_deep_research": answer_deep_research,
-    "answer_insights": answer_insights,
-    "answer_knowledge_gaps": answer_knowledge_gaps,
-    "answer_exhaustive_group_caption": answer_exhaustive_group_caption,
     # Milestone G
     "follow_up_resolution": follow_up_resolution,
     "answer_conversation_turn": answer_conversation_turn,

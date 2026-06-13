@@ -32,8 +32,18 @@ class StartResponse(BaseModel):
 
 class TurnRequest(BaseModel):
     question: str = Field(..., description="User question (may be a follow-up).")
-    mode: str = "simple_qa"
-    top_k: int = 20
+    mode: str = Field(
+        "deep_research",
+        description=(
+            "'deep_research' (default) returns a structured 6-section "
+            "answer; 'simple_qa' returns a tight 1-3 sentence direct "
+            "answer."
+        ),
+    )
+    top_k: int | None = Field(
+        None, ge=1, le=100,
+        description="Defaults to 30 for deep_research, 20 for simple_qa.",
+    )
     hops: int = 2
     max_cost_usd: float = Field(0.20, gt=0.0, le=10.0)
     decompose: bool = True
@@ -50,7 +60,6 @@ class TurnResponse(BaseModel):
     resolved_question: str
     mode: str
     answer: str | None
-    exhaustive_results: list[dict[str, Any]] | None = None
     evidence: list[dict[str, Any]]
     retrieval_run_id: str | None
     cost_usd: float

@@ -2,6 +2,12 @@
 
 Wraps `services.retrieval.retrieve_and_answer`. Same shape as the
 CLI's `query --json` output.
+
+Two modes (2026-06-13 redesign):
+  - simple_qa     -- tight 1-3 sentence direct answer.
+  - deep_research -- structured 6-section output (SPECIFICS /
+                     ANALYSIS / CONTRADICTIONS / KEY CLAIMS /
+                     COVERAGE IMBALANCE / KEY INSIGHTS). DEFAULT.
 """
 from __future__ import annotations
 
@@ -15,21 +21,30 @@ from backend.app.services.retrieval import retrieve_and_answer
 router = APIRouter(prefix="/qa", tags=["qa"])
 
 
-_VALID_MODES = (
-    "simple_qa", "summarize", "deep_research",
-    "insights", "knowledge_gaps", "exhaustive_search",
-)
+_VALID_MODES = ("simple_qa", "deep_research")
 
 
 class QARequest(BaseModel):
     question: str = Field(..., description="User question.")
-    mode: str = Field("simple_qa", description="One of the six retrieval modes.")
-    top_k: int = Field(20, ge=1, le=100)
+    mode: str = Field(
+        "deep_research",
+        description=(
+            "Retrieval mode. 'deep_research' (default) returns a "
+            "structured 6-section answer; 'simple_qa' returns a tight "
+            "1-3 sentence direct answer."
+        ),
+    )
+    top_k: int | None = Field(
+        None, ge=1, le=100,
+        description=(
+            "Candidates surfaced as evidence. Defaults to 30 for "
+            "deep_research, 20 for simple_qa."
+        ),
+    )
     hops: int = Field(2, ge=0, le=4)
     max_cost_usd: float = Field(1.0, gt=0.0, le=10.0)
     decompose: bool = Field(True, description="Run step-9a query decomposition.")
     max_probes: int = Field(5, ge=1, le=8)
-    exhaustive_limit: int = Field(100, ge=1, le=500)
 
 
 class QAEvidenceItem(BaseModel):
@@ -49,7 +64,6 @@ class QAResponse(BaseModel):
     mode: str
     resolved_query: str
     evidence: list[QAEvidenceItem]
-    exhaustive_results: list[dict[str, Any]] | None = None
     retrieval_run_id: str | None
     parsed: dict[str, Any]
     cost_usd: float
@@ -62,7 +76,12 @@ async def qa_ask(req: QARequest) -> QAResponse:
     if req.mode not in _VALID_MODES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"mode must be one of {_VALID_MODES}",
+            detail=(
+                f"mode must be one of {_VALID_MODES}. The "
+                "summarize/insights/knowledge_gaps/exhaustive_search "
+                "modes were removed -- use deep_research for structured "
+                "answers or simple_qa for direct factoids."
+            ),
         )
     result = await retrieve_and_answer(
         req.question,
@@ -72,14 +91,12 @@ async def qa_ask(req: QARequest) -> QAResponse:
         max_cost_usd=req.max_cost_usd,
         decompose=req.decompose,
         max_probes=req.max_probes,
-        exhaustive_limit=req.exhaustive_limit,
     )
     return QAResponse(
         answer=result.answer,
         mode=result.mode,
         resolved_query=result.resolved_query,
         evidence=[QAEvidenceItem(**ev) for ev in result.evidence],
-        exhaustive_results=result.exhaustive_results,
         retrieval_run_id=str(result.retrieval_run_id) if result.retrieval_run_id else None,
         parsed=result.parsed,
         cost_usd=result.cost_usd,

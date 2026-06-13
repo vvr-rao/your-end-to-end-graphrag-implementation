@@ -1,49 +1,71 @@
-# v1_smoke.example.txt -- the F-mode shipping rubric.
+# v1_smoke.example.txt -- the 2-mode F-shipping rubric.
 #
 # This file is the GIT-TRACKED template. To start using it:
 #   cp eval_questions/v1_smoke.example.txt eval_questions/v1_smoke.txt
 #   # then edit eval_questions/v1_smoke.txt (gitignored)
 #
-# 19 questions covering the styles F has to handle. Run via:
+# 19 questions covering the two retrieval modes F supports:
+#
+#   simple_qa     -- tight, direct factoid answers (1-3 sentences)
+#   deep_research -- structured 6-section output (SPECIFICS / ANALYSIS /
+#                    CONTRADICTIONS / KEY CLAIMS / COVERAGE IMBALANCE /
+#                    KEY INSIGHTS). DEFAULT mode.
+#
+# Run via:
 #   uv run python -m backend.app.cli evaluate-queries \
 #     --questions eval_questions/v1_smoke.txt \
-#     --mode simple_qa --runs-per-question 3 \
+#     --mode deep_research --runs-per-question 3 \
 #     --output /tmp/eval.json --output-md /tmp/eval.md
+#
+# Or against simple_qa only:
+#   uv run python -m backend.app.cli evaluate-queries \
+#     --questions eval_questions/v1_smoke.txt \
+#     --mode simple_qa --runs-per-question 3 ...
 #
 # Tag conventions:
 #   #  ...   -- comment line
 #  [gap] X  -- corpus does NOT contain an answer; tests gap detection.
 #
 # See README.md for the full rubric (5 metrics, pass thresholds,
-# retrieval methodology, mode descriptions) plus per-question cost
-# estimates.
+# retrieval methodology, the two modes' descriptions) plus
+# per-question cost estimates.
 
-# === Factoid (best with --mode simple_qa) ===
+# === Factoid questions (best with --mode simple_qa) ===
+# Direct fact lookup. Should answer in 1-3 sentences if the corpus
+# contains the fact, otherwise say so.
 What is OCI N.V.'s annual nitrogen fertilizer production capacity?
 When does the EU CBAM framework start?
 Which countries are listed as main producers of helium?
 What is K+S AG's potash sales volume for the first half of 2022?
 
-# === Comparison (best with --mode deep_research) ===
+# === Structured deep-dive questions (best with --mode deep_research) ===
+# These exercise every section of the deep_research output:
+#   SPECIFICS, ANALYSIS, CONTRADICTIONS, KEY CLAIMS, COVERAGE IMBALANCE,
+#   KEY INSIGHTS. The judge scores sections by their presence and quality.
+
+# --- Comparison ---
 How does Vietnam's manufacturing outlook compare to India's?
 What are the differences between EV policies in China vs ASEAN countries?
 Compare the strategic positions of BYD and Honda in the EV market.
 
-# === Listing (best with --mode exhaustive_search) ===
-List all regulations mentioned in the corpus related to EV production in Asia.
+# --- Enumeration / listing ---
+What regulations are mentioned in the corpus related to EV production in Asia?
 What companies are identified as key fertilizer producers?
-List all government subsidies for EV adoption mentioned in the corpus.
+What government subsidies for EV adoption are mentioned in the corpus?
 
-# === Synthesis (best with --mode deep_research or --mode insights) ===
+# --- Synthesis / cross-cutting patterns ---
 What are the main strategic shifts in Asian manufacturing in 2025-2026?
-Summarize the impact of the Strait of Hormuz crisis on global supply chains.
+What is the impact of the Strait of Hormuz crisis on global supply chains?
 What patterns emerge across the corpus's coverage of semiconductor supply risks?
 
-# === Time-anchored ===
+# --- Time-anchored ---
 What manufacturing trends are projected for 2026?
 What changes happened in fertilizer markets between 2022 and 2024?
 
 # === Gap detection (corpus has NO info) ===
+# These should produce an explicit refusal. simple_qa says so in one
+# sentence; deep_research says so in SPECIFICS and gracefully fills the
+# other sections with "None identified" placeholders.
 [gap] What is the current price of Bitcoin?
 [gap] Who won the 2024 Tour de France?
 [gap] What is the population of Madagascar?
