@@ -811,6 +811,502 @@ def artifact_chunk_extract_with_entities(
     return system, user
 
 
+def question_parse(question: str) -> tuple[str, str]:
+    """Phase 2 Milestone F step 3: parse a user question into structured
+    constraints the retrieval pipeline can use as graph seeds.
+
+    Returns JSON:
+      {
+        "entities": ["BYD", "Vietnam"],   # proper-noun mentions
+        "classes":  ["regulation", "manufacturer"],   # category words
+        "time_terms": ["2024", "Q1 2024", "since 2020"],
+        "intent": "comparison" | "enumeration" | "summary" | "factoid" | "research"
+      }
+    """
+    system = (
+        "You parse user questions into structured constraints. Return ONE JSON "
+        "object with four keys: entities, classes, time_terms, intent.\n\n"
+        "  - entities: proper-noun mentions (people, organizations, places, "
+        "products). Use the form that appears in the question.\n"
+        "  - classes: category words / common nouns naming a kind of thing "
+        "(e.g. 'regulation', 'manufacturer', 'country').\n"
+        "  - time_terms: any time / date expressions in the question.\n"
+        "  - intent: one of 'comparison', 'enumeration', 'summary', "
+        "'factoid', 'research'. Pick the closest fit.\n\n"
+        "Return ONLY the JSON; no preamble, no markdown."
+    )
+    user = f"QUESTION: {question}\n\nReturn the JSON now."
+    return system, user
+
+
+def concept_expansion(
+    question: str, matched_class_iris_labels: list[tuple[str, str]]
+) -> tuple[str, str]:
+    """Phase 2 Milestone F step 5: given the question + ontology classes
+    that vector-matched, propose 5-15 additional related class IRIs that
+    might be involved. Helps graph BFS find evidence the seed didn't.
+
+    Returns JSON: {"related_classes": ["<iri>", ...]}
+    """
+    listing = "\n".join(
+        f"  - {iri} ({label})" for iri, label in matched_class_iris_labels[:20]
+    )
+    system = (
+        "You expand a set of ontology class candidates with 5 to 15 related "
+        "classes the question might also involve. You will pick from the "
+        "candidate list ONLY -- never invent IRIs. Return JSON.\n\n"
+        "GUIDELINES:\n"
+        "  - Pick classes that are conceptually related (siblings, "
+        "supertypes, neighbors).\n"
+        "  - Don't repeat the IRIs you were given; ADD related ones.\n"
+        "  - If you can't find good additions, return an empty list.\n"
+        "  - Return ONLY {\"related_classes\": [\"<iri>\", ...]}."
+    )
+    user = (
+        f"QUESTION: {question}\n\n"
+        f"MATCHED CLASSES (already in seed set):\n{listing}\n\n"
+        "Return JSON with 0-15 additional class IRIs from the matched list."
+    )
+    return system, user
+
+
+def query_decompose(question: str) -> tuple[str, str]:
+    """Phase 2 Milestone F step 9a: decompose a complex/comparative
+    question into 1-5 atomic sub-questions for multi-probe vector
+    rerank.
+
+    Returns JSON: {"sub_questions": ["<q1>", "<q2>", ...]}
+
+    Empty list -> caller falls back to using just the original query.
+    """
+    system = (
+        "You break a user question into 1-5 atomic sub-questions. Each "
+        "sub-question must be answerable independently with focused "
+        "evidence. Use this when the question has multiple comparison "
+        "sides, multiple subjects, or distinct angles. For simple "
+        "factoid questions, return ONE element (the question itself).\n\n"
+        "EXAMPLES:\n"
+        "  Q: 'How do manufacturing prospects in Vietnam compare to the rest of Asia?'\n"
+        "    A: ['Vietnam manufacturing prospects',\n"
+        "        'Manufacturing prospects in Asia excluding Vietnam',\n"
+        "        'Comparison axes across Asian manufacturing']\n"
+        "  Q: 'What is BYD's annual production capacity?'\n"
+        "    A: ['BYD annual production capacity']\n\n"
+        "Return ONLY {\"sub_questions\": [\"...\", ...]}."
+    )
+    user = f"QUESTION: {question}\n\nReturn the JSON now."
+    return system, user
+
+
+def chunk_relevance_filter(
+    question: str, chunks_with_ids: list[tuple[str, str]]
+) -> tuple[str, str]:
+    """Phase 2 Milestone F step 11 for deep_research / insights: filter
+    a batch of retrieved chunks down to the relevant portions before
+    stuffing into the expensive synthesis prompt. Map-reduce-style.
+
+    `chunks_with_ids` is a list of (chunk_iri, chunk_text). Returns
+    JSON: {"chunks": [{"iri": ..., "relevance": "yes"|"partial"|"no",
+                       "extract": "..."}, ...]}
+    For 'no' the extract is "".
+    For 'partial' the extract is a 1-3 sentence relevant snippet.
+    For 'yes' the extract is the chunk verbatim.
+    """
+    listing = "\n\n".join(
+        f"---CHUNK {iri}---\n{text[:1200]}" for iri, text in chunks_with_ids
+    )
+    system = (
+        "You filter retrieved chunks for relevance to a question. For each "
+        "chunk:\n"
+        "  - relevance='yes' if the chunk DIRECTLY addresses the question; "
+        "the extract is the chunk verbatim.\n"
+        "  - relevance='partial' if PART of the chunk is relevant; the "
+        "extract is a 1-3 sentence excerpt of just the relevant part.\n"
+        "  - relevance='no' if the chunk doesn't address the question; "
+        "the extract is an empty string.\n\n"
+        "Return ONLY JSON: {\"chunks\": [{\"iri\": ..., \"relevance\": ..., "
+        "\"extract\": ...}]}"
+    )
+    user = f"QUESTION: {question}\n\n{listing}\n\nReturn the JSON now."
+    return system, user
+
+
+def _format_evidence_block(evidence_items: list[dict]) -> str:
+    """Compact textual rendering of evidence items for stuffing into
+    answer-synthesis prompts. Each item: {iri, kind, text}."""
+    lines = []
+    for it in evidence_items:
+        kind = it.get("kind", "evidence")
+        iri = it.get("iri", "")
+        text = (it.get("text") or "").strip().replace("\n", " ")
+        if len(text) > 600:
+            text = text[:600] + "..."
+        lines.append(f"  [{kind} {iri}] {text}")
+    return "\n".join(lines)
+
+
+def answer_simple_qa(
+    question: str, evidence: list[dict]
+) -> tuple[str, str]:
+    """Phase 2 Milestone F simple_qa mode: short factoid answer."""
+    system = (
+        "You answer questions briefly and accurately using ONLY the evidence "
+        "below. 1-3 sentences. Cite every claim by its IRI in brackets, e.g. "
+        "[viao:Chunk_abc...]. If the evidence doesn't answer the question, "
+        "say so explicitly. Return ONLY the answer text."
+    )
+    user = (
+        f"QUESTION: {question}\n\nEVIDENCE:\n"
+        + _format_evidence_block(evidence)
+        + "\n\nAnswer now."
+    )
+    return system, user
+
+
+def answer_summarize(
+    question: str, evidence: list[dict]
+) -> tuple[str, str]:
+    """Phase 2 Milestone F summarize mode: 2-4 paragraph thematic summary."""
+    system = (
+        "You synthesize a thematic summary of what the corpus says about the "
+        "question, using ONLY the evidence below. 2-4 paragraphs. Cite every "
+        "specific claim by IRI in brackets. Neutral tone, no opinions. If "
+        "the evidence is thin, say what's missing. Return ONLY the summary."
+    )
+    user = (
+        f"QUESTION: {question}\n\nEVIDENCE:\n"
+        + _format_evidence_block(evidence)
+        + "\n\nWrite the summary now."
+    )
+    return system, user
+
+
+def answer_deep_research(
+    question: str, evidence: list[dict]
+) -> tuple[str, str]:
+    """Phase 2 Milestone F deep_research mode: long-form synthesis."""
+    system = (
+        "You produce a thorough research-style synthesis using ONLY the "
+        "evidence below. Structure: brief framing -> evidence-grounded body "
+        "(compare angles, surface tensions) -> short conclusion. Cite every "
+        "specific claim by IRI in brackets. If the evidence supports "
+        "multiple interpretations, note them. 400-800 words. Return ONLY "
+        "the answer text -- no markdown headers."
+    )
+    user = (
+        f"QUESTION: {question}\n\nEVIDENCE:\n"
+        + _format_evidence_block(evidence)
+        + "\n\nWrite the synthesis now."
+    )
+    return system, user
+
+
+def answer_insights(
+    question: str, evidence: list[dict]
+) -> tuple[str, str]:
+    """Phase 2 Milestone F insights mode: pattern surfacing."""
+    system = (
+        "You surface non-obvious INSIGHTS across the evidence below. Group "
+        "claims into 2-5 themes; for each theme, state the insight in 1-2 "
+        "sentences, then list the evidence that grounds it (by IRI). Insights "
+        "must go beyond what any single claim says -- look for cross-cutting "
+        "patterns, contradictions, or emerging trends. Return plain text, "
+        "no markdown."
+    )
+    user = (
+        f"QUESTION: {question}\n\nEVIDENCE:\n"
+        + _format_evidence_block(evidence)
+        + "\n\nProduce the insights now."
+    )
+    return system, user
+
+
+def answer_knowledge_gaps(
+    question: str,
+    sub_questions: list[str],
+    found_for: list[str],
+) -> tuple[str, str]:
+    """Phase 2 Milestone F knowledge_gaps mode: report what's missing."""
+    found_block = "\n".join(f"  - {q}" for q in found_for) or "  (none)"
+    missing = [q for q in sub_questions if q not in found_for]
+    missing_block = "\n".join(f"  - {q}" for q in missing) or "  (none)"
+    system = (
+        "You report knowledge gaps about a question. You're given (a) the "
+        "sub-questions implied by the user's question, (b) which sub-questions "
+        "the corpus DOES have evidence for, and (c) which it does NOT. Write "
+        "2-3 short paragraphs describing the gaps and what kinds of "
+        "additional documents would close them. Return plain text only."
+    )
+    user = (
+        f"QUESTION: {question}\n\n"
+        f"SUB-QUESTIONS COVERED BY CORPUS:\n{found_block}\n\n"
+        f"SUB-QUESTIONS NOT COVERED:\n{missing_block}\n\n"
+        "Write the gap report now."
+    )
+    return system, user
+
+
+def answer_exhaustive_group_caption(
+    question: str, document_title: str, snippets: list[str]
+) -> tuple[str, str]:
+    """Phase 2 Milestone F exhaustive_search: 1-sentence caption per
+    matched document. Run in parallel; no global synthesis.
+    """
+    snip = "\n".join(f"  - {s[:300]}" for s in snippets[:5])
+    system = (
+        "You write a one-sentence caption describing what a document says "
+        "about a user query. The caption is for a list of matches, so be "
+        "specific to THIS document. <= 25 words. No preamble. Plain text."
+    )
+    user = (
+        f"USER QUERY: {question}\n\n"
+        f"DOCUMENT TITLE: {document_title}\n\n"
+        f"MATCHING SNIPPETS:\n{snip}\n\n"
+        "Write the one-sentence caption now."
+    )
+    return system, user
+
+
+def follow_up_resolution(
+    new_question: str, prior_turns: list[tuple[str, str]]
+) -> tuple[str, str]:
+    """Phase 2 Milestone G: rewrite a conversational follow-up into a
+    self-contained question.
+
+    `prior_turns` is a list of (user_question, resolved_question)
+    pairs in chronological order (oldest first).
+    """
+    if not prior_turns:
+        # caller should skip the LLM call in this case
+        return ("", new_question)
+    hist = "\n".join(
+        f"  turn {i+1}:\n    asked: {ask}\n    resolved as: {res}"
+        for i, (ask, res) in enumerate(prior_turns)
+    )
+    system = (
+        "You rewrite a follow-up user question into a SELF-CONTAINED, "
+        "standalone question that does not depend on the prior conversation. "
+        "Pronouns like 'it', 'they', 'the same' must be replaced with their "
+        "specific referents from the conversation history. If the new "
+        "question already stands alone, return it unchanged. Return ONLY "
+        "the rewritten question -- no preamble, no quotes."
+    )
+    user = (
+        f"CONVERSATION SO FAR:\n{hist}\n\n"
+        f"NEW USER QUESTION: {new_question}\n\n"
+        "Rewrite the question to be self-contained."
+    )
+    return system, user
+
+
+def _format_judge_evidence(evidence: list[dict], cap: int = 15) -> str:
+    """Compact evidence block for judge prompts."""
+    lines = []
+    for ev in evidence[:cap]:
+        kind = ev.get("kind", "evidence")
+        iri = ev.get("iri", "")
+        text = (ev.get("text") or "").strip().replace("\n", " ")
+        if len(text) > 400:
+            text = text[:400] + "..."
+        lines.append(f"  [{kind} {iri}] {text}")
+    return "\n".join(lines)
+
+
+def judge_comprehensiveness(
+    question: str, evidence: list[dict], answer: str
+) -> tuple[str, str]:
+    """Eval metric 1: did the answer actually address what was asked?
+
+    Returns JSON {score: 0.0-1.0, justification: str}.
+    """
+    system = (
+        "You judge whether an answer comprehensively addresses a user "
+        "question. Score 0.0-1.0:\n"
+        "  1.0 = answer fully addresses every part of the question.\n"
+        "  0.7-0.9 = mostly answers; minor gaps acceptable.\n"
+        "  0.4-0.6 = partial; misses important parts of the question.\n"
+        "  0.0-0.3 = answer ignores or sidesteps the question.\n\n"
+        "Do NOT judge factual accuracy here -- only whether the question's "
+        "scope is covered. Return ONLY JSON: "
+        "{\"score\": <float>, \"justification\": \"<one sentence>\"}"
+    )
+    user = (
+        f"QUESTION: {question}\n\n"
+        f"ANSWER:\n{answer}\n\n"
+        "Return the JSON now."
+    )
+    return system, user
+
+
+def judge_no_hallucination(
+    question: str, evidence: list[dict], answer: str
+) -> tuple[str, str]:
+    """Eval metric 2: every claim in the answer must be grounded in
+    the retrieved evidence. Unsupported claims dock the score.
+
+    Returns JSON {score: 0.0-1.0, justification: str}.
+    """
+    system = (
+        "You check whether every claim in an answer is grounded in the "
+        "provided evidence. Score 0.0-1.0:\n"
+        "  1.0 = every claim is directly supported by at least one piece "
+        "of evidence.\n"
+        "  0.7-0.9 = most claims supported; ONE minor claim is unsupported "
+        "but plausible.\n"
+        "  0.4-0.6 = SEVERAL claims unsupported or unstated in evidence.\n"
+        "  0.0-0.3 = answer fabricates a substantive claim. THE MOST "
+        "DANGEROUS FAILURE.\n\n"
+        "An answer that correctly says 'evidence does not cover this' "
+        "scores 1.0.\n\n"
+        "Return ONLY JSON: {\"score\": <float>, \"justification\": "
+        "\"<one sentence, name the unsupported claim if any>\"}"
+    )
+    user = (
+        f"QUESTION: {question}\n\n"
+        f"EVIDENCE:\n{_format_judge_evidence(evidence)}\n\n"
+        f"ANSWER:\n{answer}\n\n"
+        "Return the JSON now."
+    )
+    return system, user
+
+
+def judge_gap_detection(
+    question: str,
+    evidence: list[dict],
+    answer: str,
+    expected_gap: bool,
+) -> tuple[str, str]:
+    """Eval metric 3: does the LLM correctly say when the corpus has
+    no answer? Behavior flips based on `expected_gap`.
+
+    Returns JSON {score: 0.0-1.0, justification: str}.
+    """
+    if expected_gap:
+        rule = (
+            "The corpus has NO information on this question. The answer "
+            "SHOULD explicitly acknowledge this (e.g. 'the corpus does "
+            "not cover...', 'no evidence available', etc.). Score:\n"
+            "  1.0 = answer explicitly says corpus lacks this info.\n"
+            "  0.7-0.9 = answer hedges adequately but doesn't say so "
+            "outright.\n"
+            "  0.4-0.6 = answer answers anyway with shaky grounding.\n"
+            "  0.0-0.3 = answer confidently fabricates."
+        )
+    else:
+        rule = (
+            "The corpus DOES have evidence. The answer should USE it, "
+            "not refuse. Score:\n"
+            "  1.0 = answer engages with the evidence.\n"
+            "  0.7-0.9 = answer engages with mild hedging.\n"
+            "  0.4-0.6 = answer hedges excessively despite ample evidence.\n"
+            "  0.0-0.3 = answer refuses despite clear coverage."
+        )
+    system = (
+        "You judge whether an answer's gap-handling behavior is correct.\n\n"
+        + rule
+        + "\n\nReturn ONLY JSON: {\"score\": <float>, \"justification\": "
+        "\"<one sentence>\"}"
+    )
+    user = (
+        f"QUESTION: {question}\n"
+        f"EXPECTED_GAP: {expected_gap}\n\n"
+        f"EVIDENCE (first 5):\n{_format_judge_evidence(evidence, cap=5)}\n\n"
+        f"ANSWER:\n{answer}\n\n"
+        "Return the JSON now."
+    )
+    return system, user
+
+
+def judge_consistency(
+    question: str, answers: list[str]
+) -> tuple[str, str]:
+    """Eval metric 4: are N answers to the same question semantically
+    equivalent? ONE call across all N answers.
+
+    Returns JSON {score: 0.0-1.0, justification: str}.
+    """
+    if len(answers) < 2:
+        # Caller should skip the call in this case.
+        return ("", "")
+    body = "\n\n".join(
+        f"--- Answer {i+1} ---\n{a}" for i, a in enumerate(answers)
+    )
+    system = (
+        "You judge whether multiple answers to the same question are "
+        "semantically equivalent. Same facts, same framing, same level of "
+        "specificity. Score 0.0-1.0:\n"
+        "  1.0 = answers are equivalent (same key facts; phrasing may differ).\n"
+        "  0.7-0.9 = answers agree on the main facts but differ in detail/"
+        "emphasis.\n"
+        "  0.4-0.6 = answers cover overlapping but distinct facts.\n"
+        "  0.0-0.3 = answers contradict each other or share no content.\n\n"
+        "Return ONLY JSON: {\"score\": <float>, \"justification\": "
+        "\"<one sentence, note key differences>\"}"
+    )
+    user = (
+        f"QUESTION: {question}\n\n"
+        f"{body}\n\n"
+        "Return the JSON now."
+    )
+    return system, user
+
+
+def insight_gen(
+    class_label: str, claims_findings: list[dict]
+) -> tuple[str, str]:
+    """Phase 2 Milestone E (Insight subtype): synthesize 1-3 Insights
+    across the Claims+Findings attached to a single ontology class.
+
+    `claims_findings` items: {type, text, confidence}
+    Returns JSON: {"insights": [{"text", "confidence"}]}
+    """
+    listing = "\n".join(
+        f"  [{c['type']}, c={c.get('confidence','?')}] {c['text']}"
+        for c in claims_findings[:25]
+    )
+    system = (
+        "You synthesize INSIGHTS across multiple Claims and Findings about "
+        "a topic. Look for cross-cutting patterns, contradictions, emerging "
+        "trends. Each insight must go BEYOND restating any single claim and "
+        "ground itself in 2 or more of them. 1-3 insights, 1-2 sentences "
+        "each. Return ONLY JSON: {\"insights\": [{\"text\": ..., "
+        "\"confidence\": ...}]}"
+    )
+    user = (
+        f"TOPIC (ontology class): {class_label}\n\n"
+        f"CLAIMS AND FINDINGS:\n{listing}\n\n"
+        "Return the insights JSON now."
+    )
+    return system, user
+
+
+def recommendation_gen(
+    theme_label: str, insights: list[dict]
+) -> tuple[str, str]:
+    """Phase 2 Milestone E (Recommendation subtype): propose actionable
+    recommendations grounded in a theme of Insights.
+
+    `insights` items: {text, confidence}
+    Returns JSON: {"recommendations": [{"text", "confidence"}]}
+    """
+    listing = "\n".join(
+        f"  [Insight] {i['text']}" for i in insights[:15]
+    )
+    system = (
+        "You propose ACTIONABLE recommendations given a coherent theme of "
+        "insights. Each recommendation must be specific, name the entities "
+        "involved, and be grounded in the insights provided. 1-3 "
+        "recommendations, 1-3 sentences each. Return ONLY JSON: "
+        "{\"recommendations\": [{\"text\": ..., \"confidence\": ...}]}"
+    )
+    user = (
+        f"THEME: {theme_label}\n\n"
+        f"INSIGHTS:\n{listing}\n\n"
+        "Return the recommendations JSON now."
+    )
+    return system, user
+
+
 def artifact_document_summary(chunks_text: str) -> tuple[str, str]:
     """Phase 2 Milestone E: per-document Summary artifact.
 
@@ -846,4 +1342,25 @@ PROMPTS = {
     "artifact_chunk_extract_with_entities": artifact_chunk_extract_with_entities,
     "artifact_document_summary": artifact_document_summary,
     "entity_extract": entity_extract,
+    # Milestone F
+    "question_parse": question_parse,
+    "concept_expansion": concept_expansion,
+    "query_decompose": query_decompose,
+    "chunk_relevance_filter": chunk_relevance_filter,
+    "answer_simple_qa": answer_simple_qa,
+    "answer_summarize": answer_summarize,
+    "answer_deep_research": answer_deep_research,
+    "answer_insights": answer_insights,
+    "answer_knowledge_gaps": answer_knowledge_gaps,
+    "answer_exhaustive_group_caption": answer_exhaustive_group_caption,
+    # Milestone G
+    "follow_up_resolution": follow_up_resolution,
+    # Insight + Recommendation generation
+    "insight_gen": insight_gen,
+    "recommendation_gen": recommendation_gen,
+    # Eval framework (LLM-as-judge)
+    "judge_comprehensiveness": judge_comprehensiveness,
+    "judge_no_hallucination": judge_no_hallucination,
+    "judge_gap_detection": judge_gap_detection,
+    "judge_consistency": judge_consistency,
 }

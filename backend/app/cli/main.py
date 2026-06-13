@@ -524,6 +524,97 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_art.set_defaults(func=_cmd_generate_artifacts)
 
+    # ---------- Phase 2: Milestone F (retrieval + answer synthesis) ----------
+    p_q = sub.add_parser(
+        "query",
+        help=(
+            "Milestone F: run the 12-step retrieval pipeline against a "
+            "natural-language question and synthesize an answer with "
+            "citations. Persists retrieval_runs + retrieval_evidence."
+        ),
+    )
+    p_q.add_argument("question", help="The user question, in quotes.")
+    p_q.add_argument(
+        "--mode",
+        choices=(
+            "simple_qa", "summarize", "deep_research",
+            "insights", "knowledge_gaps", "exhaustive_search",
+        ),
+        default="simple_qa",
+    )
+    p_q.add_argument(
+        "--top-k", type=int, default=20,
+        help="How many candidates to surface as evidence.",
+    )
+    p_q.add_argument(
+        "--hops", type=int, default=2,
+        help="Graph BFS depth from seed nodes.",
+    )
+    p_q.add_argument(
+        "--max-cost-usd", type=float, default=1.0,
+        help="Abort if LLM spend exceeds this within the run.",
+    )
+    p_q.add_argument(
+        "--no-decompose", action="store_true",
+        help="Skip step 9a query decomposition; use original query as single probe.",
+    )
+    p_q.add_argument(
+        "--max-probes", type=int, default=5,
+        help="Cap on number of vector-search probes (incl. the original query).",
+    )
+    p_q.add_argument(
+        "--exhaustive-limit", type=int, default=100,
+        help="exhaustive_search only: cap on captioned document groups.",
+    )
+    p_q.add_argument(
+        "--json", action="store_true",
+        help="Print the full response envelope as JSON.",
+    )
+    p_q.add_argument(
+        "--verbose", action="store_true",
+        help="Print debug info from each pipeline step.",
+    )
+    p_q.set_defaults(func=_cmd_query)
+
+    # ---------- Phase 2: Eval framework (LLM-as-judge) ----------
+    p_ev = sub.add_parser(
+        "evaluate-queries",
+        help=(
+            "Run a question file through the F retrieval pipeline N "
+            "times per question, then score each answer on 4 LLM-judged "
+            "metrics (comprehensiveness, no-hallucination, consistency, "
+            "gap detection) plus wall-time. Writes JSON + optional MD log."
+        ),
+    )
+    p_ev.add_argument("--questions", type=Path, required=True,
+                      help="Text file; one question per line; `#` comments; "
+                           "`[gap]` tag marks questions the corpus shouldn't "
+                           "be able to answer.")
+    p_ev.add_argument(
+        "--mode",
+        choices=("simple_qa", "summarize", "deep_research", "insights",
+                 "knowledge_gaps", "exhaustive_search"),
+        default="simple_qa",
+    )
+    p_ev.add_argument("--runs-per-question", type=int, default=3)
+    p_ev.add_argument(
+        "--judge-model",
+        choices=("gpt-4.1", "gpt-4o-mini"),
+        default="gpt-4.1",
+        help="Override the judge model. gpt-4o-mini is ~10x cheaper but less reliable.",
+    )
+    p_ev.add_argument("--output", type=Path, default=None,
+                      help="Detailed JSON log.")
+    p_ev.add_argument("--output-md", type=Path, default=None,
+                      help="Human-readable markdown summary.")
+    p_ev.add_argument("--max-cost-usd", type=float, default=10.0,
+                      help="Whole-run cost cap; aborts mid-run.")
+    p_ev.add_argument("--query-max-cost-usd", type=float, default=0.20,
+                      help="Per-query cost cap inside the eval loop.")
+    p_ev.add_argument("--concurrency", type=int, default=4)
+    p_ev.add_argument("--verbose", action="store_true")
+    p_ev.set_defaults(func=_cmd_evaluate_queries)
+
     return parser
 
 
@@ -915,6 +1006,96 @@ def _cmd_generate_artifacts(args: argparse.Namespace) -> int:
             )
         )
 
+    return 0
+
+
+def _cmd_query(args: argparse.Namespace) -> int:
+    import json as _json
+    from backend.app.services.retrieval import retrieve_and_answer
+
+    result = asyncio.run(
+        retrieve_and_answer(
+            args.question,
+            mode=args.mode,
+            top_k=args.top_k,
+            hops=args.hops,
+            max_cost_usd=args.max_cost_usd,
+            decompose=not args.no_decompose,
+            max_probes=args.max_probes,
+            exhaustive_limit=args.exhaustive_limit,
+            verbose=args.verbose,
+        )
+    )
+
+    if args.json:
+        envelope = {
+            "answer": result.answer,
+            "mode": result.mode,
+            "resolved_query": result.resolved_query,
+            "evidence": result.evidence,
+            "exhaustive_results": result.exhaustive_results,
+            "retrieval_run_id": str(result.retrieval_run_id) if result.retrieval_run_id else None,
+            "parsed": result.parsed,
+            "cost_usd": result.cost_usd,
+            "wall_seconds": result.wall_seconds,
+            "graph_version": result.graph_version,
+        }
+        print(_json.dumps(envelope, indent=2, default=str))
+        return 0
+
+    # Human-readable text output.
+    print("=" * 72)
+    print(f"MODE:     {result.mode}")
+    print(f"QUERY:    {result.resolved_query}")
+    print(f"COST:     ${result.cost_usd:.4f}   wall: {result.wall_seconds:.1f}s")
+    print(f"RUN_ID:   {result.retrieval_run_id}")
+    print("=" * 72)
+
+    if result.exhaustive_results is not None:
+        print(f"FOUND {len(result.exhaustive_results)} matching document(s):")
+        for r in result.exhaustive_results:
+            print()
+            print(f"  [{r['match_count']}x] {r['document_title']}")
+            print(f"      {r['document_iri']}")
+            print(f"      {r['caption']}")
+        return 0
+
+    if result.answer:
+        print("ANSWER:")
+        print(result.answer)
+        print()
+    print(f"EVIDENCE ({len(result.evidence)} items):")
+    for ev in result.evidence[:15]:
+        kind = ev["kind"]
+        line = f"  [{ev['rank']:>2}] [{kind}] {ev['iri']}  (score={ev['score']:.4f})"
+        if kind == "chunk":
+            line += f"\n        doc: {ev['document_title']}"
+            snip = (ev["text"] or "").replace("\n", " ")[:140]
+            line += f"\n        > {snip}"
+        elif kind == "artifact":
+            snip = (ev["text"] or "").replace("\n", " ")[:140]
+            line += f"\n        ({ev['artifact_type']}) {snip}"
+        print(line)
+    return 0
+
+
+def _cmd_evaluate_queries(args: argparse.Namespace) -> int:
+    from backend.app.services.eval_judge import evaluate_questions
+
+    asyncio.run(
+        evaluate_questions(
+            questions_path=args.questions,
+            mode=args.mode,
+            runs_per_question=args.runs_per_question,
+            judge_model=args.judge_model,
+            output_json=args.output,
+            output_md=args.output_md,
+            max_cost_usd=args.max_cost_usd,
+            query_max_cost_usd=args.query_max_cost_usd,
+            concurrency=args.concurrency,
+            verbose=args.verbose,
+        )
+    )
     return 0
 
 
