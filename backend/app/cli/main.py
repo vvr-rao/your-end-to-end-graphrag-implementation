@@ -615,6 +615,63 @@ def build_parser() -> argparse.ArgumentParser:
     p_ev.add_argument("--verbose", action="store_true")
     p_ev.set_defaults(func=_cmd_evaluate_queries)
 
+    # ---------- Phase 2: Milestone G (conversation-aware QA) ----------
+    p_conv = sub.add_parser(
+        "conversation",
+        help=(
+            "Multi-turn QA. `start` opens a conversation; `turn` adds "
+            "a follow-up resolved against prior turns; `show` replays."
+        ),
+    )
+    conv_sub = p_conv.add_subparsers(dest="conv_cmd", required=True)
+
+    p_conv_start = conv_sub.add_parser("start", help="Open a new conversation.")
+    p_conv_start.add_argument(
+        "--title", default=None,
+        help="Optional title (stored in conversations.extra_metadata.title).",
+    )
+    p_conv_start.add_argument(
+        "--json", action="store_true",
+        help="Print full JSON envelope instead of just the IRI.",
+    )
+    p_conv_start.set_defaults(func=_cmd_conversation_start)
+
+    p_conv_turn = conv_sub.add_parser(
+        "turn", help="Add one turn (a question) to a conversation."
+    )
+    p_conv_turn.add_argument("--conv", required=True, help="Conversation IRI.")
+    p_conv_turn.add_argument("question", help="The user question in quotes.")
+    p_conv_turn.add_argument(
+        "--mode",
+        choices=(
+            "simple_qa", "summarize", "deep_research",
+            "insights", "knowledge_gaps", "exhaustive_search",
+        ),
+        default="simple_qa",
+    )
+    p_conv_turn.add_argument("--top-k", type=int, default=20)
+    p_conv_turn.add_argument("--hops", type=int, default=2)
+    p_conv_turn.add_argument(
+        "--max-cost-usd", type=float, default=0.20,
+        help="Per-turn cost cap.",
+    )
+    p_conv_turn.add_argument("--no-decompose", action="store_true")
+    p_conv_turn.add_argument("--max-probes", type=int, default=5)
+    p_conv_turn.add_argument(
+        "--history-window", type=int, default=3,
+        help="How many prior turns to feed into follow-up resolution.",
+    )
+    p_conv_turn.add_argument("--json", action="store_true")
+    p_conv_turn.add_argument("--verbose", action="store_true")
+    p_conv_turn.set_defaults(func=_cmd_conversation_turn)
+
+    p_conv_show = conv_sub.add_parser(
+        "show", help="Replay a conversation."
+    )
+    p_conv_show.add_argument("--conv", required=True, help="Conversation IRI.")
+    p_conv_show.add_argument("--json", action="store_true")
+    p_conv_show.set_defaults(func=_cmd_conversation_show)
+
     return parser
 
 
@@ -1096,6 +1153,87 @@ def _cmd_evaluate_queries(args: argparse.Namespace) -> int:
             verbose=args.verbose,
         )
     )
+    return 0
+
+
+def _cmd_conversation_start(args: argparse.Namespace) -> int:
+    import json as _json
+    from backend.app.services.db_conversation import start_conversation
+
+    result = asyncio.run(start_conversation(title=args.title))
+    if args.json:
+        print(_json.dumps(result, indent=2))
+    else:
+        print(f"iri: {result['iri']}")
+        if result.get("title"):
+            print(f"title: {result['title']}")
+    return 0
+
+
+def _cmd_conversation_turn(args: argparse.Namespace) -> int:
+    import json as _json
+    from backend.app.services.db_conversation import add_turn
+
+    result = asyncio.run(
+        add_turn(
+            conversation_iri=args.conv,
+            question=args.question,
+            mode=args.mode,
+            top_k=args.top_k,
+            hops=args.hops,
+            max_cost_usd=args.max_cost_usd,
+            decompose=not args.no_decompose,
+            max_probes=args.max_probes,
+            history_window=args.history_window,
+            verbose=args.verbose,
+        )
+    )
+    if args.json:
+        print(_json.dumps(result, indent=2, default=str))
+        return 0
+    print("=" * 72)
+    print(f"TURN:     {result['turn_index']}")
+    print(f"MODE:     {result['mode']}")
+    print(f"ASKED:    {result['user_question']}")
+    if result["follow_up_resolved"]:
+        print(f"RESOLVED: {result['resolved_question']}")
+    print(f"COST:     ${result['cost_usd']:.4f}   wall: {result['wall_seconds']:.1f}s")
+    print(f"RUN_ID:   {result['retrieval_run_id']}")
+    print("=" * 72)
+    if result.get("answer"):
+        print("ANSWER:")
+        print(result["answer"])
+    elif result.get("exhaustive_results") is not None:
+        for r in result["exhaustive_results"]:
+            print(f"  [{r['match_count']}x] {r['document_title']}")
+            print(f"      {r['caption']}")
+    return 0
+
+
+def _cmd_conversation_show(args: argparse.Namespace) -> int:
+    import json as _json
+    from backend.app.services.db_conversation import replay_conversation
+
+    result = asyncio.run(replay_conversation(conversation_iri=args.conv))
+    if args.json:
+        print(_json.dumps(result, indent=2, default=str))
+        return 0
+    print("=" * 72)
+    print(f"CONVERSATION: {result['iri']}")
+    if result.get("title"):
+        print(f"TITLE:        {result['title']}")
+    print(f"TURNS:        {result['turn_count']}")
+    print(f"STARTED:      {result['created_at']}")
+    print("=" * 72)
+    for t in result["turns"]:
+        print()
+        print(f"  --- turn {t['turn_index']} ({t['mode']}) ---")
+        print(f"  ASKED:    {t['user_question']}")
+        if t["follow_up_resolved"]:
+            print(f"  RESOLVED: {t['resolved_question']}")
+        ans = (t["answer"] or "").strip()
+        if ans:
+            print(f"  ANSWER:   {ans}")
     return 0
 
 
