@@ -323,6 +323,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_init.set_defaults(func=_cmd_db_init)
 
+    # ---------- Phase 2: clear-corpus (wipe all corpus-derived rows) ----------
+    p_clear = sub.add_parser(
+        "clear-corpus",
+        help=(
+            "Wipe ALL corpus-derived rows (documents, chunks, "
+            "time_instances, entities, intelligence_artifacts, "
+            "artifact_sources, conversations, retrieval_runs, all "
+            "graph_relationships except source='ONTOLOGY'). Leaves "
+            "the ontology side untouched. graph_version_state is NOT "
+            "reset -- the counter keeps moving forward."
+        ),
+    )
+    p_clear.add_argument(
+        "--yes", action="store_true",
+        help="Required confirmation; refuses without it.",
+    )
+    p_clear.set_defaults(func=_cmd_clear_corpus)
+
     # ---------- Phase 2: Milestone B (ingestion + lifecycle) ----------
     p_reg = sub.add_parser(
         "register-documents",
@@ -425,6 +443,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_time.set_defaults(func=_cmd_enrich_time)
 
+    # ---------- Phase 2: Milestone C (entity extraction) ----------
+    p_ext = sub.add_parser(
+        "extract-entities",
+        help=(
+            "Milestone C: extract named entities from chunks. For each "
+            "chunk, vector-finds top-K candidate ontology classes, "
+            "asks gpt-4o-mini to identify proper-noun entities + pick "
+            "the right class IRI from that list. Mints entities, "
+            "writes Chunk->viao:assertsAbout->Entity and "
+            "Entity->rdf:type->OntologyClass edges. Idempotent."
+        ),
+    )
+    p_ext.add_argument(
+        "--scope-iri", default=None,
+        help="Restrict to chunks of one document IRI.",
+    )
+    p_ext.add_argument(
+        "--limit", type=int, default=None,
+        help="Cap number of chunks processed (smoke testing).",
+    )
+    p_ext.add_argument(
+        "--candidate-classes", type=int, default=50,
+        help="How many candidate ontology classes to give the LLM per chunk.",
+    )
+    p_ext.add_argument(
+        "--concurrency", type=int, default=4,
+        help="Concurrent LLM calls.",
+    )
+    p_ext.add_argument(
+        "--max-cost-usd", type=float, default=5.0,
+        help="Abort if LLM spend exceeds this within the run.",
+    )
+    p_ext.set_defaults(func=_cmd_extract_entities)
+
     # ---------- Phase 2: Milestone E (artifacts) ----------
     p_art = sub.add_parser(
         "generate-artifacts",
@@ -458,6 +510,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_art.add_argument(
         "--max-cost-usd", type=float, default=5.0,
         help="Abort if LLM spend exceeds this within the run.",
+    )
+    p_art.add_argument(
+        "--no-entities", action="store_true",
+        help=(
+            "Skip entity grounding -- run with the generic prompt. "
+            "By default generate-artifacts looks up each chunk's "
+            "entities (from extract-entities) and feeds them to the "
+            "LLM so artifact text names them specifically. Without "
+            "this flag, if `graphrag.entities` is empty the command "
+            "errors with a hint to run extract-entities first."
+        ),
     )
     p_art.set_defaults(func=_cmd_generate_artifacts)
 
@@ -725,6 +788,17 @@ def _cmd_db_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_clear_corpus(args: argparse.Namespace) -> int:
+    from backend.app.services.db_corpus_wipe import wipe_corpus
+
+    try:
+        asyncio.run(wipe_corpus(confirm=args.yes))
+    except RuntimeError as exc:
+        print(f"[clear-corpus] REFUSED: {exc}")
+        return 1
+    return 0
+
+
 def _cmd_register_documents(args: argparse.Namespace) -> int:
     from backend.app.services.db_document_ingest import ingest_documents_folder
 
@@ -787,6 +861,21 @@ def _cmd_enrich_time(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_extract_entities(args: argparse.Namespace) -> int:
+    from backend.app.services.db_entity_extract import extract_entities
+
+    asyncio.run(
+        extract_entities(
+            scope_document_iri=args.scope_iri,
+            limit=args.limit,
+            candidate_classes_per_chunk=args.candidate_classes,
+            concurrency=args.concurrency,
+            max_cost_usd=args.max_cost_usd,
+        )
+    )
+    return 0
+
+
 def _cmd_generate_artifacts(args: argparse.Namespace) -> int:
     from backend.app.db.engine import reset_engine_cache
     from backend.app.services.db_artifact_gen import (
@@ -800,6 +889,7 @@ def _cmd_generate_artifacts(args: argparse.Namespace) -> int:
     per_chunk = tuple(t for t in types_requested if t in ("Claim", "Finding", "Observation"))
     do_summary = "Summary" in types_requested
 
+    use_entities = not args.no_entities
     if per_chunk:
         asyncio.run(
             generate_per_chunk_artifacts(
@@ -808,6 +898,7 @@ def _cmd_generate_artifacts(args: argparse.Namespace) -> int:
                 types=per_chunk,
                 concurrency=args.concurrency,
                 max_cost_usd=args.max_cost_usd,
+                use_entities=use_entities,
             )
         )
         # The above asyncio.run's loop is now dead; drop the cached

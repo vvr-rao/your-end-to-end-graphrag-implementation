@@ -150,6 +150,27 @@ tasks:
     max_tokens: 2048
     response_format: json_object
 
+  # Same config as artifact_chunk_extract -- just a different prompt
+  # (entity-grounded). Separate task so cost tracking can distinguish
+  # generic vs entity-grounded extraction runs.
+  artifact_chunk_extract_with_entities:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 2048
+    response_format: json_object
+
+  # Milestone C: per-chunk named-entity extraction. JSON mode for
+  # reliability; bounded output since each chunk yields <= 15 entities.
+  entity_extract:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 2048
+    response_format: json_object
+
   # ---------------------------------------------------------------------------
   # Phase 2 Milestone E: per-document Summary artifact. Plain-text output.
   # gpt-4o-mini suffices — this is rewrite, not synthesis.

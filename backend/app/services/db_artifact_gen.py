@@ -41,11 +41,14 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from backend.app.db.graph_version import bump_version, current_version
 from backend.app.db.models.artifacts import ArtifactSource, IntelligenceArtifact
 from backend.app.db.models.documents import Chunk, Document
+from backend.app.db.models.entities import Entity
 from backend.app.db.models.graph import GraphRelationship
+from backend.app.db.models.ontology import OntologyClass
 from backend.app.db.session import session_scope
 from backend.app.services.embeddings import Embedder
 from backend.app.services.llm_router import LLMRouter
 from backend.app.services.predicates import (
+    VIAO_ASSERTS_ABOUT,
     VIAO_DERIVED_FROM_CHUNK,
     VIAO_DERIVED_FROM_DOCUMENT,
     VIAO_SUMMARIZES,
@@ -102,15 +105,20 @@ async def generate_per_chunk_artifacts(
     types: tuple[str, ...] = _DEFAULT_PER_CHUNK_TYPES,
     concurrency: int = 4,
     max_cost_usd: float = 5.0,
+    use_entities: bool = True,
 ) -> ArtifactGenSummary:
     """Drive per-chunk Claim+Finding+Observation extraction.
 
-    `scope_document_iri` (optional) limits to a single doc.
-    `limit` caps how many chunks we process (smoke test guard).
-    `max_cost_usd` is a hard ceiling that aborts mid-run.
+    `use_entities` (default True): look up each chunk's named entities
+    via the Chunk -> viao:assertsAbout -> Entity edges produced by
+    Milestone C, then feed them into the LLM prompt so artifact text
+    names the actual entities ("BYD Company Ltd.") instead of generic
+    terms ("the manufacturer"). Falls back to the old generic prompt
+    per-chunk if that chunk has zero entities. Pass --no-entities (CLI)
+    to skip the lookup entirely.
 
     Idempotent: skips chunks that already have ANY of the target
-    artifact types attached (avoids re-billing on re-run).
+    artifact types attached.
     """
     t0 = time.time()
     summary = ArtifactGenSummary()
@@ -153,9 +161,52 @@ async def generate_per_chunk_artifacts(
         print("[generate-artifacts] no chunks to process")
         return summary
 
+    # Safety check + entity preload: refuse to run entity-grounded
+    # extraction if NO entities exist at all in the corpus -- that
+    # almost always means extract-entities wasn't run yet.
+    chunks_to_entities: dict[Any, list[dict[str, str]]] = {}
+    if use_entities:
+        async with session_scope() as session:
+            total_entities = await session.execute(
+                select(Entity.id).limit(1)
+            )
+            if total_entities.first() is None:
+                raise RuntimeError(
+                    "use_entities=True but graphrag.entities is empty. "
+                    "Run `extract-entities` first, or pass --no-entities "
+                    "to opt out of entity grounding."
+                )
+            # Bulk-load (chunk_id -> [{entity_id, canonical_name, class_label}])
+            chunk_ids = [c[0] for c in chunks]
+            r = await session.execute(
+                select(
+                    GraphRelationship.source_chunk_id,
+                    Entity.id,
+                    Entity.name,
+                    OntologyClass.label,
+                )
+                .join(Entity, Entity.id == GraphRelationship.target_node_id)
+                .join(OntologyClass, OntologyClass.id == Entity.class_id)
+                .where(
+                    GraphRelationship.predicate_iri == VIAO_ASSERTS_ABOUT,
+                    GraphRelationship.relationship_source == "DOCUMENT_EXTRACTION",
+                    GraphRelationship.source_chunk_id.in_(chunk_ids),
+                )
+            )
+            for cid, eid, name, label in r.all():
+                chunks_to_entities.setdefault(cid, []).append({
+                    "entity_id": eid,
+                    "canonical_name": name,
+                    "short_name": name,
+                    "class_label": label or "",
+                })
+
+    chunks_with_ents = sum(1 for cid, _, _, _ in chunks if chunks_to_entities.get(cid))
     print(
         f"[generate-artifacts] {len(chunks)} chunk(s) to process "
-        f"(types={','.join(types)}, concurrency={concurrency})"
+        f"(types={','.join(types)}, concurrency={concurrency}, "
+        f"entity-grounded={use_entities}; "
+        f"{chunks_with_ents}/{len(chunks)} chunks have >=1 entity)"
     )
 
     router = LLMRouter()
@@ -199,9 +250,17 @@ async def generate_per_chunk_artifacts(
         async with sem:
             if cost_limit_hit.is_set():
                 return
-            system, user = PROMPTS["artifact_chunk_extract"](text)
+            entities = chunks_to_entities.get(chunk_id, []) if use_entities else []
+            if entities:
+                system, user = PROMPTS["artifact_chunk_extract_with_entities"](
+                    text, entities
+                )
+                task_name = "artifact_chunk_extract_with_entities"
+            else:
+                system, user = PROMPTS["artifact_chunk_extract"](text)
+                task_name = "artifact_chunk_extract"
             try:
-                out = await router.chat("artifact_chunk_extract", system=system, user=user)
+                out = await router.chat(task_name, system=system, user=user)
             except Exception as exc:
                 print(f"[generate-artifacts] chunk {chunk_iri} LLM failed: {exc}")
                 summary.chunks_failed += 1
@@ -281,6 +340,11 @@ async def generate_per_chunk_artifacts(
 
                 airi = _artifact_iri(artifact_type)
                 artifact_iris.append(airi)
+                used_entities = bool(chunks_to_entities.get(chunk_id))
+                prompt_version = (
+                    "artifact_chunk_extract_with_entities@v1"
+                    if used_entities else "artifact_chunk_extract@v1"
+                )
                 artifact_payloads.append({
                     "artifact_identifier": airi,
                     "artifact_type": artifact_type,
@@ -288,12 +352,12 @@ async def generate_per_chunk_artifacts(
                     "text": text,
                     "confidence": conf,
                     "model_name": "gpt-4o-mini",
-                    "prompt_version": "artifact_chunk_extract@v1",
+                    "prompt_version": prompt_version,
                     "status": "ACTIVE",
                     "graph_version": 0,  # filled in below
                     "extra_metadata": {},
                 })
-                artifact_to_chunk.append((airi, chunk_id, doc_id))
+                artifact_to_chunk.append((airi, chunk_id, doc_id, text))
                 embed_texts.append(text)
                 summary.by_type[artifact_type] += 1
 
@@ -341,7 +405,8 @@ async def generate_per_chunk_artifacts(
     # Insert artifact_sources + graph_relationships
     source_payloads = []
     edge_payloads = []
-    for airi, chunk_id, doc_id in artifact_to_chunk:
+    asserts_about_seen: set[tuple[Any, Any]] = set()
+    for airi, chunk_id, doc_id, art_text in artifact_to_chunk:
         aid = iri_to_id.get(airi)
         if not aid:
             continue
@@ -362,6 +427,43 @@ async def generate_per_chunk_artifacts(
             "graph_version": gv,
             "extra_metadata": {},
         })
+
+        # Artifact -> viao:assertsAbout -> Entity edges
+        # For each entity attached to this artifact's source chunk,
+        # check whether the entity's canonical name appears in the
+        # artifact's text (case-insensitive substring). If so, edge.
+        # Idempotent within this run via asserts_about_seen.
+        if use_entities:
+            art_text_lower = art_text.lower()
+            for ent in chunks_to_entities.get(chunk_id, []):
+                name = (ent.get("canonical_name") or "").strip()
+                if not name:
+                    continue
+                if name.lower() not in art_text_lower:
+                    continue
+                ent_id = ent.get("entity_id")
+                if ent_id is None:
+                    continue
+                key = (aid, ent_id)
+                if key in asserts_about_seen:
+                    continue
+                asserts_about_seen.add(key)
+                edge_payloads.append({
+                    "source_node_type": "intelligence_artifact",
+                    "source_node_id": aid,
+                    "target_node_type": "entity",
+                    "target_node_id": ent_id,
+                    "predicate_iri": VIAO_ASSERTS_ABOUT,
+                    "predicate_label": "viao:assertsAbout",
+                    "relationship_type": "assertsAbout",
+                    "relationship_source": "LLM_INFERENCE",
+                    "is_authoritative": True,
+                    "source_chunk_id": chunk_id,
+                    "source_document_id": doc_id,
+                    "source_artifact_id": aid,
+                    "graph_version": gv,
+                    "extra_metadata": {},
+                })
 
     BATCH = 500
     async with session_scope() as session:

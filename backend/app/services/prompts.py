@@ -680,6 +680,137 @@ def artifact_chunk_extract(text: str) -> tuple[str, str]:
     return system, user
 
 
+def entity_extract(
+    chunk_text: str,
+    candidate_classes: list[dict[str, str]],
+) -> tuple[str, str]:
+    """Phase 2 Milestone C: extract named entities from a chunk.
+
+    `candidate_classes` is a list of {iri, label, description} dicts
+    -- the top-K classes the chunk's vector matched against
+    ontology_classes. The LLM MUST pick a class_iri from this list
+    for each entity (caller validates + drops mismatches).
+
+    Returns JSON:
+      {entities: [{canonical_name, short_name, class_iri, confidence}]}
+
+    Corpus-agnostic: works on any domain (legal, financial, science,
+    web search). No keyword baked in.
+    """
+    candidates_block_lines: list[str] = []
+    for c in candidate_classes:
+        label = (c.get("label") or "(unlabelled)").strip()
+        descr = (c.get("description") or "").strip()
+        descr_short = descr[:100] + ("..." if len(descr) > 100 else "")
+        candidates_block_lines.append(
+            f"  - {c['iri']} ─ {label}"
+            + (f" ─ {descr_short}" if descr_short else "")
+        )
+    candidates_block = "\n".join(candidates_block_lines)
+
+    system = (
+        "You extract NAMED ENTITIES from text chunks. For each entity you find:\n"
+        "  - canonical_name: the full proper form (e.g. \"BYD Company Ltd.\", "
+        "\"United Kingdom\", \"Donald Trump\")\n"
+        "  - short_name: how it was referred to in this chunk (e.g. \"BYD\", \"UK\")\n"
+        "  - class_iri: pick ONE IRI from the CANDIDATE CLASSES list below. "
+        "Do not invent IRIs. If no candidate is a sensible fit, SKIP that entity.\n"
+        "  - confidence: a float in [0,1] reflecting how clearly the entity "
+        "is present + how clearly it instantiates that class.\n\n"
+        "RULES:\n"
+        "  - Only PROPER NOUN entities: organizations, people, places, "
+        "products, named events, programs. Skip generic terms like "
+        "\"the manufacturer\", \"the report\", \"the country\".\n"
+        "  - 0 to 15 entities per chunk; quality over quantity.\n"
+        "  - Years (e.g. \"2024\", \"Q1 2024\", \"January 2024\") are handled "
+        "by a separate temporal pass -- DO NOT include them here.\n"
+        "  - canonical_name should be the entity's most complete proper name "
+        "as commonly written. If only an abbreviation is in the chunk, expand it "
+        "if the expansion is unambiguous; otherwise use the abbreviation.\n"
+        "  - Return ONLY JSON, no preamble, no markdown."
+    )
+    user = (
+        "CANDIDATE CLASSES (pick class_iri from this list ONLY):\n"
+        + candidates_block
+        + "\n\nTEXT CHUNK:\n```\n"
+        + chunk_text
+        + "\n```\n\n"
+        "Return JSON: {\"entities\": [{\"canonical_name\": ..., "
+        "\"short_name\": ..., \"class_iri\": ..., \"confidence\": ...}]}"
+    )
+    return system, user
+
+
+def artifact_chunk_extract_with_entities(
+    chunk_text: str,
+    entities: list[dict[str, str]],
+) -> tuple[str, str]:
+    """Phase 2 Milestone E (revised): entity-grounded Claim/Finding/
+    Observation extraction.
+
+    `entities` is the list of entities present in this chunk (from
+    extract-entities). Each item: {canonical_name, short_name,
+    class_label}.
+
+    Adds an ENTITY NAMING REQUIREMENT to the base prompt: forces the
+    LLM to use canonical entity names instead of generic terms.
+    If `entities` is empty, falls back to the original generic prompt.
+    """
+    if not entities:
+        return artifact_chunk_extract(chunk_text)
+
+    entity_lines = []
+    for e in entities:
+        name = e.get("canonical_name") or e.get("short_name") or ""
+        cls = e.get("class_label") or ""
+        if name:
+            entity_lines.append(f"  - {name} ({cls})" if cls else f"  - {name}")
+    entities_block = "\n".join(entity_lines)
+
+    system = (
+        "You extract structured intelligence artifacts from text chunks. "
+        "You return ONE JSON object with three keys: claims, findings, "
+        "observations. Each is a list of `{text, confidence}` items.\n\n"
+        "DEFINITIONS:\n"
+        "  - Claim: a factual assertion the text MAKES (e.g. \"X "
+        "owns 30% of Y\"). Specific and verifiable.\n"
+        "  - Finding: an analytical conclusion or insight (e.g. \"the "
+        "trend suggests Z is accelerating\"). Goes beyond raw facts.\n"
+        "  - Observation: a raw factual statement directly visible in "
+        "the text (e.g. \"price rose 5% in March\").\n\n"
+        "ENTITY NAMING REQUIREMENT (READ CAREFULLY):\n"
+        "  - You will be given a list of canonical ENTITIES present in this "
+        "chunk. Whenever your Claim / Finding / Observation refers to one of "
+        "these entities, you MUST use its EXACT canonical name as listed.\n"
+        "  - NEVER substitute generic terms when the chunk's subject is in "
+        "the entity list. Replace \"the company\" with the company's name, "
+        "\"the country\" with the country's name, \"the report\" with the "
+        "report's title, etc.\n"
+        "  - If multiple entities are involved in one assertion, name all of "
+        "them.\n"
+        "  - If an assertion is about something NOT in the entity list "
+        "(an abstract concept, a generic group), generic phrasing is fine.\n\n"
+        "GUIDELINES:\n"
+        "  - 0 to 8 of each type per chunk; only include items the "
+        "text actually supports.\n"
+        "  - `text` should be the artifact as a standalone sentence.\n"
+        "  - `confidence` is a float in [0,1] reflecting how directly "
+        "the chunk supports the artifact.\n"
+        "  - Skip items that are too vague, uncertain, or generic to be "
+        "useful.\n"
+        "  - Return ONLY the JSON object -- no preamble, no markdown."
+    )
+    user = (
+        "ENTITIES IN THIS CHUNK (use the canonical names below in your output):\n"
+        + entities_block
+        + "\n\nTEXT CHUNK:\n```\n"
+        + chunk_text
+        + "\n```\n\n"
+        "Return the JSON now."
+    )
+    return system, user
+
+
 def artifact_document_summary(chunks_text: str) -> tuple[str, str]:
     """Phase 2 Milestone E: per-document Summary artifact.
 
@@ -712,5 +843,7 @@ PROMPTS = {
     "document_summarize": document_summarize,
     "classification_audit": classification_audit,
     "artifact_chunk_extract": artifact_chunk_extract,
+    "artifact_chunk_extract_with_entities": artifact_chunk_extract_with_entities,
     "artifact_document_summary": artifact_document_summary,
+    "entity_extract": entity_extract,
 }
