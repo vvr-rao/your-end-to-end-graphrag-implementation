@@ -1,4 +1,8 @@
-# v1_smoke.txt -- the F-mode shipping rubric.
+# v1_smoke.example.txt -- the F-mode shipping rubric.
+#
+# This file is the GIT-TRACKED template. To start using it:
+#   cp eval_questions/v1_smoke.example.txt eval_questions/v1_smoke.txt
+#   # then edit eval_questions/v1_smoke.txt (gitignored)
 #
 # 19 questions covering the styles F has to handle. Run via:
 #   uv run python -m backend.app.cli evaluate-queries \
@@ -11,7 +15,8 @@
 #  [gap] X  -- corpus does NOT contain an answer; tests gap detection.
 #
 # See README.md for the full rubric (5 metrics, pass thresholds,
-# retrieval methodology, mode descriptions).
+# retrieval methodology, mode descriptions) plus per-question cost
+# estimates.
 
 # === Factoid (best with --mode simple_qa) ===
 What is OCI N.V.'s annual nitrogen fertilizer production capacity?

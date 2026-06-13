@@ -87,6 +87,26 @@ we want every match, not top-K. It also returns a different
 envelope shape (no `answer` field; `exhaustive_results` list
 instead).
 
+## Repo convention — what's tracked vs ignored
+
+This directory ships **`.example.txt` templates** in git but
+gitignores any other `*.txt`. Same pattern as
+`config/models.example.yaml`.
+
+- `v1_smoke.example.txt` — tracked; the canonical starter set.
+- `v1_smoke.txt` (if you create it) — gitignored; your local copy.
+
+To start using an example set:
+
+```bash
+cp eval_questions/v1_smoke.example.txt eval_questions/v1_smoke.txt
+# edit eval_questions/v1_smoke.txt freely; it won't get committed
+```
+
+That keeps your corpus-specific question evolution out of the repo,
+while the example stays visible as a starting point for anyone
+cloning fresh.
+
 ## Running an eval
 
 ```bash
@@ -111,6 +131,60 @@ uv run python -m backend.app.cli evaluate-queries \
   --judge-model gpt-4o-mini \
   --max-cost-usd 1.0
 ```
+
+## Cost per question
+
+Three factors drive cost: (a) the **retrieval mode** of the answer
+itself, (b) `--runs-per-question N` (every metric is judged on every
+run), (c) the **judge model**.
+
+**Cost per ONE question at default `--runs-per-question 3`**:
+
+| Mode | Query × 3 | Judges (gpt-4.1) | Per-question total | With `--judge-model gpt-4o-mini` |
+|---|---:|---:|---:|---:|
+| `simple_qa` | ~$0.018 | ~$0.27 | **~$0.29** | **~$0.04** |
+| `summarize` | ~$0.018 | ~$0.27 | **~$0.29** | **~$0.04** |
+| `exhaustive_search` | ~$0.20 (depends on doc count) | ~$0.27 | **~$0.47** | **~$0.22** |
+| `deep_research` | ~$0.21 | ~$0.27 | **~$0.48** | **~$0.23** |
+| `insights` | ~$0.21 | ~$0.27 | **~$0.48** | **~$0.23** |
+| `knowledge_gaps` | ~$0.027 | ~$0.27 | **~$0.30** | **~$0.05** |
+
+Each "Judges (gpt-4.1)" column adds up to 10 judge calls per question:
+3 × `comprehensiveness` + 3 × `no_hallucination` + 3 × `gap_detection` +
+1 × `consistency` (one call across all 3 answers). ~$0.025-$0.04 per
+judge call with gpt-4.1, vs ~$0.0025-$0.004 with mini.
+
+**Cost per ONE question at `--runs-per-question 1`** (no consistency
+metric, single answer):
+
+| Mode | Query × 1 | Judges (gpt-4.1) | Per-question total | Mini judge |
+|---|---:|---:|---:|---:|
+| `simple_qa` | ~$0.006 | ~$0.075 | **~$0.08** | **~$0.01** |
+| `deep_research` | ~$0.07 | ~$0.075 | **~$0.15** | **~$0.08** |
+
+**Quick scaling rule of thumb**:
+
+- N questions × 3 runs × `simple_qa` × **mini judge**: roughly `N ×
+  $0.04`. For 19 questions: ~$0.80.
+- Same × **gpt-4.1 judge**: roughly `N × $0.30`. For 19 questions:
+  ~$5.85.
+- For synthesis modes (`deep_research` / `insights`), multiply by
+  ~1.6.
+
+The `--max-cost-usd` flag is a hard ceiling — the run aborts as soon
+as cumulative spend (queries + judges) crosses it.
+
+**Recommendations**:
+
+- **Initial iteration** on question sets: `--runs-per-question 1
+  --judge-model gpt-4o-mini`. Sub-$0.05 per question; fast feedback.
+- **Pre-ship sign-off** for a mode: `--runs-per-question 3
+  --judge-model gpt-4.1`. The thresholds in this README assume this
+  setup.
+- **Daily / weekly regression**: `--runs-per-question 3 --judge-model
+  gpt-4o-mini` is usually enough. Trustworthy on comprehensiveness +
+  gap_detection; less so on no_hallucination (mini-judge has trouble
+  tracing citation IRIs back to evidence text).
 
 ## Question file format
 

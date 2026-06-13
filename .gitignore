@@ -75,5 +75,10 @@ source_documents/*
 # Repo ships a *.example.json template; the real file is gitignored.
 suggested_new_classes.json
 
+# Eval question sets are corpus-specific. Repo ships *.example.txt templates;
+# users copy them to a local .txt file (gitignored) before editing.
+eval_questions/*.txt
+!eval_questions/*.example.txt
+
 # Reference materials (notebooks, scratch) — local-only, not part of source code
 reference/
