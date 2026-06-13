@@ -7,9 +7,9 @@
 # 19 questions covering the two retrieval modes F supports:
 #
 #   simple_qa     -- tight, direct factoid answers (1-3 sentences)
-#   deep_research -- structured 6-section output (SPECIFICS / ANALYSIS /
-#                    CONTRADICTIONS / KEY CLAIMS / COVERAGE IMBALANCE /
-#                    KEY INSIGHTS). DEFAULT mode.
+#   deep_research -- structured 7-section output (SPECIFICS / ANALYSIS /
+#                    ANSWER / CONTRADICTIONS / KEY CLAIMS /
+#                    COVERAGE IMBALANCE / KEY INSIGHTS). DEFAULT mode.
 #
 # Run via:
 #   uv run python -m backend.app.cli evaluate-queries \
@@ -40,8 +40,9 @@ What is K+S AG's potash sales volume for the first half of 2022?
 
 # === Structured deep-dive questions (best with --mode deep_research) ===
 # These exercise every section of the deep_research output:
-#   SPECIFICS, ANALYSIS, CONTRADICTIONS, KEY CLAIMS, COVERAGE IMBALANCE,
-#   KEY INSIGHTS. The judge scores sections by their presence and quality.
+#   SPECIFICS, ANALYSIS, ANSWER, CONTRADICTIONS, KEY CLAIMS,
+#   COVERAGE IMBALANCE, KEY INSIGHTS. The judge scores sections by their
+#   presence and quality.
 
 # --- Comparison ---
 How does Vietnam's manufacturing outlook compare to India's?

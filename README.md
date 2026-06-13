@@ -28,7 +28,7 @@ The platform supports **two retrieval modes**:
 | Mode | What it produces | When to use it |
 |---|---|---|
 | `simple_qa` | Tight 1-3 sentence direct answer with citations. | Direct factoid lookup. |
-| `deep_research` (**default**) | Structured 6-section answer: **SPECIFICS → ANALYSIS → CONTRADICTIONS → KEY CLAIMS (with evidence status) → COVERAGE IMBALANCE → KEY INSIGHTS**. | Comparisons, listings, synthesis, deep-dives. |
+| `deep_research` (**default**) | Structured 7-section answer: **SPECIFICS → ANALYSIS → ANSWER → CONTRADICTIONS → KEY CLAIMS (with evidence status) → COVERAGE IMBALANCE → KEY INSIGHTS**. | Comparisons, listings, synthesis, deep-dives. |
 
 ```bash
 # One-shot question (default mode = deep_research)

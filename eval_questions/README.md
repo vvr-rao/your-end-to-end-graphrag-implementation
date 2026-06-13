@@ -31,9 +31,9 @@ retrieval pipeline and diverging only at the answer-synthesis step.
 | Mode | What it produces | When to use it | Cost / query | Wall |
 |---|---|---|---:|---:|
 | `simple_qa` | A tight, direct answer in 1-3 sentences. No padding, no broader framing. If the evidence does not answer, it says so in one sentence. | Direct factoid lookup. "What was K+S's potash volume in 2022?" | ~$0.006 | ~30s |
-| `deep_research` (DEFAULT) | A structured 6-section answer: **SPECIFICS** → **ANALYSIS** → **CONTRADICTIONS** → **KEY CLAIMS (with evidence status)** → **COVERAGE IMBALANCE** → **KEY INSIGHTS**. | Everything that needs structure: comparisons, listings, synthesis, time-anchored questions, broad investigations. | ~$0.07 | ~50-90s |
+| `deep_research` (DEFAULT) | A structured 7-section answer: **SPECIFICS** → **ANALYSIS** → **ANSWER** → **CONTRADICTIONS** → **KEY CLAIMS (with evidence status)** → **COVERAGE IMBALANCE** → **KEY INSIGHTS**. | Everything that needs structure: comparisons, listings, synthesis, time-anchored questions, broad investigations. | ~$0.07 | ~50-90s |
 
-The 6-section deep_research output is **always rendered**, even when
+The 7-section deep_research output is **always rendered**, even when
 sections are empty. Empty sections say "None identified" so the
 shape stays predictable.
 
@@ -43,6 +43,7 @@ shape stays predictable.
 |---|---|
 | **SPECIFICS** | Enumerate the named entities, regulations, events, people, places, dates, and figures from the evidence. Each line cited by IRI. If the user asks about *regulations*, list each one with its name + who passed it + when. If *companies*, list with specific dates/numbers. Verbatim from evidence — no summarizing away. |
 | **ANALYSIS** | Synthesis pulling from Finding + Insight artifacts in the evidence pool. Connects the SPECIFICS into a coherent picture. Cited. |
+| **ANSWER** | A direct, focused answer to the question, building on the ANALYSIS. Leads with the actual answer — yes/no, the list, the comparison, the cause — whatever was asked for. 2-5 sentences with key specifics inline. The section a reader can consume alone. If the corpus does not address the question, says so explicitly here. |
 | **CONTRADICTIONS** | Where two or more sources disagree, names them: *"[doc X] states A, while [doc Y] states B."* If none found: *"None identified in the evidence retrieved."* |
 | **KEY CLAIMS (with evidence status)** | Significant claims surfaced for the question. Every claim stated regardless of whether evidence backs it. Two badges per line: (a) who made the claim, (b) whether the source provided supporting evidence (BACKED / PARTIAL / UNBACKED). Backed and unbacked claims mixed together — not split. Uses the new `evidence_status` + `claim_source` metadata on Claim artifacts. |
 | **COVERAGE IMBALANCE** | Anywhere the corpus has substantially more material on one side than another. The LLM picks the axes: sub-topics, viewpoints, geographies, time periods, organizations, dimensions, etc. Format: *"The corpus contains N sources on topic A but only M on topic B; <observation about why this matters>."* |
@@ -79,7 +80,7 @@ narrowed the candidate set, not before:
 11. Context engineering — pack top-K with snippets + IRIs into
     a mode-specific prompt.
 12. Answer generation. simple_qa → gpt-4o-mini, tight 1-3 sentence.
-                        deep_research → gpt-4.1, structured 6-section.
+                        deep_research → gpt-4.1, structured 7-section.
 ```
 
 Then persist `retrieval_runs` (1 row) + `retrieval_evidence` (top-K

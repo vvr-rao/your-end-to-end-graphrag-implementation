@@ -24,9 +24,10 @@ Persists `retrieval_runs` (1 row) + `retrieval_evidence` (top-K rows).
 
 Two modes (2026-06-13 redesign):
   - simple_qa     -- tight 1-3 sentence direct answer; top_k=20.
-  - deep_research -- structured 6-section output (SPECIFICS / ANALYSIS
-                     / CONTRADICTIONS / KEY CLAIMS / COVERAGE IMBALANCE
-                     / KEY INSIGHTS); top_k=30; default mode.
+  - deep_research -- structured 7-section output (SPECIFICS / ANALYSIS
+                     / ANSWER / CONTRADICTIONS / KEY CLAIMS /
+                     COVERAGE IMBALANCE / KEY INSIGHTS); top_k=30;
+                     default mode.
 
 The summarize/insights/knowledge_gaps/exhaustive_search modes were
 removed in the redesign in favor of the structured deep_research
@@ -98,7 +99,7 @@ async def retrieve_and_answer(
     (the caller -- typically Milestone G -- already resolved it).
 
     `top_k` defaults to 30 for deep_research (more breadth for the
-    six-section output) and 20 for simple_qa.
+    seven-section output) and 20 for simple_qa.
     """
     if mode not in _VALID_MODES:
         raise ValueError(

@@ -35,7 +35,7 @@ class TurnRequest(BaseModel):
     mode: str = Field(
         "deep_research",
         description=(
-            "'deep_research' (default) returns a structured 6-section "
+            "'deep_research' (default) returns a structured 7-section "
             "answer; 'simple_qa' returns a tight 1-3 sentence direct "
             "answer."
         ),

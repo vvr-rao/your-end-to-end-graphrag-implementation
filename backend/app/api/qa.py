@@ -5,8 +5,8 @@ CLI's `query --json` output.
 
 Two modes (2026-06-13 redesign):
   - simple_qa     -- tight 1-3 sentence direct answer.
-  - deep_research -- structured 6-section output (SPECIFICS /
-                     ANALYSIS / CONTRADICTIONS / KEY CLAIMS /
+  - deep_research -- structured 7-section output (SPECIFICS /
+                     ANALYSIS / ANSWER / CONTRADICTIONS / KEY CLAIMS /
                      COVERAGE IMBALANCE / KEY INSIGHTS). DEFAULT.
 """
 from __future__ import annotations
@@ -30,7 +30,7 @@ class QARequest(BaseModel):
         "deep_research",
         description=(
             "Retrieval mode. 'deep_research' (default) returns a "
-            "structured 6-section answer; 'simple_qa' returns a tight "
+            "structured 7-section answer; 'simple_qa' returns a tight "
             "1-3 sentence direct answer."
         ),
     )

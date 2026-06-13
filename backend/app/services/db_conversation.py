@@ -137,7 +137,6 @@ async def add_turn(
     max_cost_usd: float = 1.0,
     decompose: bool = True,
     max_probes: int = 5,
-    exhaustive_limit: int = 100,
     history_window: int = 3,
     verbose: bool = False,
 ) -> dict[str, Any]:
@@ -234,7 +233,6 @@ async def add_turn(
         max_cost_usd=max_cost_usd,
         decompose=decompose,
         max_probes=max_probes,
-        exhaustive_limit=exhaustive_limit,
         conversation_turn_id=turn_uid,
         resolved_query=resolved_query,
         verbose=verbose,
@@ -245,7 +243,7 @@ async def add_turn(
     #     turn's evidence; we want the synthesizer to also know what
     #     was asked + answered before so it can build on prior context
     #     instead of treating each turn as a fresh search.
-    if prior and result.answer is not None and mode != "exhaustive_search":
+    if prior and result.answer is not None:
         prior_qa: list[tuple[str, str]] = [
             (resolved or asked, ans)
             for asked, resolved, ans in prior
@@ -293,7 +291,6 @@ async def add_turn(
         "resolved_question": resolved_query,
         "mode": result.mode,
         "answer": result.answer,
-        "exhaustive_results": result.exhaustive_results,
         "evidence": result.evidence,
         "retrieval_run_id": (
             str(result.retrieval_run_id) if result.retrieval_run_id else None

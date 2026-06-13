@@ -555,9 +555,9 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("simple_qa", "deep_research"),
         default="deep_research",
         help=(
-            "deep_research (default): structured 6-section output "
-            "(SPECIFICS / ANALYSIS / CONTRADICTIONS / KEY CLAIMS / "
-            "COVERAGE IMBALANCE / KEY INSIGHTS). "
+            "deep_research (default): structured 7-section output "
+            "(SPECIFICS / ANALYSIS / ANSWER / CONTRADICTIONS / "
+            "KEY CLAIMS / COVERAGE IMBALANCE / KEY INSIGHTS). "
             "simple_qa: tight 1-3 sentence direct answer."
         ),
     )

@@ -1023,7 +1023,7 @@ def answer_simple_qa(
 
 
 _DEEP_RESEARCH_SECTIONS = (
-    "OUTPUT STRUCTURE -- six labelled sections, always in this order. "
+    "OUTPUT STRUCTURE -- seven labelled sections, always in this order. "
     "Every section MUST render, even if empty. Use the labels verbatim "
     "as the only headers; no markdown.\n\n"
     "SPECIFICS\n"
@@ -1040,6 +1040,15 @@ _DEEP_RESEARCH_SECTIONS = (
     "Pull from Finding and Insight artifacts in the evidence when "
     "available (cite them). Address what the user actually wants to "
     "understand, not just what was found.\n\n"
+    "ANSWER\n"
+    "  A direct, focused answer to the question above, building on the "
+    "ANALYSIS. Lead with the actual answer -- yes/no, the list, the "
+    "comparison, the cause, whatever the question explicitly asked for. "
+    "2-5 sentences. Pull the most relevant specifics inline (named "
+    "entities, key numbers, key dates). This is the section a reader "
+    "could consume alone and know what the corpus says about their "
+    "question. If the corpus does not address the question, say so "
+    "explicitly here in one sentence.\n\n"
     "CONTRADICTIONS\n"
     "  Where two or more sources in the evidence disagree, name them: "
     "\"[doc X] states A, while [doc Y] states B.\" Use the documents' "
@@ -1081,7 +1090,7 @@ _DEEP_RESEARCH_SECTIONS = (
 def answer_deep_research(
     question: str, evidence: list[dict]
 ) -> tuple[str, str]:
-    """deep_research mode: structured 6-section output.
+    """deep_research mode: structured 7-section output.
 
     The fixed sections are mandatory and always render, even if empty.
     Section content uses the new `evidence_status`, `claim_source`,
@@ -1094,13 +1103,13 @@ def answer_deep_research(
         + _FACTS_FIRST_RULE
         + "\n\n"
         + _DEEP_RESEARCH_SECTIONS
-        + "\n\nLENGTH: 600-1,200 words across all six sections. "
+        + "\n\nLENGTH: 650-1,300 words across all seven sections. "
         "Return plain text only -- no markdown."
     )
     user = (
         f"QUESTION: {question}\n\nEVIDENCE:\n"
         + _format_evidence_block(evidence)
-        + "\n\nWrite the six-section answer now."
+        + "\n\nWrite the seven-section answer now."
     )
     return system, user
 
@@ -1182,7 +1191,7 @@ def answer_conversation_turn(
     `prior_turns` items: (user_question, answer). Most recent last.
     `base_mode` selects style:
        simple_qa     -> tight 1-3 sentence direct answer
-       deep_research -> 6-section structured answer (same as the
+       deep_research -> 7-section structured answer (same as the
                         deep_research one-shot, plus prior context).
 
     Falls back to the relevant one-shot prompt if `prior_turns` is empty.
