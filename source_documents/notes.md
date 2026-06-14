@@ -31,3 +31,6 @@ PDF attachment land in the output folder; the rest are reported and
 skipped. With `--allow-html`, the primary 10-K HTML body is fetched and
 rendered to PDF via WeasyPrint; if conversion fails the raw `.htm` is
 saved instead so the filing content isn't lost.
+
+Other useful sources of information
+- HKEX for Hong Kong listed securities. No API Available that I know of but you can go to their site and do a keyword search (e.g. "Annual Report") - https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&lang=EN&market=SEHK&stockId=130186

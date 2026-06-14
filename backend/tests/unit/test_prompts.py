@@ -45,8 +45,11 @@ def test_match_dedup_skips_when_no_proposals_is_not_in_prompt() -> None:
     assert '"MATCHES FOUND"' in user or "MATCHES FOUND" in user
 
 
-def test_prompts_registry_covers_seven_tasks() -> None:
-    assert set(PROMPTS) == {
+def test_prompts_registry_covers_core_phase1_tasks() -> None:
+    # Phase 1 LLM-pipeline tasks must always be present. Phase 2 added
+    # many more (artifact extraction, QA, judging) -- those are covered
+    # by a superset check below.
+    phase1_tasks = {
         "chunk_classification",
         "class_proposal",
         "match_dedup",
@@ -55,6 +58,7 @@ def test_prompts_registry_covers_seven_tasks() -> None:
         "document_summarize",
         "classification_audit",
     }
+    assert phase1_tasks.issubset(set(PROMPTS))
 
 
 def test_classification_audit_prompt_shape() -> None:

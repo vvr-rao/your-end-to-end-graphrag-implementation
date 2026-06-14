@@ -107,6 +107,34 @@ expansion:
   # Default hops for class-graph expansion in pruning step.
   prune_max_hops: 1
 
+  # ---------------------------------------------------------------------------
+  # Stage-2 entity-shaped-class filter.
+  #
+  # The stage-2 LLM occasionally proposes specific named entities (companies,
+  # documents, dashboards, country names) as new ONTOLOGY CLASSES instead of
+  # INSTANCES. A heuristic post-filter in `pipeline_llm.py` catches and
+  # demotes those. The "known places" set is built dynamically from the
+  # loaded ontology: any class whose superclass-chain includes Country /
+  # Region / Continent / City / State / Province etc. contributes its labels.
+  # No code change needed when you import a different geography ontology.
+  #
+  # The three optional `extra_*` lists below let domain users extend the
+  # built-in pattern set without code changes. Empty = use built-ins only.
+  # ---------------------------------------------------------------------------
+  entity_class_filter:
+    # Extra corporate-suffix tokens that mark a label as a company/agency
+    # name (and therefore an instance, not a class). Built-ins already
+    # include Inc, Corp, Ltd, N.V., GmbH, AG, S.A., Holdings, Group, etc.
+    extra_corporate_suffixes: []
+    # Extra trailing words that mark a label as a named document / data
+    # product / tool. Built-ins already include Report, Dashboard, Tracker,
+    # Monitor, Hub, Tool, Database, Calendar, Alert, Portal, Platform, etc.
+    extra_doc_tail_words: []
+    # Extra place labels (case-insensitive exact-match) for known proper-
+    # noun places NOT already in the loaded ontology. Usually empty --
+    # the dynamic lookup handles geography automatically.
+    extra_known_place_labels: []
+
 # -----------------------------------------------------------------------------
 # RAG QA defaults (Phase 2).
 # -----------------------------------------------------------------------------

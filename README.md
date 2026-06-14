@@ -261,23 +261,9 @@ ontology:
 
 Useful for in-house ontologies you maintain by hand (e.g. an `intelligence-artifact` schema) that you want preserved across every `prune` and `prune-expand` run. Match is by exact IRI-prefix `startswith` — pick a stable namespace.
 
-## Visualizer
+## Inspecting an ontology
 
-A local Dash-based browser viewer for any `.owl` / `.rdf` / `.ttl` file — generated merges or industry inputs.
-
-```bash
-uv run python -m visualizer
-# then open http://127.0.0.1:8050
-```
-
-Features:
-- Dropdown lists files from `output_ontologies/` (Generated) and `source_ontologies/` (Source Ontologies); the **Custom path** field accepts any absolute path.
-- Toggle node types (classes, object properties, data properties, individuals).
-- **Graph layout chooser**: force-directed (`cose`, default) / tree (`breadthfirst`) / concentric rings / circle / grid / random. The **Fit / reset view** button re-runs the currently-selected layout.
-- **Search**: substring match on labels OR IRIs, case-insensitive. Type a query and either press **Enter** or click the **Search** button to apply. `Hops` slider does N-hop BFS expansion around matches using the same `build_class_graph` / `collect_related_class_iris` helpers the pruning pipeline uses.
-- **Click any node** to open a centered **modal** with its labels, comments, superclasses, domain/range, sources, etc. Close button (or click another node to swap content).
-- Files larger than 200 MB (DRON) display a "too large to load" message instead of trying to parse.
-- Each file is loaded in its own owlready2 `World()` so switching between two files in one session can't leak entities across them.
+Generated `merged.owl` files open directly in [Protégé](https://protege.stanford.edu/) for visual inspection. The earlier in-repo Dash viewer has been moved to `archive/visualizer/`; use Protégé going forward.
 
 ## Source-document downloaders
 

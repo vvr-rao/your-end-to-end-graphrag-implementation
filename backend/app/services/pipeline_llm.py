@@ -256,6 +256,334 @@ async def _propose_for_chunk(
     return extract_json_from_output(result.text)
 
 
+# ---------- Stage 2 post-filter: drop entity-shaped class proposals ----------
+#
+# Even with the prompt's "HARD RULE" telling the LLM to emit specific named
+# entities as INSTANCES rather than CLASSES, occasional leaks happen at
+# gpt-4.1 — proper-noun company names ("BYD Company Ltd."), country names
+# ("Myanmar"), and document titles ("Sovereign Risk Tracker") show up
+# under MATCH NOT FOUND. The post-filter catches those by label signature
+# and demotes them to MATCH NOT FOUND INSTANCES so downstream entity
+# extraction can still surface them.
+
+_CORPORATE_SUFFIX_RE = re.compile(
+    r"\b(?:Inc|Corp|Corporation|Company|Co|Ltd|Limited|LLC|"
+    r"N\.?V\.?|GmbH|AG|S\.?A\.?|S\.?p\.?A\.?|plc|PLC|"
+    r"Holdings|Group|Industries|Partners|Bhd|Pty)\b\.?",
+    re.IGNORECASE,
+)
+
+# Document/report title hint words. The check fires on either a
+# whitespace-separated label or a CamelCase label (we split into words
+# before testing); so `FertilizerMarketDashboard` and `Fertilizer Market
+# Dashboard` both match.
+_DOCUMENT_TITLE_TAIL_WORDS = (
+    "Report", "Factbook", "Dashboard", "Tracker", "Index", "Bulletin",
+    "Briefing", "Forecast", "Outlook", "Whitepaper", "Yearbook", "Atlas",
+    "Monitor", "Hub", "Tool", "Database", "Calendar", "Alert", "Portal",
+    "Platform", "Survey", "Directory", "Source", "App", "Service",
+    "Review", "Reviews", "Newsletter", "Brief", "Memo", "Note", "Page",
+    "Site", "Paper",
+)
+_DOCUMENT_TITLE_TAIL_RE = re.compile(
+    # `\s` (NOT `(?:^|\s)`) means the tail word must follow another word.
+    # That keeps generic category names like "Forecast" / "Dashboard" /
+    # "Alert" as legitimate classes while still catching multi-word /
+    # CamelCase named documents like "FoodSecurityTracker".
+    r"\s(?:" + "|".join(_DOCUMENT_TITLE_TAIL_WORDS) + r")\s*$",
+    re.IGNORECASE,
+)
+
+# Years with optional descriptor (e.g. "2025 Factbook", "Q1 2024 Outlook")
+_YEAR_PREFIX_RE = re.compile(r"^(?:Q[1-4]\s+)?(?:19|20)\d{2}\b")
+
+# CamelCase splitter. Splits "FertilizerMarketDashboard" -> ["Fertilizer",
+# "Market", "Dashboard"]; preserves acronym runs like "WEO" -> ["WEO"],
+# and "EUTrade" -> ["EU", "Trade"]; respects existing whitespace.
+_CAMEL_SPLIT_RE = re.compile(
+    r"[A-Z]+(?=[A-Z][a-z])"   # acronym before a CamelCase word: "EUT" in "EUTrade"
+    r"|[A-Z][a-z]+"            # standard CamelCase token: "Fertilizer"
+    r"|[A-Z]+"                 # trailing acronym: "WEO"
+    r"|[a-z]+"                 # lowercase token (rare in class labels)
+    r"|\d+"                    # digit run: "2025"
+)
+
+
+def _split_camel(label: str) -> str:
+    """Return the label with CamelCase boundaries replaced by spaces.
+
+    Already-spaced labels pass through unchanged. Used to canonicalize a
+    label before applying tail-word / prefix regexes that key on whole
+    words. Examples:
+        FertilizerMarketDashboard -> "Fertilizer Market Dashboard"
+        EarlyWarningHub           -> "Early Warning Hub"
+        WEO                       -> "WEO"
+        2025 Factbook             -> "2025 Factbook"
+    """
+    if " " in label:
+        return label
+    tokens = _CAMEL_SPLIT_RE.findall(label)
+    return " ".join(tokens) if tokens else label
+
+
+def _looks_like_entity_not_class(
+    label: str,
+    *,
+    known_places: frozenset[str] | None = None,
+    extra_corporate_suffix_re: re.Pattern[str] | None = None,
+    extra_tail_word_re: re.Pattern[str] | None = None,
+) -> tuple[bool, str]:
+    """Return (is_entity, reason). When `is_entity` is True, the caller
+    should demote the MATCH NOT FOUND class proposal to MATCH NOT FOUND
+    INSTANCES instead of letting it land in the ontology as a class.
+
+    `known_places` is the set of lowercased place labels that should NOT
+    appear as new classes (because the same name already exists as a
+    class in the loaded ontology, OR because they're a configured extra).
+    Empty set / None -> the place check is skipped.
+
+    `extra_corporate_suffix_re` / `extra_tail_word_re` are optional user-
+    extensions sourced from `config/config.yaml`; same semantics as the
+    built-ins."""
+    if not isinstance(label, str):
+        return False, ""
+    cleaned = label.strip()
+    if not cleaned:
+        return False, ""
+    # Heuristic 1: corporate suffix anywhere in the label (built-in or
+    # user-extended).
+    if _CORPORATE_SUFFIX_RE.search(cleaned):
+        return True, "corporate-suffix"
+    if extra_corporate_suffix_re is not None and extra_corporate_suffix_re.search(cleaned):
+        return True, "corporate-suffix"
+    # Heuristic 2: known proper-noun place (case-insensitive exact match).
+    # The source set is built from the loaded ontology at runtime.
+    if known_places and cleaned.lower() in known_places:
+        return True, "known-place"
+    # Heuristic 3: document/report title ending. Works on both spaced
+    # and CamelCase labels (we split CamelCase first).
+    split = _split_camel(cleaned)
+    if _DOCUMENT_TITLE_TAIL_RE.search(split):
+        return True, "document-title"
+    if extra_tail_word_re is not None and extra_tail_word_re.search(split):
+        return True, "document-title"
+    # Heuristic 4: year prefix (e.g. "2025 Factbook" already caught by
+    # heuristic 3; this catches "2025 Strategy Conference" with no tail
+    # word). Multi-word labels only -- a bare "2025" gets caught by the
+    # temporal-instance path elsewhere.
+    if " " in cleaned and _YEAR_PREFIX_RE.match(cleaned):
+        return True, "year-prefix"
+    return False, ""
+
+
+# Class-label substrings that mark a "place-kind" class. Used to walk
+# the loaded ontology's class hierarchy and collect the labels of every
+# class whose ancestry includes one of these -- those labels become the
+# dynamic `known_places` set passed to the heuristic.
+_PLACE_KIND_LABELS = frozenset(
+    s.lower() for s in (
+        "Country", "Continent", "Region", "City", "State", "Province",
+        "Territory", "GeopoliticalEntity", "PoliticalRegion",
+        "AdministrativeRegion", "GeographicRegion", "GeographicEntity",
+        "AdministrativeArea",
+    )
+)
+
+
+def _build_known_places_from_ontology(
+    loaded_ontology: dict[str, Any] | None,
+    *,
+    extra_labels: list[str] | None = None,
+) -> frozenset[str]:
+    """Walk the loaded ontology's class hierarchy and return the set of
+    labels (lowercased) of every class whose superclass-chain includes
+    a place-kind class (Country / Continent / Region / City / etc.).
+
+    Adapts to any merge: a corpus that imports `geography_ontology.owl`
+    yields ~250 country / region labels; one that doesn't yields an
+    empty set. `extra_labels` from `config/config.yaml` are unioned on
+    top. Returns lowercased + stripped labels for case-insensitive
+    exact-match comparison.
+
+    Safe on `None` / missing keys -- returns an empty frozenset."""
+    out: set[str] = set()
+    classes = (loaded_ontology or {}).get("classes_dict") or {}
+    if not isinstance(classes, dict):
+        classes = {}
+
+    # First, identify the IRIs of the place-kind ROOT classes by label match.
+    place_root_iris: set[str] = set()
+    for iri, c in classes.items():
+        if not isinstance(c, dict):
+            continue
+        labels = c.get("labels") or []
+        if not isinstance(labels, list):
+            continue
+        for lbl in labels:
+            if not isinstance(lbl, str):
+                continue
+            normalized = re.sub(r"\s+", "", lbl).lower()
+            if normalized in _PLACE_KIND_LABELS:
+                place_root_iris.add(iri)
+                break
+
+    if not place_root_iris:
+        # No geography ontology imported -- just return the extras.
+        if extra_labels:
+            for lbl in extra_labels:
+                if isinstance(lbl, str) and lbl.strip():
+                    out.add(lbl.strip().lower())
+        return frozenset(out)
+
+    # Walk: for each class, follow its superclass chain. If any ancestor
+    # is in place_root_iris, every label of THIS class joins the
+    # known-places set. Bounded by class count; ontologies have <10k
+    # classes so the O(N * avg-chain-depth) walk is fast enough.
+    def _superclass_iris(cls_entry: dict[str, Any]) -> list[str]:
+        raw = cls_entry.get("superclasses") or cls_entry.get("superclass_iris") or []
+        if not isinstance(raw, list):
+            return []
+        iris: list[str] = []
+        for s in raw:
+            if isinstance(s, str):
+                iris.append(s)
+            elif isinstance(s, dict):
+                v = s.get("iri") or s.get("name")
+                if isinstance(v, str):
+                    iris.append(v)
+        return iris
+
+    # Cache: iri -> True if its ancestry hits a place root, False otherwise.
+    is_place_class: dict[str, bool] = {iri: True for iri in place_root_iris}
+
+    def _walks_to_place(iri: str, depth: int = 0) -> bool:
+        if iri in is_place_class:
+            return is_place_class[iri]
+        if depth > 50:  # cycle guard
+            is_place_class[iri] = False
+            return False
+        entry = classes.get(iri)
+        if not isinstance(entry, dict):
+            is_place_class[iri] = False
+            return False
+        result = any(
+            _walks_to_place(parent_iri, depth + 1)
+            for parent_iri in _superclass_iris(entry)
+        )
+        is_place_class[iri] = result
+        return result
+
+    for iri, c in classes.items():
+        if not isinstance(c, dict):
+            continue
+        if not _walks_to_place(iri):
+            continue
+        labels = c.get("labels") or []
+        if not isinstance(labels, list):
+            continue
+        for lbl in labels:
+            if isinstance(lbl, str) and lbl.strip():
+                out.add(lbl.strip().lower())
+
+    # Extras from config last (union -- never override).
+    if extra_labels:
+        for lbl in extra_labels:
+            if isinstance(lbl, str) and lbl.strip():
+                out.add(lbl.strip().lower())
+
+    return frozenset(out)
+
+
+def _compile_extra_word_regex(words: list[str] | None) -> re.Pattern[str] | None:
+    """Compile a `\\s(word1|word2|...)\\s*$` tail-word regex from a
+    user-provided list. Returns None when the list is empty. Same
+    leading-`\\s` policy as the built-in regex (so bare category names
+    matching one of the extras still survive)."""
+    if not words:
+        return None
+    safe = [re.escape(w) for w in words if isinstance(w, str) and w.strip()]
+    if not safe:
+        return None
+    return re.compile(
+        r"\s(?:" + "|".join(safe) + r")\s*$",
+        re.IGNORECASE,
+    )
+
+
+def _compile_extra_suffix_regex(suffixes: list[str] | None) -> re.Pattern[str] | None:
+    """Compile a `\\b(s1|s2|...)\\b\\.?` corporate-suffix regex from a
+    user-provided list. Returns None when the list is empty."""
+    if not suffixes:
+        return None
+    safe = [re.escape(s) for s in suffixes if isinstance(s, str) and s.strip()]
+    if not safe:
+        return None
+    return re.compile(
+        r"\b(?:" + "|".join(safe) + r")\b\.?",
+        re.IGNORECASE,
+    )
+
+
+def _filter_entity_shaped_classes(
+    stage2_result: dict[str, Any] | None,
+    *,
+    known_places: frozenset[str] | None = None,
+    extra_corporate_suffix_re: re.Pattern[str] | None = None,
+    extra_tail_word_re: re.Pattern[str] | None = None,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Strip entity-shaped entries from MATCH NOT FOUND in a single
+    stage-2 chunk result, promoting each to MATCH NOT FOUND INSTANCES.
+
+    `known_places` is the dynamic place-class label set built from the
+    loaded ontology (see `_build_known_places_from_ontology`); pass
+    `None`/empty to skip the place check entirely. `extra_*_re` come
+    from `config/config.yaml` user extensions.
+
+    Returns the updated result + a list of demotion records (for audit).
+    Safe on `None` / missing keys."""
+    demotions: list[dict[str, Any]] = []
+    if not isinstance(stage2_result, dict):
+        return stage2_result, demotions
+    classes = stage2_result.get("MATCH NOT FOUND")
+    if not isinstance(classes, list):
+        return stage2_result, demotions
+    kept_classes: list[Any] = []
+    promoted: list[dict[str, Any]] = []
+    for entry in classes:
+        if not isinstance(entry, dict):
+            kept_classes.append(entry)
+            continue
+        label = entry.get("LABEL", "")
+        is_entity, reason = _looks_like_entity_not_class(
+            label,
+            known_places=known_places,
+            extra_corporate_suffix_re=extra_corporate_suffix_re,
+            extra_tail_word_re=extra_tail_word_re,
+        )
+        if not is_entity:
+            kept_classes.append(entry)
+            continue
+        parent = entry.get("PARENT_LABEL") or "NONE"
+        promoted.append(
+            {
+                "LABEL": label,
+                "CANONICAL_FORM": label,
+                "TYPE_LABEL": parent,
+                "DESCRIPTION": entry.get("DESCRIPTION", ""),
+            }
+        )
+        demotions.append({"label": label, "parent": parent, "reason": reason})
+    if not promoted:
+        return stage2_result, demotions
+    stage2_result["MATCH NOT FOUND"] = kept_classes
+    existing_instances = stage2_result.get("MATCH NOT FOUND INSTANCES")
+    if not isinstance(existing_instances, list):
+        existing_instances = []
+    existing_instances.extend(promoted)
+    stage2_result["MATCH NOT FOUND INSTANCES"] = existing_instances
+    return stage2_result, demotions
+
+
 # ---------- Stage 3: dedup ----------
 
 
@@ -1591,6 +1919,25 @@ async def _run_llm_stages(
     concurrency = int(expansion_cfg.get("max_concurrent_llm_calls", 8))
     sem = asyncio.Semaphore(concurrency)
 
+    # Entity-shaped-class filter inputs: dynamic place set sourced from the
+    # loaded ontology + optional user extensions from config.yaml.
+    entity_filter_cfg = expansion_cfg.get("entity_class_filter", {}) or {}
+    known_places = _build_known_places_from_ontology(
+        loaded_ontology,
+        extra_labels=entity_filter_cfg.get("extra_known_place_labels") or [],
+    )
+    extra_suffix_re = _compile_extra_suffix_regex(
+        entity_filter_cfg.get("extra_corporate_suffixes") or []
+    )
+    extra_tail_re = _compile_extra_word_regex(
+        entity_filter_cfg.get("extra_doc_tail_words") or []
+    )
+    print(
+        f"[stage2-filter] known_places={len(known_places)} (from ontology + config), "
+        f"extra_suffixes={'on' if extra_suffix_re else 'off'}, "
+        f"extra_tail_words={'on' if extra_tail_re else 'off'}"
+    )
+
     async def _classify_one(chunk: TextChunk) -> list[str]:
         async with sem:
             return await _classify_chunk(router, branches, chunk)
@@ -1609,6 +1956,20 @@ async def _run_llm_stages(
                 suggested_new_classes=suggested_new_classes,
             )
             if res:
+                res, demotions = _filter_entity_shaped_classes(
+                    res,
+                    known_places=known_places,
+                    extra_corporate_suffix_re=extra_suffix_re,
+                    extra_tail_word_re=extra_tail_re,
+                )
+                if demotions:
+                    _append_audit(
+                        audit_path,
+                        idx,
+                        "entity_shaped_class_demotions",
+                        chunk.source_name,
+                        {"demotions": demotions},
+                    )
                 _append_audit(audit_path, idx, "class_proposal", chunk.source_name, res)
             return res
 
