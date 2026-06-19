@@ -131,6 +131,24 @@ def build_parser() -> argparse.ArgumentParser:
     _add_output_dir(p_pe)
     _add_llm_flags(p_pe)
     _add_suggestions_flag(p_pe)
+    p_pe.add_argument(
+        "--tables", action="store_true",
+        help=(
+            "Phase 2a (opt-in): extract structured tables from PDF documents "
+            "during the run. Writes JSON-LD payloads to "
+            "<output>/v<TS>-prune-expand/tables/<sha>.jsonld and to the "
+            "user cache. Has no effect on non-PDF inputs. Default: OFF."
+        ),
+    )
+    p_pe.add_argument(
+        "--no-table-vision",
+        dest="table_vision", action="store_false", default=True,
+        help=(
+            "Disable the vision-LLM route for complex tables (use only "
+            "pdfplumber's flat extraction). Free, loses nested/merged "
+            "tables. Effective only when --tables is set."
+        ),
+    )
     p_pe.set_defaults(func=_cmd_prune_expand)
 
     p_build = sub.add_parser(
@@ -142,6 +160,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_output_dir(p_build)
     _add_llm_flags(p_build)
     _add_suggestions_flag(p_build)
+    p_build.add_argument(
+        "--tables", action="store_true",
+        help="Phase 2a (opt-in): extract structured tables from PDF documents.",
+    )
+    p_build.add_argument(
+        "--no-table-vision",
+        dest="table_vision", action="store_false", default=True,
+        help="Disable vision-LLM route for complex tables (uses pdfplumber-only).",
+    )
     p_build.set_defaults(func=_cmd_build)
 
     p_sd = sub.add_parser(
@@ -378,6 +405,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--concurrency", type=int, default=4,
         help="Concurrent LLM calls for summarization.",
     )
+    p_reg.add_argument(
+        "--tables", action="store_true",
+        help=(
+            "Phase 2a (opt-in): also ingest StructuredTable artifacts from "
+            "PDF documents. Loads cached JSON-LD payloads when available "
+            "(from a prior `prune-expand --tables` run) and extracts inline "
+            "otherwise. Has no effect on non-PDF inputs. Default: OFF."
+        ),
+    )
+    p_reg.add_argument(
+        "--no-table-vision",
+        dest="table_vision", action="store_false", default=True,
+        help=(
+            "Disable vision-LLM route during inline extraction. Free, loses "
+            "complex tables. Effective only with --tables."
+        ),
+    )
     p_reg.set_defaults(func=_cmd_register_documents)
 
     p_del = sub.add_parser(
@@ -487,15 +531,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_art.add_argument(
         "--type",
-        choices=("Claim", "Finding", "Observation", "Summary",
+        choices=("Claim", "Finding", "Observation", "Event", "Summary",
                  "Insight", "Recommendation"),
         default=None,
         action="append",
         help=(
-            "Restrict to specific types (repeatable). Default = the four "
-            "ground-level types (Claim, Finding, Observation, Summary). "
-            "Insight + Recommendation must be opted in explicitly "
-            "(they use gpt-4.1; cost ~$2 for full corpus)."
+            "Restrict to specific types (repeatable). Default = the five "
+            "ground-level types (Claim, Finding, Observation, Event, "
+            "Summary). Insight + Recommendation must be opted in "
+            "explicitly (they use gpt-4.1; cost ~$2 for full corpus)."
         ),
     )
     p_art.add_argument(
@@ -746,6 +790,8 @@ def _cmd_prune_expand(args: argparse.Namespace) -> int:
             max_cost_usd=args.max_cost_usd,
             dry_run=args.dry_run,
             suggested_new_classes=args.suggested_new_classes,
+            extract_tables=getattr(args, "tables", False),
+            table_vision=getattr(args, "table_vision", True),
         )
     )
     print(f"\nPRUNED+EXPANDED ontology written to: {version_dir}")
@@ -764,6 +810,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
             max_cost_usd=args.max_cost_usd,
             dry_run=args.dry_run,
             suggested_new_classes=args.suggested_new_classes,
+            extract_tables=getattr(args, "tables", False),
+            table_vision=getattr(args, "table_vision", True),
         )
     )
     print(f"\nBUILT ontology written to: {version_dir}")
@@ -971,6 +1019,8 @@ def _cmd_register_documents(args: argparse.Namespace) -> int:
             chunk_size=args.chunk_size,
             chunk_overlap=args.chunk_overlap,
             concurrency=args.concurrency,
+            extract_tables=getattr(args, "tables", False),
+            table_vision=getattr(args, "table_vision", True),
         )
     )
     return 0
@@ -1044,9 +1094,12 @@ def _cmd_generate_artifacts(args: argparse.Namespace) -> int:
     )
 
     types_requested = tuple(args.type) if args.type else (
-        "Claim", "Finding", "Observation", "Summary"
+        "Claim", "Finding", "Observation", "Event", "Summary"
     )
-    per_chunk = tuple(t for t in types_requested if t in ("Claim", "Finding", "Observation"))
+    per_chunk = tuple(
+        t for t in types_requested
+        if t in ("Claim", "Finding", "Observation", "Event")
+    )
     do_summary = "Summary" in types_requested
     do_insight = "Insight" in types_requested
     do_recommendation = "Recommendation" in types_requested

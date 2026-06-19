@@ -1,8 +1,8 @@
 """Intelligence artifacts + artifact_sources M2M for traceability.
 
 Each row is an OWL individual under a VIAO class (Summary, Claim,
-Finding, Observation, Insight, Recommendation). The `artifact_type`
-column mirrors the VIAO subclass name; the IRI in
+Finding, Observation, Insight, Recommendation, StructuredTable, Event).
+The `artifact_type` column mirrors the VIAO subclass name; the IRI in
 `artifact_identifier` follows `viao:<Type>_<uuid>` convention so
 the artifact can be exported to RDF directly.
 
@@ -33,7 +33,8 @@ class IntelligenceArtifact(Base):
     __tablename__ = "intelligence_artifacts"
     __table_args__ = (
         CheckConstraint(
-            "artifact_type IN ('Summary','Claim','Finding','Observation','Insight','Recommendation')",
+            "artifact_type IN ('Summary','Claim','Finding','Observation',"
+            "'Insight','Recommendation','StructuredTable','Event')",
             name="intel_artifacts_type_check",
         ),
         CheckConstraint(

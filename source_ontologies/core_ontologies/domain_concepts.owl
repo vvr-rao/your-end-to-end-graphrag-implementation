@@ -51,6 +51,12 @@
         <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#SupplyChainConcept"/>
         <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#GeographicFeature"/>
         <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConcept"/>
+        <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialTable"/>
+        <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialObservation"/>
+        <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Metric"/>
+        <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Dimension"/>
+        <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#TimePeriod"/>
     </skos:ConceptScheme>
 
     <!-- 1. Industry -->
@@ -183,6 +189,76 @@
         <skos:prefLabel xml:lang="en">Domain Concept</skos:prefLabel>
         <rdfs:comment>Catch-all top-level fallback for genuinely broad / abstract concepts that don't cleanly fit any of the other buckets. Better than forcing a bad placement.</rdfs:comment>
         <skos:definition>Catch-all top-level fallback for broad / abstract concepts.</skos:definition>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <!-- Phase 2a follow-up buckets (2026-06-15) — table-tying anchors. -->
+    <!-- Used by the table_concept_grouping pass to anchor newly-minted
+         classes derived from extracted financial-statement tables. -->
+
+    <!-- 13. FinancialTable -->
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialTable">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:label>FinancialTable</rdfs:label>
+        <skos:prefLabel xml:lang="en">Financial Table</skos:prefLabel>
+        <rdfs:comment>A table of financial values extracted from a source document. Examples: revenue tables, balance sheet tables, capacity tables, segment breakdowns. Subclasses carry per-document table types (e.g. RevenueBySegmentTable, BalanceSheetTable).</rdfs:comment>
+        <skos:definition>A table of financial values extracted from a source document; parent class for newly-minted table-type subclasses.</skos:definition>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <!-- 14. FinancialObservation -->
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialObservation">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:label>FinancialObservation</rdfs:label>
+        <skos:prefLabel xml:lang="en">Financial Observation</skos:prefLabel>
+        <rdfs:comment>A factual statement read from a financial table cell (e.g. "FY2024 automotive revenue = USD 78.4B"). Distinct from a free-prose viao:Observation artifact; tied to a row + column + table.</rdfs:comment>
+        <skos:definition>A factual reading from a row+column intersection in a FinancialTable.</skos:definition>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <!-- 15. Metric -->
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Metric">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:label>Metric</rdfs:label>
+        <skos:prefLabel xml:lang="en">Metric</skos:prefLabel>
+        <rdfs:comment>A derived or calculated numerical value (e.g. Net Margin %, ROE, Debt-to-Equity, Yield). Distinguished from Measure by being a function of one or more measures rather than a directly observed quantity.</rdfs:comment>
+        <skos:definition>A derived or calculated numerical value computed from one or more measures.</skos:definition>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <!-- 16. Dimension -->
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Dimension">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:label>Dimension</rdfs:label>
+        <skos:prefLabel xml:lang="en">Dimension</skos:prefLabel>
+        <rdfs:comment>A categorical or qualitative axis used to slice a metric or measure (e.g. Segment, Geography, Period, Product Line, Customer Type).</rdfs:comment>
+        <skos:definition>A categorical axis along which metrics and measures are sliced.</skos:definition>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <!-- 17. Measure -->
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Measure">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:label>Measure</rdfs:label>
+        <skos:prefLabel xml:lang="en">Measure</skos:prefLabel>
+        <rdfs:comment>A raw measured quantity with units (e.g. Revenue USD M, Units Sold, Employees Count, Production MT). Distinguished from Metric by being directly observed rather than derived.</rdfs:comment>
+        <skos:definition>A raw measured quantity with units, directly observed rather than derived.</skos:definition>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <!-- 18. TimePeriod -->
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#TimePeriod">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:label>TimePeriod</rdfs:label>
+        <skos:prefLabel xml:lang="en">Time Period</skos:prefLabel>
+        <rdfs:comment>A bounded interval of time used as a slicing axis on financial reports (e.g. FY2024, Q1 2024, "first half of 2022"). Distinct from time:Interval in scope: used specifically for reporting-period anchors on financial tables.</rdfs:comment>
+        <skos:definition>A bounded reporting interval used as a slicing axis on financial tables.</skos:definition>
         <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
     </owl:Class>
 

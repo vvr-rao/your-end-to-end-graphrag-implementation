@@ -28,6 +28,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from backend.app.db.graph_version import bump_version, current_version
+from backend.app.db.models.artifacts import IntelligenceArtifact
 from backend.app.db.models.documents import Chunk, Document
 from backend.app.db.models.graph import GraphRelationship
 from backend.app.db.session import session_scope
@@ -36,7 +37,11 @@ from backend.app.services.document_io import load_documents
 from backend.app.services.embeddings import Embedder
 from backend.app.services.llm_router import LLMRouter
 from backend.app.services.pipeline_llm import summarize_long_documents_async
-from backend.app.services.predicates import VIAO_CHUNK_OF
+from backend.app.services.predicates import (
+    VIAO_CHUNK_OF,
+    VIAO_DERIVED_FROM_DOCUMENT,
+    VIAO_HAS_INTELLIGENCE_ARTIFACT,
+)
 from backend.app.services.prompts import PROMPTS
 
 _VIAO_NS = "https://veerla-ramrao.ai/ontology/intelligence-artifact"
@@ -155,6 +160,8 @@ class IngestSummary:
     docs_inserted: int = 0
     chunks_inserted: int = 0
     edges_inserted: int = 0
+    tables_inserted: int = 0
+    table_extract_cost_usd: float = 0.0
     summarization_cost_usd: float = 0.0
     embedding_cost_usd: float = 0.0
     total_cost_usd: float = 0.0
@@ -180,6 +187,8 @@ async def ingest_documents_folder(
     chunk_size: int = 800,
     chunk_overlap: int = 120,
     concurrency: int = 4,
+    extract_tables: bool = False,
+    table_vision: bool = True,
 ) -> IngestSummary:
     """Ingest every supported file in `folder`. See module docstring."""
     t0 = time.time()
@@ -429,21 +438,230 @@ async def ingest_documents_folder(
     summary.edges_inserted = len(edge_payloads)
     print(f"[ingest] inserted {summary.edges_inserted} chunk-of edge(s)")
 
+    # Phase 2a opt-in: ingest StructuredTable artifacts for any PDF docs.
+    # Uses the disk cache populated by `prune-expand --tables` when
+    # available; falls back to inline extraction (paid LLM if vision is
+    # on) for cache misses. No-op when `extract_tables=False`.
+    if extract_tables:
+        await _ingest_tables_for_docs(
+            fresh, fresh_hashes, fresh_iris, iri_to_doc_id,
+            summary, table_vision=table_vision,
+        )
+
     async with session_scope() as session:
         summary.new_graph_version = await bump_version(session)
 
     summary.total_cost_usd = (
-        summary.summarization_cost_usd + summary.embedding_cost_usd
+        summary.summarization_cost_usd
+        + summary.embedding_cost_usd
+        + summary.table_extract_cost_usd
     )
     summary.wall_seconds = time.time() - t0
 
+    tables_note = (
+        f", tables={summary.tables_inserted}" if extract_tables else ""
+    )
     print(
         f"[ingest] DONE: docs={summary.docs_inserted}, "
         f"chunks={summary.chunks_inserted}, "
-        f"edges={summary.edges_inserted}, "
+        f"edges={summary.edges_inserted}{tables_note}, "
         f"cost=${summary.total_cost_usd:.4f}, "
         f"wall={summary.wall_seconds:.1f}s, "
         f"graph_version -> {summary.new_graph_version}"
     )
 
     return summary
+
+
+# ---------- Phase 2a: ingest StructuredTable artifacts for PDF docs ----------
+
+
+def _table_artifact_iri(doc_hash: str, table_index: int) -> str:
+    return f"{_VIAO_NS}#StructuredTable_{doc_hash[:16]}_{table_index:04d}"
+
+
+async def _ingest_tables_for_docs(
+    fresh_docs: list,
+    fresh_hashes: list[str],
+    fresh_iris: list[str],
+    iri_to_doc_id: dict[str, Any],
+    summary: IngestSummary,
+    *,
+    table_vision: bool,
+) -> None:
+    """Per-PDF: load (cache or fresh-extract) tables, embed the flat
+    text summary, insert one IntelligenceArtifact row per table, then
+    write the StructuredTable -> derivedFromDocument edges. Skips
+    non-PDF inputs silently. Soft-fails per doc -- one bad PDF won't
+    take down the rest."""
+    pdf_indices: list[int] = [
+        i for i, d in enumerate(fresh_docs)
+        if d.path.suffix.lower() == ".pdf"
+    ]
+    if not pdf_indices:
+        return
+
+    from backend.app.services import table_cache, table_extract, table_jsonld
+
+    print(
+        f"[ingest][tables] {len(pdf_indices)} PDF(s) eligible "
+        f"(vision={'ON' if table_vision else 'OFF'}, isolation=subprocess)"
+    )
+
+    # Phase 2a v2: extract tables via subprocess-per-PDF workers so each
+    # PDF's memory state is fully reclaimed by the OS when its worker
+    # exits. Replaces the previous in-process extractor which OOM'd
+    # under cumulative heap fragmentation. Each worker writes its
+    # JSON-LD to the shared user cache; we read from cache for the
+    # DB-insert phase below.
+    pdf_paths = [fresh_docs[i].path for i in pdf_indices]
+    manifests = await table_extract.extract_tables_for_paths_subprocess(
+        pdf_paths,
+        run_cache_dir=None,
+        use_vision=table_vision,
+        concurrency=1,
+    )
+    for m in manifests.values():
+        if m.get("source") not in ("cache", "skipped", "spawn-failed", "worker-failed"):
+            summary.table_extract_cost_usd += float(m.get("cost_usd", 0.0) or 0.0)
+
+    # Read each worker's persisted JSON-LD bundle from the user cache
+    # and assemble the DB-side artifact payloads. The on-disk payloads
+    # are the source of truth -- the manifests above only carry counts.
+    user_cache = table_cache.user_cache_dir()
+    artifact_payloads: list[dict[str, Any]] = []
+    artifact_iris_in_order: list[str] = []
+    embed_texts: list[str] = []
+    artifact_to_doc_id: list[tuple[str, Any]] = []  # (artifact_iri, doc_id)
+
+    for i in pdf_indices:
+        doc = fresh_docs[i]
+        doc_id = iri_to_doc_id.get(fresh_iris[i])
+        if doc_id is None:
+            continue
+        try:
+            _, cache_key = table_extract._hash_pdf_streaming(doc.path)
+        except Exception as exc:
+            print(
+                f"[ingest][tables] {doc.path.name}: hash failed ({exc}); "
+                f"skipping"
+            )
+            continue
+        hit = table_cache.load(user_cache, cache_key)
+        if hit is None or not hit.tables:
+            continue
+        for t_idx, payload in enumerate(hit.tables):
+            errors = table_jsonld.validate_table_jsonld(payload)
+            if errors:
+                continue
+            airi = _table_artifact_iri(fresh_hashes[i], t_idx)
+            summary_text = table_jsonld.flat_text_summary(payload, max_cells=40)
+            if not summary_text.strip():
+                # Empty summary text -- skip to keep embedding meaningful.
+                continue
+            artifact_payloads.append({
+                "artifact_identifier": airi,
+                "artifact_type": "StructuredTable",
+                "title": (payload.get("caption") or "")[:200] or None,
+                "text": summary_text,
+                "confidence": None,
+                "model_name": payload.get("extractionMethod") or "pdfplumber",
+                "prompt_version": "phase2a_table_extract@v1",
+                "status": "ACTIVE",
+                "graph_version": 0,  # filled in below
+                "extra_metadata": payload,
+            })
+            artifact_iris_in_order.append(airi)
+            embed_texts.append(summary_text)
+            artifact_to_doc_id.append((airi, doc_id))
+
+    if not artifact_payloads:
+        print("[ingest][tables] no extractable tables across the PDF set")
+        return
+
+    embedder = Embedder()
+    vectors = await embedder.embed(embed_texts)
+    summary.embedding_cost_usd += embedder.total_cost_usd
+
+    async with session_scope() as session:
+        gv = await current_version(session)
+    for p in artifact_payloads:
+        p["graph_version"] = gv
+    for p, v in zip(artifact_payloads, vectors, strict=False):
+        p["embedding"] = v
+
+    ART_BATCH = 200
+    async with session_scope() as session:
+        for i in range(0, len(artifact_payloads), ART_BATCH):
+            await session.execute(
+                pg_insert(IntelligenceArtifact).values(
+                    artifact_payloads[i : i + ART_BATCH]
+                )
+            )
+        rs = await session.execute(
+            select(
+                IntelligenceArtifact.id,
+                IntelligenceArtifact.artifact_identifier,
+            ).where(IntelligenceArtifact.artifact_identifier.in_(artifact_iris_in_order))
+        )
+        iri_to_artifact_id = {iri: aid for aid, iri in rs.all()}
+
+    summary.tables_inserted = len(artifact_payloads)
+    print(
+        f"[ingest][tables] inserted {summary.tables_inserted} "
+        f"StructuredTable artifact(s) "
+        f"(extract cost ${summary.table_extract_cost_usd:.4f})"
+    )
+
+    # Edges: Artifact -> derivedFromDocument -> Document AND
+    #        Document -> hasIntelligenceArtifact -> Artifact (inverse).
+    table_edges: list[dict[str, Any]] = []
+    for airi, doc_id in artifact_to_doc_id:
+        aid = iri_to_artifact_id.get(airi)
+        if aid is None:
+            continue
+        # Forward edge.
+        table_edges.append({
+            "source_node_type": "intelligence_artifact",
+            "source_node_id": aid,
+            "target_node_type": "document",
+            "target_node_id": doc_id,
+            "predicate_iri": VIAO_DERIVED_FROM_DOCUMENT,
+            "predicate_label": "viao:derivedFromDocument",
+            "relationship_type": "derivedFromDocument",
+            "relationship_source": "DOCUMENT_EXTRACTION",
+            "is_authoritative": True,
+            "source_document_id": doc_id,
+            "source_chunk_id": None,
+            "source_artifact_id": aid,
+            "graph_version": gv,
+            "extra_metadata": {},
+        })
+        # Inverse edge.
+        table_edges.append({
+            "source_node_type": "document",
+            "source_node_id": doc_id,
+            "target_node_type": "intelligence_artifact",
+            "target_node_id": aid,
+            "predicate_iri": VIAO_HAS_INTELLIGENCE_ARTIFACT,
+            "predicate_label": "viao:hasIntelligenceArtifact",
+            "relationship_type": "hasIntelligenceArtifact",
+            "relationship_source": "DOCUMENT_EXTRACTION",
+            "is_authoritative": True,
+            "source_document_id": doc_id,
+            "source_chunk_id": None,
+            "source_artifact_id": aid,
+            "graph_version": gv,
+            "extra_metadata": {},
+        })
+
+    EDGE_BATCH = 500
+    async with session_scope() as session:
+        for i in range(0, len(table_edges), EDGE_BATCH):
+            await session.execute(
+                pg_insert(GraphRelationship).values(
+                    table_edges[i : i + EDGE_BATCH]
+                )
+            )
+    summary.edges_inserted += len(table_edges)
+    print(f"[ingest][tables] inserted {len(table_edges)} table<->doc edge(s)")

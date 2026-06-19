@@ -56,7 +56,7 @@ from backend.app.services.predicates import (
 from backend.app.services.prompts import PROMPTS
 
 _VIAO_NS = "https://veerla-ramrao.ai/ontology/intelligence-artifact"
-_DEFAULT_PER_CHUNK_TYPES = ("Claim", "Finding", "Observation")
+_DEFAULT_PER_CHUNK_TYPES = ("Claim", "Finding", "Observation", "Event")
 
 
 @dataclass
@@ -79,6 +79,33 @@ class ArtifactGenSummary:
 
 def _artifact_iri(artifact_type: str) -> str:
     return f"{_VIAO_NS}#{artifact_type}_{uuid.uuid4().hex[:16]}"
+
+
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _normalize_str_field(value: Any) -> str | None:
+    """Strip + null-out empty strings. Non-strings -> None."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    v = value.strip()
+    return v or None
+
+
+def _normalize_date_field(value: Any) -> str | None:
+    """Accept a YYYY-MM-DD string from the LLM and return it; otherwise None.
+
+    Kept permissive: we DO NOT parse to date here. The LLM occasionally
+    returns "2024" or "Jan 2024"; store null rather than risk a malformed
+    column value. Downstream consumers can re-parse from the raw field
+    later if we tighten validation.
+    """
+    s = _normalize_str_field(value)
+    if s is None or not _ISO_DATE_RE.match(s):
+        return None
+    return s
 
 
 def _extract_json(text: str) -> Any:
@@ -338,28 +365,46 @@ async def generate_per_chunk_artifacts(
                 except (TypeError, ValueError):
                     conf = None
 
-                # New (2026-06-13): evidence_status / claim_source /
-                # time_scope metadata captured by the updated
-                # artifact_chunk_extract_with_entities prompt. Stored
-                # in extra_metadata JSONB so deep_research can use them
-                # in the KEY CLAIMS + KEY INSIGHTS sections.
-                raw_ev_status = (item.get("evidence_status") or "").strip().lower()
-                if raw_ev_status not in ("backed", "partial", "unbacked"):
-                    raw_ev_status = None  # leave null rather than guess
-                claim_source = (item.get("claim_source") or None)
-                if isinstance(claim_source, str):
-                    claim_source = claim_source.strip() or None
-                time_scope = item.get("time_scope") or None
-                if isinstance(time_scope, str):
-                    time_scope = time_scope.strip() or None
-
                 airi = _artifact_iri(artifact_type)
                 artifact_iris.append(airi)
                 used_entities = bool(chunks_to_entities.get(chunk_id))
-                prompt_version = (
-                    "artifact_chunk_extract_with_entities@v2"
-                    if used_entities else "artifact_chunk_extract@v1"
-                )
+                # Event items carry a date-shaped extra_metadata; the other
+                # three types carry evidence_status / claim_source / time_scope.
+                # The prompt-version label tracks which prompt produced them.
+                if artifact_type == "Event":
+                    extra: dict[str, Any] = {
+                        "event_date": _normalize_date_field(item.get("event_date")),
+                        "event_start_date": _normalize_date_field(
+                            item.get("event_start_date")),
+                        "event_end_date": _normalize_date_field(
+                            item.get("event_end_date")),
+                        "event_category": _normalize_str_field(
+                            item.get("event_category")),
+                    }
+                    prompt_version = (
+                        "artifact_chunk_extract_with_entities@v3"
+                        if used_entities
+                        else "artifact_chunk_extract@v2"
+                    )
+                else:
+                    # New (2026-06-13): evidence_status / claim_source /
+                    # time_scope metadata captured by the updated
+                    # artifact_chunk_extract_with_entities prompt. Stored
+                    # in extra_metadata JSONB so deep_research can use them
+                    # in the KEY CLAIMS + KEY INSIGHTS sections.
+                    raw_ev_status = (item.get("evidence_status") or "").strip().lower()
+                    if raw_ev_status not in ("backed", "partial", "unbacked"):
+                        raw_ev_status = None  # leave null rather than guess
+                    extra = {
+                        "evidence_status": raw_ev_status,
+                        "claim_source": _normalize_str_field(item.get("claim_source")),
+                        "time_scope": _normalize_str_field(item.get("time_scope")),
+                    }
+                    prompt_version = (
+                        "artifact_chunk_extract_with_entities@v3"
+                        if used_entities
+                        else "artifact_chunk_extract@v2"
+                    )
                 artifact_payloads.append({
                     "artifact_identifier": airi,
                     "artifact_type": artifact_type,
@@ -370,11 +415,7 @@ async def generate_per_chunk_artifacts(
                     "prompt_version": prompt_version,
                     "status": "ACTIVE",
                     "graph_version": 0,  # filled in below
-                    "extra_metadata": {
-                        "evidence_status": raw_ev_status,
-                        "claim_source": claim_source,
-                        "time_scope": time_scope,
-                    },
+                    "extra_metadata": extra,
                 })
                 artifact_to_chunk.append((airi, chunk_id, doc_id, text))
                 embed_texts.append(text)

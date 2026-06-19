@@ -36,6 +36,7 @@ from sqlalchemy import func, select, text as sql_text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from backend.app.db.graph_version import bump_version, current_version
+from backend.app.db.models.artifacts import IntelligenceArtifact
 from backend.app.db.models.documents import Chunk, Document
 from backend.app.db.models.entities import Entity
 from backend.app.db.models.graph import GraphRelationship
@@ -62,6 +63,8 @@ class EntityExtractSummary:
     entities_reused: int = 0
     chunk_entity_edges: int = 0
     type_edges: int = 0
+    tables_scanned: int = 0
+    table_entity_edges: int = 0
     llm_cost_usd: float = 0.0
     embedding_cost_usd: float = 0.0
     total_cost_usd: float = 0.0
@@ -74,6 +77,103 @@ def _normalize_name(name: str) -> str:
     """Lowercase + strip non-alphanumerics (except internal spaces)."""
     s = re.sub(r"[^\w\s]", "", name, flags=re.UNICODE).strip().lower()
     return re.sub(r"\s+", " ", s)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2a v2 -- table-to-entity linking.
+#
+# After the per-chunk entity-mining pass finishes, we walk every ACTIVE
+# StructuredTable artifact, scan its caption + row labels + cell values
+# for strings that match an entity by normalized name, and emit
+# `Table -> viao:assertsAbout -> Entity` edges. This makes tables
+# first-class graph citizens for the entity-anchored BFS that Phase 2's
+# retrieval modes rely on. No LLM calls; pure DB + Python.
+# ---------------------------------------------------------------------------
+
+# Candidate-string filter: drop strings that can't possibly be entity
+# names (pure numbers, short tokens, generic table-section words). Keeps
+# everything else for the normalized-name match.
+_NUMERIC_CANDIDATE_RE = re.compile(
+    r"^[\s\-\+\$€£¥₹%()0-9,.–—a-z]+$",
+    re.IGNORECASE,
+)
+_DATE_LIKE_RE = re.compile(
+    r"^(?:Q[1-4]\s+)?(?:FY|fy|cy|CY|H[12]\s+)?(?:19|20)\d{2}\b",
+)
+
+# Generic financial-table noise that should NEVER match an entity even if
+# someone unfortunately named their entity that. Conservative -- prefer
+# false-negatives (miss-link a row labeled "Total") over false-positives.
+_GENERIC_TABLE_TOKENS = frozenset(s.lower() for s in (
+    "total", "subtotal", "grand total", "other", "others", "all",
+    "balance", "ending balance", "opening balance", "beginning balance",
+    "average", "weighted average", "sum", "n/a", "na", "nil", "none",
+    "amount", "amounts", "value", "values", "rate", "share", "shares",
+    "year", "years", "fy", "cy", "quarter", "month", "day",
+    "current", "previous", "prior", "next", "last", "first", "second",
+    "third", "fourth", "fifth", "annual", "interim", "ttm",
+    "increase", "decrease", "change", "variance",
+    "yes", "no", "true", "false", "applicable", "not applicable",
+    "above", "below", "see notes", "see note", "note", "notes",
+))
+
+
+def _filter_candidate(s: str | None) -> bool:
+    """Return True if `s` could plausibly be an entity-name reference.
+
+    Drops: empty / very short strings, pure numbers, currency / percent
+    values, dates / year prefixes, common table-section noise."""
+    if not isinstance(s, str):
+        return False
+    cleaned = s.strip()
+    if len(cleaned) < 3:
+        return False
+    lower = cleaned.lower()
+    if lower in _GENERIC_TABLE_TOKENS:
+        return False
+    if _DATE_LIKE_RE.match(cleaned):
+        return False
+    if _NUMERIC_CANDIDATE_RE.match(cleaned):
+        # Re-check: the regex is permissive (allows letters); demand the
+        # string contains at least 3 letter characters to count as text.
+        n_letters = sum(1 for c in cleaned if c.isalpha())
+        if n_letters < 3:
+            return False
+    return True
+
+
+def _collect_table_candidates(payload: Any) -> list[str]:
+    """Pull every plausibly-entity-name string out of a StructuredTable
+    JSON-LD payload. Order-preserving, deduplicated by normalized form."""
+    if not isinstance(payload, dict):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _push(raw: Any) -> None:
+        if not _filter_candidate(raw):
+            return
+        norm = _normalize_name(raw)
+        if not norm or norm in seen:
+            return
+        seen.add(norm)
+        out.append(raw.strip())
+
+    # Caption
+    _push(payload.get("caption"))
+    # Row labels
+    rows = payload.get("rows")
+    if isinstance(rows, list):
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            _push(r.get("rowLabel"))
+            cells = r.get("cells")
+            if isinstance(cells, list):
+                for c in cells:
+                    if isinstance(c, dict):
+                        _push(c.get("cellValue"))
+    return out
 
 
 def _entity_iri(canonical_name: str, class_iri: str) -> str:
@@ -485,6 +585,14 @@ async def extract_entities(
             await session.execute(
                 pg_insert(GraphRelationship).values(type_edge_payloads[i : i + EDGE_BATCH])
             )
+
+    # Phase 2a v2: link StructuredTable artifacts to entities by name. Runs
+    # AFTER the per-chunk entity-mining pass so all just-minted entities
+    # are visible. Idempotent (ON CONFLICT DO NOTHING) -- safe to re-run
+    # on existing corpora to backfill linkage.
+    await _link_tables_to_entities(summary)
+
+    async with session_scope() as session:
         summary.new_graph_version = await bump_version(session)
 
     summary.total_cost_usd = summary.llm_cost_usd + summary.embedding_cost_usd
@@ -497,8 +605,148 @@ async def extract_entities(
         f"reused={summary.entities_reused}), "
         f"chunk_entity_edges={summary.chunk_entity_edges}, "
         f"type_edges={summary.type_edges}, "
+        f"tables_scanned={summary.tables_scanned}, "
+        f"table_entity_edges={summary.table_entity_edges}, "
         f"cost=${summary.total_cost_usd:.4f}, "
         f"wall={summary.wall_seconds:.1f}s, "
         f"graph_version -> {summary.new_graph_version}"
     )
     return summary
+
+
+async def _link_tables_to_entities(summary: EntityExtractSummary) -> None:
+    """Phase 2a v2: write `Table -> viao:assertsAbout -> Entity` edges
+    for every ACTIVE StructuredTable whose JSON-LD payload mentions a
+    known entity by name.
+
+    Strategy:
+      1. Pre-load the full entity name -> id dict (1 query).
+      2. Pre-load all ACTIVE StructuredTable rows + their JSONB payloads.
+      3. For each table, walk caption + rowLabels + cellValues; normalize
+         each candidate and look up in the dict.
+      4. Batch-insert the edges with ON CONFLICT DO NOTHING.
+
+    Pure DB + Python. No LLM calls. Safe to run as the final step of
+    `extract_entities` -- if no tables exist, returns immediately."""
+    async with session_scope() as session:
+        # Build the normalized-name lookup dict.
+        ent_rows = await session.execute(
+            select(Entity.id, Entity.normalized_name).where(
+                Entity.status == "ACTIVE"
+            )
+        )
+        ent_by_norm: dict[str, Any] = {}
+        for entity_id, norm in ent_rows.all():
+            if isinstance(norm, str) and norm:
+                ent_by_norm[norm] = entity_id
+
+        if not ent_by_norm:
+            print(
+                "[link-tables] no entities in DB; skipping table->entity "
+                "linkage pass"
+            )
+            return
+
+        # Pull every ACTIVE StructuredTable artifact + its JSON-LD payload.
+        table_rows = await session.execute(
+            select(
+                IntelligenceArtifact.id,
+                IntelligenceArtifact.extra_metadata,
+            ).where(
+                IntelligenceArtifact.artifact_type == "StructuredTable",
+                IntelligenceArtifact.status == "ACTIVE",
+            )
+        )
+        all_tables = table_rows.all()
+
+        gv = await current_version(session)
+
+    if not all_tables:
+        print("[link-tables] no StructuredTable artifacts found; nothing to link")
+        return
+
+    summary.tables_scanned = len(all_tables)
+    print(
+        f"[link-tables] scanning {summary.tables_scanned} table(s) for "
+        f"name matches against {len(ent_by_norm)} entity name(s)..."
+    )
+
+    edge_payloads: list[dict[str, Any]] = []
+    seen_pairs: set[tuple[Any, Any]] = set()
+    for table_id, payload in all_tables:
+        candidates = _collect_table_candidates(payload)
+        if not candidates:
+            continue
+        for cand in candidates:
+            norm = _normalize_name(cand)
+            entity_id = ent_by_norm.get(norm)
+            if entity_id is None:
+                continue
+            pair = (table_id, entity_id)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            edge_payloads.append({
+                "source_node_type": "intelligence_artifact",
+                "source_node_id": table_id,
+                "target_node_type": "entity",
+                "target_node_id": entity_id,
+                "predicate_iri": VIAO_ASSERTS_ABOUT,
+                "predicate_label": "viao:assertsAbout",
+                "relationship_type": "assertsAbout",
+                "relationship_source": "DOCUMENT_EXTRACTION",
+                "is_authoritative": True,
+                "source_chunk_id": None,
+                "source_document_id": None,
+                "source_artifact_id": table_id,
+                "graph_version": gv,
+                "extra_metadata": {},
+            })
+
+    if not edge_payloads:
+        print("[link-tables] no name matches found; 0 edges written")
+        return
+
+    # Idempotent insert: skip rows that already exist for the same
+    # (source, target, predicate) tuple. The current schema doesn't have
+    # a unique index on those columns, so we de-dupe by reading existing
+    # pairs first instead of relying on ON CONFLICT.
+    async with session_scope() as session:
+        existing_rows = await session.execute(
+            select(
+                GraphRelationship.source_node_id,
+                GraphRelationship.target_node_id,
+            ).where(
+                GraphRelationship.predicate_iri == VIAO_ASSERTS_ABOUT,
+                GraphRelationship.source_node_type == "intelligence_artifact",
+                GraphRelationship.target_node_type == "entity",
+            )
+        )
+        already_have: set[tuple[Any, Any]] = {
+            (s, t) for s, t in existing_rows.all()
+        }
+
+    fresh = [
+        p for p in edge_payloads
+        if (p["source_node_id"], p["target_node_id"]) not in already_have
+    ]
+
+    if not fresh:
+        print(
+            f"[link-tables] {len(edge_payloads)} candidate edge(s); "
+            "all already present, 0 new"
+        )
+        return
+
+    EDGE_BATCH = 500
+    async with session_scope() as session:
+        for i in range(0, len(fresh), EDGE_BATCH):
+            await session.execute(
+                pg_insert(GraphRelationship).values(fresh[i : i + EDGE_BATCH])
+            )
+
+    summary.table_entity_edges = len(fresh)
+    print(
+        f"[link-tables] inserted {len(fresh)} table->entity edge(s) "
+        f"({len(edge_payloads) - len(fresh)} duplicate(s) skipped)"
+    )

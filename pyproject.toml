@@ -43,6 +43,9 @@ dependencies = [
     "requests>=2.33.1",
     "beautifulsoup4>=4.12",   # source_documents/* downloaders
     "weasyprint>=60",         # HTML -> PDF rendering for SEC EDGAR fallback
+    "pdfplumber>=0.11",       # Phase 2a: PDF table detection + flat extraction
+    "Pillow>=10.0",           # implicit dep of pdfplumber's image rendering
+    "jsonschema>=4",          # Phase 2a: validate StructuredTable JSON-LD
 ]
 
 [project.optional-dependencies]

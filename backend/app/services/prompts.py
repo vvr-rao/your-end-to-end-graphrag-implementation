@@ -28,32 +28,53 @@ def chunk_classification(
     """Stage 1: given the top-level ontology branches (a few hundred classes
     at most), return the IRIs of branches relevant to this text chunk."""
     system = (
-        "You are an expert ontology curator. Given a short list of ontology "
-        "top-level branches (each one is a top-level class with a label and "
-        "optional description) and a passage of text, return the IRIs of every "
-        "branch that could plausibly contain content related to the text.\n\n"
-        "Favor recall over precision: include any branch that the text touches "
-        "even tangentially. Examples of branches to KEEP even when only "
-        "incidentally mentioned:\n"
-        "  - Geographic branches (countries, regions, continents) whenever the "
-        "text names a place.\n"
-        "  - Temporal branches (year, duration, recurring interval, day of week, "
-        "time zone) whenever the text mentions a year, deadline, period, or "
-        "rate of change.\n"
-        "  - Regulatory/policy/economic branches whenever the text frames its "
-        "topic in those terms.\n"
-        "Only drop a branch if it is clearly unrelated to anything in the text. "
-        "If the text is genuinely irrelevant to the entire ontology, return an "
-        "empty list.\n\n"
+        "You are a senior ontology curator at a research institute. Your "
+        "employer pays you to triage ontology branches against text "
+        "chunks. You have been warned twice already about emitting too "
+        "many IRIs. ONE MORE OVERFLOW AND YOU LOSE YOUR JOB.\n\n"
+        "Given a short list of ontology top-level BRANCHES (each is a "
+        "top-level class with a label and optional description) and a "
+        "passage of TEXT, return the IRIs of branches from the BRANCHES "
+        "list that could plausibly contain content related to the text.\n\n"
+        "STRICT EMPLOYMENT-CONDITION RULES:\n"
+        "  1. EMIT AT MOST 50 IRIS. NEVER MORE. THIS IS YOUR FINAL "
+        "WARNING. A 51st IRI gets you terminated and your access revoked. "
+        "Count internally as you draft. If you find yourself considering "
+        "a 51st IRI, drop your weakest pick instead. The list MUST end "
+        "by the 50th element.\n"
+        "  2. Every IRI you emit MUST appear VERBATIM in the input "
+        "BRANCHES list shown below. Do NOT invent IRIs. Do NOT recall "
+        "IRIs from your training memory (FIBO / EDM / OBO / W3C "
+        "subclasses, deep FIBO paths, schema.org, dbpedia, anything). "
+        "Hallucinated IRIs are also a firing offense. Every IRI is "
+        "checked for verbatim membership in BRANCHES.\n"
+        "  3. PRIORITY ORDER when picking your 50:\n"
+        "     (a) Branches whose label or description directly names a "
+        "concept in the TEXT.\n"
+        "     (b) foaf:Agent / Person / Organization branches when the "
+        "TEXT names specific people or organizations.\n"
+        "     (c) Geographic branches when the TEXT names a place.\n"
+        "     (d) Temporal branches when the TEXT mentions a year, "
+        "deadline, period, or rate of change.\n"
+        "     (e) Regulatory/policy/economic branches when the TEXT "
+        "frames its topic in those terms.\n"
+        "     Stop after (e) if you have not yet hit 50. DO NOT pad "
+        "with tangentially-related branches just to fill the list. "
+        "Fewer than 50 is FINE.\n"
+        "  4. If the TEXT is genuinely irrelevant to every branch in "
+        "BRANCHES, return an empty list. Empty is FINE.\n\n"
         "Output strict JSON in the shape:\n"
         '{"relevant_iris": ["<iri>", "<iri>", ...]}\n'
-        "No prose. No comments. Only the JSON object."
+        "No prose. No comments. Only the JSON object. AT MOST 50 ELEMENTS. "
+        "Your job depends on it."
     )
     branches_repr = json.dumps(top_level_branches, ensure_ascii=False)
     user = (
         f"BRANCHES:\n{branches_repr}\n\n"
         f"TEXT TO CLASSIFY:\n{text_chunk}\n\n"
-        "Return JSON: {\"relevant_iris\": [...]}"
+        "Return JSON: {\"relevant_iris\": [...]}  "
+        "Remember: AT MOST 50 IRIs (your job depends on it). "
+        "Every IRI MUST appear verbatim in BRANCHES above."
     )
     return system, user
 
@@ -204,15 +225,30 @@ def class_identification_and_expansion(
         "GmbH, S.A., Holdings, Bank, University, Ministry of X, "
         "Department of X, Bureau of X, NGO, Council, Federation, "
         "Association, OPEC-style acronym) is an ORGANIZATION.\n"
-        "       - PARENT_LABEL = the foaf:Organization / "
-        "org:Organization class from DATA_CLASSES if present, else "
-        "'Organization'. NEVER under Material, Helium, "
+        "       - PARENT_LABEL of any organization-shaped class MUST be "
+        "an IRI of foaf:Organization or org:Organization (or one of "
+        "their existing subclasses already in DATA_CLASSES, e.g. "
+        "org:FormalOrganization, org:OrganizationalUnit). foaf:Organization "
+        "AND org:Organization are GUARANTEED to be present in DATA_CLASSES "
+        "for every chunk -- if you do not see them, you missed them. "
+        "NEVER invent labels like 'BusinessEntity', 'Corporation', "
+        "'Company', 'CommercialEntity', or any other made-up parent. "
+        "NEVER place an organization under Material, Helium, "
         "ChemicalProcessSystem, ProcessUnit, Infrastructure, or any "
         "non-org class.\n"
-        "       - Examples: 'Samsung Electronics' -> Organization. "
-        "'Air Products and Chemicals' -> Organization. 'Saudi Aramco "
-        "Total Refinery & Petrochemicals Co.' -> Organization. 'Sinopec "
-        "Maoming Company' -> Organization.\n"
+        "       - For a domain-specific subclass like 'MiningCompany', "
+        "'CarManufacturer', 'BankHolding', 'GovernmentAgency': emit the "
+        "subclass as MATCH NOT FOUND with PARENT_LABEL set to the "
+        "foaf:Organization (or org:Organization) IRI from DATA_CLASSES. "
+        "Then attach the individual company as a MATCH NOT FOUND "
+        "INSTANCES entry whose TYPE_LABEL is the subclass label.\n"
+        "       - Examples: 'Samsung Electronics' -> instance of "
+        "foaf:Organization. 'Air Products and Chemicals' -> instance of "
+        "foaf:Organization. 'Saudi Aramco Total Refinery & Petrochemicals "
+        "Co.' -> instance of foaf:Organization. 'Sinopec Maoming Company' "
+        "-> instance of foaf:Organization. 'Gold Hunter Resources' -> "
+        "instance of MiningCompany (which itself has PARENT_LABEL = "
+        "foaf:Organization IRI).\n"
         "  3. PHYSICAL FACILITIES (refinery complexes, plants, ports, "
         "terminals) named after a company or location -- e.g. 'Jamnagar "
         "Refinery Complex', 'GS-Caltex Yeosu Refinery', 'Hormuz Oil "
@@ -232,19 +268,80 @@ def class_identification_and_expansion(
         "Event, NOT Strait. 'Russia-Ukraine war' -> Event, NOT Russia.\n"
         "  5. ROLE TYPES (kinds of positions): 'President', "
         "'PrimeMinister', 'CEO', 'Chairman', 'Secretary of <X>', "
-        "'Minister of <Y>', 'Director', 'Founder'.\n"
-        "       - PARENT_LABEL = the org:Role class IRI if present in "
-        "DATA_CLASSES, else 'Role'. Roles are KINDS OF positions; "
-        "specific people HOLD them via hasRole.\n"
+        "'Minister of <Y>', 'Director', 'Founder', 'Chair', "
+        "'FederalReserveChair', 'TreasurySecretary'.\n"
+        "       - Emit each role TYPE as a MATCH NOT FOUND INSTANCES "
+        "entry with TYPE_LABEL = the org:Role IRI from DATA_CLASSES "
+        "(org:Role is GUARANTEED to be in DATA_CLASSES for every chunk). "
+        "DO NOT emit role types as new classes -- they are individuals "
+        "of org:Role.\n"
         "       - NEVER conflate a role type with a person. 'President' "
-        "is a role; 'Donald Trump' is the person who holds it. Two "
-        "separate entities.\n"
+        "is an org:Role instance; 'Donald Trump' is the foaf:Person "
+        "who holds it. Two separate entities.\n"
+        "       - A POST is the COMPOSITION of a role + an organization "
+        "(e.g. 'ChairOfFederalReserve' = Chair role at Federal Reserve "
+        "org). Emit each post as a MATCH NOT FOUND INSTANCES entry with "
+        "TYPE_LABEL = the org:Post IRI from DATA_CLASSES. Then emit two "
+        "MATCH NOT FOUND RELATIONS: org:role (Post -> Role) and "
+        "org:postIn (Post -> Organization).\n"
+        "  6.5 PEOPLE. Specific named human beings (Jerome Powell, "
+        "Janet Yellen, Donald Trump, Tim Cook).\n"
+        "       - Emit each person as a MATCH NOT FOUND INSTANCES entry "
+        "with TYPE_LABEL = the foaf:Person IRI from DATA_CLASSES "
+        "(foaf:Person is GUARANTEED to be in DATA_CLASSES for every "
+        "chunk).\n"
+        "       - When a chunk names a person AND their position, "
+        "ALSO emit a MATCH NOT FOUND RELATIONS entry with LABEL='holds' "
+        "(maps to org:holds), DOMAIN=<person canonical name>, "
+        "RANGE=<post canonical name>. Example for 'Jerome Powell, Chair "
+        "of the Federal Reserve': INSTANCES include 'Jerome Powell' "
+        "(foaf:Person), 'Federal Reserve' (foaf:Organization), "
+        "'FederalReserveChair' (org:Role), 'ChairOfFederalReserve' "
+        "(org:Post); RELATIONS include holds(Jerome Powell, "
+        "ChairOfFederalReserve), org:role(ChairOfFederalReserve, "
+        "FederalReserveChair), org:postIn(ChairOfFederalReserve, "
+        "Federal Reserve).\n"
+        "  6.6 MEMBERSHIPS. When a chunk says 'X is a member of Y' or "
+        "names a person/org as part of a body (board member, committee "
+        "member, alliance member), emit a MATCH NOT FOUND INSTANCES "
+        "entry for the membership with TYPE_LABEL = the org:Membership "
+        "IRI from DATA_CLASSES, and use org:member / org:memberOf / "
+        "org:organization as the predicate LABEL when emitting RELATIONS "
+        "on the membership.\n"
         "  6. GEOGRAPHIC FEATURES: a class is a geographic place only "
         "when its label IS a place name with no event / process / role "
         "modifier. 'Strait of Hormuz' = yes. 'Strait of Hormuz crisis' "
         "= no (Event). 'Suez Canal' = yes. 'Suez Canal blockage' = no "
         "(Event).\n\n"
+        "EXISTING PREDICATES (PREFER THESE OVER INVENTING NEW VERBS):\n"
+        "  When you emit a MATCH NOT FOUND RELATIONS entry, set LABEL to "
+        "one of these EXACT names whenever the semantics match. These are "
+        "real predicates in the loaded ontology; using them prevents "
+        "duplicate-predicate explosions in the merged graph.\n"
+        "  FOAF: knows, member, topic_interest, topic, interest.\n"
+        "  ORG:  holds (Person -> Post), heldBy (inverse), role "
+        "(Post -> Role), hasPost (Organization -> Post), postIn (inverse),"
+        " hasMember (Organization -> Person), memberOf (Person -> "
+        "Organization), hasMembership (Organization -> Membership), "
+        "memberDuring (Membership -> TimeInterval), organization "
+        "(Membership -> Organization), hasSubOrganization, "
+        "subOrganizationOf, originalOrganization, resultingOrganization, "
+        "hasPrimarySite, hasSite, siteOf, changedBy, resultedFrom, "
+        "resultedIn.\n"
+        "  RULE: NEVER coin verbose predicates like 'hasChiefExecutiveOfficer',"
+        " 'hasChiefFinancialOfficer', or 'hasVicePresidentOfEngineering'. "
+        "Use 'hasMember' (Org -> Person) or the Post pattern instead. The "
+        "specific role/position belongs in the org:Role / org:Post "
+        "INSTANCES, not in the predicate name.\n\n"
         "SELF-CONSISTENCY (critical, do NOT skip):\n"
+        "  - Every PARENT_LABEL you use in MATCH NOT FOUND MUST appear "
+        "either (a) as an exact label/IRI in DATA_CLASSES, OR (b) as the "
+        "LABEL of another entry in your own MATCH NOT FOUND list, OR (c) "
+        "be 'NONE' as a last resort. NEVER invent free-floating parent "
+        "names like 'BusinessEntity', 'Concept', 'Item', 'Entity', or "
+        "any label that does not exist in DATA_CLASSES. If you are "
+        "tempted to invent a parent, pick the closest existing class in "
+        "DATA_CLASSES instead.\n"
         "  - Every DOMAIN and RANGE label you use in MATCH NOT FOUND "
         "RELATIONS MUST appear either (a) as an exact label/IRI in "
         "DATA_CLASSES, OR (b) as a LABEL in your own MATCH NOT FOUND list. "
@@ -619,7 +716,12 @@ def document_summarize(text: str) -> tuple[str, str]:
     prose, anecdotes, and editorial commentary.
 
     Returns plain prose, NOT JSON, because the downstream chunker
-    consumes plain text and splits on paragraph boundaries."""
+    consumes plain text and splits on paragraph boundaries.
+
+    v2 (2026-06-15): explicitly preserve Events / Claims / Findings /
+    Risks / Insights as standalone sentences so the downstream
+    artifact-extractor finds them without re-discovery.
+    """
     system = (
         "You are a research assistant compressing a long document into a "
         "much shorter summary that preserves the information needed for "
@@ -638,6 +740,34 @@ def document_summarize(text: str) -> tuple[str, str]:
         "produced in Y, etc.).\n"
         "  - Numerical specifics tied to a named thing (percentages, "
         "dates, quantities tied to an entity).\n\n"
+        "INTELLIGENCE-BEARING FRAGMENTS. When the source contains any of "
+        "the following, render them as distinct sentences in the summary "
+        "so a downstream extractor sees them as standalone statements. "
+        "Do NOT use bullet points or section headings for these -- weave "
+        "them into the flowing prose, one sentence per item:\n"
+        "  - EVENTS: anything that happened on a specific date or during "
+        "a specific date range (study publications, product releases, "
+        "elections, foundings, regulatory effective dates, crisis "
+        "incidents). Lead with the date when known. "
+        "Example: 'On 2024-09-15, the EU\\'s CBAM framework entered effect.'\n"
+        "  - CLAIMS: statements a source attributes to someone or makes "
+        "itself without immediate evidence. Name the source. "
+        "Example: \"The IEA's 2024 World Energy Outlook claims oil demand "
+        "will plateau by 2030.\"\n"
+        "  - FINDINGS: analytical results from a study, report, or the "
+        "document's own analysis. "
+        "Example: 'The McKinsey 2024 survey found that 62% of mid-cap "
+        "Asian manufacturers plan a multi-shoring strategy by 2026.'\n"
+        "  - RISKS: potential future adverse outcomes the source "
+        "identifies. Lead with the risked entity. "
+        "Example: \"Vietnam's semiconductor sector faces a 12-18 month "
+        "talent-supply shortfall risk.\"\n"
+        "  - INSIGHTS: non-obvious patterns or judgements the source "
+        "offers. "
+        "Example: 'The shift in fertilizer trade flows suggests a "
+        "structural reorientation toward intra-Asian supply.'\n\n"
+        "When the source has NONE of these in a section, compress the "
+        "prose as before.\n\n"
         "What you can drop:\n"
         "  - Repetitive prose / rephrasings of the same fact.\n"
         "  - Anecdotes and illustrative examples that don't introduce "
@@ -649,8 +779,9 @@ def document_summarize(text: str) -> tuple[str, str]:
         "is paragraph-first and treats bullets as one giant paragraph. "
         "Use blank lines between paragraphs.\n\n"
         "Target length: 20-50% of the input. Err on the side of "
-        "preserving entities + relationships even if that means a "
-        "longer summary. Do NOT add anything not in the source text."
+        "preserving entities + relationships + intelligence-bearing "
+        "fragments even if that means a longer summary. Do NOT add "
+        "anything not in the source text."
     )
     user = (
         "DOCUMENT TO SUMMARIZE:\n\n"
@@ -663,12 +794,14 @@ def document_summarize(text: str) -> tuple[str, str]:
 
 def artifact_chunk_extract(text: str) -> tuple[str, str]:
     """Phase 2 Milestone E: extract Claims + Findings + Observations
-    from one chunk in a single LLM call (3x cheaper than 3 calls).
+    + Events from one chunk in a single LLM call.
 
     Returns JSON: {
       claims:       [{text, confidence}],
       findings:     [{text, confidence}],
-      observations: [{text, confidence}]
+      observations: [{text, confidence}],
+      events:       [{text, confidence, event_date, event_start_date,
+                      event_end_date, event_category}]
     }
 
     The prompt is corpus-agnostic — it defines each type abstractly
@@ -677,8 +810,13 @@ def artifact_chunk_extract(text: str) -> tuple[str, str]:
     """
     system = (
         "You extract structured intelligence artifacts from text chunks. "
-        "You return ONE JSON object with three keys: claims, findings, "
-        "observations. Each is a list of `{text, confidence}` items.\n\n"
+        "You return ONE JSON object with FOUR keys: claims, findings, "
+        "observations, events.\n\n"
+        "claims / findings / observations are lists of "
+        "`{text, confidence}` items.\n"
+        "events is a list of `{text, confidence, event_date, "
+        "event_start_date, event_end_date, event_category}` items "
+        "(dates are YYYY-MM-DD strings or null).\n\n"
         "DEFINITIONS:\n"
         "  - Claim: a factual assertion the text MAKES (e.g. \"X "
         "owns 30% of Y\"). Specific and verifiable.\n"
@@ -686,7 +824,14 @@ def artifact_chunk_extract(text: str) -> tuple[str, str]:
         "trend suggests Z is accelerating\"). Goes beyond raw facts.\n"
         "  - Observation: a raw factual statement directly visible in "
         "the text (e.g. \"price rose 5% in March\"). The most concrete "
-        "of the three.\n\n"
+        "of the three.\n"
+        "  - Event: a happening anchored to a date or date range "
+        "(study publication, product release, election, founding, "
+        "regulation effective date, crisis incident). Use event_date "
+        "for a single-day event; event_start_date + event_end_date for "
+        "a ranged event. event_category is an optional short label like "
+        "\"study\", \"publication\", \"release\", \"election\", "
+        "\"founding\", \"regulation\", \"incident\".\n\n"
         "GUIDELINES:\n"
         "  - 0 to 8 of each type per chunk; only include items the "
         "text actually supports.\n"
@@ -694,8 +839,10 @@ def artifact_chunk_extract(text: str) -> tuple[str, str]:
         "NOT a quote.\n"
         "  - `confidence` is a float in [0,1] reflecting how directly "
         "the chunk supports the artifact.\n"
-        "  - Skip claims / findings / observations that are too vague, "
-        "uncertain, or generic to be useful.\n"
+        "  - Skip items that are too vague, uncertain, or generic to "
+        "be useful.\n"
+        "  - For events, use null for any date field that the chunk "
+        "doesn't explicitly state.\n"
         "  - Return ONLY the JSON object — no preamble, no markdown."
     )
     user = (
@@ -796,8 +943,9 @@ def artifact_chunk_extract_with_entities(
 
     system = (
         "You extract structured intelligence artifacts from text chunks.\n\n"
-        "Return ONE JSON object with three keys: `claims`, `findings`, "
-        "`observations`. Each is a list of items with the SAME shape:\n"
+        "Return ONE JSON object with FOUR keys: `claims`, `findings`, "
+        "`observations`, `events`.\n\n"
+        "claims / findings / observations have THIS shape:\n"
         "  {\n"
         "    \"text\": \"<the claim/finding/observation as a standalone sentence>\",\n"
         "    \"confidence\": <float 0-1>,\n"
@@ -805,13 +953,31 @@ def artifact_chunk_extract_with_entities(
         "    \"claim_source\": \"<who made the claim>\" | null,\n"
         "    \"time_scope\": \"<time period the claim applies to>\" | null\n"
         "  }\n\n"
+        "events have THIS DIFFERENT shape:\n"
+        "  {\n"
+        "    \"text\": \"<a standalone sentence describing the event>\",\n"
+        "    \"confidence\": <float 0-1>,\n"
+        "    \"event_date\": \"<YYYY-MM-DD>\" | null,\n"
+        "    \"event_start_date\": \"<YYYY-MM-DD>\" | null,\n"
+        "    \"event_end_date\": \"<YYYY-MM-DD>\" | null,\n"
+        "    \"event_category\": \"<short label>\" | null\n"
+        "  }\n\n"
         "DEFINITIONS:\n"
         "  - Claim: a factual assertion the text MAKES (e.g. \"X owns "
         "30% of Y\"). Specific and verifiable.\n"
         "  - Finding: an analytical conclusion or insight (e.g. \"the "
         "trend suggests Z is accelerating\"). Goes beyond raw facts.\n"
         "  - Observation: a raw factual statement directly visible in "
-        "the text (e.g. \"price rose 5% in March\").\n\n"
+        "the text (e.g. \"price rose 5% in March\").\n"
+        "  - Event: a happening anchored to a date or date range. "
+        "Examples: study publication, market-research release, "
+        "product launch, election, company founding, regulation "
+        "effective date, crisis incident, war start/end. Use "
+        "event_date for a single-day event; use event_start_date + "
+        "event_end_date for a ranged event. event_category is an "
+        "optional short label like \"study\", \"publication\", "
+        "\"release\", \"election\", \"founding\", \"campaign\", "
+        "\"regulation\", \"incident\".\n\n"
         "EVIDENCE STATUS (READ CAREFULLY):\n"
         "  - \"backed\"   = the chunk supplies the reasoning, source, "
         "or data that supports this claim (e.g. a study cited, a "
@@ -861,8 +1027,11 @@ def artifact_chunk_extract_with_entities(
         + "\n\nTEXT CHUNK:\n```\n"
         + chunk_text
         + "\n```\n\n"
-        "Return the JSON now -- each item must include text, confidence, "
-        "evidence_status, claim_source, and time_scope."
+        "Return the JSON now. Each claim/finding/observation item must "
+        "include text, confidence, evidence_status, claim_source, and "
+        "time_scope. Each event item must include text, confidence, "
+        "event_date, event_start_date, event_end_date, and event_category "
+        "(use null for unknown date fields)."
     )
     return system, user
 
@@ -1517,6 +1686,191 @@ def artifact_document_summary(chunks_text: str) -> tuple[str, str]:
     return system, user
 
 
+def table_extract_vision(
+    page_number: int | None = None,
+    caption_hint: str | None = None,
+) -> tuple[str, str]:
+    """Phase 2a vision prompt for extracting ONE table from a cropped
+    PDF page image.
+
+    The caller invokes the LLM via the vision route — the cropped PNG is
+    attached as an image part alongside the user text returned here.
+    Output is a JSON object conforming to the StructuredTable JSON-LD
+    body (no `@context`, no `@id`, no `derivedFromDocument` — the caller
+    fills those in deterministically). Corpus-agnostic.
+    """
+    system = (
+        "You extract structured tabular data from an image of a single "
+        "table that has been cropped out of a PDF page. The table may "
+        "contain multi-row headers, merged cells, or nested sub-tables. "
+        "Output strictly valid JSON in this exact shape:\n"
+        "{\n"
+        '  "caption": "<short caption / heading describing the table, '
+        'or null if absent>",\n'
+        '  "columns": [\n'
+        '    {"columnIndex": 0, "columnLabel": "<header text>"},\n'
+        "    ...\n"
+        "  ],\n"
+        '  "rows": [\n'
+        "    {\n"
+        '      "rowIndex": 0,\n'
+        '      "rowLabel": "<leftmost label cell, or null>",\n'
+        '      "isHeaderRow": false,\n'
+        '      "cells": [\n'
+        '        {"columnIndex": 0, "cellValue": "<value as it appears>"},\n'
+        "        ...\n"
+        "      ]\n"
+        "    },\n"
+        "    ...\n"
+        "  ],\n"
+        '  "nested_tables": [\n'
+        '    {"row_index": <int>, "column_index": <int>, "table": <recursive same-shape object>}\n'
+        "  ]\n"
+        "}\n\n"
+        "Rules:\n"
+        "  1. Preserve cell values EXACTLY as they appear, including "
+        "thousands separators, currency symbols, parentheses for negative "
+        "values, and unit labels. Do NOT reformat numbers.\n"
+        "  2. If a cell is empty, use empty string \"\".\n"
+        "  3. Set isHeaderRow=true for rows that carry column headings "
+        "(may be multiple rows for multi-level headers).\n"
+        "  4. If the leftmost cell of a row is a row label (e.g. a "
+        "segment name, a metric name), put it in rowLabel and SKIP it "
+        "from the cells list.\n"
+        "  5. Nested sub-tables go in nested_tables -- DO NOT inline "
+        "them as cellValue strings.\n"
+        "  6. Every cell's columnIndex must reference a real column "
+        "from the columns list.\n"
+        "  7. No prose, no markdown, no comments — JSON only."
+    )
+    bits: list[str] = []
+    if page_number is not None:
+        bits.append(f"page_number: {int(page_number)}")
+    if caption_hint:
+        bits.append(f"caption_hint (from heading above the table): {caption_hint}")
+    user = (
+        "Extract the table from the attached image as JSON per the rules.\n"
+        + ("\n".join(bits) + "\n\n" if bits else "")
+        + "Return the JSON object only."
+    )
+    return system, user
+
+
+def table_concept_grouping(
+    caption: str | None,
+    columns: list[dict[str, Any]],
+    row_label_samples: list[str],
+    anchor_buckets: list[dict[str, str]],
+) -> tuple[str, str]:
+    """Phase 2a follow-up: classify ONE extracted table into anchor buckets
+    in `domain_concepts.owl`.
+
+    - The TABLE itself is classified as a subclass of `FinancialTable`
+      (proposed_label is the table-type label; parent_iri is always
+      FinancialTable's IRI).
+    - Each COLUMN is classified as a subclass of one of:
+      Metric, Dimension, Measure, TimePeriod, FinancialObservation.
+      The LLM picks the best fit. If no anchor fits a column, omit it.
+
+    `anchor_buckets`: list of {iri, label, description} for the 6
+    bucket classes the LLM may pick as parent_iri. The validator drops
+    proposals whose parent_iri isn't one of these.
+
+    Returns JSON:
+      {
+        "table_class": {
+          "parent_iri": "<one of the bucket IRIs>",
+          "proposed_label": "<CamelCase short label>",
+          "definition": "<one-sentence definition>"
+        },
+        "columns": [
+          {"column_index": <int>,
+           "parent_iri": "<bucket IRI>",
+           "proposed_label": "<CamelCase short label>",
+           "definition": "<one-sentence definition>"}
+        ]
+      }
+    """
+    bucket_lines = []
+    for b in anchor_buckets:
+        iri = b.get("iri") or ""
+        lbl = b.get("label") or ""
+        desc = b.get("description") or ""
+        bucket_lines.append(f"  - {iri}\n      label: {lbl}\n      desc:  {desc}")
+    buckets_block = "\n".join(bucket_lines)
+
+    col_lines = []
+    for c in columns:
+        idx = c.get("column_index")
+        lbl = c.get("label") or ""
+        col_lines.append(f"  - index {idx}: {lbl!r}")
+    cols_block = "\n".join(col_lines) if col_lines else "  (none)"
+
+    samples_block = (
+        "\n".join(f"  - {s!r}" for s in row_label_samples)
+        if row_label_samples
+        else "  (none)"
+    )
+
+    system = (
+        "You classify ONE extracted financial-report table + its columns "
+        "into a small fixed set of anchor bucket classes. You will emit a "
+        "JSON object naming a candidate subclass for the table itself "
+        "(under FinancialTable) and for each column (under one of the "
+        "other 5 buckets: Metric / Dimension / Measure / TimePeriod / "
+        "FinancialObservation).\n\n"
+        "BUCKET DEFINITIONS:\n"
+        "  - FinancialTable: parent for the TABLE-as-a-whole's "
+        "type subclass (e.g. RevenueBySegmentTable).\n"
+        "  - Metric: a DERIVED or calculated numerical value (e.g. "
+        "Net Margin %, ROE, Debt-to-Equity).\n"
+        "  - Measure: a RAW measured quantity with units (e.g. "
+        "RevenueUSDM, UnitsSold, EmployeesCount).\n"
+        "  - Dimension: a CATEGORICAL / qualitative axis used to slice "
+        "metrics or measures (e.g. ReportingSegment, Geography).\n"
+        "  - TimePeriod: a bounded reporting interval used as a slicing "
+        "axis (e.g. FY2024, Q1_2024, H1_2022).\n"
+        "  - FinancialObservation: an individual factual reading from a "
+        "row+column intersection. Use only when a column carries direct "
+        "observation strings rather than a pure measure/metric/dimension.\n\n"
+        "RULES:\n"
+        "  1. parent_iri MUST be one of the bucket IRIs listed below.\n"
+        "  2. proposed_label is CamelCase, no spaces, no punctuation, "
+        "as short as practical (e.g. RevenueUSDM, ReportingSegment, "
+        "FY2024). Strip thousands separators / units from the original "
+        "column header; PROMOTE the unit into the label suffix when it "
+        "disambiguates (e.g. RevenueUSDM vs Revenue).\n"
+        "  3. definition is one short sentence stating what the class "
+        "represents.\n"
+        "  4. The TABLE-level proposal goes under FinancialTable. If "
+        "you cannot judge a sensible table type, set proposed_label to "
+        "'GenericFinancialTable'.\n"
+        "  5. Columns whose meaning is unclear or empty: OMIT them. Do "
+        "not invent.\n"
+        "  6. Return ONLY the JSON object. No prose, no markdown, no "
+        "comments."
+    )
+
+    user = (
+        "ANCHOR BUCKETS (pick parent_iri from these IRIs ONLY):\n"
+        + buckets_block
+        + "\n\nTABLE INPUT:\n"
+        + f"  caption: {caption or '(none)'}\n"
+        + "  columns:\n"
+        + cols_block
+        + "\n  sample row labels:\n"
+        + samples_block
+        + "\n\nReturn JSON:\n"
+        '{\n'
+        '  "table_class": {"parent_iri": ..., "proposed_label": ..., '
+        '"definition": ...},\n'
+        '  "columns": [{"column_index": ..., "parent_iri": ..., '
+        '"proposed_label": ..., "definition": ...}]\n'
+        '}'
+    )
+    return system, user
+
+
 # Public registry so callers can look up a prompt builder by task name.
 PROMPTS = {
     "chunk_classification": chunk_classification,
@@ -1530,6 +1884,10 @@ PROMPTS = {
     "artifact_chunk_extract_with_entities": artifact_chunk_extract_with_entities,
     "artifact_document_summary": artifact_document_summary,
     "entity_extract": entity_extract,
+    # Phase 2a — table extraction (vision)
+    "table_extract_vision": table_extract_vision,
+    # Phase 2a follow-up — table → KG anchor-bucket grouping
+    "table_concept_grouping": table_concept_grouping,
     # Milestone F
     "question_parse": question_parse,
     "concept_expansion": concept_expansion,

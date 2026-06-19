@@ -22,7 +22,10 @@ tasks:
     model: llama-3.3-70b-versatile
     timeout: 60
     temperature: 0.0
-    max_tokens: 2048
+    # Groq llama-3.3-70b supports up to 32k output tokens. 32k is the
+    # model's hard ceiling and accommodates broad-coverage chunks
+    # without truncating the relevant_iris list mid-string.
+    max_tokens: 32768
 
   # ---------------------------------------------------------------------------
   # The hard step: looking at a slice of ontology classes + a doc chunk and
@@ -33,7 +36,10 @@ tasks:
     model: gpt-4.1
     timeout: 180
     temperature: 0.0
-    max_tokens: 8192
+    # gpt-4.1 supports up to 32k output tokens. 32k = ceiling; the model
+    # only emits the tokens it needs so cost scales with actual response
+    # size. At 8192 the JSON response truncated on rich chunks.
+    max_tokens: 32768
     response_format: json_object
 
   # ---------------------------------------------------------------------------
@@ -295,6 +301,37 @@ tasks:
     timeout: 90
     temperature: 0.2
     max_tokens: 1024
+
+  # ---------------------------------------------------------------------------
+  # Phase 2a: extract a single nested/complex table from a cropped PNG of a
+  # PDF page region. Vision input; JSON-object output that conforms to the
+  # StructuredTable JSON-LD schema. Only invoked when pdfplumber's flat
+  # extraction is rejected as low-confidence (merged cells / multi-row
+  # headers / sub-tables). gpt-4o-mini vision suffices: tables are small,
+  # the schema is fixed, no synthesis is required.
+  # ---------------------------------------------------------------------------
+  table_extract_vision:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 90
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+
+  # ---------------------------------------------------------------------------
+  # Phase 2a follow-up: per-extracted-table classification into the 6 anchor
+  # buckets in domain_concepts (FinancialTable / FinancialObservation / Metric
+  # / Dimension / Measure / TimePeriod). Runs ONCE per table during
+  # prune-expand --tables, cached by table sha256 so reruns are free. Cheap
+  # text-only call.
+  # ---------------------------------------------------------------------------
+  table_concept_grouping:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 2048
+    response_format: json_object
 
 # =============================================================================
 # Retry / backoff defaults (applied by the router via tenacity unless overridden

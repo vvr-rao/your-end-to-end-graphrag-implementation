@@ -181,10 +181,236 @@ async def _classify_chunk(
             await asyncio.sleep(sleep_s)
     data = extract_json_from_output(result.text) or {}
     iris = data.get("relevant_iris") or []
-    return [i for i in iris if isinstance(i, str) and i]
+    if not iris and result.text:
+        # Salvage path: Groq sometimes truncates mid-string when the
+        # relevant_iris list is very long for an exhaustive prompt
+        # ("favor recall"). Even if the trailing `]` is missing, we can
+        # still extract every fully-quoted IRI before the truncation.
+        # Heuristic: find every `"http(s)://..."` token in the raw text.
+        salvaged = re.findall(r'"(https?://[^"]+)"', result.text)
+        if salvaged:
+            print(
+                f"[stage1] chunk #{chunk.index} ({chunk.source_name}): "
+                f"JSON parse failed; salvaged {len(salvaged)} IRI(s) from "
+                f"truncated response"
+            )
+            iris = salvaged
+    cleaned = [i for i in iris if isinstance(i, str) and i]
+    # Defense-in-depth: the prompt threatens the model with job loss if
+    # it emits > 50 IRIs, but Groq occasionally over-emits anyway. Cap
+    # server-side so the downstream slice + the implicit response-budget
+    # guarantee both hold even when the model ignores the instruction.
+    _STAGE1_HARD_CAP = 50
+    if len(cleaned) > _STAGE1_HARD_CAP:
+        cleaned = cleaned[:_STAGE1_HARD_CAP]
+    return cleaned
 
 
 # ---------- Stage 2: focused class matching + proposal ----------
+
+
+# Anchor IRIs that should ALWAYS be available to Stage 2 as candidates,
+# regardless of which top-level branches Stage 1 surfaces for a given
+# chunk. People + organizations + roles + posts are foundational enough
+# that the LLM should never have to invent parents like "BusinessEntity"
+# (observed failure mode in pre-fix prune-expand runs). Surfacing them
+# via Stage 1 is unreliable because the label "Agent" is too generic for
+# the Groq classifier to pick on a domain chunk.
+_UNIVERSAL_ANCHOR_IRIS: tuple[str, ...] = (
+    "http://xmlns.com/foaf/0.1/Agent",
+    "http://xmlns.com/foaf/0.1/Person",
+    "http://xmlns.com/foaf/0.1/Organization",
+    "http://xmlns.com/foaf/0.1/Group",
+    "http://www.w3.org/ns/org#Organization",
+    "http://www.w3.org/ns/org#FormalOrganization",
+    "http://www.w3.org/ns/org#OrganizationalUnit",
+    "http://www.w3.org/ns/org#Role",
+    "http://www.w3.org/ns/org#Post",
+    "http://www.w3.org/ns/org#Membership",
+    "http://www.w3.org/ns/org#Site",
+)
+
+
+# Canonical labels → existing IRIs. When the LLM emits free-text labels
+# like "Person" / "Organization" / "Role" for PARENT_LABEL or TYPE_LABEL
+# (instead of the full IRI), this map routes them to the canonical
+# FOAF/ORG class IRIs in the loaded ontology, preventing orphan-class
+# duplication like merged#person and merged#organization.
+_CANONICAL_CLASS_LABEL_TO_IRI: dict[str, str] = {
+    # FOAF
+    "person": "http://xmlns.com/foaf/0.1/Person",
+    "organization": "http://xmlns.com/foaf/0.1/Organization",
+    "agent": "http://xmlns.com/foaf/0.1/Agent",
+    "group": "http://xmlns.com/foaf/0.1/Group",
+    "foaf:person": "http://xmlns.com/foaf/0.1/Person",
+    "foaf:organization": "http://xmlns.com/foaf/0.1/Organization",
+    "foaf:agent": "http://xmlns.com/foaf/0.1/Agent",
+    "foaf:group": "http://xmlns.com/foaf/0.1/Group",
+    # ORG
+    "role": "http://www.w3.org/ns/org#Role",
+    "post": "http://www.w3.org/ns/org#Post",
+    "membership": "http://www.w3.org/ns/org#Membership",
+    "formalorganization": "http://www.w3.org/ns/org#FormalOrganization",
+    "formal organization": "http://www.w3.org/ns/org#FormalOrganization",
+    "organizationalunit": "http://www.w3.org/ns/org#OrganizationalUnit",
+    "organizational unit": "http://www.w3.org/ns/org#OrganizationalUnit",
+    "site": "http://www.w3.org/ns/org#Site",
+    "org:role": "http://www.w3.org/ns/org#Role",
+    "org:post": "http://www.w3.org/ns/org#Post",
+    "org:membership": "http://www.w3.org/ns/org#Membership",
+    "org:organization": "http://www.w3.org/ns/org#Organization",
+    "org:formalorganization": "http://www.w3.org/ns/org#FormalOrganization",
+}
+
+
+# Canonical predicate labels → existing IRIs in the FOAF/ORG ontologies.
+# Used to route LLM-emitted MATCH NOT FOUND RELATIONS LABELs to existing
+# object_properties instead of minting merged#holds when org:holds
+# already exists.
+_CANONICAL_PREDICATE_LABEL_TO_IRI: dict[str, str] = {
+    # FOAF
+    "knows": "http://xmlns.com/foaf/0.1/knows",
+    "foaf:knows": "http://xmlns.com/foaf/0.1/knows",
+    "member": "http://xmlns.com/foaf/0.1/member",
+    "foaf:member": "http://xmlns.com/foaf/0.1/member",
+    "topic_interest": "http://xmlns.com/foaf/0.1/topic_interest",
+    "topic": "http://xmlns.com/foaf/0.1/topic",
+    "interest": "http://xmlns.com/foaf/0.1/interest",
+    # ORG
+    "holds": "http://www.w3.org/ns/org#holds",
+    "heldby": "http://www.w3.org/ns/org#heldBy",
+    "held by": "http://www.w3.org/ns/org#heldBy",
+    "role": "http://www.w3.org/ns/org#role",
+    "haspost": "http://www.w3.org/ns/org#hasPost",
+    "has post": "http://www.w3.org/ns/org#hasPost",
+    "postin": "http://www.w3.org/ns/org#postIn",
+    "post in": "http://www.w3.org/ns/org#postIn",
+    "hasmember": "http://www.w3.org/ns/org#hasMember",
+    "has member": "http://www.w3.org/ns/org#hasMember",
+    "memberof": "http://www.w3.org/ns/org#memberOf",
+    "member of": "http://www.w3.org/ns/org#memberOf",
+    "hasmembership": "http://www.w3.org/ns/org#hasMembership",
+    "has membership": "http://www.w3.org/ns/org#hasMembership",
+    "memberduring": "http://www.w3.org/ns/org#memberDuring",
+    "member during": "http://www.w3.org/ns/org#memberDuring",
+    "organization": "http://www.w3.org/ns/org#organization",
+    "hassuborganization": "http://www.w3.org/ns/org#hasSubOrganization",
+    "has suborganization": "http://www.w3.org/ns/org#hasSubOrganization",
+    "has sub organization": "http://www.w3.org/ns/org#hasSubOrganization",
+    "suborganizationof": "http://www.w3.org/ns/org#subOrganizationOf",
+    "sub organization of": "http://www.w3.org/ns/org#subOrganizationOf",
+    "originalorganization": "http://www.w3.org/ns/org#originalOrganization",
+    "original organization": "http://www.w3.org/ns/org#originalOrganization",
+    "resultingorganization": "http://www.w3.org/ns/org#resultingOrganization",
+    "resulting organization": "http://www.w3.org/ns/org#resultingOrganization",
+    "hasprimarysite": "http://www.w3.org/ns/org#hasPrimarySite",
+    "has primary site": "http://www.w3.org/ns/org#hasPrimarySite",
+    "hassite": "http://www.w3.org/ns/org#hasSite",
+    "has site": "http://www.w3.org/ns/org#hasSite",
+    "siteof": "http://www.w3.org/ns/org#siteOf",
+    "site of": "http://www.w3.org/ns/org#siteOf",
+    "changedby": "http://www.w3.org/ns/org#changedBy",
+    "resultedfrom": "http://www.w3.org/ns/org#resultedFrom",
+    "resultedin": "http://www.w3.org/ns/org#resultedIn",
+    "transitivelyhassubord": "http://www.w3.org/ns/org#transitiveSubOrganization",
+}
+
+
+def _coerce_canonical_labels(
+    stage2_result: dict[str, Any],
+    loaded_ontology: dict[str, Any],
+) -> dict[str, Any]:
+    """Walk a Stage-2 result (merged + deduped or raw) and coerce
+    free-text canonical labels to their existing IRIs.
+
+    - MATCH NOT FOUND classes whose PARENT_LABEL is "Person" /
+      "Organization" / "Role" / "Post" / "Membership" (case-insensitive,
+      with FOAF/ORG prefix variants) → PARENT_LABEL becomes the
+      foaf:Person / foaf:Organization / org:Role / org:Post / org:Membership
+      IRI from `loaded_ontology['classes_dict']`.
+    - MATCH NOT FOUND INSTANCES with the same TYPE_LABEL stop-list →
+      TYPE_LABEL becomes the canonical IRI.
+    - MATCH NOT FOUND RELATIONS whose LABEL matches a canonical FOAF/ORG
+      predicate (case-insensitive, with prefix variants) → LABEL is left
+      alone (predicate-level coercion happens later in
+      add_new_relations_from_match_results via the existing-predicate
+      lookup), but DOMAIN / RANGE are coerced if they hit the class
+      stop-list.
+
+    Coercion only happens when the canonical IRI actually exists in
+    loaded_ontology['classes_dict'] (or object_properties_dict for
+    predicates). If the merge doesn't carry FOAF or ORG, the labels are
+    left as-is so downstream auto-mint still works.
+
+    Mutates the input and returns it for convenience.
+    """
+    classes_dict = loaded_ontology.get("classes_dict") or {}
+    obj_props_dict = loaded_ontology.get("object_properties_dict") or {}
+
+    def _coerce_class(label: Any) -> Any:
+        if not isinstance(label, str):
+            return label
+        norm = label.strip().lower()
+        target = _CANONICAL_CLASS_LABEL_TO_IRI.get(norm)
+        if target and target in classes_dict:
+            return target
+        return label
+
+    def _coerce_predicate(label: Any) -> Any:
+        if not isinstance(label, str):
+            return label
+        norm = label.strip().lower()
+        target = _CANONICAL_PREDICATE_LABEL_TO_IRI.get(norm)
+        if target and target in obj_props_dict:
+            return target
+        return label
+
+    coerced_classes = 0
+    coerced_instances = 0
+    coerced_relations = 0
+
+    for cls in stage2_result.get("MATCH NOT FOUND") or []:
+        if not isinstance(cls, dict):
+            continue
+        before = cls.get("PARENT_LABEL")
+        after = _coerce_class(before)
+        if after != before:
+            cls["PARENT_LABEL"] = after
+            coerced_classes += 1
+
+    for inst in stage2_result.get("MATCH NOT FOUND INSTANCES") or []:
+        if not isinstance(inst, dict):
+            continue
+        before = inst.get("TYPE_LABEL")
+        after = _coerce_class(before)
+        if after != before:
+            inst["TYPE_LABEL"] = after
+            coerced_instances += 1
+
+    for rel in stage2_result.get("MATCH NOT FOUND RELATIONS") or []:
+        if not isinstance(rel, dict):
+            continue
+        # Coerce class endpoints (DOMAIN/RANGE)
+        for endpoint in ("DOMAIN", "RANGE"):
+            before = rel.get(endpoint)
+            after = _coerce_class(before)
+            if after != before:
+                rel[endpoint] = after
+        # Coerce predicate LABEL if it matches a canonical FOAF/ORG name.
+        before_label = rel.get("LABEL")
+        after_label = _coerce_predicate(before_label)
+        if after_label != before_label:
+            rel["LABEL"] = after_label
+            coerced_relations += 1
+
+    if coerced_classes or coerced_instances or coerced_relations:
+        print(
+            f"[stage3-coerce] canonical-label coercion: "
+            f"{coerced_classes} class parents, "
+            f"{coerced_instances} instance types, "
+            f"{coerced_relations} predicate labels routed to existing IRIs"
+        )
+    return stage2_result
 
 
 def _slice_ontology(
@@ -206,13 +432,23 @@ def _slice_ontology(
         descriptions + comments. So the pipeline still works on
         un-summarized merges -- the compact form is an optional
         optimization the user opts into per merge folder.
+
+    Always-include anchors: the universal FOAF + ORG seed IRIs are
+    unioned into `detected_iris` before slicing so Stage 2's
+    DATA_CLASSES reliably contains foaf:Person / foaf:Organization /
+    org:Organization / org:Role / org:Post / org:Membership for every
+    chunk -- the LLM uses them as parents for any people/organization/
+    role/post proposals.
     """
     classes = loaded_ontology.get("classes_dict", {})
     if not detected_iris:
         return {}
+    # Always include the universal anchors that are present in this merge.
+    anchor_iris = [iri for iri in _UNIVERSAL_ANCHOR_IRIS if iri in classes]
+    seeds = list(detected_iris) + anchor_iris
     # collect_related_class_iris builds its own graph internally; no need to
     # call build_class_graph separately.
-    relevant = collect_related_class_iris(classes, list(detected_iris), max_hops=max_hops)
+    relevant = collect_related_class_iris(classes, seeds, max_hops=max_hops)
     out: dict[str, Any] = {}
     base_fields = ("name", "iri", "labels", "superclasses")
     for iri in relevant:
@@ -1279,7 +1515,7 @@ async def summarize_class_descriptions_async(
 # Bump this string ONLY when the document_summarize prompt changes
 # meaningfully. The prompt version is mixed into each cache key so old
 # cached summaries are silently invalidated.
-_DOC_SUMMARY_PROMPT_VERSION = "v1"
+_DOC_SUMMARY_PROMPT_VERSION = "v2"
 
 
 def _doc_summary_cache_dir() -> Path:
@@ -1869,6 +2105,7 @@ async def _run_llm_stages(
     app_cfg: dict[str, Any],
     audit_path: Path,
     suggested_new_classes: list[dict[str, Any]] | None = None,
+    extra_stage2_results: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Stages 1-3. Returns the merged + deduplicated match-results dict.
 
@@ -1998,6 +2235,17 @@ async def _run_llm_stages(
         f"{skipped_empty} other chunks; those were skipped)"
     )
 
+    # Phase 2a follow-up: optional extra Stage-2-shaped JSON dicts from the
+    # table-concept-grouping pass.  These are merged into the chunk results
+    # via the same recursive merge so Stage 3 dedup collapses table-derived
+    # proposals against prose-derived ones uniformly.
+    if extra_stage2_results:
+        valid.extend(r for r in extra_stage2_results if r)
+        print(
+            f"[stage2] merged {len(extra_stage2_results)} extra Stage-2 "
+            "result(s) from table mining"
+        )
+
     if max_cost_usd is not None and router.total_cost_usd > max_cost_usd:
         raise RuntimeError(
             f"Projected cost exceeded cap: ${router.total_cost_usd:.4f} > ${max_cost_usd:.4f}. "
@@ -2011,6 +2259,13 @@ async def _run_llm_stages(
         f"{len(merged.get('MATCH NOT FOUND RELATIONS', []))} new relation proposals"
     )
     deduped = await _dedup(router, merged)
+    # Canonical-label coercion: replace free-text "Person" / "Organization"
+    # / "Role" / "Post" PARENT_LABELs and TYPE_LABELs with the actual FOAF/
+    # ORG class IRIs from the merge, and route predicate LABELs like
+    # "holds" / "memberOf" / "hasPost" to org#holds etc. Prevents the
+    # orphan-class duplication (merged#person, merged#organization, ...)
+    # and predicate explosion (merged#holds vs org#holds).
+    deduped = _coerce_canonical_labels(deduped, loaded_ontology)
     _append_audit(audit_path, -1, "match_dedup", None, deduped)
     return deduped
 
@@ -2080,6 +2335,8 @@ async def prune_and_expand_async(
     dry_run: bool,
     use_owl: bool = False,
     suggested_new_classes: Path | None = None,
+    extract_tables: bool = False,
+    table_vision: bool = True,
 ) -> Path:
     return await _run(
         "prune-expand",
@@ -2090,6 +2347,8 @@ async def prune_and_expand_async(
         max_cost_usd,
         dry_run,
         suggestions_path=suggested_new_classes,
+        extract_tables=extract_tables,
+        table_vision=table_vision,
     )
 
 
@@ -2102,6 +2361,8 @@ async def build_async(
     max_cost_usd: float | None,
     dry_run: bool,
     suggested_new_classes: Path | None = None,
+    extract_tables: bool = False,
+    table_vision: bool = True,
 ) -> Path:
     # build = merge + prune-expand chained. Merge first (sync), then drive the
     # async LLM pipeline against the just-written version folder.
@@ -2117,6 +2378,8 @@ async def build_async(
         max_cost_usd,
         dry_run,
         suggestions_path=suggested_new_classes,
+        extract_tables=extract_tables,
+        table_vision=table_vision,
     )
 
 
@@ -2129,6 +2392,9 @@ async def _run(
     max_cost_usd: float | None,
     dry_run: bool,
     suggestions_path: Path | None = None,
+    *,
+    extract_tables: bool = False,
+    table_vision: bool = True,
 ) -> Path:
     settings = get_settings()
     app_cfg = settings.app_config
@@ -2151,6 +2417,81 @@ async def _run(
         print(f"[{operation}] loaded {len(suggested)} user-suggested class(es) from {suggestions_path}")
 
     router = LLMRouter(settings)
+
+    # Phase 2a v2 (Option B): table extraction runs in PER-PDF SUBPROCESS
+    # workers. Each worker exits before the next starts, so the kernel
+    # reclaims all per-PDF memory unconditionally and the parent process
+    # never accumulates extraction-loop heap. Empirically: peak worker
+    # RSS ~39 MB on the largest PDF in the financial corpus, vs. ~640 MB
+    # in-process before the OOM kill.
+    if extract_tables and not dry_run:
+        from backend.app.services import table_extract  # local import: pdfplumber heavy
+
+        tables_dir = version_dir / "tables"
+        tables_dir.mkdir(parents=True, exist_ok=True)
+        print(
+            f"[{operation}] table extraction: scanning {documents_dir} for "
+            f"PDFs (vision={'ON' if table_vision else 'OFF'}, "
+            f"isolation=subprocess)"
+        )
+        manifests = await table_extract.extract_tables_for_folder_subprocess(
+            documents_dir,
+            run_cache_dir=tables_dir,
+            use_vision=table_vision,
+            concurrency=1,
+        )
+        total = sum(int(m.get("n_tables", 0) or 0) for m in manifests.values())
+        cost = sum(float(m.get("cost_usd", 0.0) or 0.0) for m in manifests.values())
+        n_cached = sum(1 for m in manifests.values() if m.get("source") == "cache")
+        n_failed = sum(
+            1 for m in manifests.values()
+            if m.get("source") in ("spawn-failed", "worker-failed")
+        )
+        print(
+            f"[{operation}] table extraction done: {total} tables across "
+            f"{len(manifests)} PDF(s) ({n_cached} cache-hits, {n_failed} failed), "
+            f"cost ${cost:.4f}"
+        )
+        _append_audit(
+            audit_path, -1, "table_extract", None,
+            {
+                "n_pdfs": len(manifests),
+                "n_tables": total,
+                "n_cached_pdfs": n_cached,
+                "n_failed_pdfs": n_failed,
+                "cost_usd": round(cost, 5),
+                "vision_enabled": table_vision,
+                "isolation": "subprocess",
+            },
+        )
+        # The manifests dict only carries lightweight per-PDF stats (the
+        # full JSON-LD payloads stay on disk in tables_dir + user cache).
+        # Drop the dict + force a GC pass before the LLM stages begin.
+        del manifests
+        import gc as _gc
+        _gc.collect()
+        print(f"[{operation}] table extraction memory released; proceeding to LLM stages")
+
+    # Phase 2a follow-up: anchor-bucket grouping for every extracted table.
+    # Runs ONLY when tables were just extracted (i.e. tables_dir exists).
+    # Two-layer matching: reuse existing ontology classes first, then collapse
+    # cross-table duplicates, then emit MATCH NOT FOUND proposals anchored under
+    # the 6 buckets in domain_concepts.owl.
+    table_mining_stage2: dict[str, Any] | None = None
+    if extract_tables and not dry_run:
+        from backend.app.services import table_ontology_mining
+
+        def _audit_table_mining(task: str, payload: dict[str, Any]) -> None:
+            _append_audit(audit_path, -1, task, None, payload)
+
+        table_mining_stage2 = await table_ontology_mining.mine_table_concepts_async(
+            tables_dir=tables_dir,
+            loaded_ontology=loaded,
+            router=router,
+            cache_dir=tables_dir,
+            audit_callback=_audit_table_mining,
+        )
+
     deduped = await _run_llm_stages(
         loaded_ontology=loaded,
         documents_dir=documents_dir,
@@ -2161,6 +2502,7 @@ async def _run(
         app_cfg=app_cfg,
         audit_path=audit_path,
         suggested_new_classes=suggested or None,
+        extra_stage2_results=[table_mining_stage2] if table_mining_stage2 else None,
     )
 
     # Inject user-suggested classes that the LLM didn't already propose. These

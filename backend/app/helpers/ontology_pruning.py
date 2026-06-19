@@ -2283,7 +2283,34 @@ def add_new_relations_from_match_results(
     created_props: list[str] = []
     auto_minted_classes: list[str] = []
     skipped: list[dict] = []
+    reused_existing = 0
     base_iri = new_class_base_iri or new_property_base_iri
+
+    # Build a case-insensitive label index over EXISTING object_properties
+    # so the LLM's free-text labels ("holds" / "hasMember" / "knows") get
+    # routed to the canonical FOAF/ORG predicates already in the merge,
+    # rather than minting merged#holds when org:holds already exists.
+    existing_pred_label_index: dict[str, str] = {}
+    for prop_iri, prop_data in obj_props_dict.items():
+        if not isinstance(prop_data, dict):
+            continue
+        labels = prop_data.get("labels") or []
+        for lab in labels:
+            if isinstance(lab, str) and lab.strip():
+                existing_pred_label_index.setdefault(lab.strip().lower(), prop_iri)
+            elif isinstance(lab, dict):
+                v = lab.get("value")
+                if isinstance(v, str) and v.strip():
+                    existing_pred_label_index.setdefault(v.strip().lower(), prop_iri)
+        name = prop_data.get("name")
+        if isinstance(name, str) and name.strip():
+            existing_pred_label_index.setdefault(name.strip().lower(), prop_iri)
+        # Also index the IRI's local-name (the tail after `#` or final `/`)
+        # so labels like "hasPost" route to org#hasPost even when the
+        # explicit label field is missing.
+        tail = prop_iri.rsplit("#", 1)[-1].rsplit("/", 1)[-1]
+        if tail:
+            existing_pred_label_index.setdefault(tail.strip().lower(), prop_iri)
 
     def _try_resolve(value: Any) -> tuple[str | None, str | None, str | None]:
         """Return (resolved_iri, normalized_text, reason_if_unresolved).
@@ -2310,6 +2337,32 @@ def add_new_relations_from_match_results(
         description = normalize_to_string(item.get("DESCRIPTION"))
         if not label:
             skipped.append({"relation": item, "reason": "missing LABEL"})
+            continue
+
+        # Step 0: if `label` is already an existing predicate IRI (from
+        # the upstream canonical-label coercion) OR matches an existing
+        # predicate by label/name/local-name, REUSE that predicate
+        # instead of minting a new one. This prevents the merged#holds
+        # vs org#holds explosion the user observed.
+        existing_iri: str | None = None
+        if label in obj_props_dict:
+            existing_iri = label
+        else:
+            existing_iri = existing_pred_label_index.get(label.lower())
+        if existing_iri:
+            # Best-effort: augment the existing predicate's domain/range
+            # if the LLM's relation resolved to known classes that weren't
+            # already listed. Never overwrite existing endpoint metadata.
+            d_iri, _, _ = _try_resolve(item.get("DOMAIN"))
+            r_iri, _, _ = _try_resolve(item.get("RANGE"))
+            existing_entry = obj_props_dict[existing_iri]
+            for end_key, end_iri in (("domain", d_iri), ("range", r_iri)):
+                if not end_iri:
+                    continue
+                current = existing_entry.setdefault(end_key, [])
+                if not any(safe_get_iri(e) == end_iri for e in current):
+                    current.append({"iri": end_iri, "name": end_iri.rsplit("#", 1)[-1].rsplit("/", 1)[-1]})
+            reused_existing += 1
             continue
 
         d_iri, d_text, _ = _try_resolve(item.get("DOMAIN"))
@@ -2368,6 +2421,12 @@ def add_new_relations_from_match_results(
         obj_props_dict[new_iri] = entry
         created_props.append(new_iri)
 
+    if reused_existing:
+        print(
+            f"[relations] reused {reused_existing} existing predicate(s) "
+            f"(skipped minting duplicate merged# entries for canonical "
+            f"FOAF/ORG relations)"
+        )
     return result, created_props, skipped, auto_minted_classes
 
 

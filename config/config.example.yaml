@@ -47,11 +47,14 @@ chunking:
   # (slightly more compression risk).
   oversize_doc_sub_chunk_tokens: 80000
   # Number of documents loaded into memory per batch during the
-  # streaming summarize -> chunk pass. 16 keeps peak memory low on tight
-  # RAM budgets (~50 MB on a 2.7 GiB box); raise on machines with more
-  # RAM for slightly faster runs. Set to 0 to fall back to "load
-  # everything at once" (legacy behavior; will OOM on large corpora).
-  streaming_batch_size: 16
+  # streaming summarize -> chunk pass. 8 keeps peak memory low on tight
+  # RAM budgets (~25 MB on a 2.7 GiB box); raise on machines with more
+  # RAM for slightly faster runs. The default was 16 historically but
+  # was lowered to 8 in Phase 2a after the financial-corpus run OOM'd
+  # mid-stream-loader (big PDF doc-texts in a 16-batch loaded ~150-300
+  # MB at once). Set to 0 to fall back to "load everything at once"
+  # (legacy behavior; will OOM on large corpora).
+  streaming_batch_size: 8
   # tiktoken encoding name. o200k_base matches GPT-4o family + recent embedding models.
   encoding: o200k_base
 
