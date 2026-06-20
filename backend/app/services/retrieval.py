@@ -293,6 +293,10 @@ async def retrieve_and_answer(
             continue
         evidence.append({
             "kind": "chunk",
+            # `node_id` is the chunk's primary-key UUID; persisted as
+            # retrieval_evidence.evidence_uuid so downstream consumers can
+            # JOIN back to chunks.id without parsing the IRI string.
+            "node_id": cid,
             "iri": info["iri"],
             "rank": rank,
             "score": score,
@@ -306,6 +310,10 @@ async def retrieve_and_answer(
             continue
         evidence.append({
             "kind": "artifact",
+            # `node_id` is the artifact's primary-key UUID; persisted as
+            # retrieval_evidence.evidence_uuid so JOINs against
+            # intelligence_artifacts.id work directly.
+            "node_id": aid,
             "iri": info["iri"],
             "artifact_type": info["type"],
             "rank": rank + len(fused_chunks),
@@ -544,14 +552,22 @@ async def _persist_run(
             },
         )
 
-        # Evidence rows
+        # Evidence rows. evidence_uuid carries the source node's primary
+        # key (chunk_id for kind='chunk', artifact_id for kind='artifact')
+        # so downstream queries can JOIN re.evidence_uuid against
+        # graphrag.chunks.id / graphrag.intelligence_artifacts.id without
+        # parsing the IRI string. Falls back to a fresh UUID only if a
+        # caller produced an evidence dict without `node_id` (legacy).
         ev_rows = []
         for ev in result.evidence[:50]:
+            node_id = ev.get("node_id")
+            if node_id is None:
+                node_id = uuid.uuid4()
             ev_rows.append({
                 "id": uuid.uuid4(),
                 "retrieval_run_id": run_id,
                 "evidence_kind": ev["kind"],
-                "evidence_uuid": uuid.uuid4(),   # not tracked here; client uses IRI
+                "evidence_uuid": node_id,
                 "evidence_iri": ev["iri"],
                 "rank": ev["rank"],
                 "score": float(ev["score"]),
