@@ -194,6 +194,62 @@ async def fetch_candidate_artifacts_for_entities(
     return [(aid, float(hits)) for aid, hits in result.all()]
 
 
+async def fetch_table_artifacts_for_chunks(
+    session: AsyncSession,
+    chunk_ids: list[uuid.UUID],
+    *,
+    limit: int = 200,
+) -> list[tuple[uuid.UUID, float]]:
+    """StructuredTable artifacts derived from documents that own any of
+    the given chunks.
+
+    Path: chunks -> document_id -> intelligence_artifacts where
+    artifact_type='StructuredTable' AND graph_relationships ties the
+    table to the document via 'viao:derivedFromDocument'.
+
+    Why this exists: when a user asks "what was BHP's 2025 revenue?",
+    we reach BHP-related chunks via the chunk->entity edges, but the
+    actual revenue table in the BHP 10-K won't have a direct
+    table->entity edge (table cells contain numbers, not "BHP" text).
+    Pulling tables document-mediated -- "for every doc whose chunks we
+    found, include its tables" -- closes that gap.
+
+    Scoring: hits = number of distinct candidate chunks owned by the
+    table's source document. So a doc with many relevant chunks pulls
+    its tables higher than a doc with one tangential chunk.
+    """
+    if not chunk_ids:
+        return []
+    result = await session.execute(
+        sql_text("""
+        WITH candidate_docs AS (
+            SELECT c.document_id, count(*) AS n_chunks
+              FROM graphrag.chunks c
+             WHERE c.id = ANY(CAST(:chunk_ids AS uuid[]))
+               AND c.document_id IS NOT NULL
+             GROUP BY c.document_id
+        )
+        SELECT a.id, cd.n_chunks::float AS hits
+          FROM graphrag.intelligence_artifacts a
+          JOIN graphrag.graph_relationships gr
+            ON gr.source_node_id = a.id
+           AND gr.source_node_type = 'intelligence_artifact'
+           AND gr.predicate_label = 'viao:derivedFromDocument'
+           AND gr.target_node_type = 'document'
+          JOIN candidate_docs cd ON cd.document_id = gr.target_node_id
+         WHERE a.status = 'ACTIVE'
+           AND a.artifact_type = 'StructuredTable'
+         ORDER BY hits DESC
+         LIMIT :limit
+        """),
+        {
+            "chunk_ids": [str(cid) for cid in chunk_ids],
+            "limit": limit,
+        },
+    )
+    return [(aid, float(hits)) for aid, hits in result.all()]
+
+
 async def vector_rerank_chunks(
     session: AsyncSession,
     candidate_chunk_ids: list[uuid.UUID],

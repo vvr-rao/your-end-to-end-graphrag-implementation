@@ -181,6 +181,40 @@ async def retrieve_and_answer(
     candidate_chunk_ids = list({cid for cid, _ in ent_chunks + time_chunks})
     candidate_artifact_ids = [aid for aid, _ in artifact_candidates]
 
+    # Document-mediated table inclusion: pull every StructuredTable
+    # artifact derived from a document that owns at least one of our
+    # candidate chunks. Without this step, revenue / financial-data
+    # tables that don't repeat the company name inside their cells get
+    # missed -- the entity-anchored artifact path only catches tables
+    # with direct entity edges (~10-15% of tables in practice). With
+    # this step, asking "BHP's 2025 revenue" pulls every table from the
+    # BHP 10-K into the candidate pool, where vector rerank then
+    # surfaces the actually-relevant revenue table by similarity to the
+    # query probes. Bounded at 200 tables to keep Stage-9 vector-rerank
+    # cheap; the limit only bites for queries that match very many
+    # documents simultaneously.
+    if candidate_chunk_ids:
+        async with session_scope() as session:
+            doc_table_candidates = (
+                await retrieval_sql.fetch_table_artifacts_for_chunks(
+                    session, candidate_chunk_ids, limit=200,
+                )
+            )
+        # Avoid duplicates if a table was already in candidate_artifact_ids
+        # via a direct entity edge.
+        already_in = set(candidate_artifact_ids)
+        for aid, _ in doc_table_candidates:
+            if aid not in already_in:
+                candidate_artifact_ids.append(aid)
+                already_in.add(aid)
+        if verbose:
+            n_added = len(candidate_artifact_ids) - len(artifact_candidates)
+            print(
+                f"[query] document-mediated tables added: {n_added} "
+                f"StructuredTable artifact(s) (now {len(candidate_artifact_ids)} "
+                f"total artifact candidates)"
+            )
+
     if not candidate_chunk_ids and not candidate_artifact_ids:
         if verbose:
             print("[query] zero candidates from graph; falling back to global vector search")

@@ -79,6 +79,66 @@ def _normalize_name(name: str) -> str:
     return re.sub(r"\s+", " ", s)
 
 
+# Corporate / legal-entity suffixes commonly appended to organization
+# canonical names. Stripping them yields the "short form" the entity is
+# usually referred to in tables and shorthand mentions ("BYD" rather
+# than "BYD Company Ltd."). Matched as trailing tokens against the
+# already-normalized name (post `_normalize_name`), so each entry is
+# lowercase, no punctuation, no leading space.
+_CORPORATE_SUFFIX_TOKENS: tuple[str, ...] = (
+    # Compound suffixes first so they match before their single-word components.
+    "co ltd", "company ltd", "company limited", "holdings limited",
+    "holdings inc", "holdings group", "holdings ltd", "group plc",
+    "group inc", "group ltd", "incorporated", "corporation",
+    # Then single tokens.
+    "inc", "ltd", "limited", "corp", "company", "co",
+    "holdings", "holding", "group", "plc",
+    "ag", "gmbh", "sa", "nv", "spa", "llc", "llp", "lp",
+    "se", "asa", "ab", "oy", "kk", "kabushiki",
+    "pty", "bv", "kg",
+)
+
+
+def _short_form_variants(normalized_name: str) -> list[str]:
+    """Return the set of normalized variants an entity might appear as.
+
+    Always includes the input `normalized_name` itself. Repeatedly strips
+    trailing corporate-suffix tokens (e.g. "byd company ltd" -> "byd
+    company" -> "byd") and adds each intermediate form to the set.
+
+    Stops shrinking once the remaining string is too short (< 3 chars or
+    < 1 token) to be a safe table-match candidate.
+
+    Examples:
+      "byd company ltd"            -> ["byd company ltd", "byd company", "byd"]
+      "tesla inc"                  -> ["tesla inc", "tesla"]
+      "saudi aramco"               -> ["saudi aramco"]
+      "ford motor company"         -> ["ford motor company", "ford motor"]
+      "general motors company"     -> ["general motors company", "general motors"]
+      "mercedesbenz"               -> ["mercedesbenz"]      (no suffix)
+    """
+    base = normalized_name.strip()
+    if not base:
+        return []
+    variants: list[str] = [base]
+    seen: set[str] = {base}
+    while True:
+        stripped: str | None = None
+        for suf in _CORPORATE_SUFFIX_TOKENS:
+            tail = " " + suf
+            if base.endswith(tail):
+                cand = base[: -len(tail)].strip()
+                if len(cand) >= 3 and " " in (" " + cand):
+                    stripped = cand
+                    break
+        if stripped is None or stripped in seen:
+            break
+        variants.append(stripped)
+        seen.add(stripped)
+        base = stripped
+    return variants
+
+
 # ---------------------------------------------------------------------------
 # Phase 2a v2 -- table-to-entity linking.
 #
@@ -629,16 +689,65 @@ async def _link_tables_to_entities(summary: EntityExtractSummary) -> None:
     Pure DB + Python. No LLM calls. Safe to run as the final step of
     `extract_entities` -- if no tables exist, returns immediately."""
     async with session_scope() as session:
-        # Build the normalized-name lookup dict.
+        # Build the normalized-name lookup dict in TWO PASSES, preferring
+        # canonical names over derived short-form variants whenever a
+        # collision occurs. Each entity contributes (a) its full
+        # normalized name (the canonical form) and (b) short-form
+        # variants derived by stripping trailing corporate suffixes
+        # (Inc, Ltd, Corp, Co, Holdings, PLC, AG, GmbH, ...). This lets
+        # a table cell saying "BYD" link to the entity whose
+        # canonical_name is "BYD Company Ltd." while still allowing
+        # "BYD" to remain matchable for an entity literally named "BYD".
+        #
+        # Pass 1: register every entity's full canonical normalized name.
+        #         On collision (two entities sharing the same canonical
+        #         name), the first writer wins. Rare; usually means the
+        #         entity-extraction pass already collapsed them.
+        # Pass 2: register short-form variants ONLY when the key isn't
+        #         already taken by a canonical name in pass 1. On
+        #         variant-vs-variant collision (two entities deriving
+        #         the same short form), drop the variant entirely so
+        #         neither matches on it -- each entity is still
+        #         reachable via its full canonical name from pass 1.
         ent_rows = await session.execute(
             select(Entity.id, Entity.normalized_name).where(
                 Entity.status == "ACTIVE"
             )
         )
+        all_rows = [
+            (eid, norm) for eid, norm in ent_rows.all()
+            if isinstance(norm, str) and norm
+        ]
         ent_by_norm: dict[str, Any] = {}
-        for entity_id, norm in ent_rows.all():
-            if isinstance(norm, str) and norm:
+        canonical_keys: set[str] = set()
+        ambiguous_variants: set[str] = set()
+
+        # Pass 1: canonical names. Don't overwrite (first wins).
+        for entity_id, norm in all_rows:
+            if norm not in ent_by_norm:
                 ent_by_norm[norm] = entity_id
+            canonical_keys.add(norm)
+
+        # Pass 2: short-form variants. Skip any key already claimed by
+        # a canonical name. Drop variant-vs-variant collisions.
+        for entity_id, norm in all_rows:
+            variants = _short_form_variants(norm)
+            for v in variants:
+                if v == norm:
+                    continue  # canonical, already handled in pass 1
+                if v in canonical_keys:
+                    continue  # never override a canonical name
+                if v in ambiguous_variants:
+                    continue
+                existing = ent_by_norm.get(v)
+                if existing is None:
+                    ent_by_norm[v] = entity_id
+                elif existing != entity_id:
+                    # Two distinct entities derive the same short form.
+                    # Drop it from the lookup; each entity is still
+                    # reachable via its full canonical name.
+                    del ent_by_norm[v]
+                    ambiguous_variants.add(v)
 
         if not ent_by_norm:
             print(
@@ -646,6 +755,12 @@ async def _link_tables_to_entities(summary: EntityExtractSummary) -> None:
                 "linkage pass"
             )
             return
+        n_short_keys = len(ent_by_norm) - len(canonical_keys)
+        print(
+            f"[link-tables] entity lookup: {len(canonical_keys)} canonical "
+            f"name(s) + {n_short_keys} short-form variant(s); "
+            f"{len(ambiguous_variants)} ambiguous variant(s) dropped"
+        )
 
         # Pull every ACTIVE StructuredTable artifact + its JSON-LD payload.
         table_rows = await session.execute(
