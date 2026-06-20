@@ -53,9 +53,9 @@ uv run python -m backend.app.cli register-documents \
   --input source_documents/<your-corpus>
 uv run python -m backend.app.cli enrich-time
 uv run python -m backend.app.cli extract-entities
-uv run python -m backend.app.cli generate-artifacts                # Claim / Finding / Observation / Summary
-uv run python -m backend.app.cli generate-artifacts --type Insight  # cross-document synthesis
-uv run python -m backend.app.cli generate-artifacts --type Recommendation
+uv run python -m backend.app.cli generate-artifacts                # Claim / Finding / Observation / Event + per-doc Summary
+uv run python -m backend.app.cli generate-artifacts --type Insight  # cross-document synthesis (gpt-4.1)
+uv run python -m backend.app.cli generate-artifacts --type Recommendation  # cross-Insight (gpt-4.1)
 
 # Evaluate the retrieval quality (5 metrics: comprehensiveness,
 # no_hallucination, consistency, gap_detection, time)
@@ -68,6 +68,97 @@ uv run python -m backend.app.cli evaluate-queries \
 See [eval_questions/README.md](eval_questions/README.md) for the
 methodology, retrieval pipeline diagram, per-question cost estimates,
 and what each metric measures.
+
+## Intelligence artifacts
+
+The retrieval layer reads from a typed library of **Intelligence Artifacts** — rows in `graphrag.intelligence_artifacts`, each a typed instance of a VIAO class. Eight types are extracted today (`Fact`, `Conclusion`, `Risk` are also in VIAO but reserved for future passes).
+
+### The 8 supported types
+
+| Type | VIAO class | Definition | Generator | Model |
+|---|---|---|---|---|
+| **Claim** | `viao:Claim` | A factual assertion the source MAKES (e.g. *"BYD owns 30% of the Vietnamese EV market"*). Specific + verifiable. | `artifact_chunk_extract_with_entities` (per chunk) | gpt-4o-mini |
+| **Finding** | `viao:Finding` | An analytical conclusion or insight (e.g. *"the trend suggests EV demand is accelerating in ASEAN"*). Goes beyond raw facts. | same prompt, single LLM call | gpt-4o-mini |
+| **Observation** | `viao:Observation` | A raw factual statement directly visible in the text (e.g. *"price rose 5% in March"*). The most concrete of the assertion types. | same prompt | gpt-4o-mini |
+| **Event** | `viao:Event` | A happening anchored to a date or date range (study publication, election, founding, regulation effective date, crisis incident). Carries `event_date` / `event_start_date` / `event_end_date` / `event_category` metadata. | same prompt | gpt-4o-mini |
+| **Summary** | `viao:Summary` | Condensed 200-word representation of one Document. | `artifact_document_summary` (per doc, once) | gpt-4o-mini |
+| **StructuredTable** | `viao:StructuredTable` | JSON-LD representation of a table extracted from a PDF (caption + columns + rows + cells). Full payload lives in `extra_metadata` JSONB. | `register-documents --tables` (PDFs only; reads pre-extracted JSON-LD from `~/.cache/.../tables/`) | pdfplumber + gpt-4o-mini vision (during prune-expand) |
+| **Insight** | `viao:Insight` | Cross-class synthesis. Non-obvious pattern across many Claims/Findings tied to the same ontology class. Opt-in via `--type Insight`. | `insight_gen` clusters by `class_id` of attached entities | **gpt-4.1** |
+| **Recommendation** | `viao:Recommendation` | Actionable judgment derived from clustered Insights. Opt-in via `--type Recommendation`. | `recommendation_gen` clusters Insights by embedding k-means | **gpt-4.1** |
+
+### Which nodes get artifacts derived from them
+
+Artifacts are derived from **3 corpus-side node types** + the artifact graph itself. Ontology-side nodes (classes, properties, instances) are *referenced* by artifacts but don't produce them.
+
+| Node type | Artifacts derived FROM each node |
+|---|---|
+| **Document** (1 row per ingested file) | 1 `Summary` (always) · N `StructuredTable`s (PDFs only — typically 50–300 per annual report) |
+| **Chunk** (1+ per document after summarization + chunking) | ~0–8 of each of: `Claim`, `Finding`, `Observation`, `Event` per chunk (single LLM call returns all 4 types as JSON) |
+| **Cluster of Claim+Finding** (grouped by ontology class via the entity's `class_id`) | 1–3 `Insight`s per qualifying cluster (≥10 attached artifacts by default) |
+| **Cluster of Insights** (grouped by embedding k-means) | 1–3 `Recommendation`s per theme |
+| Ontology classes / properties / instances | ❌ no artifacts derived |
+| Entities | ❌ no artifacts derived. Entities are *subjects* of artifacts via `viao:assertsAbout` edges |
+| Time instances | ❌ no artifacts derived. Chunks link to them via `time:inPeriod` |
+
+### The derivation hierarchy (mirrors VIAO predicates)
+
+```
+            Document
+              │ ─────────────────────────┐
+              │ has chunks               │ derivedFromDocument / summarizes
+              ▼                          ▼
+            Chunk                  Summary  +  StructuredTable (PDFs only)
+              │
+              │ derivedFromChunk
+              ▼
+       ┌──────┼──────┬──────────┐
+       ▼      ▼      ▼          ▼
+     Claim  Finding  Observation  Event
+       │      │
+       │   insightBasedOn
+       └──────┘
+           │
+           ▼
+        Insight                   ── cross-class synthesis (opt-in, gpt-4.1)
+           │
+           │ recommendationBasedOn
+           ▼
+     Recommendation               ── cross-Insight (opt-in, gpt-4.1)
+```
+
+### Per-artifact metadata captured in `extra_metadata` JSONB
+
+| Type | Fields |
+|---|---|
+| `Claim` / `Finding` / `Observation` | `evidence_status` (`"backed"`/`"partial"`/`"unbacked"` — whether the chunk supplies reasoning) · `claim_source` (who made the claim, e.g. *"BHP's CEO"*) · `time_scope` (what period the claim applies to) |
+| `Event` | `event_date` / `event_start_date` / `event_end_date` (YYYY-MM-DD strings) · `event_category` (free-text label like *"study"*, *"election"*, *"founding"*) |
+| `StructuredTable` | Full JSON-LD bundle: `caption`, `pageNumber`, `extractionMethod`, `columns[]`, `rows[]`, `cells[]` |
+| `Insight` / `Recommendation` | `cluster_class` (the ontology-class the cluster came from) · base-Claim/Insight references via `artifact_sources` M2M |
+
+### Entity grounding
+
+When a chunk has entities attached (from `extract-entities`), the per-chunk prompt is `artifact_chunk_extract_with_entities` — it lists the chunk's entities in the prompt and **requires** the LLM to use exact canonical names (no *"the company"* / *"the manufacturer"* substitution). For each entity whose canonical name then appears in the artifact text, an `Artifact → viao:assertsAbout → Entity` edge is written. That gives you the citation chain *artifact → asserted entity → typed ontology class* used by `deep_research`.
+
+### Cardinality expectations on a ~80-doc / ~90-chunk financial-reports corpus
+
+| Type | Approximate count |
+|---|---:|
+| `Summary` | ~80 (1 per doc) |
+| `StructuredTable` | 1,500–3,000 (depends heavily on PDF density) |
+| `Claim` | ~250–400 |
+| `Finding` | ~150–300 |
+| `Observation` | ~200–400 |
+| `Event` | ~50–150 |
+| `Insight` (opt-in) | ~20–40 |
+| `Recommendation` (opt-in) | ~10–20 |
+
+### Storage shape
+
+Every artifact lives in `graphrag.intelligence_artifacts` with `artifact_identifier` matching `viao:<Type>_<uuid16>`, a `vector(1024)` embedding over `(title + text)`, a `graph_version` stamp, and `status` in `{ACTIVE, STALE, RETIRED, DELETED}`. Traceability flows through:
+
+```
+Answer → retrieval_evidence → intelligence_artifacts → artifact_sources → chunks → documents → file_path
+```
 
 ## Phase 1 — ontology CLI
 
