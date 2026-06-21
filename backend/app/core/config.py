@@ -119,10 +119,19 @@ def _normalize_postgres_dsn(raw: str) -> str:
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
+    # Prefer the user's local .yaml (gitignored, may be tuned). Fall back
+    # to the tracked .example.yaml so deployed images (which only ship the
+    # examples, never the gitignored real files) boot cleanly. The two
+    # files are functionally identical -- they differ only in comments.
     if not path.exists():
-        raise FileNotFoundError(
-            f"Missing {path.name}. Did you `cp config/{path.stem}.example.yaml config/{path.name}`?"
-        )
+        example = path.with_name(f"{path.stem}.example{path.suffix}")
+        if example.exists():
+            path = example
+        else:
+            raise FileNotFoundError(
+                f"Missing {path.name} and {example.name}. Did you `cp "
+                f"config/{path.stem}.example.yaml config/{path.name}`?"
+            )
     with path.open("r") as f:
         return yaml.safe_load(f) or {}
 
