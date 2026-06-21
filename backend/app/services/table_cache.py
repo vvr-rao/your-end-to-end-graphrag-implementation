@@ -8,7 +8,7 @@ pay the extraction cost again. Two tiers:
    run; useful when you want to inspect what a specific run produced or
    share it with another machine.
 
-2. **User cache** -- `~/.cache/your-personal-knowledge-graph-creator/tables/`.
+2. **User cache** -- `~/.cache/your-end-to-end-graphrag-implementation/tables/`.
    Reused across runs + by Phase 2 `register-documents` for docs that
    never went through a prune-expand. Same hash key shape.
 
@@ -80,7 +80,7 @@ def user_cache_dir() -> Path:
 
     Mirrors `_doc_summary_cache_dir` in pipeline_llm.py so the cache
     lives under the same root as other caches."""
-    root = Path.home() / ".cache" / "your-personal-knowledge-graph-creator" / "tables"
+    root = Path.home() / ".cache" / "your-end-to-end-graphrag-implementation" / "tables"
     root.mkdir(parents=True, exist_ok=True)
     return root
 

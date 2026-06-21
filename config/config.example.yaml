@@ -26,7 +26,7 @@ chunking:
   # documents. Set to 0 to disable; the pipeline then chunks raw text.
   summarization_threshold_tokens: 2000
   # Persistent disk cache for document summaries at
-  # ~/.cache/your-personal-knowledge-graph-creator/doc_summaries/. Cache
+  # ~/.cache/your-end-to-end-graphrag-implementation/doc_summaries/. Cache
   # key hashes the doc text + model + prompt version, so editing a doc
   # or changing the model invalidates that entry automatically. Re-runs
   # against unchanged docs cost nothing for summarization. Set to false

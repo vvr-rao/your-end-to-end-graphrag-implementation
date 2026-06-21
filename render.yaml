@@ -1,5 +1,5 @@
 # =============================================================================
-# render.yaml — Render Blueprint for your-personal-knowledge-graph-creator
+# render.yaml — Render Blueprint for your-end-to-end-graphrag-implementation
 #
 # Services:
 #   - backend  : FastAPI + MCP (Streamable HTTP) — single uvicorn process at /mcp + REST

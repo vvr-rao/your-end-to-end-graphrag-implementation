@@ -54,7 +54,7 @@ from _downloader_common import (
 )
 
 
-CONTACT = "your-personal-knowledge-graph-creator (contact@example.com)"
+CONTACT = "your-end-to-end-graphrag-implementation (contact@example.com)"
 EDGAR_SEARCH = "https://efts.sec.gov/LATEST/search-index"
 EDGAR_ARCHIVE_BASE = "https://www.sec.gov/Archives/edgar/data"
 DEFAULT_FORMS = "10-K,10-Q,20-F,40-F,8-K"
@@ -269,7 +269,7 @@ def _company_label(filing: dict) -> str:
 
 def _edgar_cache_dir() -> Path:
     """Return (and ensure) the user-level cache directory for EDGAR."""
-    root = Path.home() / ".cache" / "your-personal-knowledge-graph-creator" / "edgar"
+    root = Path.home() / ".cache" / "your-end-to-end-graphrag-implementation" / "edgar"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -548,7 +548,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "hundred MB of RSS.")
     p.add_argument("--no-cache", action="store_true", dest="no_cache",
                    help="Bypass the disk cache. Default: cache on at "
-                        "~/.cache/your-personal-knowledge-graph-creator/edgar/. "
+                        "~/.cache/your-end-to-end-graphrag-implementation/edgar/. "
                         "SEC filings are immutable per accession+document, "
                         "so the cache stays valid forever -- re-runs against "
                         "the same filings skip both download and HTML->PDF "

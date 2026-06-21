@@ -88,7 +88,7 @@ def _add_suggestions_flag(p: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ypo",
-        description="your-personal-knowledge-graph-creator CLI",
+        description="your-end-to-end-graphrag-implementation CLI",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

@@ -1,4 +1,4 @@
-# your-personal-knowledge-graph-creator
+# Your End-to-End GraphRAG Implementation
 
 GraphRAG-based ontology and document management system. Ingests domain documents,
 imports/merges OWL ontologies, expands them with LLMs, stores everything in

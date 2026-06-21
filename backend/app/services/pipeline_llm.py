@@ -1271,7 +1271,7 @@ async def run_classification_audit_async(
     instances_dict in place. Returns a summary dict.
 
     Caches each batch by SHA-256 of its items at
-    ~/.cache/your-personal-knowledge-graph-creator/doc_summaries/
+    ~/.cache/your-end-to-end-graphrag-implementation/doc_summaries/
     (the same cache directory as document summaries) under a key
     prefixed with 'audit-v1'. Re-running against the same set of
     suspicious classes costs nothing for LLM calls.
@@ -1520,7 +1520,7 @@ _DOC_SUMMARY_PROMPT_VERSION = "v2"
 
 def _doc_summary_cache_dir() -> Path:
     """Return the on-disk cache root, creating it if missing."""
-    root = Path.home() / ".cache" / "your-personal-knowledge-graph-creator" / "doc_summaries"
+    root = Path.home() / ".cache" / "your-end-to-end-graphrag-implementation" / "doc_summaries"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -1682,7 +1682,7 @@ async def summarize_long_documents_async(
         doc's new text and cached under the original doc's hash key.
 
     `use_cache` (default True) reads/writes the summary at
-    ~/.cache/your-personal-knowledge-graph-creator/doc_summaries/. Cache
+    ~/.cache/your-end-to-end-graphrag-implementation/doc_summaries/. Cache
     key hashes (doc text + model + prompt version), so editing a doc or
     changing the model invalidates that entry automatically. The cache
     works the same for hierarchical summaries -- the COMBINED summary

@@ -25,7 +25,7 @@ function App() {
       <div className="max-w-xl w-full space-y-6">
         <header>
           <h1 className="text-3xl font-semibold tracking-tight">
-            your-personal-knowledge-graph-creator
+            Your End-to-End GraphRAG Implementation
           </h1>
           <p className="text-slate-400 mt-1">
             GraphRAG ontology + document management — bootstrap UI

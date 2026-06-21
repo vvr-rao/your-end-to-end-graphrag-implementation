@@ -1,5 +1,5 @@
 [project]
-name = "your-personal-knowledge-graph-creator"
+name = "your-end-to-end-graphrag-implementation"
 version = "0.0.1"
 description = "GraphRAG-based ontology and document management system. Exposes FastAPI (REST) and MCP server in parallel so the same operations can be called by clients or by agents."
 readme = "README.md"

@@ -17,7 +17,7 @@ import requests
 # A real contact email is required by SEC EDGAR (they block generic UAs)
 # and good practice for any polite scraper. Edit this string before
 # running the financial_report_download tool in production.
-DEFAULT_CONTACT = "your-personal-knowledge-graph-creator (contact@example.com)"
+DEFAULT_CONTACT = "your-end-to-end-graphrag-implementation (contact@example.com)"
 
 
 def safe_filename(text: str, max_len: int = 120) -> str:

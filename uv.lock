@@ -2612,7 +2612,7 @@ wheels = [
 ]
 
 [[package]]
-name = "your-personal-knowledge-graph-creator"
+name = "your-end-to-end-graphrag-implementation"
 version = "0.0.1"
 source = { editable = "." }
 dependencies = [

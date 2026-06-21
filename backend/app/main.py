@@ -30,7 +30,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="your-personal-knowledge-graph-creator",
+    title="your-end-to-end-graphrag-implementation",
     version="0.0.1",
     description=(
         "GraphRAG-based ontology and document management system. "
@@ -65,7 +65,7 @@ app.include_router(browse.router)
 
 mcp = FastApiMCP(
     app,
-    name="your-personal-knowledge-graph-creator",
+    name="your-end-to-end-graphrag-implementation",
     description="Ontology + document GraphRAG operations exposed as MCP tools.",
     exclude_operations=["health"],   # /health is not useful as an agent tool
 )

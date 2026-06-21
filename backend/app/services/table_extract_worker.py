@@ -30,7 +30,7 @@ Exit codes:
 Output:
     Writes the JSON-LD bundle to BOTH `run-cache-dir/<key>.jsonld` AND
     the standard user cache at
-    `~/.cache/your-personal-knowledge-graph-creator/tables/<key>.jsonld`.
+    `~/.cache/your-end-to-end-graphrag-implementation/tables/<key>.jsonld`.
     The cache key is `sha256(EXTRACTOR_VERSION + doc_bytes)` so re-runs
     over an unchanged PDF are free.
 

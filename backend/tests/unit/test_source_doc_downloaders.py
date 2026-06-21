@@ -219,7 +219,7 @@ def test_edgar_cache_paths_have_expected_shape(monkeypatch, tmp_path) -> None:
     directories produce the right paths for direct PDFs vs. HTML->PDF."""
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     root = edgar_mod._edgar_cache_dir()
-    assert root == tmp_path / ".cache" / "your-personal-knowledge-graph-creator" / "edgar"
+    assert root == tmp_path / ".cache" / "your-end-to-end-graphrag-implementation" / "edgar"
     assert root.is_dir()  # _edgar_cache_dir() creates the root
     direct = edgar_mod._cached_pdf_path("000032019324000123", "ex23-1.pdf")
     assert direct == root / "pdfs" / "000032019324000123" / "ex23-1.pdf"

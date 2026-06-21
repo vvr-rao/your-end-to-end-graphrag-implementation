@@ -5,7 +5,7 @@ Per-doc pipeline:
   2. Compute sha256 of the ORIGINAL text (the citation anchor)
   3. Dup check: skip if an ACTIVE row with this hash already exists
   4. Summarize oversize docs via Phase 1 `summarize_long_documents_async`
-     (warm disk cache at ~/.cache/your-personal-knowledge-graph-creator/doc_summaries/)
+     (warm disk cache at ~/.cache/your-end-to-end-graphrag-implementation/doc_summaries/)
   5. Chunk via Phase 1 `chunk_documents`
   6. Embed chunks + doc-level summary via the shared Embedder
   7. Insert documents + chunks rows
