@@ -1619,8 +1619,17 @@ def _cmd_render_init(args: argparse.Namespace) -> int:
                     "env": "docker",
                     "plan": bdef.get("plan", "free"),
                     "region": bdef.get("region", "oregon"),
-                    "dockerfilePath": bdef.get("dockerfilePath", "./backend/Dockerfile"),
                     "healthCheckPath": bdef.get("healthCheckPath", "/health"),
+                    # Docker-specific fields MUST nest under envSpecificDetails;
+                    # the Render API silently ignores them at the top level and
+                    # falls back to looking for ./Dockerfile in the repo root,
+                    # which fails for our backend/Dockerfile layout.
+                    "envSpecificDetails": {
+                        "dockerfilePath": bdef.get(
+                            "dockerfilePath", "./backend/Dockerfile"
+                        ),
+                        "dockerContext": ".",
+                    },
                 },
             }
             print("→ creating backend service...")
@@ -1849,6 +1858,19 @@ def _cmd_render_logs(args: argparse.Namespace) -> int:
 
     async def _run() -> dict:
         client = RenderClient()
+        # The Render /v1/logs endpoint requires ownerId. If the user
+        # didn't pin RENDER_OWNER_ID, auto-discover from the API key.
+        if not client._owner_id:
+            owners = await client.list_owners()
+            if not owners:
+                raise RuntimeError(
+                    "no Render owners visible from this API key"
+                )
+            if len(owners) > 1:
+                raise RuntimeError(
+                    "multiple owners visible; pin RENDER_OWNER_ID in .env"
+                )
+            client._owner_id = owners[0]["id"]
         svc = await client.resolve_service(args.service)
         return await client.fetch_logs(
             svc["id"],
