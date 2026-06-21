@@ -1,8 +1,7 @@
 import ReactMarkdown from "react-markdown";
 
 /** Render an answer string. For `deep_research` mode, split on the 7
- * section labels and render each as its own labelled block. For
- * `simple_qa` (or anything we can't parse), render as one paragraph. */
+ * section labels and render each as its own labelled block. */
 
 const DEEP_SECTIONS = [
   "SPECIFICS",
@@ -20,7 +19,6 @@ interface Section {
 }
 
 function splitDeepResearch(answer: string): Section[] | null {
-  // Find each section label appearing on its own line.
   const lines = answer.split(/\r?\n/);
   const found: { idx: number; label: string }[] = [];
   for (let i = 0; i < lines.length; i++) {
@@ -29,7 +27,7 @@ function splitDeepResearch(answer: string): Section[] | null {
       found.push({ idx: i, label: trimmed });
     }
   }
-  if (found.length < 3) return null; // not the structured form
+  if (found.length < 3) return null;
   const out: Section[] = [];
   for (let i = 0; i < found.length; i++) {
     const start = found[i].idx + 1;
@@ -51,7 +49,7 @@ export function AnswerView({
 }) {
   if (!answer || !answer.trim()) {
     return (
-      <p className="text-slate-400 italic">
+      <p className="text-stone-500 italic">
         (no answer returned — see evidence below)
       </p>
     );
@@ -63,10 +61,10 @@ export function AnswerView({
         <div className="space-y-4">
           {sections.map((s) => (
             <section key={s.label}>
-              <h3 className="text-xs font-semibold tracking-wider text-emerald-400 mb-1">
+              <h3 className="text-xs font-semibold tracking-wider text-emerald-700 mb-1">
                 {s.label}
               </h3>
-              <div className="prose prose-invert prose-sm max-w-none text-slate-200">
+              <div className="prose prose-sm max-w-none text-stone-800">
                 <ReactMarkdown>{s.body || "_None identified._"}</ReactMarkdown>
               </div>
             </section>
@@ -76,7 +74,7 @@ export function AnswerView({
     }
   }
   return (
-    <div className="prose prose-invert prose-sm max-w-none text-slate-200">
+    <div className="prose prose-sm max-w-none text-stone-800">
       <ReactMarkdown>{answer}</ReactMarkdown>
     </div>
   );

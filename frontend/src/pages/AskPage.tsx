@@ -9,9 +9,7 @@ import { LoadingSpinner } from "../components/LoadingSpinner";
 import type { Mode, TurnResponse } from "../api/types";
 
 /** Asking a question creates a new conversation (so it shows up in
- * /conversations) and adds the first turn. The single-turn-only path
- * (POST /qa) is intentionally not used here — we want every Q&A to be
- * replayable from history. */
+ * /conversations) and adds the first turn. */
 export function AskPage() {
   const navigate = useNavigate();
   const [question, setQuestion] = useState("");
@@ -48,13 +46,13 @@ export function AskPage() {
           onChange={(e) => setQuestion(e.target.value)}
           placeholder="Ask your knowledge graph anything..."
           rows={3}
-          className="w-full rounded-lg border border-slate-700 bg-slate-900 px-4 py-3 text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-emerald-500"
+          className="w-full rounded-lg border border-stone-300 bg-white px-4 py-3 text-stone-900 placeholder:text-stone-400 focus:outline-none focus:border-emerald-500 shadow-sm"
         />
         <div className="flex items-center gap-3">
           <select
             value={mode}
             onChange={(e) => setMode(e.target.value as Mode)}
-            className="rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm"
+            className="rounded border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900"
           >
             <option value="deep_research">deep_research (default)</option>
             <option value="simple_qa">simple_qa</option>
@@ -62,7 +60,7 @@ export function AskPage() {
           <button
             type="submit"
             disabled={ask.isPending || !question.trim()}
-            className="ml-auto inline-flex items-center gap-2 rounded bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 px-4 py-2 text-sm font-medium"
+            className="ml-auto inline-flex items-center gap-2 rounded bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 px-4 py-2 text-sm font-medium text-white"
           >
             <Send className="h-4 w-4" /> Ask
           </button>
@@ -70,18 +68,18 @@ export function AskPage() {
       </form>
 
       {ask.isPending && (
-        <div className="rounded-lg border border-slate-800 bg-slate-900 p-4">
+        <div className="rounded-lg border border-stone-200 bg-white p-4 shadow-sm">
           <LoadingSpinner label="Retrieving + synthesizing..." />
         </div>
       )}
       {ask.isError && (
-        <div className="rounded-lg border border-rose-800 bg-rose-950 p-4 text-rose-200">
+        <div className="rounded-lg border border-rose-200 bg-rose-50 p-4 text-rose-700">
           {(ask.error as Error)?.message || "Request failed."}
         </div>
       )}
       {result && (
-        <div className="rounded-lg border border-slate-800 bg-slate-900 p-5">
-          <div className="flex items-center justify-between text-xs text-slate-500 mb-3">
+        <div className="rounded-lg border border-stone-200 bg-white p-5 shadow-sm">
+          <div className="flex items-center justify-between text-xs text-stone-500 mb-3">
             <span>mode: {result.mode}</span>
             <span>
               ${result.cost_usd.toFixed(4)} · {result.wall_seconds.toFixed(1)}s
@@ -91,7 +89,7 @@ export function AskPage() {
           <EvidenceList evidence={result.evidence} />
           <div className="mt-5 flex items-center gap-3 text-sm">
             <button
-              className="text-emerald-400 hover:text-emerald-300"
+              className="text-emerald-700 hover:text-emerald-600 font-medium"
               onClick={() =>
                 navigate(
                   `/conversations/${encodeURIComponent(

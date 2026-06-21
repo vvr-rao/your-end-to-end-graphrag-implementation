@@ -2,13 +2,14 @@ import { Link, NavLink, Outlet } from "react-router-dom";
 import { MessageSquare, History, Settings as SettingsIcon } from "lucide-react";
 
 const navItem =
-  "px-3 py-2 rounded text-sm flex items-center gap-2 hover:bg-slate-800";
-const navActive = "bg-slate-800 text-white";
+  "px-3 py-2 rounded text-sm flex items-center gap-2 hover:bg-stone-100 transition-colors";
+const navActive = "bg-stone-200 text-stone-900";
+const navInactive = "text-stone-500";
 
 export function Layout() {
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100">
-      <header className="border-b border-slate-800 bg-slate-900">
+    <div className="min-h-screen bg-stone-100 text-stone-900">
+      <header className="border-b border-stone-200 bg-white">
         <div className="max-w-5xl mx-auto px-4 py-3 flex items-center gap-6">
           <Link
             to="/ask"
@@ -20,7 +21,7 @@ export function Layout() {
             <NavLink
               to="/ask"
               className={({ isActive }) =>
-                `${navItem} ${isActive ? navActive : "text-slate-400"}`
+                `${navItem} ${isActive ? navActive : navInactive}`
               }
             >
               <MessageSquare className="h-4 w-4" /> Ask
@@ -28,7 +29,7 @@ export function Layout() {
             <NavLink
               to="/conversations"
               className={({ isActive }) =>
-                `${navItem} ${isActive ? navActive : "text-slate-400"}`
+                `${navItem} ${isActive ? navActive : navInactive}`
               }
             >
               <History className="h-4 w-4" /> History
@@ -36,7 +37,7 @@ export function Layout() {
             <NavLink
               to="/settings"
               className={({ isActive }) =>
-                `${navItem} ${isActive ? navActive : "text-slate-400"}`
+                `${navItem} ${isActive ? navActive : navInactive}`
               }
             >
               <SettingsIcon className="h-4 w-4" /> Settings

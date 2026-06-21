@@ -10,7 +10,7 @@ export function LoadingSpinner({ label = "Loading..." }: { label?: string }) {
     return () => clearTimeout(t);
   }, []);
   return (
-    <div className="flex items-center gap-3 text-slate-400">
+    <div className="flex items-center gap-3 text-stone-600">
       <Loader2 className="h-5 w-5 animate-spin" />
       <span>
         {coldStart
