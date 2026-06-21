@@ -300,6 +300,43 @@ async def add_turn(
     }
 
 
+async def list_conversations(
+    *, limit: int = 50, offset: int = 0
+) -> list[dict[str, Any]]:
+    """Return up to `limit` conversation headers ordered by created_at
+    DESC, skipping the first `offset`. Each row carries the IRI, title,
+    created_at, turn_count, and the most-recent turn's created_at."""
+    async with session_scope() as session:
+        r = await session.execute(
+            sql_text("""
+            SELECT c.conversation_identifier,
+                   c.extra_metadata,
+                   c.created_at,
+                   coalesce(count(t.id), 0) AS turn_count,
+                   max(t.created_at)         AS last_turn_at
+              FROM graphrag.conversations c
+              LEFT JOIN graphrag.conversation_turns t
+                ON t.conversation_id = c.id
+             GROUP BY c.id, c.conversation_identifier, c.extra_metadata,
+                      c.created_at
+             ORDER BY c.created_at DESC
+             LIMIT :lim OFFSET :off
+            """),
+            {"lim": limit, "off": offset},
+        )
+        rows = r.all()
+    return [
+        {
+            "iri": iri,
+            "title": (meta or {}).get("title"),
+            "created_at": created_at.isoformat(),
+            "turn_count": int(turn_count),
+            "last_turn_at": last_turn_at.isoformat() if last_turn_at else None,
+        }
+        for iri, meta, created_at, turn_count, last_turn_at in rows
+    ]
+
+
 async def replay_conversation(
     conversation_iri: str,
 ) -> dict[str, Any]:

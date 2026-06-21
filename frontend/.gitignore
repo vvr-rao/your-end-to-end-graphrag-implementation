@@ -3,3 +3,12 @@ dist/
 .vite/
 *.log
 .DS_Store
+
+# tsc build artifacts (we build via 'tsc --noEmit && vite build' so these
+# should never appear, but old checkouts may have them lying around).
+*.tsbuildinfo
+src/**/*.js
+src/App.d.ts
+src/main.d.ts
+vite.config.js
+vite.config.d.ts

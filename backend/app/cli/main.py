@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -728,6 +729,120 @@ def build_parser() -> argparse.ArgumentParser:
     p_conv_show.add_argument("--json", action="store_true")
     p_conv_show.set_defaults(func=_cmd_conversation_show)
 
+    # ---- Phase 3: Render lifecycle CLI -----------------------------------
+    p_rb = sub.add_parser(
+        "render-bootstrap",
+        help=(
+            "One-time setup helper: list Render owners to find your "
+            "RENDER_OWNER_ID."
+        ),
+    )
+    p_rb.add_argument("--json", action="store_true")
+    p_rb.set_defaults(func=_cmd_render_bootstrap)
+
+    p_ri = sub.add_parser(
+        "render-init",
+        help=(
+            "First-time CLI deploy: create backend + frontend services on "
+            "Render from render.yaml + .env, no dashboard click-through."
+        ),
+    )
+    p_ri.add_argument(
+        "--branch", default=None,
+        help="Git branch to track (default: current local branch).",
+    )
+    p_ri.add_argument(
+        "--repo", default=None,
+        help="GitHub repo URL (default: parsed from 'origin' remote).",
+    )
+    p_ri.add_argument(
+        "--no-deploy", action="store_true",
+        help="Create services + env vars but skip the initial deploy trigger.",
+    )
+    p_ri.set_defaults(func=_cmd_render_init)
+
+    p_rs = sub.add_parser(
+        "render-status",
+        help="Show the state of one or all Render services.",
+    )
+    p_rs.add_argument(
+        "--service", default="all",
+        help="Service name (backend / frontend) or 'all' (default).",
+    )
+    p_rs.add_argument("--json", action="store_true")
+    p_rs.set_defaults(func=_cmd_render_status)
+
+    p_rd = sub.add_parser(
+        "render-deploy",
+        help="Trigger a fresh deploy of a Render service.",
+    )
+    p_rd.add_argument(
+        "--service", default="backend",
+        help="Service name (backend / frontend). Default: backend.",
+    )
+    p_rd.add_argument(
+        "--wait", action="store_true",
+        help="Poll until the deploy reaches 'live' or 'failed'.",
+    )
+    p_rd.add_argument(
+        "--clear-cache", action="store_true",
+        help="Pass clearCache:'clear' to the deploy.",
+    )
+    p_rd.add_argument("--json", action="store_true")
+    p_rd.set_defaults(func=_cmd_render_deploy)
+
+    p_rsus = sub.add_parser(
+        "render-suspend",
+        help="Suspend a Render service (stops compute immediately).",
+    )
+    p_rsus.add_argument("--service", help="Service name.")
+    p_rsus.add_argument(
+        "--all", action="store_true",
+        help="Suspend backend + frontend together.",
+    )
+    p_rsus.set_defaults(func=_cmd_render_suspend)
+
+    p_rres = sub.add_parser(
+        "render-resume",
+        help="Resume a previously-suspended Render service.",
+    )
+    p_rres.add_argument("--service", help="Service name.")
+    p_rres.add_argument(
+        "--all", action="store_true",
+        help="Resume backend + frontend together.",
+    )
+    p_rres.set_defaults(func=_cmd_render_resume)
+
+    p_rl = sub.add_parser(
+        "render-logs",
+        help="Fetch recent log lines from a Render service.",
+    )
+    p_rl.add_argument("--service", required=True, help="Service name.")
+    p_rl.add_argument(
+        "--since", default="30m",
+        help="Look back this far (e.g. 5m, 1h, 24h). Default: 30m.",
+    )
+    p_rl.add_argument("--limit", type=int, default=100)
+    p_rl.add_argument("--json", action="store_true")
+    p_rl.set_defaults(func=_cmd_render_logs)
+
+    p_rtd = sub.add_parser(
+        "render-takedown",
+        help=(
+            "Suspend (default) or delete the backend + frontend services. "
+            "Requires --yes."
+        ),
+    )
+    p_rtd.add_argument(
+        "--hard", action="store_true",
+        help="Delete the services entirely (irreversible). Default: suspend.",
+    )
+    p_rtd.add_argument(
+        "--yes", action="store_true",
+        help="Confirm the takedown without an interactive prompt.",
+    )
+    p_rtd.set_defaults(func=_cmd_render_takedown)
+
     return parser
 
 
@@ -1310,6 +1425,501 @@ def _cmd_conversation_show(args: argparse.Namespace) -> int:
         if ans:
             print(f"  ANSWER:   {ans}")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Render lifecycle handlers
+# ---------------------------------------------------------------------------
+
+
+_RENDER_PHASE3_SERVICES = ("backend", "frontend")
+
+
+def _iso_minutes_ago(spec: str) -> str:
+    """Parse '30m' / '2h' / '24h' / '7d' into an RFC3339 timestamp in UTC."""
+    import datetime as _dt
+    import re
+
+    m = re.fullmatch(r"\s*(\d+)\s*([mhd])\s*", spec)
+    if not m:
+        raise SystemExit(f"--since must look like '30m' / '2h' / '7d', got {spec!r}")
+    n, unit = int(m.group(1)), m.group(2)
+    delta = {
+        "m": _dt.timedelta(minutes=n),
+        "h": _dt.timedelta(hours=n),
+        "d": _dt.timedelta(days=n),
+    }[unit]
+    return (
+        _dt.datetime.now(_dt.UTC) - delta
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _print_json(obj: object) -> None:
+    print(json.dumps(obj, indent=2, default=str))
+
+
+def _cmd_render_bootstrap(args: argparse.Namespace) -> int:
+    from backend.app.services.render_client import RenderClient
+
+    async def _run() -> list[dict]:
+        client = RenderClient()
+        return await client.list_owners()
+
+    try:
+        owners = asyncio.run(_run())
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+    if args.json:
+        _print_json(owners)
+        return 0
+    print("Render owners visible to this API key:\n")
+    print(f"{'OWNER ID':<24} {'TYPE':<10} NAME")
+    print("-" * 72)
+    for o in owners:
+        print(
+            f"{o.get('id', ''):<24} {o.get('type', 'unknown'):<10} "
+            f"{o.get('name', '?')}"
+        )
+    print("\nAdd the desired ID to .env as RENDER_OWNER_ID.")
+    return 0
+
+
+def _git_remote_url() -> str:
+    """Read the 'origin' remote, normalize to https://github.com/.../foo."""
+    import subprocess
+    out = subprocess.run(
+        ["git", "remote", "get-url", "origin"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    if out.startswith("git@github.com:"):
+        out = "https://github.com/" + out[len("git@github.com:"):]
+    return out.removesuffix(".git")
+
+
+def _git_current_branch() -> str:
+    import subprocess
+    return subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def _read_env_file(path: str = ".env") -> dict[str, str]:
+    """Minimal .env parser. Ignores comments + blank lines. Strips
+    surrounding quotes from values. Doesn't expand variable references."""
+    from pathlib import Path
+    out: dict[str, str] = {}
+    p = Path(path)
+    if not p.exists():
+        return out
+    for line in p.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        v = v.strip().strip('"').strip("'")
+        out[k.strip()] = v
+    return out
+
+
+def _cmd_render_init(args: argparse.Namespace) -> int:
+    """Create backend + frontend services on Render from render.yaml +
+    .env, no dashboard click-through. Idempotent: skips services that
+    already exist by name. Cross-links FRONTEND_ORIGIN <-> VITE_API_BASE_URL
+    after both services have URLs."""
+    import yaml
+    from pathlib import Path
+    from backend.app.services.render_client import RenderClient
+
+    repo_root = Path(__file__).resolve().parents[3]
+    rys = repo_root / "render.yaml"
+    if not rys.exists():
+        print(f"ERROR: {rys} not found.")
+        return 1
+    with rys.open() as f:
+        blueprint = yaml.safe_load(f) or {}
+
+    env_file = _read_env_file(str(repo_root / ".env"))
+    required_secrets = ["DATABASE_URL", "OPENAI_API_KEY", "BEARER_TOKEN"]
+    missing = [k for k in required_secrets if not env_file.get(k)]
+    if missing:
+        print(f"ERROR: missing required env vars in .env: {missing}")
+        return 1
+
+    try:
+        repo_url = args.repo or _git_remote_url()
+        branch = args.branch or _git_current_branch()
+    except Exception as exc:
+        print(f"ERROR: could not read git remote/branch: {exc}")
+        return 1
+    print(f"→ repo:   {repo_url}")
+    print(f"→ branch: {branch}")
+
+    async def _run() -> int:
+        client = RenderClient()
+        # Auto-discover owner if not set.
+        if not client._owner_id:
+            owners = await client.list_owners()
+            if not owners:
+                print("ERROR: no Render owners visible from this API key.")
+                return 1
+            if len(owners) > 1:
+                print(
+                    "Multiple Render owners visible. Set RENDER_OWNER_ID in "
+                    ".env to disambiguate. Owners: "
+                    + ", ".join(f"{o.get('name')} ({o.get('id')})" for o in owners)
+                )
+                return 1
+            client._owner_id = owners[0]["id"]
+            print(f"→ owner:  {owners[0].get('name')} ({client._owner_id})")
+
+        existing = {
+            s.get("name"): s for s in await client.list_services()
+        }
+
+        # Find the backend + frontend service defs from render.yaml.
+        svc_defs: dict[str, dict] = {}
+        for svc in blueprint.get("services", []):
+            name = svc.get("name")
+            if name in ("backend", "frontend"):
+                svc_defs[name] = svc
+        if "backend" not in svc_defs or "frontend" not in svc_defs:
+            print("ERROR: render.yaml must declare both 'backend' and 'frontend' services.")
+            return 1
+
+        # --- 1. backend (or pick up existing) ---
+        backend = existing.get("backend")
+        if backend:
+            print(f"= backend already exists: {backend.get('id')}")
+        else:
+            bdef = svc_defs["backend"]
+            backend_env = [
+                {"key": "DATABASE_URL",    "value": env_file["DATABASE_URL"]},
+                {"key": "OPENAI_API_KEY",  "value": env_file["OPENAI_API_KEY"]},
+                {"key": "BEARER_TOKEN",    "value": env_file["BEARER_TOKEN"]},
+                {"key": "FRONTEND_ORIGIN", "value": "http://localhost:5173"},
+                {"key": "LOG_LEVEL",       "value": "INFO"},
+                {"key": "ENV",             "value": "production"},
+            ]
+            if env_file.get("GROQ_API_KEY"):
+                backend_env.append(
+                    {"key": "GROQ_API_KEY", "value": env_file["GROQ_API_KEY"]}
+                )
+            payload = {
+                "type": "web_service",
+                "name": "backend",
+                "ownerId": client._owner_id,
+                "repo": repo_url,
+                "branch": branch,
+                "autoDeploy": "yes",
+                "rootDir": bdef.get("rootDir", "."),
+                "envVars": backend_env,
+                "serviceDetails": {
+                    "env": "docker",
+                    "plan": bdef.get("plan", "free"),
+                    "region": bdef.get("region", "oregon"),
+                    "dockerfilePath": bdef.get("dockerfilePath", "./backend/Dockerfile"),
+                    "healthCheckPath": bdef.get("healthCheckPath", "/health"),
+                },
+            }
+            print("→ creating backend service...")
+            backend = await client.create_service(payload)
+            print(f"  created: id={backend.get('id')}")
+
+        # Discover backend URL.
+        backend_url = (
+            backend.get("serviceDetails", {}).get("url")
+            or f"https://{backend.get('name', 'backend')}.onrender.com"
+        )
+        print(f"→ backend URL: {backend_url}")
+
+        # --- 2. frontend (or pick up existing) ---
+        frontend = existing.get("frontend")
+        if frontend:
+            print(f"= frontend already exists: {frontend.get('id')}")
+        else:
+            fdef = svc_defs["frontend"]
+            payload = {
+                "type": "static_site",
+                "name": "frontend",
+                "ownerId": client._owner_id,
+                "repo": repo_url,
+                "branch": branch,
+                "autoDeploy": "yes",
+                "rootDir": fdef.get("rootDir", "frontend"),
+                "envVars": [
+                    {"key": "VITE_API_BASE_URL", "value": backend_url},
+                ],
+                "serviceDetails": {
+                    "buildCommand": fdef.get("buildCommand", "npm ci && npm run build"),
+                    "publishPath": fdef.get("staticPublishPath", "./dist"),
+                    "pullRequestPreviewsEnabled": "no",
+                },
+            }
+            print("→ creating frontend service...")
+            frontend = await client.create_service(payload)
+            print(f"  created: id={frontend.get('id')}")
+
+        frontend_url = (
+            frontend.get("serviceDetails", {}).get("url")
+            or f"https://{frontend.get('name', 'frontend')}.onrender.com"
+        )
+        print(f"→ frontend URL: {frontend_url}")
+
+        # --- 3. cross-link FRONTEND_ORIGIN on backend ---
+        new_frontend_origin = f"http://localhost:5173,{frontend_url}"
+        if existing.get("backend") is None or env_file.get(
+            "FRONTEND_ORIGIN"
+        ) != new_frontend_origin:
+            print(
+                f"→ updating backend FRONTEND_ORIGIN -> {new_frontend_origin}"
+            )
+            backend_env_full = [
+                {"key": "DATABASE_URL",    "value": env_file["DATABASE_URL"]},
+                {"key": "OPENAI_API_KEY",  "value": env_file["OPENAI_API_KEY"]},
+                {"key": "BEARER_TOKEN",    "value": env_file["BEARER_TOKEN"]},
+                {"key": "FRONTEND_ORIGIN", "value": new_frontend_origin},
+                {"key": "LOG_LEVEL",       "value": "INFO"},
+                {"key": "ENV",             "value": "production"},
+            ]
+            if env_file.get("GROQ_API_KEY"):
+                backend_env_full.append(
+                    {"key": "GROQ_API_KEY", "value": env_file["GROQ_API_KEY"]}
+                )
+            await client.update_env_vars(backend["id"], backend_env_full)
+
+        # --- 4. optionally trigger first deploys ---
+        if not args.no_deploy:
+            print("→ triggering first deploys")
+            try:
+                await client.trigger_deploy(backend["id"])
+                await client.trigger_deploy(frontend["id"])
+            except Exception as exc:
+                print(f"  (deploy trigger had a hiccup, ignore if auto-deploy is on: {exc})")
+
+        print("\nDONE. Next steps:")
+        print(f"  open {frontend_url} in a browser")
+        print(f"  paste BEARER_TOKEN={env_file['BEARER_TOKEN'][:8]}... into /settings")
+        print("  monitor build progress:")
+        print("    uv run python -m backend.app.cli render-status")
+        print("    uv run python -m backend.app.cli render-logs --service backend --since 10m")
+        return 0
+
+    try:
+        return asyncio.run(_run())
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+
+def _cmd_render_status(args: argparse.Namespace) -> int:
+    from backend.app.services.render_client import RenderClient
+
+    async def _run() -> list[dict]:
+        client = RenderClient()
+        services = await client.list_services()
+        if args.service != "all":
+            services = [s for s in services if s.get("name") == args.service]
+        return services
+
+    try:
+        services = asyncio.run(_run())
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+    if args.json:
+        _print_json(services)
+        return 0
+    if not services:
+        print(f"No services found for --service {args.service!r}.")
+        return 1
+    print(f"{'NAME':<20} {'TYPE':<10} {'STATE':<14} URL")
+    print("-" * 90)
+    for s in services:
+        state = s.get("suspended", "not_suspended")
+        if state == "suspended":
+            pretty = "suspended"
+        else:
+            pretty = s.get("serviceDetails", {}).get("buildStatus", "running")
+        print(
+            f"{s.get('name', '?'):<20} {s.get('type', '?'):<10} "
+            f"{pretty:<14} {s.get('serviceDetails', {}).get('url', '')}"
+        )
+    return 0
+
+
+def _cmd_render_deploy(args: argparse.Namespace) -> int:
+    from backend.app.services.render_client import RenderClient
+
+    async def _run() -> dict:
+        client = RenderClient()
+        svc = await client.resolve_service(args.service)
+        sid = svc["id"]
+        print(f"→ triggering deploy for {svc['name']} ({sid})")
+        deploy = await client.trigger_deploy(sid, clear_cache=args.clear_cache)
+        if not args.wait:
+            return deploy
+        deploy_id = deploy.get("id")
+        if not deploy_id:
+            print(f"WARN: deploy response missing id: {deploy}")
+            return deploy
+        last_status = ""
+        import asyncio as _asy
+        while True:
+            d = await client.get_deploy(sid, deploy_id)
+            status_ = d.get("status", "?")
+            if status_ != last_status:
+                print(f"  [{status_}]")
+                last_status = status_
+            if status_ in ("live", "deactivated", "build_failed",
+                           "update_failed", "canceled"):
+                return d
+            await _asy.sleep(10)
+
+    try:
+        deploy = asyncio.run(_run())
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+    if args.json:
+        _print_json(deploy)
+    else:
+        print(
+            f"\nDEPLOY ID:  {deploy.get('id', '?')}\n"
+            f"STATUS:     {deploy.get('status', '?')}\n"
+            f"COMMIT:     {(deploy.get('commit') or {}).get('id', '?')[:12]}"
+        )
+    return 0 if deploy.get("status") in ("live", "created", "build_in_progress",
+                                          "update_in_progress", "queued") else 1
+
+
+def _cmd_render_suspend(args: argparse.Namespace) -> int:
+    return _render_lifecycle(args, action="suspend")
+
+
+def _cmd_render_resume(args: argparse.Namespace) -> int:
+    return _render_lifecycle(args, action="resume")
+
+
+def _render_lifecycle(args: argparse.Namespace, *, action: str) -> int:
+    """Shared driver for suspend/resume that accepts --service or --all."""
+    from backend.app.services.render_client import RenderClient
+
+    targets: list[str]
+    if args.all:
+        targets = list(_RENDER_PHASE3_SERVICES)
+    elif args.service:
+        targets = [args.service]
+    else:
+        print("ERROR: pass either --service NAME or --all.")
+        return 1
+
+    async def _run() -> list[tuple[str, str]]:
+        client = RenderClient()
+        results: list[tuple[str, str]] = []
+        for name in targets:
+            try:
+                svc = await client.resolve_service(name)
+                sid = svc["id"]
+                if action == "suspend":
+                    await client.suspend_service(sid)
+                else:
+                    await client.resume_service(sid)
+                results.append((name, f"{action}ed"))
+            except Exception as exc:
+                results.append((name, f"ERROR: {exc}"))
+        return results
+
+    try:
+        results = asyncio.run(_run())
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+    failed = False
+    for name, msg in results:
+        print(f"  {name:<20} {msg}")
+        if msg.startswith("ERROR"):
+            failed = True
+    return 1 if failed else 0
+
+
+def _cmd_render_logs(args: argparse.Namespace) -> int:
+    from backend.app.services.render_client import RenderClient
+
+    async def _run() -> dict:
+        client = RenderClient()
+        svc = await client.resolve_service(args.service)
+        return await client.fetch_logs(
+            svc["id"],
+            start_time=_iso_minutes_ago(args.since),
+            limit=args.limit,
+        )
+
+    try:
+        data = asyncio.run(_run())
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+    if args.json:
+        _print_json(data)
+        return 0
+    logs = data.get("logs") if isinstance(data, dict) else []
+    if not logs:
+        print(f"(no log lines in the last {args.since} for {args.service})")
+        return 0
+    for entry in logs:
+        ts = entry.get("timestamp", "")
+        msg = entry.get("message", "")
+        print(f"{ts}  {msg}")
+    return 0
+
+
+def _cmd_render_takedown(args: argparse.Namespace) -> int:
+    """Suspend (default) or hard-delete the Phase-3 services. --yes required."""
+    from backend.app.services.render_client import RenderClient
+
+    if not args.yes:
+        print(
+            f"This will {'DELETE' if args.hard else 'SUSPEND'} the following "
+            f"Render services: {', '.join(_RENDER_PHASE3_SERVICES)}.\n"
+            "Re-run with --yes to confirm."
+        )
+        return 1
+
+    async def _run() -> list[tuple[str, str]]:
+        client = RenderClient()
+        out: list[tuple[str, str]] = []
+        for name in _RENDER_PHASE3_SERVICES:
+            try:
+                svc = await client.resolve_service(name)
+                sid = svc["id"]
+                if args.hard:
+                    await client.delete_service(sid)
+                    out.append((name, "deleted"))
+                else:
+                    await client.suspend_service(sid)
+                    out.append((name, "suspended"))
+            except Exception as exc:
+                out.append((name, f"ERROR: {exc}"))
+        return out
+
+    try:
+        results = asyncio.run(_run())
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+    failed = False
+    for name, msg in results:
+        print(f"  {name:<20} {msg}")
+        if msg.startswith("ERROR"):
+            failed = True
+    if not args.hard:
+        print(
+            "\nTip: 'render-resume --all' brings them back when you're "
+            "ready to use the app again."
+        )
+    return 1 if failed else 0
 
 
 def main(argv: list[str] | None = None) -> int:

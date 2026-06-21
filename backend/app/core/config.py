@@ -48,8 +48,17 @@ class Settings(BaseSettings):
 
     frontend_origin: str = Field(
         "http://localhost:5173",
-        description="CORS allow-origin for the React UI. Override in prod to the Render static URL.",
+        description=(
+            "CORS allow-origin(s) for the React UI. Comma-separate to allow "
+            "multiple (e.g. dev + prod): "
+            "'http://localhost:5173,https://your-frontend.onrender.com'."
+        ),
     )
+
+    @property
+    def frontend_origins(self) -> list[str]:
+        """Parse `frontend_origin` as a CSV into a list of allowed origins."""
+        return [o.strip() for o in self.frontend_origin.split(",") if o.strip()]
 
     log_level: str = "INFO"
     env: str = "development"

@@ -5,18 +5,24 @@
 #   - backend  : FastAPI + MCP (Streamable HTTP) — single uvicorn process at /mcp + REST
 #   - worker   : arq background worker (Phase 1+; autoDeploy disabled until WorkerSettings lands)
 #   - frontend : static React + Vite UI
-#   - redis    : managed Redis (used by arq)
 #
 # Postgres is intentionally external (Supabase) — paste your connection string
 # into the `DATABASE_URL` env var of the backend + worker services. The app
 # auto-normalizes the scheme to asyncpg and appends ?ssl=require for *.supabase.co.
+#
+# Plan = free everywhere. Free-tier limits to be aware of:
+#   - backend web sleeps after 15 min idle (first request after sleep: 30-60s).
+#   - no persistent disk (STORAGE_DIR is unused in Phase 3; uploads not supported).
+#   - Redis service is NOT declared (Render no longer offers free Redis; re-add
+#     when the arq worker actually ships and we move to a paid plan).
+#   - 750 hr/month per account; one always-on backend uses ~720 hr.
 # =============================================================================
 
 services:
   - type: web
     name: backend
     runtime: docker
-    plan: starter
+    plan: free
     region: oregon
     rootDir: .
     dockerfilePath: ./backend/Dockerfile
@@ -24,11 +30,6 @@ services:
     envVars:
       - key: DATABASE_URL
         sync: false                          # paste Supabase DSN in dashboard
-      - key: REDIS_URL
-        fromService:
-          type: redis
-          name: redis
-          property: connectionString
       - key: OPENAI_API_KEY
         sync: false
       - key: GROQ_API_KEY
@@ -36,35 +37,27 @@ services:
       - key: BEARER_TOKEN
         generateValue: true
       - key: FRONTEND_ORIGIN
-        sync: false                          # set to the deployed frontend URL
-      - key: STORAGE_DIR
-        value: /var/data/uploads
+        sync: false                          # CSV of allowed origins; e.g.
+                                             # "http://localhost:5173,https://<frontend>.onrender.com"
       - key: LOG_LEVEL
         value: INFO
       - key: ENV
         value: production
-    disk:
-      name: backend-uploads
-      mountPath: /var/data/uploads
-      sizeGB: 5
 
   - type: worker
     name: worker
     runtime: docker
-    plan: starter
+    plan: free
     region: oregon
     rootDir: .
     dockerfilePath: ./backend/Dockerfile
     dockerCommand: uv run arq backend.app.jobs.worker.WorkerSettings
-    autoDeploy: false                        # enable once Phase 1 ships the worker module
+    autoDeploy: false                        # enable once the worker module ships
     envVars:
       - key: DATABASE_URL
         sync: false
       - key: REDIS_URL
-        fromService:
-          type: redis
-          name: redis
-          property: connectionString
+        sync: false                          # set when Redis is provisioned
       - key: OPENAI_API_KEY
         sync: false
       - key: GROQ_API_KEY
@@ -74,8 +67,6 @@ services:
           type: web
           name: backend
           envVarKey: BEARER_TOKEN
-      - key: STORAGE_DIR
-        value: /var/data/uploads
       - key: LOG_LEVEL
         value: INFO
       - key: ENV
@@ -84,8 +75,6 @@ services:
   - type: web
     name: frontend
     runtime: static
-    plan: starter
-    region: oregon
     rootDir: frontend
     buildCommand: npm ci && npm run build
     staticPublishPath: ./dist
@@ -96,10 +85,3 @@ services:
       - type: rewrite
         source: /*
         destination: /index.html
-
-  - type: redis
-    name: redis
-    plan: starter
-    region: oregon
-    ipAllowList: []                          # only Render-internal services
-    maxmemoryPolicy: noeviction

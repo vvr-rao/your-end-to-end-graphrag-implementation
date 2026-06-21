@@ -1,5 +1,6 @@
 """Conversation routes (Milestone G over HTTP).
 
+GET    /conversations                -- list past conversations (paginated)
 POST   /conversations                -- start
 POST   /conversations/{iri}/turns    -- add a turn (follow-up resolved automatically)
 GET    /conversations/{iri}          -- replay
@@ -8,11 +9,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Path, status
+from fastapi import APIRouter, HTTPException, Path, Query, status
 from pydantic import BaseModel, Field
 
 from backend.app.services.db_conversation import (
     add_turn,
+    list_conversations,
     replay_conversation,
     start_conversation,
 )
@@ -72,6 +74,27 @@ class ConversationView(BaseModel):
     created_at: str
     turn_count: int
     turns: list[dict[str, Any]]
+
+
+class ConversationListItem(BaseModel):
+    iri: str
+    title: str | None
+    created_at: str
+    turn_count: int
+    last_turn_at: str | None
+
+
+@router.get(
+    "",
+    response_model=list[ConversationListItem],
+    operation_id="conversation_list",
+)
+async def conversation_list(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> list[ConversationListItem]:
+    rows = await list_conversations(limit=limit, offset=offset)
+    return [ConversationListItem(**row) for row in rows]
 
 
 @router.post("", response_model=StartResponse, operation_id="conversation_start")
