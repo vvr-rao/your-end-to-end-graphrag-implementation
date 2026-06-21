@@ -69,6 +69,29 @@ See [eval_questions/README.md](eval_questions/README.md) for the
 methodology, retrieval pipeline diagram, per-question cost estimates,
 and what each metric measures.
 
+## Document summarization (pre-ingestion)
+
+Documents above `chunking.summarization_threshold_tokens` (default 2,000 tokens
+in [config/config.yaml](config/config.yaml)) are compressed via gpt-4o-mini
+before chunking + embedding. The summary — not the raw text — is what gets
+embedded and stored on `chunks.text`; `documents.file_path` still points at
+the original so citations can resolve back to source.
+
+**Designed to keep** (per the prompt):
+
+- Named entities (countries, regions, companies, products, people, regulations, dates, monetary amounts, measurements)
+- Conceptual categories (industries, sectors, technologies, materials, processes, frameworks)
+- Relationships between entities (X causes Y, X is part of Y, X exports Y, etc.)
+- Numerical specifics tied to a named thing
+- Intelligence-bearing fragments rendered as standalone sentences: **Events** (with dates), **Claims** (with source attribution), **Findings**, **Risks**, **Insights**
+
+The prompt lives in [`document_summarize`](backend/app/services/prompts.py#L711)
+at [prompts.py:711-792](backend/app/services/prompts.py#L711-L792). Users may
+want to look at it and edit it to retain specific information their corpus
+needs. When you change the prompt, bump `_DOC_SUMMARY_PROMPT_VERSION` at
+[pipeline_llm.py:1518](backend/app/services/pipeline_llm.py#L1518) to
+invalidate the on-disk summary cache.
+
 ## Intelligence artifacts
 
 The retrieval layer reads from a typed library of **Intelligence Artifacts** — rows in `graphrag.intelligence_artifacts`, each a typed instance of a VIAO class. Eight types are extracted today (`Fact`, `Conclusion`, `Risk` are also in VIAO but reserved for future passes).
