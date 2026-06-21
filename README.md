@@ -487,6 +487,62 @@ The app normalizes the scheme to `postgresql+asyncpg://` and appends
 `?ssl=require` for `*.supabase.co` hosts internally. Supabase ships with
 pgvector enabled, so no extra setup is required for the embedding tables.
 
+## Deploying to Render
+
+Two services are created on Render — a Docker web service (FastAPI + MCP at `/mcp`) and a static site (the React UI). Postgres stays external at Supabase. All driven by a single CLI command — no dashboard click-through except the one-time GitHub App install below.
+
+### One-time GitHub App install
+
+Render needs read access to your repo before its API can fetch from it. If `render-init` fails with `Render API 400: ... unfetchable: https://github.com/...`, the GitHub App isn't installed yet. Two paths — whichever you find faster:
+
+**Path A — install directly from GitHub** (most reliable):
+
+1. Go to https://github.com/apps/render
+2. Click the green **Install** (or **Configure** if it's already there)
+3. Pick your GitHub account/org
+4. Either "All repositories" or pick `your-end-to-end-graphrag-implementation`
+5. Click **Install** / **Save**
+
+**Path B — trigger the OAuth from Render's New-Service flow:**
+
+1. Render dashboard → click **New +** (top right) → **Web Service**
+2. The page should show a "Connect GitHub" or "Configure GitHub App" button — click it
+3. Authorize → install on the repo
+4. Don't actually create the service from this page — just close the tab once GitHub is connected
+
+After either path, Render's GitHub App is installed on your repo permanently — you won't need to do it again for future deploys.
+
+### Deploy
+
+Required env vars in `.env`: `RENDER_API_KEY`, `DATABASE_URL`, `OPENAI_API_KEY`, `BEARER_TOKEN` (plus optional `GROQ_API_KEY`, `RENDER_OWNER_ID`).
+
+```bash
+uv run python -m backend.app.cli render-init
+```
+
+One command. It reads `render.yaml` + `.env` + your git origin/branch, creates both services on Render, sets env vars, cross-links `FRONTEND_ORIGIN` ↔ `VITE_API_BASE_URL`, and triggers the first deploys. Idempotent — safe to re-run if anything errored partway through.
+
+Add `--no-deploy` to create the services without auto-triggering builds (useful if you want to review env vars first).
+
+### Lifecycle commands
+
+```bash
+uv run python -m backend.app.cli render-status                          # state of both services
+uv run python -m backend.app.cli render-deploy --service backend --wait # force a fresh build
+uv run python -m backend.app.cli render-logs --service backend --since 10m
+uv run python -m backend.app.cli render-suspend --all                   # park overnight to save Free-tier hours
+uv run python -m backend.app.cli render-resume --all
+uv run python -m backend.app.cli render-takedown --yes                  # soft (suspend both)
+uv run python -m backend.app.cli render-takedown --hard --yes           # delete services entirely
+```
+
+### Render Free-tier limits
+
+- **Web services**: 750 instance-hours per workspace per month (one always-on web service uses ~720 hr; sleeps after 15 min idle).
+- **Static sites**: 100 GB bandwidth + 500 build minutes/month; never sleeps.
+- **No free Postgres, Redis, or persistent disks** — Postgres lives at Supabase; Redis is dropped from `render.yaml` until the worker ships; the backend disk was removed since Phase 3 doesn't ingest from the web.
+- First request after sleep takes 30-60s to wake (the UI's `LoadingSpinner` switches copy to warn about this).
+
 ## Helper scripts
 
 ### `source_ontologies/download_ontology.py`
