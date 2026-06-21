@@ -25,6 +25,12 @@ _PUBLIC_PATHS: frozenset[str] = frozenset({
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next) -> Response:
+        # CORS preflight requests must pass through unauthenticated --
+        # browsers don't send auth headers on OPTIONS, so 401-ing the
+        # preflight blocks the actual request from ever being sent.
+        # The wrapped CORSMiddleware adds the allow-origin headers.
+        if request.method == "OPTIONS":
+            return await call_next(request)
         path = request.url.path
         # Public paths bypass auth.
         if path in _PUBLIC_PATHS or path.startswith("/docs/"):
