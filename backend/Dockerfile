@@ -21,8 +21,11 @@ RUN sh /tmp/uv-install.sh && rm /tmp/uv-install.sh
 
 WORKDIR /app
 
-# Resolve and install dependencies first for better layer caching
-COPY pyproject.toml uv.lock ./
+# Resolve and install dependencies first for better layer caching.
+# README.md is required because pyproject.toml's [project].readme field
+# points at it -- hatchling validates the file exists when building the
+# project wheel in the final install step below.
+COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 # Now copy app code
