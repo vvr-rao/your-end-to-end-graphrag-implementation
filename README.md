@@ -26,7 +26,7 @@ Conversation view: a prior simple_qa turn with its cited answer, plus a deep_res
 
 3. **Automatic intelligence-artifact extraction.** Per chunk: typed `Claim` / `Finding` / `Observation` / `Event` artifacts. Per document: `Summary`. Opt-in cross-cluster `Insight` and `Recommendation` artifacts via gpt-4.1 synthesis. Created a new Ontology - **VIAO** - with classes to hold this structure. This defines the artifact taxonomy + edge predicates (`derivedFromChunk`, `assertsAbout`, `insightBasedOn`, etc.) providing traceability. 
 
-4. **Tables as first-class objects.** PDFs are scanned by `pdfplumber` (and gpt-4o-mini vision for nested cases), extracted as JSON-LD, and stored as `StructuredTable` artifacts alongside text chunks. Numeric drill-downs on become retrievable via the graph structure.
+4. **Tables as first-class objects.** PDFs are scanned by `pdfplumber` (and gpt-4o-mini vision for nested cases), extracted as JSON-LD, and stored as `StructuredTable` artifacts alongside text chunks. Numeric drill-downs become retrievable via the graph structure.
 
 5. **Time + geography expansion, curated upper ontologies.** Temporal mentions auto-expand into a year/quarter/month/day hierarchy with parent creation + gap-fill. Geography rides on existing OWL classes from the merged geography ontology. This allows automatic discovery in GraphRAG (e.g. documents talking about "Jan 2024" and retrievable in queries on "2024" and vice-versa. documents talking about "India" and retrievable in queries on "Asia" and vice-versa) 
 
