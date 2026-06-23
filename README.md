@@ -12,17 +12,25 @@ Three surfaces, one process: REST at `/`, MCP at `/mcp`, and a React UI hosted a
 
 Conversation view: a prior simple_qa turn with its cited answer, plus a deep_research follow-up being composed. Top nav switches between **Ask** (single questions), **History** (browse + replay), and **Settings** (paste your bearer token).
 
+## Architecture Notes
+
+**LLMs Used** - Multi-LLM support, currently uses GROQ(for simple tasks) and OpenAI(for more complex reasoning). Will expand to other LLMs in the future.
+**Database** - Postgres to hold the knowledge graph and Vectors. I used Supabase but any Postgres DB should work.
+**Hosting** - Render for the React UI and MCP Server endpoints. You should be able to move things around to other platforms if you prefer.
+
 ## Key differentiators
 
-1. **End-to-end in one tool.** Starts with the raw documents and ends with a deployment of a React UI and an MCP server. Supports Document ingestion → ontology curation → entity + intelligence-artifact extraction → ontology-aware retrieval → React UI + MCP server deployed on Postgres (Supabase) + Render. No glue scripts between stages — every step is a subcommand of the same CLI.
+1. **End-to-end in one tool.** Starts with the raw documents and ends with a deployment of a React UI and an MCP server. Supports Document ingestion → ontology curation → entity + intelligence-artifact extraction → ontology-aware retrieval → React UI + MCP server deployed on Postgres (Supabase) + Render. No glue scripts between stages — every step is a subcommand of the same CLI. UI has basic functionality - multi-turn conversation, ability to store and retrieve old conversations etc.
 
-2. **Ontology-based** Supports import of standard `.rdf` / `.owl` / `.ttl` ontologies and expands them with corpus-driven LLM proposals. Tested with multiple domain specific ontologies across Finance(e.g. FIBO), Pharma( e.g. OCRe, HP), Manufacturing and SUpply Chain(OntoCAPE) and general/non-domain spcific ones(e.g. FOAF, SKOS). Output is a standard OWL — and can be opened and modified in standard tool such as Protege.
+2. **Ontology-based.** Supports import of standard `.rdf` / `.owl` / `.ttl` ontologies and expands them with corpus-driven LLM proposals. Tested with multiple domain specific ontologies across Finance(e.g. FIBO), Pharma( e.g. OCRe, HP), Manufacturing and Supply Chain(OntoCAPE) and general/non-domain specific ones(e.g. FOAF, SKOS). Output is a standard OWL — and can be opened and modified in standard tool such as Protege.
 
-3. **Automatic intelligence-artifact extraction.** Per chunk: typed `Claim` / `Finding` / `Observation` / `Event` artifacts. Per document: `Summary`. Opt-in cross-cluster `Insight` and `Recommendation` artifacts via gpt-4.1 synthesis. Created a new Ontology - **VIAO** - with classes to hold this structure. This defines the artifact taxonomy + edge predicates (`derivedFromChunk`, `assertsAbout`, `insightBasedOn`, etc.) providing tracability. 
+3. **Automatic intelligence-artifact extraction.** Per chunk: typed `Claim` / `Finding` / `Observation` / `Event` artifacts. Per document: `Summary`. Opt-in cross-cluster `Insight` and `Recommendation` artifacts via gpt-4.1 synthesis. Created a new Ontology - **VIAO** - with classes to hold this structure. This defines the artifact taxonomy + edge predicates (`derivedFromChunk`, `assertsAbout`, `insightBasedOn`, etc.) providing traceability. 
 
-4. **Tables as first-class objects.** PDFs are scanned by `pdfplumber` (and gpt-4o-mini vision for nested cases), extracted as JSON-LD, and stored as `StructuredTable` artifacts alongside text chunks. Numeric drill-downs on  become retrievable via the graph structure.
+4. **Tables as first-class objects.** PDFs are scanned by `pdfplumber` (and gpt-4o-mini vision for nested cases), extracted as JSON-LD, and stored as `StructuredTable` artifacts alongside text chunks. Numeric drill-downs on become retrievable via the graph structure.
 
-5. **Time + geography expansion, curated upper ontologies** Temporal mentions auto-expand into a year/quarter/month/day hierarchy with parent creation + gap-fill. Geography rides on existing OWL classes from the merged geography ontology. This allows automatic discovery in GraphRAG (e.g. documents talking about "Jan 2024" and relrevable in queries on "2024" amd vice-versa. documents talking about "India" and retreivable in queris on "Asia" and vice-versa) 
+5. **Time + geography expansion, curated upper ontologies.** Temporal mentions auto-expand into a year/quarter/month/day hierarchy with parent creation + gap-fill. Geography rides on existing OWL classes from the merged geography ontology. This allows automatic discovery in GraphRAG (e.g. documents talking about "Jan 2024" and retrievable in queries on "2024" and vice-versa. documents talking about "India" and retrievable in queries on "Asia" and vice-versa) 
+
+6. **Output formatting.** 2 modes of information retrieval - *simple_qa* and *deep_research*. *deep_research* does a deep search, identifies facts, provides the analysis and insights on the facts, identifies claims made and **calls out whether or not the claim is backed with evidence** (I feel this is important), identifies **imbalances in data within the corpus** (e.g. more information on one company/country/product etc. than another - a key issue I see in real world RAG applications). 
 
 ## Notes
 
@@ -154,7 +162,7 @@ Drop your source ontologies in `source_ontologies/` (any combination of `.owl`, 
 ```bash
 # Deterministic merge (no LLM cost). Combines multiple input ontologies.
 # NOTE: you HAVE TO import the VIAO ontology - core_ontologies/viao_intelligence_artifact_ontology_v2.owl
-#strongly recomend you also import the other core ontologies as they are handled especially wel and cover areas like people, tim, geographies
+# Strongly recommend you also import the other core ontologies as they are handled especially well and cover areas like people, time, geographies
 
 #EXAMPLE FROM FINANCE DOMAIN
 uv run python -m backend.app.cli merge \
