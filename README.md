@@ -6,17 +6,23 @@ End-to-end GraphRAG platform that ingests your documents, weaves them into an OW
 
 Three surfaces, one process: REST at `/`, MCP at `/mcp`, and a React UI hosted alongside the backend on Render.
 
+## UI
+
+![Screenshot of the React UI showing a conversation thread with a simple_qa answer and a follow-up in deep_research mode](images/screenshot.png)
+
+Conversation view: a prior simple_qa turn with its cited answer, plus a deep_research follow-up being composed. Top nav switches between **Ask** (single questions), **History** (browse + replay), and **Settings** (paste your bearer token).
+
 ## Key differentiators
 
-1. **End-to-end in one tool.** Document ingestion → ontology curation → entity + intelligence-artifact extraction → ontology-aware retrieval → React UI + MCP server deployed on Postgres (Supabase) + Render. No glue scripts between stages — every step is a subcommand of the same CLI.
+1. **End-to-end in one tool.** Starts with the raw documents and ends with a deployment of a React UI and an MCP server. Supports Document ingestion → ontology curation → entity + intelligence-artifact extraction → ontology-aware retrieval → React UI + MCP server deployed on Postgres (Supabase) + Render. No glue scripts between stages — every step is a subcommand of the same CLI.
 
-2. **Ontology-based, not just vector RAG.** Imports standard `.rdf` / `.owl` / `.ttl` ontologies (FIBO, OCRe, SKOS, FOAF, ORG, geography, custom domain ontologies) and expands them with corpus-driven LLM proposals. Output is standard OWL — open `merged.owl` directly in [Protégé](https://protege.stanford.edu/) to inspect.
+2. **Ontology-based** Supports import of standard `.rdf` / `.owl` / `.ttl` ontologies and expands them with corpus-driven LLM proposals. Tested with multiple domain specific ontologies across Finance(e.g. FIBO), Pharma( e.g. OCRe, HP), Manufacturing and SUpply Chain(OntoCAPE) and general/non-domain spcific ones(e.g. FOAF, SKOS). Output is a standard OWL — and can be opened and modified in standard tool such as Protege.
 
-3. **Automatic intelligence-artifact extraction.** Per chunk: typed `Claim` / `Finding` / `Observation` / `Event` artifacts. Per document: `Summary`. Opt-in cross-cluster `Insight` and `Recommendation` artifacts via gpt-4.1 synthesis. All instances of VIAO classes for full traceability from answer → artifact → chunk → document.
+3. **Automatic intelligence-artifact extraction.** Per chunk: typed `Claim` / `Finding` / `Observation` / `Event` artifacts. Per document: `Summary`. Opt-in cross-cluster `Insight` and `Recommendation` artifacts via gpt-4.1 synthesis. Created a new Ontology - **VIAO** - with classes to hold this structure. This defines the artifact taxonomy + edge predicates (`derivedFromChunk`, `assertsAbout`, `insightBasedOn`, etc.) providing tracability. 
 
-4. **Tables as first-class objects.** PDFs are scanned by `pdfplumber` (and gpt-4o-mini vision for nested cases), extracted as JSON-LD, and stored as `StructuredTable` artifacts alongside text chunks. Numeric drill-downs on financial filings (10-K segment tables, capacity figures, balance-sheet detail) become retrievable without losing structure.
+4. **Tables as first-class objects.** PDFs are scanned by `pdfplumber` (and gpt-4o-mini vision for nested cases), extracted as JSON-LD, and stored as `StructuredTable` artifacts alongside text chunks. Numeric drill-downs on  become retrievable via the graph structure.
 
-5. **Time + geography expansion, curated upper ontologies, VIAO.** Temporal mentions auto-expand into a year/quarter/month/day hierarchy with parent creation + gap-fill. Geography rides on existing OWL classes from the merged geography ontology. **FOAF** + **W3C ORG** anchor people / organizations / roles / memberships. The curated **VIAO** ontology (`https://veerla-ramrao.ai/ontology/intelligence-artifact#`) defines the artifact taxonomy + edge predicates (`derivedFromChunk`, `assertsAbout`, `insightBasedOn`, etc.) and is protected from prune.
+5. **Time + geography expansion, curated upper ontologies** Temporal mentions auto-expand into a year/quarter/month/day hierarchy with parent creation + gap-fill. Geography rides on existing OWL classes from the merged geography ontology. This allows automatic discovery in GraphRAG (e.g. documents talking about "Jan 2024" and relrevable in queries on "2024" amd vice-versa. documents talking about "India" and retreivable in queris on "Asia" and vice-versa) 
 
 ## Notes
 
@@ -147,11 +153,45 @@ Drop your source ontologies in `source_ontologies/` (any combination of `.owl`, 
 
 ```bash
 # Deterministic merge (no LLM cost). Combines multiple input ontologies.
+# NOTE: you HAVE TO import the VIAO ontology - core_ontologies/viao_intelligence_artifact_ontology_v2.owl
+#strongly recomend you also import the other core ontologies as they are handled especially wel and cover areas like people, tim, geographies
+
+#EXAMPLE FROM FINANCE DOMAIN
 uv run python -m backend.app.cli merge \
-  --ontology source_ontologies/general_ontologies/foaf.rdf \
-  --ontology source_ontologies/general_ontologies/org.rdf \
-  --ontology source_ontologies/general_ontologies/time.rdf \
-  --ontology source_ontologies/core_ontologies/viao_intelligence_artifact_ontology_v2.owl
+  --ontology source_ontologies/core_ontologies/viao_intelligence_artifact_ontology_v2.owl \
+  --ontology source_ontologies/core_ontologies/foaf.rdf \
+  --ontology source_ontologies/core_ontologies/org.ttl \
+  --ontology source_ontologies/core_ontologies/geography_ontology.owl \
+  --ontology source_ontologies/core_ontologies/time.ttl \
+  --ontology source_ontologies/core_ontologies/skos.rdf \
+  --ontology source_ontologies/core_ontologies/domain_concepts.owl \
+  --ontology source_ontologies/finance_ontologies/prod.rdf.zip
+
+#EXAMPLE FROM PHARMA DOMAIN
+uv run python -m backend.app.cli merge \
+  --ontology source_ontologies/core_ontologies/viao_intelligence_artifact_ontology_v2.owl \
+  --ontology source_ontologies/core_ontologies/foaf.rdf \
+  --ontology source_ontologies/core_ontologies/org.ttl \
+  --ontology source_ontologies/core_ontologies/geography_ontology.owl \
+  --ontology source_ontologies/core_ontologies/time.ttl \
+  --ontology source_ontologies/core_ontologies/skos.rdf \
+  --ontology source_ontologies/core_ontologies/domain_concepts.owl \
+  --ontology source_ontologies/pharma_ontologies/OCRe.zip \
+  --ontology source_ontologies/pharma_ontologies/hp.owl
+
+#EXAMPLE FROM SUPPLY CHAIN/GLOBAL GEOPOLITICS
+uv run python -m backend.app.cli merge \
+  --ontology source_ontologies/core_ontologies/viao_intelligence_artifact_ontology_v2.owl \
+  --ontology source_ontologies/core_ontologies/foaf.rdf \
+  --ontology source_ontologies/core_ontologies/org.ttl \
+  --ontology source_ontologies/core_ontologies/geography_ontology.owl \
+  --ontology source_ontologies/core_ontologies/time.ttl \
+  --ontology source_ontologies/core_ontologies/skos.rdf \
+  --ontology source_ontologies/core_ontologies/domain_concepts.owl \
+  --ontology source_ontologies/manufacturing_supplychain_ontologies/OntoCAPE_domain+ontology.zip
+
+
+
 
 # LLM-driven prune-expand against a document corpus.
 # Drops classes the corpus doesn't reference; proposes new classes for
