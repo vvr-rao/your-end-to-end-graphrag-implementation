@@ -68,6 +68,25 @@ def _is_viao(iri: str) -> bool:
     return iri.startswith(_VIAO_NAMESPACE)
 
 
+def _strip_nul(obj: Any) -> Any:
+    """Recursively remove NUL (\\u0000) code points from all strings in a
+    JSON-decoded structure (keys and values).
+
+    Postgres ``text``/``varchar`` cannot store NUL bytes -- asyncpg raises
+    ``UntranslatableCharacterError`` on insert. NULs leak in via mojibake
+    from Phase-1 entity expansion (e.g. a UTF-16BE ``®`` mis-decoded into the
+    pair ``\\x00\\xae`` leaves a stray NUL like ``Ozempic\\x00ae``). We drop the
+    NUL so the import succeeds; the cosmetic label corruption is tracked as a
+    Phase-1 followup rather than fixed here."""
+    if isinstance(obj, str):
+        return obj.replace("\x00", "")
+    if isinstance(obj, dict):
+        return {_strip_nul(k): _strip_nul(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_strip_nul(v) for v in obj]
+    return obj
+
+
 def _first_str(values: Any) -> str | None:
     """Extract the first non-empty string from a value that may be
     str / list[str] / list[dict{value, lang}]."""
@@ -125,7 +144,7 @@ async def import_ontology_folder(
         raise FileNotFoundError(merged_path)
 
     with merged_path.open() as f:
-        merged = json.load(f)
+        merged = _strip_nul(json.load(f))
 
     classes = merged.get("classes_dict") or {}
     obj_props = merged.get("object_properties_dict") or {}
