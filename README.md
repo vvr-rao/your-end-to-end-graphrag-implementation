@@ -198,6 +198,10 @@ uv run python -m backend.app.cli merge \
   --ontology source_ontologies/core_ontologies/domain_concepts.owl \
   --ontology source_ontologies/manufacturing_supplychain_ontologies/OntoCAPE_domain+ontology.zip
 
+#Summarize Descriptions in the merged ontology
+#OPTIONAL reduces context size
+uv run python -m backend.app.cli summarize-descriptions \
+  --input output_ontologies/v<TS>-merge
 
 
 
@@ -297,18 +301,34 @@ Two modes: `simple_qa` (tight 1-3 sentence direct answer) and `deep_research` (*
 ```bash
 # One-shot question (default = deep_research)
 uv run python -m backend.app.cli query \
-  "What are the regulations around EV production in Asia?"
+  "What competitors to Ozempic and Wegovy emerged in the GLP-1 weight-loss market by 2025?"
+
+# Comparison across entities — the graph walk pulls in related drugs/trials
+uv run python -m backend.app.cli query \
+  "Compare the clinical studies of Ozempic versus its competitors. What trials support each drug?"
+
+uv run python -m backend.app.cli query \
+  "Compare the side effects of Ozempic against its competitors."
+
+# Temporal reasoning — resolves relative dates against the time hierarchy
+uv run python -m backend.app.cli query \
+  "What is the most recent clinical study mentioned in the corpus, and when was it?"
 
 # Tight factoid answer
 uv run python -m backend.app.cli query --mode simple_qa \
-  "What is OCI N.V.'s annual nitrogen fertilizer production capacity?"
+  "What is Ozempic's active ingredient?"
+
+# Override graph BFS depth (default comes from config.yaml qa.hops); --verbose
+# prints per-step diagnostics (parsed query, matched seeds, BFS node yield, cost)
+uv run python -m backend.app.cli query --hops 4 --verbose \
+  "Which GLP-1 drugs are available as an oral formulation?"
 
 # Multi-turn conversation with automatic follow-up resolution
 CONV=$(uv run python -m backend.app.cli conversation start | grep '^iri:' | awk '{print $2}')
 uv run python -m backend.app.cli conversation turn --conv "$CONV" \
-  "What does the corpus say about EV production?"
+  "What competitors does Ozempic have?"
 uv run python -m backend.app.cli conversation turn --conv "$CONV" \
-  "And how does Vietnam compare specifically?"   # resolved against prior turn
+  "Which of them are oral?"   # 'them' resolved against prior turn
 uv run python -m backend.app.cli conversation show --conv "$CONV"
 ```
 

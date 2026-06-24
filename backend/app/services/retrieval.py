@@ -48,6 +48,7 @@ from sqlalchemy import select, text as sql_text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.core.config import get_settings
 from backend.app.db.graph_version import current_version
 from backend.app.db.models.documents import Chunk, Document
 from backend.app.db.models.entities import Entity, TimeInstance
@@ -60,6 +61,21 @@ from backend.app.services.prompts import PROMPTS
 from backend.app.services import retrieval_sql
 from backend.app.services.retrieval_ranking import rrf_fuse
 from backend.app.services.retrieval_sql import _vec_str
+
+
+_DEFAULT_HOPS_FALLBACK = 3
+
+
+def default_hops() -> int:
+    """Graph-BFS depth (step 7) default, sourced from config.yaml's
+    `qa.hops`. Falls back to 3 if the key is missing or config can't be
+    read. This is the single source of truth -- the CLI and the
+    conversation path both pass `hops=None` so they inherit it."""
+    try:
+        value = get_settings().app_config.get("qa", {}).get("hops")
+        return int(value) if value is not None else _DEFAULT_HOPS_FALLBACK
+    except Exception:
+        return _DEFAULT_HOPS_FALLBACK
 
 
 _VALID_MODES = ("simple_qa", "deep_research")
@@ -87,7 +103,7 @@ async def retrieve_and_answer(
     *,
     mode: str = "deep_research",
     top_k: int | None = None,
-    hops: int = 2,
+    hops: int | None = None,
     max_cost_usd: float = 1.0,
     decompose: bool = True,
     max_probes: int = 5,
@@ -110,6 +126,8 @@ async def retrieve_and_answer(
         )
     if top_k is None:
         top_k = 30 if mode == "deep_research" else 20
+    if hops is None:
+        hops = default_hops()
     t0 = time.time()
     router = LLMRouter()
     cost_before = router.total_cost_usd

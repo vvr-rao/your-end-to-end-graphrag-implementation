@@ -146,8 +146,10 @@ qa:
   k_classes: 15
   # Top-k chunks after graph-aware filtering.
   k_chunks: 20
-  # Hops over class_relationships for graph expansion (0 = no expansion).
-  hops: 1
+  # Graph-BFS depth (Milestone-F retrieval step 7): how many hops to walk
+  # out from the seed nodes over graph_relationships. Higher = broader
+  # evidence but more candidates + cost. `query --hops N` overrides per-run.
+  hops: 3
 
 # -----------------------------------------------------------------------------
 # Background jobs (arq).

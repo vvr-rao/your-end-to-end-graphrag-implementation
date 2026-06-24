@@ -133,7 +133,7 @@ async def add_turn(
     question: str,
     mode: str = "simple_qa",
     top_k: int = 20,
-    hops: int = 2,
+    hops: int | None = None,
     max_cost_usd: float = 1.0,
     decompose: bool = True,
     max_probes: int = 5,

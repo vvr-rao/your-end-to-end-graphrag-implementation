@@ -612,8 +612,8 @@ def build_parser() -> argparse.ArgumentParser:
              "30 for deep_research, 20 for simple_qa.",
     )
     p_q.add_argument(
-        "--hops", type=int, default=2,
-        help="Graph BFS depth from seed nodes.",
+        "--hops", type=int, default=None,
+        help="Graph BFS depth from seed nodes. Default from config.yaml qa.hops.",
     )
     p_q.add_argument(
         "--max-cost-usd", type=float, default=1.0,
@@ -707,7 +707,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="deep_research",
     )
     p_conv_turn.add_argument("--top-k", type=int, default=None)
-    p_conv_turn.add_argument("--hops", type=int, default=2)
+    p_conv_turn.add_argument("--hops", type=int, default=None,
+                             help="Graph BFS depth. Default from config.yaml qa.hops.")
     p_conv_turn.add_argument(
         "--max-cost-usd", type=float, default=0.20,
         help="Per-turn cost cap.",
