@@ -95,6 +95,23 @@ markers = [
     "slow: deselect by default; runs the multi-ontology deterministic merge across all sample ontologies",
 ]
 
+[tool.coverage.run]
+source = ["backend/app"]
+branch = true
+omit = [
+    "backend/tests/*",
+    "backend/app/db/migrations/*",   # alembic boilerplate
+]
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
+
 [tool.mypy]
 python_version = "3.12"
 plugins = ["pydantic.mypy"]

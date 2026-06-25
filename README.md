@@ -1,5 +1,9 @@
 # Your End-to-End GraphRAG Implementation
 
+[![CI](https://github.com/vvr-rao/your-end-to-end-graphrag-implementation/actions/workflows/ci.yml/badge.svg)](https://github.com/vvr-rao/your-end-to-end-graphrag-implementation/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/vvr-rao/your-end-to-end-graphrag-implementation/branch/main/graph/badge.svg)](https://codecov.io/gh/vvr-rao/your-end-to-end-graphrag-implementation)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 ## Overview
 
 End-to-end GraphRAG platform that ingests your documents, weaves them into an OWL ontology you can curate, and answers questions over the resulting knowledge graph via a React UI plus an MCP server, all deployable to Render with one command.

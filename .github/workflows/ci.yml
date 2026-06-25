@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: tests + coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Run tests with coverage
+        # The fast suite (-m 'not slow', from pyproject addopts) needs no
+        # live Postgres -- DB/large-ontology tests are @slow or self-skip.
+        run: uv run pytest --cov --cov-report=xml --cov-report=term-missing
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.xml
+          # Public repos upload tokenless; if you add a CODECOV_TOKEN repo
+          # secret it will be used automatically. A Codecov hiccup must not
+          # fail the build.
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
