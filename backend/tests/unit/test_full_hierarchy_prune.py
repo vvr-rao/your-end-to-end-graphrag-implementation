@@ -3004,16 +3004,25 @@ def test_repair_output_rebrands_local_iris_to_veerla_ramrao_ai(tmp_path) -> None
         do_person_convert=False,
     ))
 
+    # The rebrand rewrites the .local/ontology/ prefix to the configured
+    # default_base_iri -- so assert against THAT, not a hardcoded namespace
+    # (config.yaml is gitignored; CI loads config.example.yaml, whose
+    # default_base_iri differs). Mirrors the pipeline's own fallback.
+    from backend.app.core.config import get_settings
+    default_base_iri = (get_settings().app_config.get("ontology") or {}).get(
+        "default_base_iri", "https://veerla-ramrao.ai/ontology/merged#"
+    )
+
     after = folder_io.load_version_folder(folder)
     classes = after["classes_dict"]
     # No .local IRIs left.
     leftover = [iri for iri in classes if "your-personal-ontologist.local" in iri]
     assert leftover == [], f"leftover .local IRIs: {leftover}"
-    # New IRIs present.
-    veerla_keys = [iri for iri in classes if "veerla-ramrao.ai" in iri]
-    assert len(veerla_keys) == 2
+    # Both classes rebranded into the configured project namespace.
+    new_keys = [iri for iri in classes if iri.startswith(default_base_iri)]
+    assert len(new_keys) == 2
     # Cross-reference updated (widget's parent points at the new thing IRI).
     widget_iri = next(iri for iri in classes if iri.endswith("widget"))
     parent_iri = classes[widget_iri]["superclasses"][0]["iri"]
-    assert "veerla-ramrao.ai" in parent_iri
+    assert parent_iri.startswith(default_base_iri)
     assert "thing" in parent_iri

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from owlready2 import World
 
 from backend.app.helpers.ontology_parsing import extract_ontology_to_dicts
@@ -19,18 +20,23 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 SKOS = REPO_ROOT / "source_ontologies" / "core_ontologies" / "skos.rdf"
 INDEX = REPO_ROOT / "source_ontologies" / "general_ontologies" / "index.rdf"
 
+# source_ontologies/ subdirs are gitignored, so these fixtures exist only in
+# local dev checkouts -- not in a clean CI clone. Skip rather than fail there.
+_skip_without_fixtures = pytest.mark.skipif(
+    not (SKOS.exists() and INDEX.exists()),
+    reason="source_ontologies/ fixtures (skos.rdf, index.rdf) not present (gitignored)",
+)
+
 
 def _class_iris(ontology_dict: dict) -> set[str]:
     return set(ontology_dict["classes_dict"].keys())
 
 
+@_skip_without_fixtures
 def test_isolated_worlds_do_not_bleed_entities() -> None:
     """Loading two different ontologies into two separate Worlds must produce
     disjoint class sets -- i.e. World A's load doesn't leak triples into
     World B's rdf_graph snapshot."""
-    assert SKOS.exists(), f"missing test fixture: {SKOS}"
-    assert INDEX.exists(), f"missing test fixture: {INDEX}"
-
     world_a = World()
     world_b = World()
 
@@ -65,11 +71,10 @@ def test_isolated_worlds_do_not_bleed_entities() -> None:
     )
 
 
+@_skip_without_fixtures
 def test_reloading_same_file_in_fresh_world_returns_same_classes() -> None:
     """Loading the same file twice into two fresh Worlds must yield the same
     class set. Proves the per-file isolation is stable, not order-dependent."""
-    assert SKOS.exists()
-
     first = extract_ontology_to_dicts(
         str(SKOS),
         load_imported=False,
