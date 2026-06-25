@@ -8,8 +8,14 @@ on:
 
 jobs:
   test:
-    name: tests + coverage
+    name: tests (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      # Run every Python version even if one fails, so the matrix reports
+      # exactly which versions pass.
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
 
@@ -18,14 +24,14 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Set up Python
-        run: uv python install 3.12
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --dev
+        run: uv sync --dev --python ${{ matrix.python-version }}
 
       - name: Run tests with coverage
         # The fast suite (-m 'not slow', from pyproject addopts) needs no
         # live Postgres -- DB/large-ontology tests are @slow or self-skip.
         # Coverage is printed to the CI log only; not published anywhere.
-        run: uv run pytest --cov --cov-report=term-missing
+        run: uv run --python ${{ matrix.python-version }} pytest --cov --cov-report=term-missing
