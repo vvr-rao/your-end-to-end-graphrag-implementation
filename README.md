@@ -356,14 +356,13 @@ Or use the React UI / MCP server (see deploy section).
 
 Supply it a flat file with test questions. Evaluation produces scores for hallucinations, completeness and consustency across multiple runs.
 
-'''
+```bash
 uv run python -m backend.app.cli evaluate-queries \
   --questions eval_questions/test_questions_websearch_corpus.txt \
   --mode deep_research --runs-per-question 3 \
   --judge-model gpt-4.1 \
   --max-cost-usd 10.0
-
-'''
+```
 
 ### 11. Deploy to Render
 
