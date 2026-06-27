@@ -22,6 +22,8 @@ _Requires Python 3.12+. CI runs the test suite on CPython 3.12, 3.13, and 3.14._
 
 Three surfaces, one process: REST at `/`, MCP at `/mcp`, and a React UI hosted on Render alongside a alongside the backend on Postgres.
 
+I have tested this using open source data and common ontologies from Pharma, Finance and Manfufacturing and Supply Chain domains.
+
 ## UI
 
 ![Screenshot of the React UI showing a conversation thread with a simple_qa answer and a follow-up in deep_research mode](images/screenshot.png)
