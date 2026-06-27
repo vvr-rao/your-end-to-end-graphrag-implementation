@@ -352,7 +352,20 @@ uv run python -m backend.app.cli conversation show --conv "$CONV"
 
 Or use the React UI / MCP server (see deploy section).
 
-### 10. Deploy to Render
+### 10. Automated Evaluation
+
+Supply it a flat file with test questions. Evaluation produces scores for hallucinations, completeness and consustency across multiple runs.
+
+'''
+uv run python -m backend.app.cli evaluate-queries \
+  --questions eval_questions/test_questions_websearch_corpus.txt \
+  --mode deep_research --runs-per-question 3 \
+  --judge-model gpt-4.1 \
+  --max-cost-usd 10.0
+
+'''
+
+### 11. Deploy to Render
 
 Two services on Render: a Docker web service (FastAPI + MCP at `/mcp`) and a static site (the React UI). Postgres stays external at Supabase. One CLI command, plus a one-time GitHub App install.
 
@@ -385,7 +398,7 @@ Add `--no-deploy` to create the services without auto-triggering builds.
 
 After ~5-8 min the backend reaches `live`. Open the printed frontend URL → /settings → paste your `BEARER_TOKEN` → /ask.
 
-### 11. Monitor, suspend, terminate
+### 12. Monitor, suspend, terminate
 
 ```bash
 # State of both services + last-deploy status
