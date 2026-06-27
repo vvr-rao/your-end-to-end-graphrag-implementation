@@ -11,11 +11,7 @@
 _Requires Python 3.12+. CI runs the test suite on CPython 3.12, 3.13, and 3.14._
 
 ## Overview
-<div align="center">
 
-<img src="images/system-flow-and-architecture.png" alt="Overall System flow and architecture" width="75%">
-
-</div>
 
 
 **CLI based End-to-end GraphRAG Tool** that ingests your documents, weaves them into an OWL ontology you can curate, populates a fully connected Knowledge Graph, implements a RAG system with automated evaluation and scoring  and publishes the entire system as a **React based UI**, **MCP Server** and a **Postgres database** all via the CLI.
