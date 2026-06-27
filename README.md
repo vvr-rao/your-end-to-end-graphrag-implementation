@@ -1,8 +1,8 @@
-<center>
+<div align="center">
 
 # Your End-to-End GraphRAG Implementation
 
-</center>
+</div>
 
 [![CI](https://github.com/vvr-rao/your-end-to-end-graphrag-implementation/actions/workflows/ci.yml/badge.svg)](https://github.com/vvr-rao/your-end-to-end-graphrag-implementation/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.12%20%7C%203.13%20%7C%203.14-blue.svg)](https://www.python.org/downloads/)
