@@ -31,7 +31,9 @@ Conversation view: a prior *simple_qa* turn with its cited answer, plus a *deep_
 ## Architecture Notes
 
 **LLMs Used** - Multi-LLM support, currently uses GROQ(for simple tasks) and OpenAI(for more complex reasoning). Will expand to other LLMs in the future.
+
 **Database** - Postgres to hold the knowledge graph and Vectors. I used Supabase but any Postgres DB should work.
+
 **Hosting** - Render for the React UI and MCP Server endpoints. You should be able to move things around to other platforms if you prefer.
 
 ## Key differentiators from other RAG and GraphRAG libraries
