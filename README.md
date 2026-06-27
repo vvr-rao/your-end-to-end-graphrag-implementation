@@ -14,7 +14,7 @@ _Requires Python 3.12+. CI runs the test suite on CPython 3.12, 3.13, and 3.14._
 
 <div align="center">
 
-<img src="images/system-flow-and-architecture.png" alt="Overall System flow and architecture" width="75%">
+<img src="images/system-flow-and-architecture-2.png" alt="Overall System flow and architecture" width="75%">
 
 </div>
 
