@@ -11,7 +11,12 @@
 _Requires Python 3.12+. CI runs the test suite on CPython 3.12, 3.13, and 3.14._
 
 ## Overview
-![Overall System flow and architecture](images/system-flow-and-architecture.png)
+<div align="center">
+
+<img src="images/system-flow-and-architecture.png" alt="Overall System flow and architecture" width="75%">
+
+</div>
+
 
 End-to-end GraphRAG platform that ingests your documents, weaves them into an OWL ontology you can curate, and answers questions over the resulting knowledge graph via a React UI plus an MCP server, all deployable to Render with one command.
 
