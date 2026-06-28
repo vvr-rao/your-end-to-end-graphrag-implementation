@@ -2179,7 +2179,12 @@ async def _run_llm_stages(
         async with sem:
             return await _classify_chunk(router, branches, chunk)
 
-    print(f"[stage1] classifying {len(chunks)} chunk(s) (Groq, concurrency={concurrency})")
+    _s1_spec = router.task_spec("chunk_classification")
+    print(
+        f"[stage1] classifying {len(chunks)} chunk(s) "
+        f"({_s1_spec.get('provider', '?')}:{_s1_spec.get('model', '?')}, "
+        f"concurrency={concurrency})"
+    )
     stage1_results = await asyncio.gather(*[_classify_one(c) for c in chunks])
 
     async def _propose_one(idx: int, chunk: TextChunk, iris: list[str]) -> dict[str, Any] | None:

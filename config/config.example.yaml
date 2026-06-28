@@ -104,6 +104,22 @@ expansion:
   # How many ontology classes to send per LLM batch (matches notebook's split_dict_by_size).
   ontology_chunk_size: 50
   # Concurrency cap for LLM calls inside a run (respects provider rate limits).
+  #
+  # TUNE THIS PER PROVIDER (set via config/models.yaml). Stage-1
+  # chunk_classification sends large prompts (the full top-level BRANCHES list
+  # + the chunk text), so the right concurrency depends on which model serves
+  # that task:
+  #   - Groq (default preset, llama-3.3-70b): very high throughput + low
+  #     latency. 8 is fine; you can push higher. Groq is FASTER and CHEAPER for
+  #     this high-volume tagging step (~10x cheaper than GPT-4-class), but it's
+  #     a second vendor + a second API key + a separate (free-tier) rate limit.
+  #   - OpenAI (openai-only preset, gpt-4o-mini): slower per request, and with
+  #     8 concurrent large requests against a modest OpenAI tier the calls
+  #     queue/throttle and can exceed the task's `timeout`, surfacing as
+  #     "Request timed out" in Stage 1. Drop this to ~3-4 AND raise
+  #     chunk_classification `timeout` (e.g. 180) in config/models.yaml. The
+  #     advantage of OpenAI here is SINGLE-VENDOR simplicity — one key, no Groq.
+  # Rule of thumb: Groq -> 8 (or more); OpenAI gpt-4o-mini -> 3-4.
   max_concurrent_llm_calls: 8
   # Hard cost ceiling per run in USD; run aborts if estimated cost exceeds this.
   max_cost_usd: 25.00

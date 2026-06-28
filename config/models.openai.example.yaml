@@ -11,14 +11,22 @@
 # =============================================================================
 
 tasks:
-  # Repointed from Groq → OpenAI. gpt-4o-mini's output ceiling is 16k (not 32k);
-  # for very broad-coverage corpora bump to gpt-4.1 (32k ceiling, ~16x cost).
+  # Repointed from Groq → OpenAI. gpt-4o-mini is slower than Groq's Llama, so
+  # this task needs a longer timeout AND lower concurrency
+  # (expansion.max_concurrent_llm_calls: 3-4 in config.yaml) — otherwise Stage 1
+  # times out ("Request timed out") under 8 concurrent large requests.
+  # max_tokens: the prompt asks for <=50 IRIs but gpt-4o-mini often over-emits
+  # (~200); a downstream hard-cap trims to 50. 8192 lets the JSON finish cleanly
+  # — a smaller cap truncates mid-list and triggers the "salvaged N IRIs" path.
+  # json_object mode is safe (the prompt already requests JSON).
+  # For very broad-coverage corpora bump model to gpt-4.1 (32k ceiling, ~16x cost).
   chunk_classification:
     provider: openai
     model: gpt-4o-mini
-    timeout: 60
+    timeout: 180
     temperature: 0.0
-    max_tokens: 16384
+    max_tokens: 8192
+    response_format: json_object
 
   class_proposal:
     provider: openai

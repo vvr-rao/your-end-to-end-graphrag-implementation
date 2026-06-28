@@ -16,6 +16,16 @@ tasks:
   # Cheap, high-volume classification: tag each doc chunk against the existing
   # ontology's class list. Groq's 70B Llama runs at <1s/call and is ~10× cheaper
   # than GPT-4-class for this volume of work.
+  #
+  # SWITCHING THIS TASK TO OPENAI (gpt-4o-mini)? It's slower than Groq, so also:
+  #   - raise `timeout` here to ~180 (60 is fine for Groq, too tight for mini),
+  #   - lower expansion.max_concurrent_llm_calls in config.yaml to 3-4 (8
+  #     concurrent large requests on mini throttle and time out),
+  #   - drop max_tokens to ~4096 (output is <=50 IRIs) and add
+  #     `response_format: json_object`.
+  # See config/models.openai.example.yaml for a ready-made OpenAI-only preset,
+  # and config/config.example.yaml for the per-provider concurrency guidance.
+  # Trade-off: Groq = faster + cheaper for this step; OpenAI = single-vendor.
   # ---------------------------------------------------------------------------
   chunk_classification:
     provider: groq
