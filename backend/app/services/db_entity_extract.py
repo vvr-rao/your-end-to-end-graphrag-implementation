@@ -269,6 +269,7 @@ async def extract_entities(
             select(Chunk.id, Chunk.chunk_identifier, Chunk.text, Chunk.embedding, Chunk.document_id)
             .where(
                 Chunk.status == "ACTIVE",
+                Chunk.kind == "summary",  # entities come from summary chunks, not fulltext
                 Chunk.id.notin_(already_subq),
             )
             .order_by(Chunk.created_at)

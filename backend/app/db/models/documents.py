@@ -70,6 +70,10 @@ class Chunk(Base):
             "status IN ('ACTIVE','STALE','DELETED')",
             name="chunks_status_check",
         ),
+        CheckConstraint(
+            "kind IN ('summary','fulltext')",
+            name="chunks_kind_check",
+        ),
     )
 
     id: Mapped[uuid.UUID] = uuid_pk_column()
@@ -83,6 +87,12 @@ class Chunk(Base):
     )  # viao:Chunk IRI
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     text: Mapped[str] = mapped_column(Text, nullable=False)
+    # 'summary' (default; the summarized text that gets embedded) or 'fulltext'
+    # (verbatim original text, written only when register-documents is run with
+    # --full-text-chunks). See chunks_kind_check constraint above.
+    kind: Mapped[str] = mapped_column(
+        Text, nullable=False, default="summary", server_default="summary"
+    )
     token_count: Mapped[int] = mapped_column(Integer, nullable=False)
     page_number: Mapped[int | None] = mapped_column(Integer)
     section_title: Mapped[str | None] = mapped_column(Text)

@@ -233,16 +233,63 @@ async def retrieve_and_answer(
                 f"total artifact candidates)"
             )
 
+    # -------- step 8.5: full-text bridge --------
+    # When documents owning our candidate (summary) chunks also carry verbatim
+    # full-text chunks (ingested with --full-text-chunks), swap them into the
+    # candidate pool so retrieval runs over verbatim text (better recall + exact
+    # citations). The graph entered via summary-chunk entity edges; here we exit
+    # into full text, document-mediated (mirrors the table bridge above). The
+    # graph-coverage signal is propagated to the fulltext chunks by document.
+    # No-op when no full-text chunks exist → identical to prior behavior.
+    graph_chunk_ranking: list[uuid.UUID] = [cid for cid, _ in ent_chunks]
+    if candidate_chunk_ids:
+        ft_rows: list[tuple[uuid.UUID, float, uuid.UUID]] = []
+        chunk_doc_map: dict[uuid.UUID, uuid.UUID] = {}
+        async with session_scope() as session:
+            ft_rows = await retrieval_sql.fetch_fulltext_chunks_for_chunks(
+                session, candidate_chunk_ids, limit=500,
+            )
+            if ft_rows:
+                chunk_doc_map = await retrieval_sql.fetch_chunk_document_ids(
+                    session, candidate_chunk_ids,
+                )
+        if ft_rows:
+            ft_doc_ids = {did for _, _, did in ft_rows}
+            # Keep summary chunks only for docs that have NO full-text chunks.
+            summary_keep = [
+                cid for cid in candidate_chunk_ids
+                if chunk_doc_map.get(cid) not in ft_doc_ids
+            ]
+            ft_ids = [cid for cid, _, _ in ft_rows]
+            candidate_chunk_ids = summary_keep + ft_ids
+            # Propagate graph scores: fulltext chunks inherit their document's
+            # candidate-chunk count; kept summary chunks keep their entity score.
+            ent_score = {cid: sc for cid, sc in ent_chunks}
+            scored = [(cid, ent_score.get(cid, 0.0)) for cid in summary_keep]
+            scored += [(cid, hits) for cid, hits, _ in ft_rows]
+            scored.sort(key=lambda t: t[1], reverse=True)
+            graph_chunk_ranking = [cid for cid, _ in scored]
+            if verbose:
+                print(
+                    f"[query] full-text bridge: {len(ft_ids)} fulltext chunk(s) "
+                    f"across {len(ft_doc_ids)} doc(s); candidate pool now "
+                    f"{len(candidate_chunk_ids)}"
+                )
+
     if not candidate_chunk_ids and not candidate_artifact_ids:
         if verbose:
             print("[query] zero candidates from graph; falling back to global vector search")
         # Pure vector fallback. Helps when the query has no entity/class
-        # match (e.g. abstract questions about the corpus).
+        # match (e.g. abstract questions about the corpus). Prefer full-text
+        # chunks globally when any exist (verbatim citations); else summary.
         async with session_scope() as session:
             r = await session.execute(
                 sql_text("""
                 SELECT id FROM graphrag.chunks
                  WHERE embedding IS NOT NULL AND status='ACTIVE'
+                   AND (kind = 'fulltext' OR NOT EXISTS (
+                         SELECT 1 FROM graphrag.chunks
+                          WHERE kind = 'fulltext' AND status = 'ACTIVE'))
                  ORDER BY embedding <-> CAST(:probe AS vector)
                  LIMIT :limit
                 """),
@@ -285,9 +332,10 @@ async def retrieve_and_answer(
                 )
                 artifact_rankings.append([aid for aid, _ in ranked_a])
 
-    # Graph-distance ranking: BFS score per chunk (via its entities).
-    # For simplicity we just use the entity-coverage ranking from step 8.
-    chunk_rankings.append([cid for cid, _ in ent_chunks])
+    # Graph-distance ranking: BFS score per chunk (via its entities). Uses the
+    # entity-coverage ranking from step 8, propagated to full-text chunks by the
+    # step-8.5 bridge when present (else identical to `ent_chunks`).
+    chunk_rankings.append(graph_chunk_ranking)
     if artifact_candidates:
         artifact_rankings.append([aid for aid, _ in artifact_candidates])
 

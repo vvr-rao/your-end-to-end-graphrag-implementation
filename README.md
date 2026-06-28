@@ -32,7 +32,7 @@ Conversation view: a prior *simple_qa* turn with its cited answer, plus a *deep_
 
 ## Architecture Notes
 
-**LLMs Used** - Multi-LLM support, currently uses GROQ(for simple tasks) and OpenAI(for more complex reasoning). Will expand to other LLMs in the future.
+**LLMs Used** - Multi-LLM support via config presets: default (Groq + OpenAI), OpenAI-only, or Anthropic-only chat. Provider/model per task is set in `config/models.yaml`. Embeddings always run on OpenAI (Anthropic has no embeddings API).
 
 **Database** - Postgres to hold the knowledge graph and Vectors. I used Supabase but any Postgres DB should work. It needs to have pgvector enabled.
 
@@ -170,7 +170,8 @@ Fill `.env` with:
 | `DATABASE_URL` | yes | Supabase → Project Settings → Database → **Session pooler** URL (don't use the direct `db.*.supabase.co` URL — IPv6-only) |
 | `OPENAI_API_KEY` | yes | https://platform.openai.com/api-keys |
 | `BEARER_TOKEN` | yes | `python -c "import secrets; print(secrets.token_urlsafe(32))"` |
-| `GROQ_API_KEY` | optional | Only needed if you use the Groq-backed Stage 1 in ontology expansion |
+| `GROQ_API_KEY` | optional | Only needed for the default preset's Groq-backed Stage 1 in ontology expansion |
+| `ANTHROPIC_API_KEY` | optional | Only needed for the anthropic-only chat preset (`config/models.anthropic.example.yaml`). That preset still needs `OPENAI_API_KEY` for embeddings |
 | `RENDER_API_KEY` | optional | Only needed for Render deploy — https://dashboard.render.com/u/settings#api-keys |
 
 `pgvector` must be enabled in Supabase: Dashboard → Database → Extensions → toggle on **vector**.
@@ -446,6 +447,22 @@ Task → provider/model map lives in `config/models.yaml`. Defaults:
 | `embeddings` | OpenAI | `text-embedding-3-small` @ 1024 dim |
 
 `OPENAI_API_KEY` is required; `GROQ_API_KEY` is only needed if you use the Groq-backed Stage 1 in ontology expansion.
+
+### Provider presets (modes)
+
+The task → provider map is fully config-driven, so you can run the whole pipeline on a single vendor by copying a preset over `config/models.yaml`:
+
+| Preset | Copy command | Keys needed |
+|---|---|---|
+| **Default** (Groq + OpenAI) | `cp config/models.example.yaml config/models.yaml` | `OPENAI_API_KEY` + `GROQ_API_KEY` |
+| **OpenAI-only** | `cp config/models.openai.example.yaml config/models.yaml` | `OPENAI_API_KEY` |
+| **Anthropic-only (chat)** | `cp config/models.anthropic.example.yaml config/models.yaml` | `ANTHROPIC_API_KEY` + `OPENAI_API_KEY` |
+
+**Embeddings always run on OpenAI** (`text-embedding-3-small` @ 1024 dim) in every preset — Anthropic has no embeddings API — so the Anthropic-only preset still requires `OPENAI_API_KEY`. Edit the model names in any preset to taste; the provider abstraction lives in `backend/app/services/llm_router.py`.
+
+### Full-text vs summary chunks
+
+By default documents are summarized, then the *summary* is chunked + embedded (smaller DB footprint). Pass `--full-text-chunks` to `register-documents` to *also* store verbatim full-text chunks: retrieval then runs over the original text (better recall + exact citations), while entity/artifact extraction continues to use the cheaper summary chunks. This increases DB size — smoke-test with `--limit` and check `db-size` before a full corpus run.
 
 ## Source-document downloaders
 

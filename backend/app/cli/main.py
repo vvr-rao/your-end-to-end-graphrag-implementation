@@ -423,6 +423,16 @@ def build_parser() -> argparse.ArgumentParser:
             "complex tables. Effective only with --tables."
         ),
     )
+    p_reg.add_argument(
+        "--full-text-chunks", action="store_true",
+        help=(
+            "Also store verbatim full-text chunks (kind='fulltext') in addition "
+            "to the summary chunks. Retrieval prefers full-text chunks (better "
+            "recall + exact citations); entity/artifact extraction still use "
+            "summary chunks. Increases DB size — smoke-test with --limit and "
+            "check `db-size`. Default: OFF."
+        ),
+    )
     p_reg.set_defaults(func=_cmd_register_documents)
 
     p_del = sub.add_parser(
@@ -1137,6 +1147,7 @@ def _cmd_register_documents(args: argparse.Namespace) -> int:
             concurrency=args.concurrency,
             extract_tables=getattr(args, "tables", False),
             table_vision=getattr(args, "table_vision", True),
+            full_text_chunks=getattr(args, "full_text_chunks", False),
         )
     )
     return 0

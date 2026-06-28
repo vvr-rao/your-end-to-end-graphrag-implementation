@@ -1,0 +1,261 @@
+# =============================================================================
+# models.anthropic.example.yaml  —  ANTHROPIC-ONLY (CHAT) PRESET
+#
+# A drop-in `models.yaml` that runs every CHAT task on Anthropic Claude models.
+#   cp config/models.anthropic.example.yaml config/models.yaml
+#
+# IMPORTANT: Anthropic has no embeddings API, so the `embeddings` task stays on
+# OpenAI (text-embedding-3-small @ 1024). This preset therefore needs BOTH
+# ANTHROPIC_API_KEY (chat) AND OPENAI_API_KEY (embeddings). GROQ_API_KEY is not
+# used. table_extract_vision also stays on OpenAI (the Anthropic provider in
+# llm_router.py is text-only; vision input is not wired).
+#
+# Model tiers: claude-haiku-4-5 for cheap/high-volume tasks; claude-sonnet-4-6
+# for harder reasoning; claude-opus-4-8 only for genuine synthesis (qa_synthesis).
+# Notes:
+#   - Opus 4.6+/Fable reject temperature (the router omits it automatically for
+#     those models). Sonnet/Haiku accept it.
+#   - Anthropic has no JSON-mode flag; the router instructs bare JSON + strips
+#     ```json fences, so `response_format: json_object` still works here.
+#   - max_tokens kept <= 8192 (the router is non-streaming; larger risks SDK
+#     HTTP timeouts). Bump per-task if your corpus needs longer outputs.
+# =============================================================================
+
+tasks:
+  chunk_classification:
+    provider: anthropic
+    model: claude-haiku-4-5
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 8192
+
+  class_proposal:
+    provider: anthropic
+    model: claude-sonnet-4-6
+    timeout: 180
+    temperature: 0.0
+    max_tokens: 8192
+    response_format: json_object
+
+  match_dedup:
+    provider: anthropic
+    model: claude-sonnet-4-6
+    timeout: 120
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+
+  concept_grouping:
+    provider: anthropic
+    model: claude-sonnet-4-6
+    timeout: 240
+    temperature: 0.0
+    max_tokens: 8192
+    response_format: json_object
+
+  compact_description:
+    provider: anthropic
+    model: claude-haiku-4-5
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 2048
+    response_format: json_object
+
+  document_summarize:
+    provider: anthropic
+    model: claude-haiku-4-5
+    timeout: 120
+    temperature: 0.0
+    max_tokens: 4096
+
+  classification_audit:
+    provider: anthropic
+    model: claude-haiku-4-5
+    timeout: 90
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+
+  class_summarization:
+    provider: anthropic
+    model: claude-haiku-4-5
+    timeout: 60
+    temperature: 0.2
+    max_tokens: 1024
+
+  # Highest-reasoning task — gets Opus. Opus rejects temperature; router omits it.
+  qa_synthesis:
+    provider: anthropic
+    model: claude-opus-4-8
+    timeout: 180
+    max_tokens: 4096
+
+  # Embeddings ALWAYS run on OpenAI (Anthropic has no embeddings API).
+  embeddings:
+    provider: openai
+    model: text-embedding-3-small
+    dim: 1024
+    batch_size: 100
+
+  artifact_chunk_extract:
+    provider: anthropic
+    model: claude-haiku-4-5
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 2048
+    response_format: json_object
+
+  artifact_chunk_extract_with_entities:
+    provider: anthropic
+    model: claude-haiku-4-5
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 2048
+    response_format: json_object
+
+  entity_extract:
+    provider: anthropic
+    model: claude-haiku-4-5
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 2048
+    response_format: json_object
+
+  question_parse:
+    provider: anthropic
+    model: claude-haiku-4-5
+    timeout: 30
+    temperature: 0.0
+    max_tokens: 1024
+    response_format: json_object
+
+  concept_expansion:
+    provider: anthropic
+    model: claude-haiku-4-5
+    timeout: 30
+    temperature: 0.0
+    max_tokens: 1024
+    response_format: json_object
+
+  query_decompose:
+    provider: anthropic
+    model: claude-haiku-4-5
+    timeout: 30
+    temperature: 0.0
+    max_tokens: 1024
+    response_format: json_object
+
+  chunk_relevance_filter:
+    provider: anthropic
+    model: claude-haiku-4-5
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+
+  answer_simple_qa:
+    provider: anthropic
+    model: claude-haiku-4-5
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 1024
+
+  answer_deep_research:
+    provider: anthropic
+    model: claude-sonnet-4-6
+    timeout: 180
+    temperature: 0.1
+    max_tokens: 4096
+
+  follow_up_resolution:
+    provider: anthropic
+    model: claude-haiku-4-5
+    timeout: 30
+    temperature: 0.0
+    max_tokens: 512
+
+  answer_conversation_turn:
+    provider: anthropic
+    model: claude-haiku-4-5
+    timeout: 90
+    temperature: 0.1
+    max_tokens: 2048
+
+  insight_gen:
+    provider: anthropic
+    model: claude-sonnet-4-6
+    timeout: 120
+    temperature: 0.2
+    max_tokens: 2048
+    response_format: json_object
+
+  recommendation_gen:
+    provider: anthropic
+    model: claude-sonnet-4-6
+    timeout: 120
+    temperature: 0.2
+    max_tokens: 2048
+    response_format: json_object
+
+  judge_comprehensiveness:
+    provider: anthropic
+    model: claude-sonnet-4-6
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 1024
+    response_format: json_object
+
+  judge_no_hallucination:
+    provider: anthropic
+    model: claude-sonnet-4-6
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 1024
+    response_format: json_object
+
+  judge_gap_detection:
+    provider: anthropic
+    model: claude-sonnet-4-6
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 1024
+    response_format: json_object
+
+  judge_consistency:
+    provider: anthropic
+    model: claude-sonnet-4-6
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 2048
+    response_format: json_object
+
+  artifact_document_summary:
+    provider: anthropic
+    model: claude-haiku-4-5
+    timeout: 90
+    temperature: 0.2
+    max_tokens: 1024
+
+  # Vision input is NOT wired for the Anthropic provider — keep on OpenAI.
+  table_extract_vision:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 90
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+
+  table_concept_grouping:
+    provider: anthropic
+    model: claude-haiku-4-5
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 2048
+    response_format: json_object
+
+defaults:
+  retries:
+    max_attempts: 5
+    initial_wait_seconds: 1
+    max_wait_seconds: 30
+    retry_on_status: [429, 500, 502, 503, 504]

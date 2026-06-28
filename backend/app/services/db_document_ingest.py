@@ -178,6 +178,11 @@ def _chunk_iri(doc_hash: str, idx: int) -> str:
     return f"{_VIAO_NS}#Chunk_{doc_hash[:16]}_{idx:04d}"
 
 
+def _fulltext_chunk_iri(doc_hash: str, idx: int) -> str:
+    # Distinct namespace from summary chunks so both sets can coexist for one doc.
+    return f"{_VIAO_NS}#Chunk_{doc_hash[:16]}_ft_{idx:04d}"
+
+
 async def ingest_documents_folder(
     folder: Path,
     *,
@@ -189,8 +194,17 @@ async def ingest_documents_folder(
     concurrency: int = 4,
     extract_tables: bool = False,
     table_vision: bool = True,
+    full_text_chunks: bool = False,
 ) -> IngestSummary:
-    """Ingest every supported file in `folder`. See module docstring."""
+    """Ingest every supported file in `folder`. See module docstring.
+
+    `full_text_chunks` (default False): in ADDITION to the summary chunks
+    (kind='summary', what gets embedded + used by entity/artifact extraction),
+    also chunk + embed the VERBATIM original text as kind='fulltext' chunks.
+    Retrieval prefers fulltext chunks when present (better recall + exact
+    citations); entity/artifact extraction still runs over summary chunks only.
+    Default off → byte-identical output to before.
+    """
     t0 = time.time()
     summary = IngestSummary()
 
@@ -372,6 +386,7 @@ async def ingest_documents_folder(
                 "chunk_identifier": ciri,
                 "chunk_index": c.index,
                 "text": c.text,
+                "kind": "summary",
                 "token_count": c.token_count,
                 "embedding": (
                     chunk_vectors[global_idx]
@@ -438,6 +453,14 @@ async def ingest_documents_folder(
     summary.edges_inserted = len(edge_payloads)
     print(f"[ingest] inserted {summary.edges_inserted} chunk-of edge(s)")
 
+    # Opt-in: additionally store verbatim full-text chunks (kind='fulltext').
+    # Additive — leaves the summary-chunk path above byte-identical.
+    if full_text_chunks:
+        await _ingest_fulltext_chunks_for_docs(
+            fresh, fresh_hashes, fresh_iris, iri_to_doc_id, summary,
+            chunk_size=chunk_size, chunk_overlap=chunk_overlap,
+        )
+
     # Phase 2a opt-in: ingest StructuredTable artifacts for any PDF docs.
     # Uses the disk cache populated by `prune-expand --tables` when
     # available; falls back to inline extraction (paid LLM if vision is
@@ -471,6 +494,132 @@ async def ingest_documents_folder(
     )
 
     return summary
+
+
+# ---------- Optional: ingest verbatim full-text chunks (kind='fulltext') ----------
+
+
+async def _ingest_fulltext_chunks_for_docs(
+    fresh_docs: list,
+    fresh_hashes: list[str],
+    fresh_iris: list[str],
+    iri_to_doc_id: dict[str, Any],
+    summary: IngestSummary,
+    *,
+    chunk_size: int,
+    chunk_overlap: int,
+) -> None:
+    """Chunk + embed each doc's VERBATIM original text and store the rows as
+    kind='fulltext', plus their chunk->chunkOf->document edges. Additive: the
+    summary-chunk path is untouched. Entity/artifact extraction ignore these
+    rows (they filter kind='summary'); retrieval prefers them.
+    """
+    # Chunk each original doc (per-doc so chunk indices are 0-based per doc).
+    ft_chunks_by_doc: list[list[Any]] = []
+    for doc in fresh_docs:
+        cs = list(
+            chunk_documents([doc], chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        )
+        ft_chunks_by_doc.append(cs)
+
+    all_texts: list[str] = []
+    for cs in ft_chunks_by_doc:
+        all_texts.extend(c.text for c in cs)
+    if not all_texts:
+        print("[ingest][fulltext] zero full-text chunks produced; skipping")
+        return
+
+    print(
+        f"[ingest][fulltext] {len(all_texts)} full-text chunk(s) across "
+        f"{len(fresh_docs)} doc(s); embedding ..."
+    )
+    embedder = Embedder()
+    vectors = await embedder.embed(all_texts)
+    summary.embedding_cost_usd += embedder.total_cost_usd
+
+    # Build + insert chunk rows.
+    chunk_payloads: list[dict[str, Any]] = []
+    chunk_iris_in_order: list[str] = []
+    gidx = 0
+    for di, cs in enumerate(ft_chunks_by_doc):
+        doc_id = iri_to_doc_id.get(fresh_iris[di])
+        if doc_id is None:
+            gidx += len(cs)
+            continue
+        for c in cs:
+            ciri = _fulltext_chunk_iri(fresh_hashes[di], c.index)
+            chunk_iris_in_order.append(ciri)
+            chunk_payloads.append({
+                "document_id": doc_id,
+                "chunk_identifier": ciri,
+                "chunk_index": c.index,
+                "text": c.text,
+                "kind": "fulltext",
+                "token_count": c.token_count,
+                "embedding": vectors[gidx] if gidx < len(vectors) else None,
+                "status": "ACTIVE",
+                "extra_metadata": {},
+            })
+            gidx += 1
+
+    if not chunk_payloads:
+        return
+
+    CHUNK_BATCH = 200
+    async with session_scope() as session:
+        for i in range(0, len(chunk_payloads), CHUNK_BATCH):
+            await session.execute(
+                pg_insert(Chunk).values(chunk_payloads[i : i + CHUNK_BATCH])
+            )
+        result = await session.execute(
+            select(Chunk.id, Chunk.chunk_identifier).where(
+                Chunk.chunk_identifier.in_(chunk_iris_in_order)
+            )
+        )
+        iri_to_chunk_id = {iri: cid for cid, iri in result.all()}
+
+    summary.chunks_inserted += len(chunk_payloads)
+    print(f"[ingest][fulltext] inserted {len(chunk_payloads)} full-text chunk row(s)")
+
+    # chunk -> viao:chunkOf -> document edges.
+    async with session_scope() as session:
+        gv = await current_version(session)
+
+    edge_payloads: list[dict[str, Any]] = []
+    for di, cs in enumerate(ft_chunks_by_doc):
+        doc_id = iri_to_doc_id.get(fresh_iris[di])
+        if doc_id is None:
+            continue
+        for c in cs:
+            ciri = _fulltext_chunk_iri(fresh_hashes[di], c.index)
+            chunk_id = iri_to_chunk_id.get(ciri)
+            if chunk_id is None:
+                continue
+            edge_payloads.append({
+                "source_node_type": "chunk",
+                "source_node_id": chunk_id,
+                "target_node_type": "document",
+                "target_node_id": doc_id,
+                "predicate_iri": VIAO_CHUNK_OF,
+                "predicate_label": "viao:chunkOf",
+                "relationship_type": "chunkOf",
+                "relationship_source": "DOCUMENT_EXTRACTION",
+                "is_authoritative": True,
+                "source_document_id": doc_id,
+                "source_chunk_id": chunk_id,
+                "source_artifact_id": None,
+                "graph_version": gv,
+                "extra_metadata": {},
+            })
+
+    EDGE_BATCH = 500
+    async with session_scope() as session:
+        for i in range(0, len(edge_payloads), EDGE_BATCH):
+            await session.execute(
+                pg_insert(GraphRelationship).values(edge_payloads[i : i + EDGE_BATCH])
+            )
+    summary.edges_inserted += len(edge_payloads)
+    print(f"[ingest][fulltext] inserted {len(edge_payloads)} full-text chunk-of edge(s)")
 
 
 # ---------- Phase 2a: ingest StructuredTable artifacts for PDF docs ----------

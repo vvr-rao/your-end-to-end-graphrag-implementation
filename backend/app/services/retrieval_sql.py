@@ -250,6 +250,67 @@ async def fetch_table_artifacts_for_chunks(
     return [(aid, float(hits)) for aid, hits in result.all()]
 
 
+async def fetch_fulltext_chunks_for_chunks(
+    session: AsyncSession,
+    chunk_ids: list[uuid.UUID],
+    *,
+    limit: int = 500,
+) -> list[tuple[uuid.UUID, float, uuid.UUID]]:
+    """Full-text chunks (kind='fulltext') belonging to the documents that own
+    any of the given (summary) chunks.
+
+    Mirrors `fetch_table_artifacts_for_chunks`: the graph reaches a document via
+    its summary chunks' entity edges, but those edges point at summary chunks.
+    When a document also carries verbatim full-text chunks (ingested with
+    --full-text-chunks), this swaps them into the retrieval candidate pool so
+    vector rerank surfaces the exact passage and citations are verbatim.
+
+    Returns (fulltext_chunk_id, hits, document_id) where hits = the number of
+    candidate summary chunks owned by that document — i.e. the document's graph
+    score, propagated to each of its full-text chunks. Empty when no full-text
+    chunks exist (→ caller keeps today's summary-chunk behavior)."""
+    if not chunk_ids:
+        return []
+    result = await session.execute(
+        sql_text("""
+        WITH candidate_docs AS (
+            SELECT c.document_id, count(*) AS n_chunks
+              FROM graphrag.chunks c
+             WHERE c.id = ANY(CAST(:chunk_ids AS uuid[]))
+               AND c.document_id IS NOT NULL
+             GROUP BY c.document_id
+        )
+        SELECT ft.id, cd.n_chunks::float AS hits, ft.document_id
+          FROM graphrag.chunks ft
+          JOIN candidate_docs cd ON cd.document_id = ft.document_id
+         WHERE ft.kind = 'fulltext'
+           AND ft.status = 'ACTIVE'
+           AND ft.embedding IS NOT NULL
+         ORDER BY hits DESC, ft.chunk_index
+         LIMIT :limit
+        """),
+        {"chunk_ids": [str(cid) for cid in chunk_ids], "limit": limit},
+    )
+    return [(cid, float(hits), did) for cid, hits, did in result.all()]
+
+
+async def fetch_chunk_document_ids(
+    session: AsyncSession, chunk_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, uuid.UUID]:
+    """Lightweight chunk_id -> document_id map (no joins, no text)."""
+    if not chunk_ids:
+        return {}
+    result = await session.execute(
+        sql_text("""
+        SELECT c.id, c.document_id
+          FROM graphrag.chunks c
+         WHERE c.id = ANY(CAST(:ids AS uuid[]))
+        """),
+        {"ids": [str(cid) for cid in chunk_ids]},
+    )
+    return {cid: did for cid, did in result.all()}
+
+
 async def vector_rerank_chunks(
     session: AsyncSession,
     candidate_chunk_ids: list[uuid.UUID],

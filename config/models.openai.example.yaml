@@ -1,0 +1,250 @@
+# =============================================================================
+# models.openai.example.yaml  —  OPENAI-ONLY PRESET
+#
+# A drop-in `models.yaml` that runs EVERY task on OpenAI. Use this if you don't
+# have (or don't want) a Groq key.
+#   cp config/models.openai.example.yaml config/models.yaml
+#
+# Difference from the default preset (config/models.example.yaml): the single
+# Groq task, chunk_classification, is repointed to OpenAI gpt-4o-mini. Embeddings
+# already run on OpenAI in every mode. GROQ_API_KEY is NOT needed with this file.
+# =============================================================================
+
+tasks:
+  # Repointed from Groq → OpenAI. gpt-4o-mini's output ceiling is 16k (not 32k);
+  # for very broad-coverage corpora bump to gpt-4.1 (32k ceiling, ~16x cost).
+  chunk_classification:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 16384
+
+  class_proposal:
+    provider: openai
+    model: gpt-4.1
+    timeout: 180
+    temperature: 0.0
+    max_tokens: 32768
+    response_format: json_object
+
+  match_dedup:
+    provider: openai
+    model: gpt-4.1
+    timeout: 120
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+
+  concept_grouping:
+    provider: openai
+    model: gpt-4.1
+    timeout: 240
+    temperature: 0.0
+    max_tokens: 8192
+    response_format: json_object
+
+  compact_description:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 2048
+    response_format: json_object
+
+  document_summarize:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 120
+    temperature: 0.0
+    max_tokens: 4096
+
+  classification_audit:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 90
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+
+  class_summarization:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 60
+    temperature: 0.2
+    max_tokens: 1024
+
+  qa_synthesis:
+    provider: openai
+    model: gpt-4.1
+    timeout: 180
+    temperature: 0.1
+    max_tokens: 4096
+
+  embeddings:
+    provider: openai
+    model: text-embedding-3-small
+    dim: 1024
+    batch_size: 100
+
+  artifact_chunk_extract:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 2048
+    response_format: json_object
+
+  artifact_chunk_extract_with_entities:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 2048
+    response_format: json_object
+
+  entity_extract:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 2048
+    response_format: json_object
+
+  question_parse:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 30
+    temperature: 0.0
+    max_tokens: 1024
+    response_format: json_object
+
+  concept_expansion:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 30
+    temperature: 0.0
+    max_tokens: 1024
+    response_format: json_object
+
+  query_decompose:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 30
+    temperature: 0.0
+    max_tokens: 1024
+    response_format: json_object
+
+  chunk_relevance_filter:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+
+  answer_simple_qa:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 1024
+
+  answer_deep_research:
+    provider: openai
+    model: gpt-4.1
+    timeout: 180
+    temperature: 0.1
+    max_tokens: 4096
+
+  follow_up_resolution:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 30
+    temperature: 0.0
+    max_tokens: 512
+
+  answer_conversation_turn:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 90
+    temperature: 0.1
+    max_tokens: 2048
+
+  insight_gen:
+    provider: openai
+    model: gpt-4.1
+    timeout: 120
+    temperature: 0.2
+    max_tokens: 2048
+    response_format: json_object
+
+  recommendation_gen:
+    provider: openai
+    model: gpt-4.1
+    timeout: 120
+    temperature: 0.2
+    max_tokens: 2048
+    response_format: json_object
+
+  judge_comprehensiveness:
+    provider: openai
+    model: gpt-4.1
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 1024
+    response_format: json_object
+
+  judge_no_hallucination:
+    provider: openai
+    model: gpt-4.1
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 1024
+    response_format: json_object
+
+  judge_gap_detection:
+    provider: openai
+    model: gpt-4.1
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 1024
+    response_format: json_object
+
+  judge_consistency:
+    provider: openai
+    model: gpt-4.1
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 2048
+    response_format: json_object
+
+  artifact_document_summary:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 90
+    temperature: 0.2
+    max_tokens: 1024
+
+  table_extract_vision:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 90
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+
+  table_concept_grouping:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 2048
+    response_format: json_object
+
+defaults:
+  retries:
+    max_attempts: 5
+    initial_wait_seconds: 1
+    max_wait_seconds: 30
+    retry_on_status: [429, 500, 502, 503, 504]

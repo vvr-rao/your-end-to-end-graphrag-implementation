@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 import tenacity
+from anthropic import AsyncAnthropic
 from groq import AsyncGroq
 from openai import AsyncOpenAI
 
@@ -60,6 +61,10 @@ _PRICING_PER_1K = {
     "gpt-4o-mini": (0.00015, 0.00060),
     "llama-3.3-70b-versatile": (0.00059, 0.00079),
     "llama-3.1-8b-instant": (0.00005, 0.00008),
+    # Anthropic (per-1K tokens; $5/$25, $3/$15, $1/$5 per-1M respectively)
+    "claude-opus-4-8": (0.005, 0.025),
+    "claude-sonnet-4-6": (0.003, 0.015),
+    "claude-haiku-4-5": (0.001, 0.005),
 }
 
 
@@ -158,12 +163,101 @@ class GroqProvider:
         )
 
 
+# Anthropic models that REJECT sampling params (temperature/top_p/top_k) with a
+# 400. Current-generation Opus (4.6+), Fable, and Mythos are adaptive-thinking
+# only. Sonnet/Haiku still accept temperature, so we send it for those.
+_ANTHROPIC_NO_SAMPLING_PREFIXES = (
+    "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-fable",
+    "claude-mythos",
+)
+
+
+def _anthropic_accepts_temperature(model: str) -> bool:
+    return not model.startswith(_ANTHROPIC_NO_SAMPLING_PREFIXES)
+
+
+def _strip_json_fences(text: str) -> str:
+    """Remove a leading ```json / ``` fence and trailing ``` if present.
+
+    Anthropic has no `response_format: json_object`; we instruct the model to
+    emit bare JSON but defensively strip fences so strict `json.loads` callers
+    (e.g. class_proposal) don't choke. No-op when there's no fence.
+    """
+    s = text.strip()
+    if s.startswith("```"):
+        # Drop the opening fence line (``` or ```json) ...
+        first_nl = s.find("\n")
+        s = s[first_nl + 1 :] if first_nl != -1 else s[3:]
+        # ... and a closing fence if present.
+        if s.rstrip().endswith("```"):
+            s = s.rstrip()[:-3]
+    return s.strip()
+
+
+class AnthropicProvider:
+    def __init__(self, api_key: str) -> None:
+        self._client = AsyncAnthropic(api_key=api_key)
+
+    async def chat(
+        self,
+        *,
+        model: str,
+        system: str,
+        user: str,
+        temperature: float,
+        max_tokens: int,
+        timeout: int,
+        response_format: str | None,
+    ) -> ChatResult:
+        # Anthropic takes the system prompt as a top-level arg, not a message.
+        sys_prompt = system
+        if response_format == "json_object":
+            sys_prompt = (
+                f"{system}\n\nOutput only a single valid JSON object. "
+                "Do not include any prose, explanation, or markdown code fences."
+            )
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "system": sys_prompt,
+            "messages": [{"role": "user", "content": user}],
+            "timeout": timeout,
+        }
+        # Only send temperature where the model accepts it (Sonnet/Haiku).
+        # Opus 4.6+/Fable/Mythos 400 on sampling params.
+        if _anthropic_accepts_temperature(model):
+            kwargs["temperature"] = temperature
+
+        resp = await self._client.messages.create(**kwargs)
+        text = "".join(
+            block.text for block in resp.content if getattr(block, "type", None) == "text"
+        )
+        if response_format == "json_object":
+            text = _strip_json_fences(text)
+        usage = resp.usage
+        prompt_tokens = getattr(usage, "input_tokens", None) if usage else None
+        completion_tokens = getattr(usage, "output_tokens", None) if usage else None
+        return ChatResult(
+            text=text,
+            model=model,
+            provider="anthropic",
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cost_usd=_estimate_cost(model, prompt_tokens, completion_tokens),
+        )
+
+
 def _build_providers(settings: Settings) -> dict[str, Provider]:
     providers: dict[str, Provider] = {}
     if settings.openai_api_key:
         providers["openai"] = OpenAIProvider(api_key=settings.openai_api_key)
     if settings.groq_api_key:
         providers["groq"] = GroqProvider(api_key=settings.groq_api_key)
+    if settings.anthropic_api_key:
+        providers["anthropic"] = AnthropicProvider(api_key=settings.anthropic_api_key)
     return providers
 
 

@@ -37,9 +37,11 @@ dependencies = [
     # Background jobs
     "arq>=0.26",
     "redis>=5.2",
-    # LLM providers (OpenAI for most tasks; Groq for chunk_classification only)
+    # LLM providers (OpenAI for most tasks; Groq for chunk_classification only;
+    # Anthropic for the optional Anthropic-only chat preset — embeddings stay OpenAI)
     "openai>=1.59",
     "groq>=0.15",
+    "anthropic>=0.40",
     "requests>=2.33.1",
     "beautifulsoup4>=4.12",   # source_documents/* downloaders
     "weasyprint>=60",         # HTML -> PDF rendering for SEC EDGAR fallback

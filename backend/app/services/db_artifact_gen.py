@@ -164,6 +164,7 @@ async def generate_per_chunk_artifacts(
             select(Chunk.id, Chunk.chunk_identifier, Chunk.text, Chunk.document_id)
             .where(
                 Chunk.status == "ACTIVE",
+                Chunk.kind == "summary",  # artifacts come from summary chunks, not fulltext
                 Chunk.id.notin_(already_processed_subq),
             )
             .order_by(Chunk.created_at)

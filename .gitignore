@@ -11,6 +11,7 @@ CLAUDE.local.md
 .env.backup
 config/config.yaml
 config/models.yaml
+config/*.bak
 
 # Python
 __pycache__/
