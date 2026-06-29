@@ -34,7 +34,7 @@ Conversation view: a prior *simple_qa* turn with its cited answer, plus a *deep_
 
 **LLMs Used** - Multi-LLM support, currently uses GROQ(for simple tasks) and OpenAI(for more complex reasoning). Will expand to other LLMs in the future.
 
-**Database** - Postgres to hold the knowledge graph and Vectors. I used Supabase but any Postgres DB should work.
+**Database** - Postgres to hold the knowledge graph and Vectors. I used Supabase but any Postgres DB should work. It needs to have pgvector enabled.
 
 **Hosting** - Render for the React UI and MCP Server endpoints. You should be able to move things around to other platforms if you prefer.
 
