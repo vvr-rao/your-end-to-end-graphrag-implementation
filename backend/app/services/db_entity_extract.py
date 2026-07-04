@@ -463,129 +463,154 @@ async def extract_entities(
             class_id_by_iri[ciri] = cid
             class_label_by_iri[ciri] = clabel or ""
 
-    # Dedup + mint. For each (canonical_name, class_iri) pair across
-    # all chunks, look up the existing entity (pg_trgm) or mint.
+    # Dedup + mint. EXACT in-memory dedup against a one-shot preload of existing
+    # entities; the pg_trgm fuzzy DB query is only a FALLBACK for exact-misses,
+    # and only when the table already had entities. A fresh run needs no
+    # cross-run dedup, so it does ZERO fuzzy queries. This replaces the old
+    # per-entity fuzzy query -- thousands of sequential pooler round-trips on one
+    # long-held connection that hung on --from-fulltext.
     seen_in_this_run: dict[tuple[str, Any], Any] = {}  # (normalized_name, class_id) -> entity_id
-    fresh_to_embed: list[tuple[str, Any]] = []  # (text_to_embed, key)
-    entity_mints: list[dict[str, Any]] = []     # payloads waiting for INSERT
+    fresh_to_embed: list[str] = []              # embed text, index-parallel to entity_mints
+    entity_mints: list[dict[str, Any]] = []     # payloads waiting for INSERT (parallel to fresh_to_embed)
     type_edge_keys: set[tuple[Any, Any]] = set()  # (entity_id, class_id) for type edges
     minted_entity_class_pairs: list[tuple[Any, Any]] = []  # for type edges
-
-    # Aggregate: which (chunk_id, entity_key) pairs need a chunk->entity edge?
     chunk_entity_pairs: list[tuple[Any, tuple[str, Any], Any]] = []  # (chunk_id, key, doc_id)
     samples_buf: list[dict[str, Any]] = []
 
-    async def _find_existing(session, normalized: str, class_id: Any) -> Any | None:
-        """pg_trgm fuzzy match. Returns existing entity.id or None."""
-        r = await session.execute(
-            sql_text("""
-                SELECT id FROM graphrag.entities
-                 WHERE class_id = :cls
-                   AND similarity(normalized_name, :nrm) >= 0.85
-                 ORDER BY similarity(normalized_name, :nrm) DESC
-                 LIMIT 1
-            """),
-            {"cls": class_id, "nrm": normalized},
-        )
-        return r.scalar_one_or_none()
-
+    # Preload existing (normalized_name, class_id) -> id for O(1) exact match.
+    # Cheap: strings + ids (~250 bytes/entity), NOT embeddings.
+    existing_exact: dict[tuple[str, Any], Any] = {}
     async with session_scope() as session:
-        for tup in results:
-            if tup is None:
+        r = await session.execute(
+            select(Entity.id, Entity.normalized_name, Entity.class_id)
+        )
+        for eid, nname, cid in r.all():
+            existing_exact[(nname, cid)] = eid
+    had_existing = bool(existing_exact)
+
+    async def _fuzzy_existing(normalized: str, class_id: Any) -> Any | None:
+        """pg_trgm fuzzy match against the DB in a SHORT-lived session (no
+        long-held connection). Only called for exact-misses when the table
+        already had entities."""
+        async with session_scope() as session:
+            r = await session.execute(
+                sql_text("""
+                    SELECT id FROM graphrag.entities
+                     WHERE class_id = :cls
+                       AND similarity(normalized_name, :nrm) >= 0.85
+                     ORDER BY similarity(normalized_name, :nrm) DESC
+                     LIMIT 1
+                """),
+                {"cls": class_id, "nrm": normalized},
+            )
+            return r.scalar_one_or_none()
+
+    for tup in results:
+        if tup is None:
+            continue
+        chunk_id, chunk_iri, doc_id, kept = tup
+        if not kept:
+            continue
+        for e in kept:
+            class_id = class_id_by_iri.get(e["class_iri"])
+            if class_id is None:
                 continue
-            chunk_id, chunk_iri, doc_id, kept = tup
-            if not kept:
+            normalized = _normalize_name(e["canonical_name"])
+            if not normalized:
                 continue
-            for e in kept:
-                class_id = class_id_by_iri.get(e["class_iri"])
-                if class_id is None:
-                    continue
-                normalized = _normalize_name(e["canonical_name"])
-                if not normalized:
-                    continue
-                key = (normalized, class_id)
-                if key in seen_in_this_run:
-                    chunk_entity_pairs.append((chunk_id, key, doc_id))
-                    continue
-                # Check DB.
-                existing = await _find_existing(session, normalized, class_id)
-                if existing is not None:
-                    seen_in_this_run[key] = existing
+            key = (normalized, class_id)
+            if key in seen_in_this_run:
+                chunk_entity_pairs.append((chunk_id, key, doc_id))
+                continue
+            # Exact match against preloaded existing entities.
+            hit = existing_exact.get(key)
+            if hit is not None:
+                seen_in_this_run[key] = hit
+                summary.entities_reused += 1
+                chunk_entity_pairs.append((chunk_id, key, doc_id))
+                continue
+            # Fuzzy fallback -- only when the table already had entities.
+            if had_existing:
+                match = await _fuzzy_existing(normalized, class_id)
+                if match is not None:
+                    seen_in_this_run[key] = match
+                    existing_exact[key] = match
                     summary.entities_reused += 1
                     chunk_entity_pairs.append((chunk_id, key, doc_id))
                     continue
-                # Mint new.
-                eiri = _entity_iri(e["canonical_name"], e["class_iri"])
-                payload = {
-                    "entity_identifier": eiri,
+            # Mint new.
+            eiri = _entity_iri(e["canonical_name"], e["class_iri"])
+            entity_mints.append({
+                "entity_identifier": eiri,
+                "name": e["canonical_name"],
+                "normalized_name": normalized,
+                "class_id": class_id,
+                "iri": eiri,
+                "status": "ACTIVE",
+                "extra_metadata": {
+                    "first_seen_in_chunk": chunk_iri,
+                    "first_confidence": e["confidence"],
+                },
+            })
+            fresh_to_embed.append(
+                f"{e['canonical_name']} -- {class_label_by_iri.get(e['class_iri'], '')}"
+            )
+            seen_in_this_run[key] = None  # backfilled with the real id after INSERT
+            summary.entities_minted += 1
+            if len(samples_buf) < 10:
+                samples_buf.append({
                     "name": e["canonical_name"],
-                    "normalized_name": normalized,
-                    "class_id": class_id,
-                    "iri": eiri,
-                    "status": "ACTIVE",
-                    "extra_metadata": {
-                        "first_seen_in_chunk": chunk_iri,
-                        "first_confidence": e["confidence"],
-                    },
-                }
-                entity_mints.append(payload)
-                # Placeholder -- real id comes back after INSERT.
-                seen_in_this_run[key] = None  # filled in below after INSERT
-                fresh_to_embed.append((
-                    f"{e['canonical_name']} -- {class_label_by_iri.get(e['class_iri'], '')}",
-                    key,
-                ))
-                summary.entities_minted += 1
-                if len(samples_buf) < 10:
-                    samples_buf.append({
-                        "name": e["canonical_name"],
-                        "class": class_label_by_iri.get(e["class_iri"], ""),
-                        "chunk": chunk_iri,
-                    })
-                chunk_entity_pairs.append((chunk_id, key, doc_id))
+                    "class": class_label_by_iri.get(e["class_iri"], ""),
+                    "chunk": chunk_iri,
+                })
+            chunk_entity_pairs.append((chunk_id, key, doc_id))
 
-    # Embed all new entity names (one batched call).
+    # Stream embed -> insert -> discard per batch: never hold all entity vectors
+    # in RAM (bounds peak memory), and retry transient pooler drops so one
+    # dropped connection doesn't lose the whole run.
     embedder = Embedder()
-    if fresh_to_embed:
-        embed_inputs = [t for t, _ in fresh_to_embed]
-        vecs = await embedder.embed(embed_inputs)
-        for (text_in, key), vec in zip(fresh_to_embed, vecs, strict=False):
-            # Attach vector to the matching mint payload.
-            for p in entity_mints:
-                if (p["normalized_name"], p["class_id"]) == key:
-                    p["embedding"] = vec
-                    break
+    iri_to_id: dict[str, Any] = {}
+    _EBATCH = 200
+    for i in range(0, len(entity_mints), _EBATCH):
+        batch = entity_mints[i : i + _EBATCH]
+        texts = fresh_to_embed[i : i + _EBATCH]
+        vecs = await embedder.embed(texts) if texts else []
+        for p, v in zip(batch, vecs, strict=False):
+            p["embedding"] = v
+        for _attempt in range(4):
+            try:
+                async with session_scope() as session:
+                    await session.execute(pg_insert(Entity).values(batch))
+                    r = await session.execute(
+                        select(Entity.id, Entity.entity_identifier).where(
+                            Entity.entity_identifier.in_(
+                                [p["entity_identifier"] for p in batch]
+                            )
+                        )
+                    )
+                    for eid, iri in r.all():
+                        iri_to_id[iri] = eid
+                break
+            except Exception as _exc:
+                if _attempt == 3:
+                    raise
+                await asyncio.sleep(2 ** _attempt)
+        for p in batch:
+            p.pop("embedding", None)  # free the vector once persisted
     summary.embedding_cost_usd = embedder.total_cost_usd
     print(
-        f"[extract-entities] embedded {len(fresh_to_embed)} new "
-        f"entity name(s): ${summary.embedding_cost_usd:.4f}"
+        f"[extract-entities] embedded + inserted {len(entity_mints)} new "
+        f"entity(ies): ${summary.embedding_cost_usd:.4f}"
     )
 
-    # Insert mints + fetch their IDs.
-    BATCH = 200
-    if entity_mints:
-        async with session_scope() as session:
-            for i in range(0, len(entity_mints), BATCH):
-                await session.execute(
-                    pg_insert(Entity).values(entity_mints[i : i + BATCH])
-                )
-            # Look up the new IDs.
-            new_iris = [p["entity_identifier"] for p in entity_mints]
-            r = await session.execute(
-                select(Entity.id, Entity.entity_identifier).where(
-                    Entity.entity_identifier.in_(new_iris)
-                )
-            )
-            iri_to_id = {iri: eid for eid, iri in r.all()}
-
-        # Backfill seen_in_this_run with the real IDs.
-        for p in entity_mints:
-            key = (p["normalized_name"], p["class_id"])
-            eid = iri_to_id.get(p["entity_identifier"])
-            if eid is None:
-                continue
-            seen_in_this_run[key] = eid
-            minted_entity_class_pairs.append((eid, p["class_id"]))
+    # Backfill seen_in_this_run with the real IDs + collect type-edge pairs.
+    for p in entity_mints:
+        key = (p["normalized_name"], p["class_id"])
+        eid = iri_to_id.get(p["entity_identifier"])
+        if eid is None:
+            continue
+        seen_in_this_run[key] = eid
+        minted_entity_class_pairs.append((eid, p["class_id"]))
 
     # Build edges.
     async with session_scope() as session:
