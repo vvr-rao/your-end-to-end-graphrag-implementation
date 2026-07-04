@@ -133,6 +133,7 @@ async def generate_per_chunk_artifacts(
     concurrency: int = 4,
     max_cost_usd: float = 5.0,
     use_entities: bool = True,
+    chunk_kind: str = "summary",
 ) -> ArtifactGenSummary:
     """Drive per-chunk Claim+Finding+Observation extraction.
 
@@ -164,7 +165,7 @@ async def generate_per_chunk_artifacts(
             select(Chunk.id, Chunk.chunk_identifier, Chunk.text, Chunk.document_id)
             .where(
                 Chunk.status == "ACTIVE",
-                Chunk.kind == "summary",  # artifacts come from summary chunks, not fulltext
+                Chunk.kind == chunk_kind,  # 'summary' (default) or 'fulltext' (--from-fulltext)
                 Chunk.id.notin_(already_processed_subq),
             )
             .order_by(Chunk.created_at)

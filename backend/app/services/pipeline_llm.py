@@ -1512,10 +1512,12 @@ async def summarize_class_descriptions_async(
 
 # ---------- Pre-pipeline document summarization (optional) ----------
 
-# Bump this string ONLY when the document_summarize prompt changes
-# meaningfully. The prompt version is mixed into each cache key so old
-# cached summaries are silently invalidated.
-_DOC_SUMMARY_PROMPT_VERSION = "v2"
+# Bump this string ONLY when the document_summarize prompt OR the
+# summarization strategy changes meaningfully. The version is mixed into each
+# cache key so old cached summaries are silently invalidated.
+# v4 (2026-07-04): segment-wise summarization for docs >4k tokens (was single
+#   over-compressed summary >100k only) -> fuller, proportional summaries.
+_DOC_SUMMARY_PROMPT_VERSION = "v4"
 
 
 def _doc_summary_cache_dir() -> Path:
@@ -1662,8 +1664,8 @@ async def summarize_long_documents_async(
     concurrency: int = 4,
     model_name: str = "gpt-4o-mini",
     use_cache: bool = True,
-    max_doc_input_tokens: int = 100_000,
-    oversize_doc_sub_chunk_tokens: int = 80_000,
+    max_doc_input_tokens: int = 4_000,
+    oversize_doc_sub_chunk_tokens: int = 4_000,
 ) -> list[LoadedDocument]:
     """Optional pre-pipeline pass that rewrites long source documents
     into denser entity-preserving summaries before chunking.
@@ -1743,12 +1745,18 @@ async def summarize_long_documents_async(
         needs_llm = list(plan)
 
     oversize_needs_llm = sum(1 for _, _, h in needs_llm if h)
+    # Show the ACTUAL configured model (from models.yaml document_summarize),
+    # not a hardcoded label -- otherwise a gpt-4.1 run misreports as gpt-4o-mini.
+    try:
+        _summ_model = router.task_spec("document_summarize").get("model", model_name)
+    except Exception:
+        _summ_model = model_name
     print(
         f"[summarize-docs] {len(plan)}/{len(documents)} doc(s) over "
         f"threshold ({threshold_tokens} tokens): "
         f"{cache_hits} cache hit(s), {len(needs_llm)} cache miss(es) "
-        f"({oversize_needs_llm} require hierarchical summarization) "
-        f"via gpt-4o-mini at concurrency={concurrency}"
+        f"({oversize_needs_llm} require segment-wise summarization) "
+        f"via {_summ_model} at concurrency={concurrency}"
     )
 
     if not needs_llm:
@@ -1842,8 +1850,8 @@ async def stream_summarize_and_chunk_async(
     chunk_overlap: int = 150,
     encoding_name: str = "o200k_base",
     threshold_tokens: int = 2000,
-    max_doc_input_tokens: int = 100_000,
-    oversize_doc_sub_chunk_tokens: int = 80_000,
+    max_doc_input_tokens: int = 4_000,
+    oversize_doc_sub_chunk_tokens: int = 4_000,
     use_cache: bool = True,
     concurrency: int = 4,
     batch_size: int = 16,
@@ -2127,8 +2135,8 @@ async def _run_llm_stages(
     expansion_cfg_for_concur = app_cfg.get("expansion", {}) or {}
     threshold_tokens = int(chunking_cfg.get("summarization_threshold_tokens", 0))
     use_cache = bool(chunking_cfg.get("use_summary_cache", True))
-    max_doc_input_tokens = int(chunking_cfg.get("max_doc_input_tokens", 100_000))
-    oversize_sub_chunk = int(chunking_cfg.get("oversize_doc_sub_chunk_tokens", 80_000))
+    max_doc_input_tokens = int(chunking_cfg.get("max_doc_input_tokens", 4_000))
+    oversize_sub_chunk = int(chunking_cfg.get("oversize_doc_sub_chunk_tokens", 4_000))
     streaming_batch_size = int(chunking_cfg.get("streaming_batch_size", 16))
 
     chunks = await stream_summarize_and_chunk_async(

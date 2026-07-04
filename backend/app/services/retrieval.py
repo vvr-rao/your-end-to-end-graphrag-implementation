@@ -110,6 +110,8 @@ async def retrieve_and_answer(
     conversation_turn_id: uuid.UUID | None = None,
     resolved_query: str | None = None,
     verbose: bool = False,
+    multi_round: bool = True,
+    _round_depth: int = 0,
 ) -> RetrievalResult:
     """Driver. `resolved_query` skips the follow-up resolution step
     (the caller -- typically Milestone G -- already resolved it).
@@ -133,6 +135,58 @@ async def retrieve_and_answer(
     cost_before = router.total_cost_usd
 
     resolved_query = resolved_query or question
+
+    # -------- iterative (2-round) retrieval, deep_research only --------
+    # Some questions depend on entities that must be discovered first (e.g.
+    # "compare Ozempic to its competitors, which is fastest?" needs the
+    # competitor list before it can retrieve each competitor's attributes). A
+    # planner LLM detects that; if so we run a cheap BRIDGE round (simple_qa) to
+    # find those entities, then a FINAL deep_research round whose question is
+    # enriched with them -- so the normal pipeline seeds on the discovered
+    # entities and the synthesis can use them. Capped at 2 rounds: sub-rounds run
+    # with `_round_depth=1` / `multi_round=False`, so they never re-plan.
+    if mode == "deep_research" and multi_round and _round_depth == 0:
+        plan = await _plan_rounds(router, resolved_query)
+        if plan["needs_second_round"] and plan["round1_question"] and plan["round2_question"]:
+            if verbose:
+                print(
+                    f"[query] 2-round retrieval: "
+                    f"bridge={plan['round1_question']!r} final={plan['round2_question']!r}"
+                )
+            # Round 1 (bridge): cheap simple_qa to discover the entities.
+            r1 = await retrieve_and_answer(
+                plan["round1_question"], mode="simple_qa",
+                hops=hops, max_cost_usd=max_cost_usd, decompose=decompose,
+                max_probes=max_probes, verbose=verbose,
+                multi_round=False, _round_depth=1,
+            )
+            # Round 2 (final): enrich the question with round-1 findings so the
+            # pipeline seeds on the discovered entities AND the synthesis uses them.
+            enriched_final = (
+                f"{plan['round2_question']}\n\n"
+                f"[Prior research -- {plan['round1_question']}]\n{r1.answer}"
+            )
+            r2 = await retrieve_and_answer(
+                enriched_final, mode="deep_research", top_k=top_k,
+                hops=hops, max_cost_usd=max_cost_usd, decompose=decompose,
+                max_probes=max_probes, conversation_turn_id=conversation_turn_id,
+                verbose=verbose, multi_round=False, _round_depth=1,
+            )
+            # Merge: r2 is the final answer; fold in round-1 evidence + all cost.
+            seen = {ev.get("node_id") for ev in r2.evidence}
+            for ev in r1.evidence:
+                if ev.get("node_id") not in seen:
+                    r2.evidence.append(ev)
+            planning_cost = router.total_cost_usd - cost_before
+            r2.cost_usd += r1.cost_usd + planning_cost
+            r2.resolved_query = resolved_query  # report the user's original query
+            r2.parsed["rounds"] = {
+                "round1_question": plan["round1_question"],
+                "round2_question": plan["round2_question"],
+                "round1_answer": r1.answer,
+            }
+            r2.wall_seconds = time.time() - t0
+            return r2
 
     # -------- step 3: parse the question --------
     parsed = await _question_parse(router, resolved_query)
@@ -566,6 +620,32 @@ async def _query_decompose(router: LLMRouter, q: str) -> list[str]:
         return []
     sqs = parsed.get("sub_questions") or []
     return [s for s in sqs if isinstance(s, str) and s.strip()]
+
+
+async def _plan_rounds(router: LLMRouter, q: str) -> dict[str, Any]:
+    """Decide whether `q` needs a 2nd (dependent) retrieval round. Conservative
+    by design -- only genuine bridge questions (must discover entities first, or
+    a multi-part question whose 2nd part depends on the 1st) get two rounds; the
+    common case returns needs_second_round=False. Fails safe to one round."""
+    sys_p, user_p = PROMPTS["retrieval_rounds_plan"](q)
+    try:
+        out = await router.chat("retrieval_rounds_plan", system=sys_p, user=user_p)
+        parsed = _extract_json(out.text) or {}
+    except Exception:
+        return {"needs_second_round": False, "round1_question": "", "round2_question": ""}
+    r1 = (parsed.get("round1_question") or "").strip()
+    r2 = (parsed.get("round2_question") or "").strip()
+    # Guard: only treat as multi-round if BOTH sub-questions are present and the
+    # bridge question is actually distinct from the original (avoids spurious
+    # 2-round runs the planner sometimes proposes for simple questions).
+    needs = bool(parsed.get("needs_second_round")) and bool(r1) and bool(r2) \
+        and r1.strip().lower() != q.strip().lower()
+    return {
+        "needs_second_round": needs,
+        "round1_question": r1,
+        "round2_question": r2,
+        "reason": parsed.get("reason") or "",
+    }
 
 
 # --------------- persistence ---------------

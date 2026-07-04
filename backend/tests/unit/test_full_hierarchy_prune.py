@@ -1722,7 +1722,7 @@ def test_summarize_long_documents_skips_short_docs() -> None:
     from backend.app.services.pipeline_llm import summarize_long_documents_async
 
     short = LoadedDocument(path=Path("short.txt"), text="Short doc, just a few words.")
-    long_words = "Long document with many entities. " * 800  # ~5000 tokens
+    long_words = "Long document with many entities. " * 450  # ~2800 tokens: >threshold, <4k segment-trigger -> single call
     long_a = LoadedDocument(path=Path("long_a.txt"), text=long_words)
     long_b = LoadedDocument(path=Path("long_b.txt"), text=long_words)
 
@@ -1779,7 +1779,7 @@ def test_summarize_long_documents_falls_back_on_llm_failure() -> None:
     from backend.app.services.document_io import LoadedDocument
     from backend.app.services.pipeline_llm import summarize_long_documents_async
 
-    long_text = "Long document with many entities. " * 800  # ~5000 tokens
+    long_text = "Long document with many entities. " * 450  # ~2800 tokens: >threshold, <4k segment-trigger -> single call
     doc = LoadedDocument(path=Path("doc.txt"), text=long_text)
 
     class _ExplodingRouter:
@@ -1897,7 +1897,7 @@ def test_doc_summary_cache_miss_writes_cache_for_future_runs(
         lambda: tmp_path,
     )
 
-    long_text = "Long document with named entities and relationships. " * 500
+    long_text = "Long document with named entities and relationships. " * 350  # ~2800 tok: single-call range
     doc = LoadedDocument(path=Path("doc.txt"), text=long_text)
 
     class _FakeResult:
@@ -2250,31 +2250,32 @@ def test_summarize_oversize_caches_combined_summary(monkeypatch, tmp_path) -> No
     assert out2[0].text == out1[0].text
 
 
-def test_summarize_default_max_doc_input_tokens_is_100k() -> None:
-    """The function signature exposes max_doc_input_tokens with a default
-    of 100_000 -- below gpt-4o-mini's 128K context, with headroom for
-    the system + user prompt overhead."""
+def test_summarize_default_max_doc_input_tokens_is_4k() -> None:
+    """Default segmentation trigger: docs over 4K tokens get segment-wise
+    summarization (split + summarize each segment) rather than one
+    over-compressed whole-doc summary. Lowered from 100K so large docs keep
+    ~20%+ per-segment retention instead of collapsing to ~5%."""
     import inspect
     from backend.app.services.pipeline_llm import summarize_long_documents_async
 
     sig = inspect.signature(summarize_long_documents_async)
     param = sig.parameters.get("max_doc_input_tokens")
     assert param is not None, "max_doc_input_tokens parameter missing"
-    assert param.default == 100_000, (
-        f"default ceiling should be 100K, got {param.default}"
+    assert param.default == 4_000, (
+        f"segment trigger should be 4K, got {param.default}"
     )
 
 
-def test_summarize_default_oversize_sub_chunk_is_80k() -> None:
-    """Default sub-chunk size for hierarchical path is 80K tokens --
-    leaves comfortable headroom under gpt-4o-mini's 128K input limit."""
+def test_summarize_default_oversize_sub_chunk_is_4k() -> None:
+    """Default segment size for the segment-wise path is 4K tokens -- each
+    segment is summarized independently so retention stays near the 20% floor."""
     import inspect
     from backend.app.services.pipeline_llm import summarize_long_documents_async
 
     sig = inspect.signature(summarize_long_documents_async)
     param = sig.parameters.get("oversize_doc_sub_chunk_tokens")
     assert param is not None
-    assert param.default == 80_000
+    assert param.default == 4_000
 
 
 # ============================================================================

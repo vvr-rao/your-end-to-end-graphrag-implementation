@@ -11,15 +11,19 @@
 # =============================================================================
 
 tasks:
-  # Repointed from Groq → OpenAI. gpt-4o-mini is slower than Groq's Llama, so
-  # this task needs a longer timeout AND lower concurrency
-  # (expansion.max_concurrent_llm_calls: 3-4 in config.yaml) — otherwise Stage 1
-  # times out ("Request timed out") under 8 concurrent large requests.
-  # max_tokens: the prompt asks for <=50 IRIs but gpt-4o-mini often over-emits
-  # (~200); a downstream hard-cap trims to 50. 8192 lets the JSON finish cleanly
-  # — a smaller cap truncates mid-list and triggers the "salvaged N IRIs" path.
-  # json_object mode is safe (the prompt already requests JSON).
-  # For very broad-coverage corpora bump model to gpt-4.1 (32k ceiling, ~16x cost).
+  # OpenAI Stage-1 classifier. Notes:
+  #  - gpt-4o-mini is the cheap default and fine for SMALL/MEDIUM ontologies.
+  #  - It needs a longer timeout + lower concurrency
+  #    (expansion.max_concurrent_llm_calls: 3-4 in config.yaml) or it times out.
+  #  - On LARGE, FLAT ontologies (e.g. pharma DRON/HP, ~256 top-level branches)
+  #    gpt-4o-mini ignores the "<=50 IRIs" rule and dumps 200-400+ IRIs: the JSON
+  #    truncates ("salvaged N IRIs") AND the downstream hard-cap then keeps an
+  #    ARBITRARY 50, degrading Stage 2. For those corpora switch to gpt-4.1
+  #    (better instruction-following, 32k output ceiling) — it's one call per
+  #    source chunk so the cost is modest:
+  #      model: gpt-4.1
+  #      max_tokens: 16384
+  # json_object mode is safe here (the prompt already requests JSON).
   chunk_classification:
     provider: openai
     model: gpt-4o-mini
@@ -60,12 +64,20 @@ tasks:
     max_tokens: 2048
     response_format: json_object
 
+  # RECOMMENDATION: use gpt-4.1 for summarization, not gpt-4o-mini. Mini ignores
+  # the "preserve entities/lists/numbers, keep 20-50%" instructions and
+  # over-compresses to ~5% of the source, which starves downstream entity/
+  # artifact extraction. gpt-4.1 follows them -> fuller, more faithful summaries.
+  # Combined with segment-wise summarization (docs >4k tokens are split; see
+  # pipeline_llm), a large doc gets several proportional summaries near the 20%
+  # floor. Cost is one-time + cached (~$2 for a ~500k-token corpus).
+  #   model: gpt-4.1  ;  max_tokens: 8192  ;  timeout: 180
   document_summarize:
     provider: openai
-    model: gpt-4o-mini
-    timeout: 120
+    model: gpt-4.1
+    timeout: 180
     temperature: 0.0
-    max_tokens: 4096
+    max_tokens: 8192
 
   classification_audit:
     provider: openai

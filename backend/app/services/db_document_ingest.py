@@ -174,6 +174,16 @@ def _document_iri(doc_hash: str) -> str:
     return f"{_VIAO_NS}#Document_{doc_hash[:16]}"
 
 
+def _clean_text(s: str) -> str:
+    """Strip NUL (0x00) bytes. Postgres text/jsonb columns reject them
+    ('invalid byte sequence for encoding UTF8: 0x00'), and raw original text
+    (esp. pypdf-extracted PDF text) routinely contains them -- unlike the
+    LLM-generated summaries, which are always clean. Applied to every chunk
+    text before embedding + insert so both summary (for under-threshold docs
+    chunked from the original) and full-text chunks are safe."""
+    return s.replace("\x00", "") if s else s
+
+
 def _chunk_iri(doc_hash: str, idx: int) -> str:
     return f"{_VIAO_NS}#Chunk_{doc_hash[:16]}_{idx:04d}"
 
@@ -303,7 +313,7 @@ async def ingest_documents_folder(
 
     all_chunk_texts: list[str] = []
     for cs in chunks_by_doc:
-        all_chunk_texts.extend(c.text for c in cs)
+        all_chunk_texts.extend(_clean_text(c.text) for c in cs)
 
     if not all_chunk_texts:
         print("[ingest] WARNING: zero chunks produced; bailing")
@@ -385,7 +395,7 @@ async def ingest_documents_folder(
                 "document_id": doc_id,
                 "chunk_identifier": ciri,
                 "chunk_index": c.index,
-                "text": c.text,
+                "text": _clean_text(c.text),
                 "kind": "summary",
                 "token_count": c.token_count,
                 "embedding": (
@@ -524,7 +534,7 @@ async def _ingest_fulltext_chunks_for_docs(
 
     all_texts: list[str] = []
     for cs in ft_chunks_by_doc:
-        all_texts.extend(c.text for c in cs)
+        all_texts.extend(_clean_text(c.text) for c in cs)
     if not all_texts:
         print("[ingest][fulltext] zero full-text chunks produced; skipping")
         return
@@ -553,7 +563,7 @@ async def _ingest_fulltext_chunks_for_docs(
                 "document_id": doc_id,
                 "chunk_identifier": ciri,
                 "chunk_index": c.index,
-                "text": c.text,
+                "text": _clean_text(c.text),
                 "kind": "fulltext",
                 "token_count": c.token_count,
                 "embedding": vectors[gidx] if gidx < len(vectors) else None,

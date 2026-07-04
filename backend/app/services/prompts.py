@@ -721,6 +721,11 @@ def document_summarize(text: str) -> tuple[str, str]:
     v2 (2026-06-15): explicitly preserve Events / Claims / Findings /
     Risks / Insights as standalone sentences so the downstream
     artifact-extractor finds them without re-discovery.
+
+    v3 (2026-06-28): non-negotiable preservation of regulatory info +
+    regulatory bodies, safety warnings + adverse events, every entity /
+    organization, COMPLETE lists (no sampling), and ALL numbers /
+    statistics — these override the length target.
     """
     system = (
         "You are a research assistant compressing a long document into a "
@@ -740,6 +745,26 @@ def document_summarize(text: str) -> tuple[str, str]:
         "produced in Y, etc.).\n"
         "  - Numerical specifics tied to a named thing (percentages, "
         "dates, quantities tied to an entity).\n\n"
+        "NON-NEGOTIABLE PRESERVATION (never omit, sample, or abbreviate "
+        "these, even if it makes the summary long):\n"
+        "  - EVERY entity and organization mentioned -- do not drop any as "
+        "'minor'. Retain all people, companies, subsidiaries, agencies, "
+        "brands, and products by name.\n"
+        "  - REGULATORY information: every regulation, law, rule, guidance, "
+        "approval, or compliance requirement, AND the regulatory BODY that "
+        "issues or enforces it (e.g. FDA, EMA, SEC, EPA). Name both the "
+        "rule and the body.\n"
+        "  - SAFETY information: all warnings (including boxed / black-box "
+        "warnings), precautions, contraindications, and ADVERSE EVENTS / "
+        "side effects (including drug adverse events). Preserve each item.\n"
+        "  - COMPLETE LISTS: when the source enumerates items (subsidiaries, "
+        "organizations, people, products, ingredients, warnings, adverse "
+        "events, board members, etc.), reproduce EVERY item in the list. "
+        "Never write 'including X, Y, and others' or otherwise truncate a "
+        "list -- list them all.\n"
+        "  - ALL numbers and statistics: every percentage, dosage, count, "
+        "monetary amount, date, measurement, ratio, and statistic, whether "
+        "or not it is tied to a named entity.\n\n"
         "INTELLIGENCE-BEARING FRAGMENTS. When the source contains any of "
         "the following, render them as distinct sentences in the summary "
         "so a downstream extractor sees them as standalone statements. "
@@ -778,7 +803,12 @@ def document_summarize(text: str) -> tuple[str, str]:
         "bullet points or markdown headings -- the downstream chunker "
         "is paragraph-first and treats bullets as one giant paragraph. "
         "Use blank lines between paragraphs.\n\n"
-        "Target length: 20-50% of the input. Err on the side of "
+        "Target length: 20-50% of the input. The NON-NEGOTIABLE "
+        "PRESERVATION rules above OVERRIDE this target -- if retaining "
+        "every entity, complete list, number, regulatory detail, and "
+        "safety / adverse-event item pushes the summary well past 50%, "
+        "that is acceptable and expected. Completeness of those items is "
+        "mandatory; length is only a soft target. Err on the side of "
         "preserving entities + relationships + intelligence-bearing "
         "fragments even if that means a longer summary. Do NOT add "
         "anything not in the source text."
@@ -1118,6 +1148,53 @@ def query_decompose(question: str) -> tuple[str, str]:
         "  Q: 'What is BYD's annual production capacity?'\n"
         "    A: ['BYD annual production capacity']\n\n"
         "Return ONLY {\"sub_questions\": [\"...\", ...]}."
+    )
+    user = f"QUESTION: {question}\n\nReturn the JSON now."
+    return system, user
+
+
+def retrieval_rounds_plan(question: str) -> tuple[str, str]:
+    """Iterative-retrieval planner (deep_research only). Decides whether the
+    question needs TWO sequential retrieval rounds: a BRIDGE round to discover
+    intermediate entities, then a FINAL round that uses them.
+
+    Returns JSON:
+      {"needs_second_round": bool,
+       "round1_question": "<discovery question>",
+       "round2_question": "<final question, answerable once round 1 is known>",
+       "reason": "<one line>"}
+    """
+    system = (
+        "You plan retrieval for a research assistant. Given a QUESTION, decide "
+        "whether answering it well needs TWO sequential retrieval rounds:\n"
+        "  - a BRIDGE round that first DISCOVERS intermediate entities/facts, then\n"
+        "  - a FINAL round that USES those discovered entities to answer the "
+        "main question.\n\n"
+        "Require two rounds ONLY when the question depends on entities that must "
+        "be found first -- e.g. 'compare X to its competitors and say which is "
+        "fastest' needs the competitor list before you can retrieve each "
+        "competitor's attributes. Also use it for chained/multi-part questions "
+        "where the second part depends on the answer to the first.\n"
+        "Most questions need only ONE round (a specific entity is already named, "
+        "or it's a single lookup) -- then set needs_second_round=false.\n\n"
+        "When two rounds are needed:\n"
+        "  round1_question = the discovery question (what must be found first, "
+        "e.g. 'What are the main competitor drugs to Ozempic?').\n"
+        "  round2_question = the final question, phrased so it can be answered "
+        "once round 1's findings are known (e.g. 'Among Ozempic and its "
+        "competitor drugs, which has the fastest onset of therapeutic effect?').\n\n"
+        "EXAMPLES:\n"
+        "  Q: 'Compare Ozempic to its competitors. Which drug has the fastest "
+        "effect?'\n"
+        "    -> {\"needs_second_round\": true, \"round1_question\": \"What are the "
+        "main competitor drugs to Ozempic?\", \"round2_question\": \"Among Ozempic "
+        "and its main competitor drugs, which has the fastest onset of "
+        "therapeutic effect, and how do they compare?\", \"reason\": \"competitors "
+        "must be discovered first\"}\n"
+        "  Q: 'What is the recommended dose of Mounjaro?'\n"
+        "    -> {\"needs_second_round\": false, \"round1_question\": \"\", "
+        "\"round2_question\": \"\", \"reason\": \"single named entity, one lookup\"}\n\n"
+        "Return ONLY the JSON object."
     )
     user = f"QUESTION: {question}\n\nReturn the JSON now."
     return system, user
@@ -1892,6 +1969,7 @@ PROMPTS = {
     "question_parse": question_parse,
     "concept_expansion": concept_expansion,
     "query_decompose": query_decompose,
+    "retrieval_rounds_plan": retrieval_rounds_plan,
     "chunk_relevance_filter": chunk_relevance_filter,
     "answer_simple_qa": answer_simple_qa,
     "answer_deep_research": answer_deep_research,

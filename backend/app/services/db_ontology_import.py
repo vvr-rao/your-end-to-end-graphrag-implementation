@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -184,7 +185,7 @@ async def import_ontology_folder(
     UPSERT_BATCH = 100
 
     async def _upsert_batched(
-        Model, payloads: list[dict[str, Any]], label: str
+        Model, payloads: list[dict[str, Any]], label: str, quiet: bool = False
     ) -> None:
         """Multi-row INSERT...ON CONFLICT DO UPDATE in batches of
         UPSERT_BATCH. Each batch is its own transaction so a pooler
@@ -195,55 +196,112 @@ async def import_ontology_folder(
         total_batches = (len(payloads) + UPSERT_BATCH - 1) // UPSERT_BATCH
         for batch_idx in range(total_batches):
             chunk = payloads[batch_idx * UPSERT_BATCH : (batch_idx + 1) * UPSERT_BATCH]
-            async with session_scope() as session:
-                stmt = pg_insert(Model).values(chunk)
-                # `excluded.<col>` references the values that WOULD have
-                # been inserted -- each conflicted row gets its own
-                # proposed values back as the update set.
-                set_cols = [c for c in chunk[0].keys() if c != "iri"]
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=["iri"],
-                    set_={c: getattr(stmt.excluded, c) for c in set_cols},
-                )
-                await session.execute(stmt)
-            if (batch_idx + 1) % 10 == 0 or batch_idx == total_batches - 1:
+            # `excluded.<col>` references the values that WOULD have been
+            # inserted -- each conflicted row gets its own proposed values back.
+            set_cols = [c for c in chunk[0].keys() if c != "iri"]
+            # Retry transient failures. The Supabase pooler drops connections
+            # mid-operation now and then (asyncpg ConnectionDoesNotExistError),
+            # which otherwise crashes the whole import. Each attempt opens a
+            # fresh session (a new pooled connection) and the upsert is
+            # idempotent, so re-running a batch is safe.
+            for _attempt in range(4):
+                try:
+                    async with session_scope() as session:
+                        stmt = pg_insert(Model).values(chunk)
+                        stmt = stmt.on_conflict_do_update(
+                            index_elements=["iri"],
+                            set_={c: getattr(stmt.excluded, c) for c in set_cols},
+                        )
+                        await session.execute(stmt)
+                    break
+                except Exception as _exc:
+                    if _attempt == 3:
+                        raise
+                    _wait = 2 ** _attempt
+                    print(
+                        f"[db-import] {label} upsert batch {batch_idx} failed "
+                        f"({type(_exc).__name__}); retry {_attempt + 1}/3 in {_wait}s"
+                    )
+                    await asyncio.sleep(_wait)
+            if not quiet and ((batch_idx + 1) % 10 == 0 or batch_idx == total_batches - 1):
                 done = min((batch_idx + 1) * UPSERT_BATCH, len(payloads))
                 print(f"[db-import] {label}: {done}/{len(payloads)} upserted")
 
     # ---- Pass 1: classes (with embedding) ----
+    # STREAMED: embed -> upsert -> discard per chunk. We must NOT accumulate all
+    # embedding vectors in RAM: 25k+ vectors as Python float-lists reach ~800 MB
+    # and OOM-killed the process mid-run (~7k classes) on 2.7 GB boxes -- a
+    # SIGKILL, so no traceback, which looked like a silent hang+stop. Streaming
+    # keeps peak memory flat at ~one chunk's worth. Each chunk commits, so a
+    # killed run leaves partial progress, and re-running RESUMES: classes that
+    # already have an embedding are skipped (see below), so an interrupted
+    # import picks up where it left off instead of re-embedding all 25k.
     if classes:
-        texts: list[str] = []
-        records: list[tuple[str, dict[str, Any]]] = []
+        # Resume support: skip classes already loaded WITH an embedding. To force
+        # a full re-embed (e.g. changed embed model / text), clear the rows first
+        # or use db-init --mode replace.
+        async with session_scope() as session:
+            _res = await session.execute(
+                select(OntologyClass.iri).where(OntologyClass.embedding.isnot(None))
+            )
+            _already_embedded = {row[0] for row in _res.all()}
+        if _already_embedded:
+            print(
+                f"[db-import] resume: {len(_already_embedded):,} class(es) already "
+                f"embedded -> skipping; embedding only the remainder"
+            )
+        class_records: list[tuple[str, dict[str, Any]]] = []
+        class_texts: list[str] = []
         for iri, rec in classes.items():
+            if iri in _already_embedded:
+                continue
             text = _build_embed_text(rec)
             if not text:
                 continue
-            texts.append(text)
-            records.append((iri, rec))
+            class_records.append((iri, rec))
+            class_texts.append(text)
 
-        print(f"[db-import] embedding {len(texts)} class text(s) ...")
-        vectors = await embedder.embed(texts) if texts else []
-        print(f"[db-import] embedding DONE (cost ${embedder.total_cost_usd:.4f}, "
+        total_cls = len(class_records)
+        _PROGRESS_CHUNK = 500
+        print(
+            f"[db-import] embedding + upserting {total_cls:,} class(es) "
+            f"in streamed chunks of {_PROGRESS_CHUNK} (bounded memory) ..."
+        )
+        _t0 = time.time()
+        _done = 0
+        for _i in range(0, total_cls, _PROGRESS_CHUNK):
+            _recs = class_records[_i : _i + _PROGRESS_CHUNK]
+            _vecs = await embedder.embed(class_texts[_i : _i + _PROGRESS_CHUNK])
+            _payloads = []
+            for (iri, rec), vec in zip(_recs, _vecs, strict=False):
+                _payloads.append({
+                    "iri": iri,
+                    "label": _first_str(rec.get("labels")) or rec.get("name"),
+                    "description": (
+                        _first_str(rec.get("compact_description"))
+                        or _first_str(rec.get("descriptions"))
+                        or _first_str(rec.get("comments"))
+                    ),
+                    "namespace": _namespace_of(iri),
+                    "source_ontology": _first_str(rec.get("sources")),
+                    "is_viao_class": _is_viao(iri),
+                    "embedding": vec,
+                    "extra_metadata": rec,
+                })
+            await _upsert_batched(OntologyClass, _payloads, "classes", quiet=True)
+            _done += len(_recs)
+            _elapsed = time.time() - _t0
+            _rate = _done / _elapsed if _elapsed > 0 else 0.0
+            _eta = (total_cls - _done) / _rate if _rate > 0 else 0.0
+            print(
+                f"[db-import]   {_done:,}/{total_cls:,} classes "
+                f"({100 * _done / total_cls:.0f}%) embedded+upserted, "
+                f"${embedder.total_cost_usd:.4f}, ~{_eta:.0f}s left"
+            )
+            del _payloads, _vecs, _recs
+        summary.classes_embedded = _done
+        print(f"[db-import] classes DONE (cost ${embedder.total_cost_usd:.4f}, "
               f"{embedder.total_tokens:,} tokens)")
-
-        payloads = []
-        for (iri, rec), vec in zip(records, vectors, strict=False):
-            payloads.append({
-                "iri": iri,
-                "label": _first_str(rec.get("labels")) or rec.get("name"),
-                "description": (
-                    _first_str(rec.get("compact_description"))
-                    or _first_str(rec.get("descriptions"))
-                    or _first_str(rec.get("comments"))
-                ),
-                "namespace": _namespace_of(iri),
-                "source_ontology": _first_str(rec.get("sources")),
-                "is_viao_class": _is_viao(iri),
-                "embedding": vec,
-                "extra_metadata": rec,
-            })
-        await _upsert_batched(OntologyClass, payloads, "classes")
-        summary.classes_embedded = len(payloads)
 
     # ---- Pass 2: object + data properties (no embeddings) ----
     for prop_dict, Model, label in (

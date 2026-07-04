@@ -253,8 +253,15 @@ async def extract_entities(
     candidate_classes_per_chunk: int = 50,
     concurrency: int = 4,
     max_cost_usd: float = 5.0,
+    chunk_kind: str = "summary",
 ) -> EntityExtractSummary:
-    """Drive entity extraction over chunks that haven't been processed."""
+    """Drive entity extraction over chunks that haven't been processed.
+
+    `chunk_kind` ('summary' default | 'fulltext'): which chunk set to mine.
+    Summary is cheap but only captures what survived summarization; 'fulltext'
+    mines the verbatim chunks (far more complete, e.g. every clinical study),
+    at ~18x the LLM calls + more DB rows. Requires --full-text-chunks at ingest.
+    """
     t0 = time.time()
     summary = EntityExtractSummary()
 
@@ -269,7 +276,7 @@ async def extract_entities(
             select(Chunk.id, Chunk.chunk_identifier, Chunk.text, Chunk.embedding, Chunk.document_id)
             .where(
                 Chunk.status == "ACTIVE",
-                Chunk.kind == "summary",  # entities come from summary chunks, not fulltext
+                Chunk.kind == chunk_kind,  # 'summary' (default) or 'fulltext' (--from-fulltext)
                 Chunk.id.notin_(already_subq),
             )
             .order_by(Chunk.created_at)

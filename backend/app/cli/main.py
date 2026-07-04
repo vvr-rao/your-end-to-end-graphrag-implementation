@@ -530,6 +530,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-cost-usd", type=float, default=5.0,
         help="Abort if LLM spend exceeds this within the run.",
     )
+    p_ext.add_argument(
+        "--from-fulltext", action="store_true",
+        help=(
+            "Mine entities from the verbatim FULL-TEXT chunks (kind='fulltext') "
+            "instead of the summary chunks. Far more complete (captures every "
+            "study/entity in the source), but ~18x more LLM calls + more DB rows. "
+            "Requires the corpus was ingested with --full-text-chunks. Default: summary."
+        ),
+    )
     p_ext.set_defaults(func=_cmd_extract_entities)
 
     # ---------- Phase 2: Milestone E (artifacts) ----------
@@ -593,6 +602,15 @@ def build_parser() -> argparse.ArgumentParser:
             "errors with a hint to run extract-entities first."
         ),
     )
+    p_art.add_argument(
+        "--from-fulltext", action="store_true",
+        help=(
+            "Extract per-chunk artifacts (Claim/Finding/Observation/Event) from "
+            "the verbatim FULL-TEXT chunks instead of the summary chunks. More "
+            "complete, but ~18x more LLM calls + more DB rows. Requires the corpus "
+            "was ingested with --full-text-chunks. Default: summary."
+        ),
+    )
     p_art.set_defaults(func=_cmd_generate_artifacts)
 
     # ---------- Phase 2: Milestone F (retrieval + answer synthesis) ----------
@@ -644,6 +662,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_q.add_argument(
         "--verbose", action="store_true",
         help="Print debug info from each pipeline step.",
+    )
+    p_q.add_argument(
+        "--single-round", dest="multi_round", action="store_false", default=True,
+        help=(
+            "Disable the 2-round iterative retrieval (deep_research only). By "
+            "default, a planner detects dependent multi-part questions (e.g. "
+            "'compare X to its competitors, which is fastest?') and runs a bridge "
+            "round to discover entities first. This flag forces a single round."
+        ),
     )
     p_q.set_defaults(func=_cmd_query)
 
@@ -1208,6 +1235,7 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
             candidate_classes_per_chunk=args.candidate_classes,
             concurrency=args.concurrency,
             max_cost_usd=args.max_cost_usd,
+            chunk_kind="fulltext" if getattr(args, "from_fulltext", False) else "summary",
         )
     )
     return 0
@@ -1241,6 +1269,7 @@ def _cmd_generate_artifacts(args: argparse.Namespace) -> int:
                 concurrency=args.concurrency,
                 max_cost_usd=args.max_cost_usd,
                 use_entities=use_entities,
+                chunk_kind="fulltext" if getattr(args, "from_fulltext", False) else "summary",
             )
         )
         # The above asyncio.run's loop is now dead; drop the cached
@@ -1297,6 +1326,7 @@ def _cmd_query(args: argparse.Namespace) -> int:
             decompose=not args.no_decompose,
             max_probes=args.max_probes,
             verbose=args.verbose,
+            multi_round=getattr(args, "multi_round", True),
         )
     )
 
