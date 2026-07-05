@@ -496,6 +496,14 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("month", "day"), default="month",
         help="Bottom of the time hierarchy + gap-fill granularity.",
     )
+    p_time.add_argument(
+        "--from-fulltext", action="store_true",
+        help=(
+            "Scan the verbatim FULL-TEXT chunks for dates instead of summary "
+            "chunks, matching extract-entities / generate-artifacts so time "
+            "edges anchor on the same chunk kind. Default: summary."
+        ),
+    )
     p_time.set_defaults(func=_cmd_enrich_time)
 
     # ---------- Phase 2: Milestone C (entity extraction) ----------
@@ -1220,6 +1228,7 @@ def _cmd_enrich_time(args: argparse.Namespace) -> int:
             limit=args.limit,
             highest_level=args.highest_level,
             lowest_level=args.lowest_level,
+            chunk_kind="fulltext" if getattr(args, "from_fulltext", False) else "summary",
         )
     )
     return 0

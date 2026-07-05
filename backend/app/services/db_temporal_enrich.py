@@ -253,8 +253,14 @@ async def enrich_temporal(
     limit: int | None = None,
     highest_level: str = "year",
     lowest_level: str = "month",
+    chunk_kind: str = "summary",
 ) -> EnrichSummary:
-    """Drive: scan chunks not yet enriched, mint time_instances + edges."""
+    """Drive: scan chunks not yet enriched, mint time_instances + edges.
+
+    `chunk_kind` ('summary' default | 'fulltext'): which chunk set to scan for
+    dates, matching extract-entities / generate-artifacts so the graph anchors
+    on one chunk kind consistently.
+    """
     t0 = time.time()
     summary = EnrichSummary()
 
@@ -268,6 +274,7 @@ async def enrich_temporal(
             select(Chunk.id, Chunk.text)
             .where(
                 Chunk.status == "ACTIVE",
+                Chunk.kind == chunk_kind,  # 'summary' (default) or 'fulltext' (--from-fulltext)
                 Chunk.id.notin_(already_enriched_subq),
             )
             .order_by(Chunk.created_at)
