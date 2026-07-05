@@ -340,6 +340,28 @@ async def vector_rerank_chunks(
     return [(cid, float(dist)) for cid, dist in result.all()]
 
 
+async def vector_search_all_artifacts(
+    session: AsyncSession,
+    probe_embedding: list[float],
+    *,
+    top_k: int = 100,
+) -> list[uuid.UUID]:
+    """Global HNSW nearest-neighbor over ALL active artifacts (no id filter, so
+    the vector index IS used -> fast even over the whole artifact layer). Used by
+    artifact_only mode to bring every artifact type into scope, including
+    Insights / Recommendations / Summaries that have no entity edge."""
+    result = await session.execute(
+        sql_text("""
+        SELECT id FROM graphrag.intelligence_artifacts
+         WHERE embedding IS NOT NULL AND status = 'ACTIVE'
+         ORDER BY embedding <-> CAST(:probe AS vector)
+         LIMIT :limit
+        """),
+        {"probe": _vec_str(probe_embedding), "limit": top_k},
+    )
+    return [row[0] for row in result.all()]
+
+
 async def vector_rerank_artifacts(
     session: AsyncSession,
     candidate_artifact_ids: list[uuid.UUID],

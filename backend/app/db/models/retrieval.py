@@ -27,7 +27,7 @@ class RetrievalRun(Base):
     __tablename__ = "retrieval_runs"
     __table_args__ = (
         CheckConstraint(
-            "retrieval_mode IN ('simple_qa','summarize','deep_research','insights','knowledge_gaps')",
+            "retrieval_mode IN ('simple_qa','summarize','deep_research','insights','knowledge_gaps','artifact_only')",
             name="retrieval_runs_mode_check",
         ),
     )

@@ -78,11 +78,13 @@ def default_hops() -> int:
         return _DEFAULT_HOPS_FALLBACK
 
 
-_VALID_MODES = ("simple_qa", "deep_research")
+_VALID_MODES = ("simple_qa", "deep_research", "artifact_only")
 # deep_research is the default workhorse mode; simple_qa is the tight
-# direct-answer mode. Other modes (summarize, insights, knowledge_gaps,
-# exhaustive_search) were removed 2026-06-13 in favor of the structured
-# deep_research output. See plan: "QA + artifact redesign: 2-mode ...".
+# direct-answer mode. artifact_only runs the graph pipeline over ALL
+# intelligence artifacts (entity-linked + a global vector pass), never chunks,
+# and synthesizes with the deep_research structured prompt.
+# Other modes (summarize, insights, knowledge_gaps, exhaustive_search) were
+# removed 2026-06-13 in favor of the structured deep_research output.
 
 
 @dataclass
@@ -98,6 +100,18 @@ class RetrievalResult:
     graph_version: int = 0
 
 
+# Matches inline evidence citation tokens the synthesis emits, e.g.
+# "[viao:Chunk_180a994f...]", "[viao:Claim_c91c...]", or a bracketed URL.
+# Used to scrub chunk citations out of the artifact_only bridge's prior-research
+# text so round 2 can't echo citations to evidence it never retrieved.
+_CITATION_TOKEN_RE = re.compile(r"\s*\[(?:viao:[^\]]+|https?://[^\]]+)\]")
+
+
+def _strip_citation_tokens(text: str) -> str:
+    """Remove inline [viao:...] / [http...] citation tokens from prose."""
+    return _CITATION_TOKEN_RE.sub("", text)
+
+
 async def retrieve_and_answer(
     question: str,
     *,
@@ -106,7 +120,7 @@ async def retrieve_and_answer(
     hops: int | None = None,
     max_cost_usd: float = 1.0,
     decompose: bool = True,
-    max_probes: int = 5,
+    max_probes: int = 3,
     conversation_turn_id: uuid.UUID | None = None,
     resolved_query: str | None = None,
     verbose: bool = False,
@@ -127,7 +141,8 @@ async def retrieve_and_answer(
             "answers or simple_qa for direct factoids."
         )
     if top_k is None:
-        top_k = 30 if mode == "deep_research" else 20
+        # artifacts are tiny (~35 tokens) so we can afford many more of them.
+        top_k = 40 if mode == "artifact_only" else (30 if mode == "deep_research" else 20)
     if hops is None:
         hops = default_hops()
     t0 = time.time()
@@ -145,7 +160,7 @@ async def retrieve_and_answer(
     # enriched with them -- so the normal pipeline seeds on the discovered
     # entities and the synthesis can use them. Capped at 2 rounds: sub-rounds run
     # with `_round_depth=1` / `multi_round=False`, so they never re-plan.
-    if mode == "deep_research" and multi_round and _round_depth == 0:
+    if mode in ("deep_research", "artifact_only") and multi_round and _round_depth == 0:
         plan = await _plan_rounds(router, resolved_query)
         if plan["needs_second_round"] and plan["round1_question"] and plan["round2_question"]:
             if verbose:
@@ -162,19 +177,32 @@ async def retrieve_and_answer(
             )
             # Round 2 (final): enrich the question with round-1 findings so the
             # pipeline seeds on the discovered entities AND the synthesis uses them.
+            # For artifact_only the round-1 bridge is a chunk-based *discovery*
+            # step; strip its citation tokens from the prior-research block so the
+            # final artifact-only synthesis can't echo chunk citations it never
+            # retrieved (keeps the mode's "answer from artifacts only" contract).
+            prior = _strip_citation_tokens(r1.answer) if mode == "artifact_only" else r1.answer
             enriched_final = (
                 f"{plan['round2_question']}\n\n"
-                f"[Prior research -- {plan['round1_question']}]\n{r1.answer}"
+                f"[Prior research -- {plan['round1_question']}]\n{prior}"
             )
+            # Round 2 (final): stay in the caller's mode so artifact_only keeps
+            # synthesizing from artifacts only (just now enriched with the
+            # discovered competitor entities), while deep_research stays as-is.
             r2 = await retrieve_and_answer(
-                enriched_final, mode="deep_research", top_k=top_k,
+                enriched_final, mode=mode, top_k=top_k,
                 hops=hops, max_cost_usd=max_cost_usd, decompose=decompose,
                 max_probes=max_probes, conversation_turn_id=conversation_turn_id,
                 verbose=verbose, multi_round=False, _round_depth=1,
             )
             # Merge: r2 is the final answer; fold in round-1 evidence + all cost.
+            # artifact_only only ever surfaces artifact evidence, so skip folding
+            # in round-1's chunk evidence (it would reintroduce chunk rows into an
+            # artifact-only result); still merge any artifact rows round 1 found.
             seen = {ev.get("node_id") for ev in r2.evidence}
             for ev in r1.evidence:
+                if mode == "artifact_only" and ev.get("kind") != "artifact":
+                    continue
                 if ev.get("node_id") not in seen:
                     r2.evidence.append(ev)
             planning_cost = router.total_cost_usd - cost_before
@@ -287,6 +315,30 @@ async def retrieve_and_answer(
                 f"total artifact candidates)"
             )
 
+    # -------- artifact_only: run graphrag over ALL artifacts, no chunks --------
+    if mode == "artifact_only":
+        # Keep the entity-linked artifacts (graph arm, already in
+        # candidate_artifact_ids) and add a GLOBAL vector pass over every
+        # artifact -- so Insights / Recommendations / Summaries that carry no
+        # entity edge are also in scope. Then disable the chunk arm entirely:
+        # answers are synthesized from artifacts only.
+        async with session_scope() as session:
+            global_arts = await retrieval_sql.vector_search_all_artifacts(
+                session, qvec, top_k=max(top_k * 3, 120),
+            )
+        _seen_a = set(candidate_artifact_ids)
+        for aid in global_arts:
+            if aid not in _seen_a:
+                candidate_artifact_ids.append(aid)
+                _seen_a.add(aid)
+        candidate_chunk_ids = []   # no chunk arm
+        ent_chunks = []            # -> empty graph_chunk_ranking; no chunk leakage
+        if verbose:
+            print(
+                f"[query] artifact_only: {len(candidate_artifact_ids)} artifact "
+                f"candidate(s) (entity-linked + global vector); chunk arm off"
+            )
+
     # -------- step 8.5: full-text bridge --------
     # When documents owning our candidate (summary) chunks also carry verbatim
     # full-text chunks (ingested with --full-text-chunks), swap them into the
@@ -372,6 +424,13 @@ async def retrieve_and_answer(
 
     probe_vecs = await embedder.embed(probes)
 
+    # Rerank all probes on ONE session so the per-connection query-plan cache /
+    # warm pgvector state is reused (first rerank ~cold, the rest are ~5x faster).
+    # NOTE: do NOT parallelize with a session-per-probe here -- on a CPU-limited
+    # pooled Postgres (Supabase) concurrent queries serialize AND each fresh
+    # session pays the cold cost, which is strictly slower. The id-filtered
+    # rerank can't use the HNSW index (exact scan), so the real levers are fewer
+    # probes (max_probes) and a smaller candidate set, not concurrency.
     chunk_rankings: list[list[uuid.UUID]] = []
     artifact_rankings: list[list[uuid.UUID]] = []
     async with session_scope() as session:
@@ -394,8 +453,10 @@ async def retrieve_and_answer(
         artifact_rankings.append([aid for aid, _ in artifact_candidates])
 
     # -------- step 10: RRF fusion --------
-    fused_chunks = rrf_fuse(chunk_rankings)[:top_k]
-    fused_artifacts = rrf_fuse(artifact_rankings)[:top_k // 2]
+    fused_chunks = [] if mode == "artifact_only" else rrf_fuse(chunk_rankings)[:top_k]
+    # artifact_only packs a full artifact context (not top_k//2).
+    _art_k = top_k if mode == "artifact_only" else top_k // 2
+    fused_artifacts = rrf_fuse(artifact_rankings)[:_art_k]
 
     # -------- step 11: pack context --------
     async with session_scope() as session:
@@ -474,6 +535,8 @@ async def retrieve_and_answer(
 _ANSWER_TASK_BY_MODE = {
     "simple_qa": "answer_simple_qa",
     "deep_research": "answer_deep_research",
+    # artifact_only reuses the deep_research structured 7-section synthesis.
+    "artifact_only": "answer_deep_research",
 }
 
 

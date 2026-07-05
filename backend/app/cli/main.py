@@ -633,13 +633,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_q.add_argument("question", help="The user question, in quotes.")
     p_q.add_argument(
         "--mode",
-        choices=("simple_qa", "deep_research"),
+        choices=("simple_qa", "deep_research", "artifact_only", "artifact-only"),
         default="deep_research",
         help=(
             "deep_research (default): structured 7-section output "
             "(SPECIFICS / ANALYSIS / ANSWER / CONTRADICTIONS / "
             "KEY CLAIMS / COVERAGE IMBALANCE / KEY INSIGHTS). "
-            "simple_qa: tight 1-3 sentence direct answer."
+            "simple_qa: tight 1-3 sentence direct answer. "
+            "artifact_only: same structured output, but retrieves ONLY from the "
+            "intelligence artifacts (all types, entity-linked + global vector), "
+            "never chunks."
         ),
     )
     p_q.add_argument(
@@ -698,7 +701,7 @@ def build_parser() -> argparse.ArgumentParser:
                            "be able to answer.")
     p_ev.add_argument(
         "--mode",
-        choices=("simple_qa", "deep_research"),
+        choices=("simple_qa", "deep_research", "artifact_only", "artifact-only"),
         default="deep_research",
     )
     p_ev.add_argument("--runs-per-question", type=int, default=3)
@@ -748,15 +751,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_conv_turn.add_argument("question", help="The user question in quotes.")
     p_conv_turn.add_argument(
         "--mode",
-        choices=("simple_qa", "deep_research"),
+        choices=("simple_qa", "deep_research", "artifact_only", "artifact-only"),
         default="deep_research",
     )
     p_conv_turn.add_argument("--top-k", type=int, default=None)
     p_conv_turn.add_argument("--hops", type=int, default=None,
                              help="Graph BFS depth. Default from config.yaml qa.hops.")
     p_conv_turn.add_argument(
-        "--max-cost-usd", type=float, default=0.20,
-        help="Per-turn cost cap.",
+        "--max-cost-usd", type=float, default=0.50,
+        help=(
+            "Per-turn cost cap. Default 0.50: a deep_research turn runs the "
+            "2-round bridge + several gpt-4.1 synthesis calls, which the old "
+            "0.20 cap could truncate. simple_qa turns stay well under it."
+        ),
     )
     p_conv_turn.add_argument("--no-decompose", action="store_true")
     p_conv_turn.add_argument("--max-probes", type=int, default=5)
@@ -1325,6 +1332,10 @@ def _cmd_query(args: argparse.Namespace) -> int:
     import json as _json
     from backend.app.services.retrieval import retrieve_and_answer
 
+    # Accept the hyphenated spelling (artifact-only) as an alias for the
+    # canonical underscore mode name used throughout the code.
+    args.mode = args.mode.replace("-", "_")
+
     result = asyncio.run(
         retrieve_and_answer(
             args.question,
@@ -1384,6 +1395,10 @@ def _cmd_query(args: argparse.Namespace) -> int:
 def _cmd_evaluate_queries(args: argparse.Namespace) -> int:
     from backend.app.services.eval_judge import evaluate_questions
 
+    # Accept the hyphenated spelling (artifact-only) as an alias for the
+    # canonical underscore mode name used throughout the code.
+    args.mode = args.mode.replace("-", "_")
+
     asyncio.run(
         evaluate_questions(
             questions_path=args.questions,
@@ -1418,6 +1433,10 @@ def _cmd_conversation_start(args: argparse.Namespace) -> int:
 def _cmd_conversation_turn(args: argparse.Namespace) -> int:
     import json as _json
     from backend.app.services.db_conversation import add_turn
+
+    # Accept the hyphenated spelling (artifact-only) as an alias for the
+    # canonical underscore mode name used throughout the code.
+    args.mode = args.mode.replace("-", "_")
 
     result = asyncio.run(
         add_turn(
