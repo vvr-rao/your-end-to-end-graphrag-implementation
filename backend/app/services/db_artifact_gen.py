@@ -38,6 +38,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from backend.app.core.config import get_settings
 from backend.app.db.graph_version import bump_version, current_version
 from backend.app.db.models.artifacts import ArtifactSource, IntelligenceArtifact
 from backend.app.db.models.documents import Chunk, Document
@@ -571,6 +572,24 @@ async def generate_per_chunk_artifacts(
     return summary
 
 
+async def _auto_summary_rollup(max_cost_usd: float) -> float:
+    """Automatically roll up Summary artifacts (consolidate similar per-document
+    summaries across the corpus). Config-driven layers (summary_rollup_rounds,
+    default 2). Returns the rollup's total cost. No-op when rounds <= 0 or there
+    is nothing new to cluster (generate_rollups is idempotent)."""
+    rounds = int(
+        get_settings().app_config.get("summarization", {}).get("summary_rollup_rounds", 2)
+    )
+    if rounds <= 0:
+        return 0.0
+    from backend.app.services.db_artifact_rollup import generate_rollups
+    print(f"[generate-artifacts] auto Summary rollup ({rounds} layer(s)) ...")
+    roll = await generate_rollups(
+        types=("Summary",), layers=rounds, max_cost_usd=max_cost_usd,
+    )
+    return roll.total_cost_usd
+
+
 async def generate_document_summaries(
     *,
     scope_document_iri: str | None = None,
@@ -658,15 +677,11 @@ async def generate_document_summaries(
         async with sem:
             if cost_limit_hit.is_set():
                 return
-            system, user = PROMPTS["artifact_document_summary"](body)
-            try:
-                out = await router.chat("artifact_document_summary", system=system, user=user)
-            except Exception as exc:
-                print(f"[generate-artifacts] doc {diri} LLM failed: {exc}")
-                async with progress_lock:
-                    progress_state["done"] += 1
-                return
-            doc_results[idx] = (doc_id, diri, title, out.text.strip())
+            # Summary artifact = the document summary VERBATIM (no LLM re-summary
+            # -- the artifact would be redundant with documents.text_summary).
+            # Consolidation across documents happens in the auto 2-round rollup
+            # below, not here.
+            doc_results[idx] = (doc_id, diri, title, body.strip())
 
             async with progress_lock:
                 progress_state["done"] += 1
@@ -721,8 +736,8 @@ async def generate_document_summaries(
             "title": title,
             "text": text,
             "confidence": None,
-            "model_name": "gpt-4o-mini",
-            "prompt_version": "artifact_document_summary@v1",
+            "model_name": None,
+            "prompt_version": "verbatim_text_summary@v1",
             "status": "ACTIVE",
             "graph_version": 0,
             "extra_metadata": {"source_document_iri": diri},
@@ -732,7 +747,9 @@ async def generate_document_summaries(
         summary.by_type["Summary"] += 1
 
     if not art_payloads:
-        summary.total_cost_usd = summary.llm_cost_usd
+        # No NEW Summaries this run, but still consolidate any existing ones.
+        print("[generate-artifacts] no new Summary artifacts; running auto rollup only")
+        summary.total_cost_usd = summary.llm_cost_usd + await _auto_summary_rollup(max_cost_usd)
         summary.wall_seconds = time.time() - t0
         return summary
 
@@ -824,10 +841,15 @@ async def generate_document_summaries(
 
     print(
         f"[generate-artifacts] Summary DONE: "
-        f"docs={summary.docs_summarized}, "
+        f"docs={summary.docs_summarized} (verbatim, no re-summary), "
         f"sources={summary.sources_inserted}, edges={summary.edges_inserted}, "
         f"cost=${summary.total_cost_usd:.4f}, "
         f"wall={summary.wall_seconds:.1f}s, "
         f"graph_version -> {summary.new_graph_version}"
     )
+
+    # Auto rollup over Summary artifacts (consolidate similar per-document
+    # summaries across the corpus). Config-driven layers (default 2).
+    summary.total_cost_usd += await _auto_summary_rollup(max_cost_usd)
+
     return summary

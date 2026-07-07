@@ -1233,16 +1233,20 @@ def chunk_relevance_filter(
     return system, user
 
 
-def _format_evidence_block(evidence_items: list[dict]) -> str:
+def _format_evidence_block(evidence_items: list[dict], char_cap: int = 600) -> str:
     """Compact textual rendering of evidence items for stuffing into
-    answer-synthesis prompts. Each item: {iri, kind, text}."""
+    answer-synthesis prompts. Each item: {iri, kind, text}.
+
+    `char_cap` bounds each item's text so the prompt stays manageable. The
+    default 600 is the legacy value; callers pass `qa.evidence_char_cap` (1500)
+    so richer (e.g. evaluated-summary) chunks aren't clipped to ~150 tokens."""
     lines = []
     for it in evidence_items:
         kind = it.get("kind", "evidence")
         iri = it.get("iri", "")
         text = (it.get("text") or "").strip().replace("\n", " ")
-        if len(text) > 600:
-            text = text[:600] + "..."
+        if len(text) > char_cap:
+            text = text[:char_cap] + "..."
         lines.append(f"  [{kind} {iri}] {text}")
     return "\n".join(lines)
 
@@ -1268,7 +1272,7 @@ _FACTS_FIRST_RULE = (
 
 
 def answer_simple_qa(
-    question: str, evidence: list[dict]
+    question: str, evidence: list[dict], evidence_char_cap: int = 600
 ) -> tuple[str, str]:
     """Tight one-shot answer. Only the question, nothing more.
 
@@ -1289,7 +1293,7 @@ def answer_simple_qa(
     )
     user = (
         f"QUESTION: {question}\n\nEVIDENCE:\n"
-        + _format_evidence_block(evidence)
+        + _format_evidence_block(evidence, evidence_char_cap)
         + "\n\nAnswer now."
     )
     return system, user
@@ -1361,7 +1365,7 @@ _DEEP_RESEARCH_SECTIONS = (
 
 
 def answer_deep_research(
-    question: str, evidence: list[dict]
+    question: str, evidence: list[dict], evidence_char_cap: int = 600
 ) -> tuple[str, str]:
     """deep_research mode: structured 7-section output.
 
@@ -1381,7 +1385,7 @@ def answer_deep_research(
     )
     user = (
         f"QUESTION: {question}\n\nEVIDENCE:\n"
-        + _format_evidence_block(evidence)
+        + _format_evidence_block(evidence, evidence_char_cap)
         + "\n\nWrite the seven-section answer now."
     )
     return system, user
@@ -1458,6 +1462,7 @@ def answer_conversation_turn(
     current_evidence: list[dict],
     prior_turns: list[tuple[str, str]],
     base_mode: str = "deep_research",
+    evidence_char_cap: int = 600,
 ) -> tuple[str, str]:
     """Conversation-turn answer with prior Q+A in scope.
 
@@ -1527,7 +1532,7 @@ def answer_conversation_turn(
         f"CONVERSATION HISTORY:\n{hist}\n\n"
         f"CURRENT QUESTION: {resolved_query}\n\n"
         f"CURRENT EVIDENCE:\n"
-        + _format_evidence_block(current_evidence)
+        + _format_evidence_block(current_evidence, evidence_char_cap)
         + "\n\nAnswer now."
     )
     return system, user
@@ -1741,24 +1746,117 @@ def recommendation_gen(
     return system, user
 
 
+def artifact_merge(
+    artifact_type: str, child_texts: list[str]
+) -> tuple[str, str]:
+    """Artifact rollup: losslessly consolidate a cluster of semantically
+    similar artifacts (all of the same `artifact_type`) into ONE merged
+    artifact.
+
+    The ONLY permitted deletion is a semantically-identical duplicate
+    restatement -- every distinct fact, entity, organization, number,
+    statistic, date, dosage, and qualifier from ANY child MUST survive.
+    This is consolidation, NOT summarization. Pair with gpt-4.1 (an
+    instruction-following model); weaker models over-compress and lose data.
+
+    `child_texts` are the source artifacts' text strings.
+    Returns JSON: {"text": ..., "confidence": ...}
+    """
+    listing = "\n".join(
+        f"  [{i + 1}] {t}" for i, t in enumerate(child_texts)
+    )
+    system = (
+        "You LOSSLESSLY consolidate a group of similar "
+        f"{artifact_type} statements into ONE merged {artifact_type}. This is "
+        "DEDUPLICATION, not summarization.\n\n"
+        "STRICT RULES (non-negotiable):\n"
+        "  - Reproduce EVERY distinct fact, named entity, organization, "
+        "number, percentage, statistic, date, dosage, measurement, and "
+        "qualifier that appears in ANY input item. Nothing may be lost.\n"
+        "  - The ONLY thing you may remove is a restatement that is "
+        "SEMANTICALLY IDENTICAL to one you already kept (an exact or "
+        "near-exact duplicate). Collapse those into a single mention.\n"
+        "  - NEVER summarize, sample, generalize, shorten, or drop a detail "
+        "as 'minor'. Completeness OVERRIDES brevity -- the output may be as "
+        "long as needed, and longer than any single input.\n"
+        "  - If two inputs CONFLICT (different numbers/claims for the same "
+        "thing), keep BOTH and note the discrepancy; do not pick one or "
+        "average them.\n"
+        "  - Neutral third-person prose. Do NOT invent anything not present "
+        "in the inputs.\n\n"
+        "Return ONLY JSON: {\"text\": \"<the merged statement>\", "
+        "\"confidence\": <float 0-1>}. `confidence` should reflect the "
+        "strongest support across the merged items."
+    )
+    user = (
+        f"{artifact_type.upper()} ITEMS TO MERGE (remove only duplicates, "
+        f"lose nothing else):\n{listing}\n\n"
+        "Return the merged JSON now."
+    )
+    return system, user
+
+
 def artifact_document_summary(chunks_text: str) -> tuple[str, str]:
     """Phase 2 Milestone E: per-document Summary artifact.
 
     Given the concatenated chunks of a document (already summarized
     upstream if oversize), produce a single Summary artifact.
     Corpus-agnostic prose, no domain-specific framing.
+
+    v2 (2026-07-05): preservation-focused, mirroring the document_summarize
+    v3 upgrade. The old 150-250 word hard cap dropped named entities, complete
+    lists, numbers, and regulatory/safety detail. The Summary artifact is a
+    retrieval surface, so it must RETAIN that intelligence -- length is now a
+    soft target that preservation overrides. Pair with gpt-4.1 in models.yaml
+    (mini ignores preservation instructions and over-compresses).
     """
     system = (
-        "You write neutral, third-person document summaries. Capture "
-        "the document's main points in 150-250 words. No opinions, no "
-        "editorial framing, no bullet lists — flowing prose only. "
-        "Return ONLY the summary text."
+        "You write neutral, third-person document summaries that preserve the "
+        "information needed for downstream retrieval and analysis. Flowing "
+        "prose only -- no opinions, no editorial framing, no bullet lists, no "
+        "markdown headings. Return ONLY the summary text.\n\n"
+        "The summary MUST preserve:\n"
+        "  - Every named entity: people, organizations, companies, "
+        "subsidiaries, agencies, brands, products, studies, reports, places, "
+        "regulations, laws, treaties, dates, time periods, monetary amounts, "
+        "measurements.\n"
+        "  - Every conceptual category: industries, sectors, technologies, "
+        "materials, processes, methods, frameworks.\n"
+        "  - All relationships between entities/concepts (X causes Y, X is "
+        "part of Y, X impacts Y, X depends on Y, etc.).\n\n"
+        "NON-NEGOTIABLE PRESERVATION (never omit, sample, or abbreviate these, "
+        "even if it makes the summary long):\n"
+        "  - EVERY entity and organization -- do not drop any as 'minor'. "
+        "Retain all people, companies, subsidiaries, agencies, brands, and "
+        "products by name.\n"
+        "  - REGULATORY information: every regulation, law, rule, guidance, "
+        "approval, or compliance requirement, AND the regulatory BODY that "
+        "issues or enforces it (e.g. FDA, EMA, SEC, EPA). Name both.\n"
+        "  - SAFETY information: all warnings (including boxed / black-box "
+        "warnings), precautions, contraindications, and ADVERSE EVENTS / side "
+        "effects (including drug adverse events). Preserve each item.\n"
+        "  - COMPLETE LISTS: when the source enumerates items (subsidiaries, "
+        "organizations, people, products, ingredients, warnings, adverse "
+        "events, board members, etc.), reproduce EVERY item -- never write "
+        "'including X, Y, and others' or otherwise truncate a list.\n"
+        "  - ALL numbers and statistics: every percentage, dosage, count, "
+        "monetary amount, date, measurement, ratio, and statistic, whether or "
+        "not it is tied to a named entity.\n\n"
+        "What you can drop: repetitive prose / rephrasings of the same fact; "
+        "anecdotes and illustrative examples that introduce no new entity or "
+        "relationship; editorial commentary, opinions, transitions, hedges; "
+        "filler ('in conclusion', 'as we have seen').\n\n"
+        "Target length: 20-50% of the input. The NON-NEGOTIABLE PRESERVATION "
+        "rules OVERRIDE this target -- if retaining every entity, complete "
+        "list, number, regulatory detail, and safety item pushes the summary "
+        "past 50%, that is acceptable and expected. Completeness is mandatory; "
+        "length is only a soft target. Do NOT add anything not in the source."
     )
     user = (
         "DOCUMENT CONTENT:\n```\n"
         + chunks_text
         + "\n```\n\n"
-        "Write the summary now."
+        "Write the summary now -- flowing prose, no preamble, no markdown."
     )
     return system, user
 
@@ -1948,6 +2046,215 @@ def table_concept_grouping(
     return system, user
 
 
+# =============================================================================
+# Evaluated document summarizer (near-lossless, section-structured) -- ported
+# from new_summarizer_reference_code/. Used by
+# backend/app/services/evaluated_summarizer.py: per chunk it runs
+# summarize -> question-gen -> evaluate -> revise (default 3 rounds), then a
+# deterministic section-coverage check over REQUIRED_SECTIONS.
+# =============================================================================
+
+# Canonical sections every evaluated chunk summary must emit (writing "None
+# identified in this chunk." when empty). Each canonical name maps to the header
+# aliases the deterministic coverage checker accepts. Keep in sync with the
+# section list in the prompts below.
+REQUIRED_SECTIONS: list[tuple[str, list[str]]] = [
+    ("CLAIMS", ["CLAIMS"]),
+    ("EVIDENCE", ["EVIDENCE"]),
+    ("FINDINGS", ["FINDINGS"]),
+    ("OBSERVATIONS", ["OBSERVATIONS"]),
+    ("EVENTS", ["EVENTS"]),
+    ("ENTITIES", ["ENTITIES"]),
+    ("DATES", ["DATES"]),
+    ("REGULATORY_SAFETY_WARNINGS", ["REGULATORY", "SAFETY", "WARNINGS"]),
+    ("LISTS", ["LISTS", "LIST COMPLETENESS"]),
+]
+
+# JSON enum string used by the evaluator's section_issues schema.
+_SUMMARY_SECTION_ENUM = "|".join(name for name, _ in REQUIRED_SECTIONS)
+
+_SUMMARY_SECTION_RULES = """
+In addition to preserving the original document structure where useful, explicitly include these sections when the source contains relevant information:
+
+CLAIMS:
+- Any claims, assertions, positions, conclusions presented as true, arguments made by authors, companies, researchers, regulators, or other parties.
+- Preserve who made the claim, the exact scope, qualifiers, caveats, and any numeric/date/entity details.
+
+EVIDENCE:
+- Any evidence offered in support of claims, including data, citations, study results, measurements, examples, documents, testimony, tables, charts, experiments, market data, or quoted sources.
+- Tie evidence back to the claim it supports when possible.
+
+FINDINGS:
+- A finding is any conclusion, result, outcome, determination, or final assessment reached by a document, management discussion, financial analysis, study, clinical study, market research, survey, experiment, investigation, audit, review, legal proceeding, regulator, committee, or report.
+- Capture final findings and important intermediate findings.
+- Preserve methodology details, population/sample, dates, endpoints, limitations, and result values when present.
+
+OBSERVATIONS:
+- Explicit observations stated in the text, including noticed patterns, conditions, trends, anomalies, behaviors, or descriptive statements.
+- Do not convert your own inference into an observation. Only include observations present in the source.
+
+ENTITIES:
+- Every named entity that appears in the source: people (with roles/titles), organizations, companies, agencies, regulators, institutions, government bodies, committees, products, brands, drugs, systems, technologies, facilities, subsidiaries, locations/jurisdictions, and named studies/trials.
+- Preserve the exact name and, when stated, the role, affiliation, or relationship.
+- Do not drop entities that appear only once. Group by type when the list is long.
+
+EVENTS:
+- Anything that happened on a specific date or date range, including launches, approvals, incidents, meetings, transactions, study periods, announcements, filings, policy changes, conflicts, shipments, outages, inspections, or milestones.
+- Preserve the date/date range, actors, location, action, outcome, and source wording qualifiers.
+
+DATES:
+- Every distinct date, date range, fiscal period, quarter, year, deadline, effective date, reporting period, or duration mentioned in the source.
+- Preserve the exact date and what it refers to. A date already tied to an EVENTS entry may be listed compactly here for completeness.
+
+REGULATORY / SAFETY / WARNINGS:
+- Preserve all regulatory information, legal obligations, compliance requirements, safety information, warnings, cautions, limitations, risk warnings, contraindications, recalls, adverse events, product safety issues, cybersecurity warnings, privacy requirements, and inspection/audit findings.
+- Do not compress away jurisdiction-specific, regulator-specific, date-specific, or threshold-specific details.
+
+LIST COMPLETENESS:
+- If the source contains a list, table-like list, enumerated items, bullets, examples, product lists, risk lists, jurisdictions, requirements, entities, symptoms, adverse events, facilities, subsidiaries, exhibits, or exceptions, every item must be represented in some way in the summary.
+- You may group related items, but do not silently drop list members.
+- For long lists, use compact semicolon-separated lists or grouped sub-bullets.
+
+If a section has no relevant content in the source chunk, write: None identified in this chunk.
+""".strip()
+
+_SUMMARIZER_SYSTEM = f"""
+You are a lossless compression summarizer.
+Your goal is to preserve every distinct piece of information from the source text.
+You may remove duplicate statements and rewrite long wording into concise language.
+You must not omit facts, numbers, entities, dates, qualifiers, exceptions, caveats,
+procedural steps, definitions, relationships, evidence, source-specific claims,
+findings, observations, dated events, regulatory/safety/warning information, or list items.
+Do not add external knowledge.
+
+{_SUMMARY_SECTION_RULES}
+""".strip()
+
+
+def evaluated_summary_chunk(source_text: str) -> tuple[str, str]:
+    """Near-lossless, section-structured summary of one source chunk."""
+    user = (
+        "Summarize the source chunk below using lossless compression.\n\n"
+        "Rules:\n"
+        "1. Preserve ALL distinct information.\n"
+        "2. Remove only duplicate or redundant wording.\n"
+        "3. Use concise language.\n"
+        "4. Keep important names, dates, numbers, obligations, claims, evidence, "
+        "findings, observations, events, risks, caveats, examples, and source references.\n"
+        "5. Retain all regulatory information, safety information, warnings, "
+        "compliance requirements, and legal obligations.\n"
+        "6. If the source contains lists, preserve every list item in some compact "
+        "form. Do not drop list members.\n"
+        "7. If the source has sections or bullets, preserve the structure when useful.\n"
+        "8. Do not invent or infer beyond the text.\n"
+        "9. Mark unclear OCR/PDF extraction artifacts as [unclear] instead of guessing.\n"
+        "10. Always include ALL of these explicit sections, each as its own header "
+        "line, in this exact order:\n"
+        "    CLAIMS\n    EVIDENCE\n    FINDINGS\n    OBSERVATIONS\n    EVENTS\n"
+        "    ENTITIES\n    DATES\n    REGULATORY / SAFETY / WARNINGS\n    LISTS\n"
+        "11. If a section has no relevant content, still emit its header and write "
+        '"None identified in this chunk."\n'
+        "12. ENTITIES must capture every person (with role/title), organization, "
+        "company, agency, regulator, product, brand, facility, jurisdiction, and "
+        "named study. DATES must capture every distinct date, date range, fiscal "
+        "period, or deadline. LISTS must confirm every source list/table/enumeration "
+        'is represented (enumerate them or state "all list items preserved above").\n\n'
+        "Return only the compressed summary.\n\n"
+        "SOURCE CHUNK:\n"
+        + source_text
+    )
+    return _SUMMARIZER_SYSTEM, user
+
+
+def summary_question_gen(num_questions: int, source_text: str) -> tuple[str, str]:
+    """Generate source-derived coverage questions (JSON) used to audit the summary."""
+    system = (
+        "You are an evaluator that tests whether a summary preserved all source "
+        "information. Generate questions whose answers are explicitly present in the "
+        "source text. Cover facts, numbers, entities, dates, caveats, exceptions, "
+        "relationships, procedures, claims, evidence, findings, observations, "
+        "dated/date-range events, regulatory/safety/warning information, and "
+        "completeness of lists. Do not ask questions that require external knowledge."
+    )
+    user = (
+        f"Generate {num_questions} high-coverage questions from the source text.\n"
+        "Include questions that test the explicit CLAIMS, EVIDENCE, FINDINGS, "
+        "OBSERVATIONS, EVENTS, ENTITIES (named people/organizations/products/"
+        "jurisdictions), DATES (specific dates, ranges, fiscal periods), regulatory/"
+        "safety/warning information, and list completeness when present.\n"
+        "Ensure at least one question probes whether named entities are preserved and "
+        "at least one probes whether specific dates are preserved, when the source "
+        "contains them.\n"
+        'Return valid JSON only, with this schema:\n'
+        '{"questions": [{"question": "...", "expected_answer": "..."}]}\n\n'
+        "SOURCE TEXT:\n"
+        + source_text
+    )
+    return system, user
+
+
+def summary_evaluate(questions_json: str, summary_text: str) -> tuple[str, str]:
+    """Judge whether the summary answers each source-derived question (JSON)."""
+    system = (
+        "You are a strict information-preservation evaluator. You compare "
+        "source-derived questions against a summary. A question passes only if the "
+        "summary contains enough information to answer it accurately. Also verify "
+        "that CLAIMS, EVIDENCE, FINDINGS, OBSERVATIONS, EVENTS, ENTITIES (every named "
+        "person/organization/product/jurisdiction), DATES (every specific date, "
+        "range, or fiscal period), regulatory/safety/warning information, and all "
+        "source list items are retained in the appropriate sections when present. "
+        "Flag as a section issue any named entity or specific date present in the "
+        "source but absent from the summary. Do not give credit for guesses or "
+        "external knowledge."
+    )
+    user = (
+        "Evaluate whether the SUMMARY answers each SOURCE-DERIVED QUESTION.\n"
+        "Return valid JSON only with this schema:\n"
+        '{\n'
+        '  "passed": true/false,\n'
+        '  "missing_items": [\n'
+        '    {"question": "...", "expected_answer": "...", "problem": "what is missing or distorted in the summary"}\n'
+        '  ],\n'
+        '  "section_issues": [\n'
+        f'    {{"section": "{_SUMMARY_SECTION_ENUM}", "problem": "what is missing, misplaced, or distorted"}}\n'
+        '  ],\n'
+        '  "revision_instructions": "specific instructions for the summarizer"\n'
+        '}\n\n'
+        "SOURCE-DERIVED QUESTIONS:\n"
+        + questions_json
+        + "\n\nSUMMARY:\n"
+        + summary_text
+    )
+    return system, user
+
+
+def summary_revise(
+    source_text: str, summary_text: str, evaluation_json: str
+) -> tuple[str, str]:
+    """Revise a summary to close the evaluator's reported gaps."""
+    user = (
+        "Revise the summary to fix the evaluator's findings.\n\n"
+        "Rules:\n"
+        "1. Add back every missing or distorted information item.\n"
+        "2. Preserve the existing correct summary content.\n"
+        "3. Keep the result concise but complete.\n"
+        "4. Do not add information not present in the original source.\n"
+        "5. Preserve and correct the explicit CLAIMS, EVIDENCE, FINDINGS, "
+        "OBSERVATIONS, EVENTS, ENTITIES, DATES, REGULATORY / SAFETY / WARNINGS, and "
+        "LISTS sections (keep all headers, in order).\n"
+        "6. Add back any missing regulatory/safety/warning information, any missing "
+        "named entities, any missing dates, and any missing list items.\n\n"
+        "ORIGINAL SOURCE CHUNK:\n"
+        + source_text
+        + "\n\nCURRENT SUMMARY:\n"
+        + summary_text
+        + "\n\nEVALUATOR FINDINGS:\n"
+        + evaluation_json
+        + "\n\nReturn only the revised summary."
+    )
+    return _SUMMARIZER_SYSTEM, user
+
+
 # Public registry so callers can look up a prompt builder by task name.
 PROMPTS = {
     "chunk_classification": chunk_classification,
@@ -1960,6 +2267,11 @@ PROMPTS = {
     "artifact_chunk_extract": artifact_chunk_extract,
     "artifact_chunk_extract_with_entities": artifact_chunk_extract_with_entities,
     "artifact_document_summary": artifact_document_summary,
+    # Evaluated (near-lossless) document summarizer
+    "evaluated_summary_chunk": evaluated_summary_chunk,
+    "summary_question_gen": summary_question_gen,
+    "summary_evaluate": summary_evaluate,
+    "summary_revise": summary_revise,
     "entity_extract": entity_extract,
     # Phase 2a — table extraction (vision)
     "table_extract_vision": table_extract_vision,
@@ -1979,6 +2291,8 @@ PROMPTS = {
     # Insight + Recommendation generation
     "insight_gen": insight_gen,
     "recommendation_gen": recommendation_gen,
+    # Artifact rollup (hierarchical clustered merge)
+    "artifact_merge": artifact_merge,
     # Eval framework (LLM-as-judge)
     "judge_comprehensiveness": judge_comprehensiveness,
     "judge_no_hallucination": judge_no_hallucination,

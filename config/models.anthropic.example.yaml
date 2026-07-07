@@ -68,6 +68,37 @@ tasks:
     temperature: 0.0
     max_tokens: 4096
 
+  # Evaluated (near-lossless) document summarizer -- new default ingestion path.
+  # Uses the synthesis-tier sonnet (NOT haiku): the lossless-preservation + JSON
+  # eval loop needs strong instruction-following. The AnthropicProvider handles
+  # the json_object tasks by instructing bare JSON + stripping ```json fences.
+  evaluated_summary_chunk:
+    provider: anthropic
+    model: claude-sonnet-4-6
+    timeout: 180
+    temperature: 0.0
+    max_tokens: 8192
+  summary_question_gen:
+    provider: anthropic
+    model: claude-sonnet-4-6
+    timeout: 120
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+  summary_evaluate:
+    provider: anthropic
+    model: claude-sonnet-4-6
+    timeout: 120
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+  summary_revise:
+    provider: anthropic
+    model: claude-sonnet-4-6
+    timeout: 180
+    temperature: 0.0
+    max_tokens: 8192
+
   classification_audit:
     provider: anthropic
     model: claude-haiku-4-5

@@ -109,6 +109,46 @@ tasks:
     max_tokens: 4096
 
   # ---------------------------------------------------------------------------
+  # Evaluated (near-lossless) document summarizer -- the new DEFAULT ingestion
+  # summarizer (config summarization.method=evaluated; set to single_pass to use
+  # document_summarize above instead). Per source chunk it runs
+  # summarize -> question-gen -> evaluate -> revise (config eval_rounds, default 3),
+  # then a deterministic section-coverage check. Much higher fidelity, ~6-9 calls
+  # per chunk -- smoke-test with --limit before a full corpus run.
+  #
+  # gpt-4.1 for strict instruction-following. Groq equivalent for ALL FOUR tasks
+  # is llama-3.3-70b-versatile (cheaper; already integrated). A mixed/groq preset
+  # would set `provider: groq` / `model: llama-3.3-70b-versatile` on each.
+  # Embeddings stay on OpenAI in every mode.
+  # ---------------------------------------------------------------------------
+  evaluated_summary_chunk:
+    provider: openai
+    model: gpt-4.1              # groq: llama-3.3-70b-versatile
+    timeout: 180
+    temperature: 0.0
+    max_tokens: 8192
+  summary_question_gen:
+    provider: openai
+    model: gpt-4.1              # groq: llama-3.3-70b-versatile
+    timeout: 120
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+  summary_evaluate:
+    provider: openai
+    model: gpt-4.1              # groq: llama-3.3-70b-versatile
+    timeout: 120
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+  summary_revise:
+    provider: openai
+    model: gpt-4.1              # groq: llama-3.3-70b-versatile
+    timeout: 180
+    temperature: 0.0
+    max_tokens: 8192
+
+  # ---------------------------------------------------------------------------
   # Layer H (classification audit): post-Stage-4 misclassification pass.
   # Reviews newly-created classes whose current parent is "suspicious" and
   # returns KEEP / RE_HOME / CONVERT_TO_INSTANCE decisions.
@@ -303,14 +343,32 @@ tasks:
 
   # ---------------------------------------------------------------------------
   # Phase 2 Milestone E: per-document Summary artifact. Plain-text output.
-  # gpt-4o-mini suffices — this is rewrite, not synthesis.
+  # v2 (2026-07-05) is preservation-focused (keeps every entity / complete list
+  # / number / regulatory + safety detail), so it needs an instruction-following
+  # model. gpt-4o-mini over-compressed and ignored the preservation rules; use
+  # gpt-4.1 (the same upgrade document_summarize got). 4096 tokens + 180s.
   # ---------------------------------------------------------------------------
   artifact_document_summary:
     provider: openai
-    model: gpt-4o-mini
-    timeout: 90
+    model: gpt-4.1
+    timeout: 180
     temperature: 0.2
-    max_tokens: 1024
+    max_tokens: 4096
+
+  # ---------------------------------------------------------------------------
+  # Artifact rollup: hierarchical clustered-merge of similar artifacts
+  # (generate-artifacts --rollup). The merge is a STRICTLY LOSSLESS dedup --
+  # every distinct fact/entity/number must survive, only exact-duplicate
+  # restatements collapse -- which weaker models violate. gpt-4.1 required.
+  # json_object output: {"text": ..., "confidence": ...}.
+  # ---------------------------------------------------------------------------
+  artifact_merge:
+    provider: openai
+    model: gpt-4.1
+    timeout: 180
+    temperature: 0.2
+    max_tokens: 4096
+    response_format: json_object
 
   # ---------------------------------------------------------------------------
   # Phase 2a: extract a single nested/complex table from a cropped PNG of a

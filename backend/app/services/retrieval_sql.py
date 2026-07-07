@@ -362,6 +362,54 @@ async def vector_search_all_artifacts(
     return [row[0] for row in result.all()]
 
 
+async def same_type_neighbor_edges(
+    session: AsyncSession,
+    candidate_ids: list[uuid.UUID],
+    artifact_type: str,
+    *,
+    threshold: float,
+    max_neighbors: int = 25,
+) -> list[tuple[uuid.UUID, uuid.UUID]]:
+    """All same-type similarity edges among `candidate_ids`, within L2 distance
+    `threshold`. Used by the artifact-rollup clustering stage
+    (db_artifact_rollup) to build a graph for union-find grouping.
+
+    Returns (source_id, neighbor_id) pairs where source is one of `candidate_ids`
+    and neighbor is its nearest-<=threshold same-type artifact (the caller drops
+    neighbors outside the candidate set). Done in ONE batched query -- a LATERAL
+    top-k over each candidate whose inner ORDER BY uses the HNSW index -- rather
+    than one round-trip per candidate, which does not scale on a latency-bound
+    pooled Postgres (thousands of sequential round-trips time out)."""
+    if not candidate_ids:
+        return []
+    result = await session.execute(
+        sql_text("""
+        SELECT a.id, n.id
+          FROM graphrag.intelligence_artifacts a
+         CROSS JOIN LATERAL (
+              SELECT x.id, (x.embedding <-> a.embedding) AS dist
+                FROM graphrag.intelligence_artifacts x
+               WHERE x.status = 'ACTIVE'
+                 AND x.artifact_type = :atype
+                 AND x.embedding IS NOT NULL
+                 AND x.id <> a.id
+               ORDER BY x.embedding <-> a.embedding
+               LIMIT :k
+         ) n
+         WHERE a.id = ANY(CAST(:cand AS uuid[]))
+           AND a.embedding IS NOT NULL
+           AND n.dist <= :threshold
+        """),
+        {
+            "cand": [str(i) for i in candidate_ids],
+            "atype": artifact_type,
+            "k": max_neighbors,
+            "threshold": threshold,
+        },
+    )
+    return [(a, b) for a, b in result.all()]
+
+
 async def vector_rerank_artifacts(
     session: AsyncSession,
     candidate_artifact_ids: list[uuid.UUID],

@@ -1965,6 +1965,97 @@ async def stream_summarize_and_chunk_async(
     return all_chunks
 
 
+async def stream_evaluated_summarize_and_chunk_async(
+    *,
+    documents_dir: Path,
+    router: LLMRouter,
+    threshold_tokens: int = 2000,
+    eval_rounds: int = 3,
+    questions_per_chunk: int = 12,
+    max_chunk_tokens: int = 12_000,
+    overlap_tokens: int = 500,
+    summary_chunk_max_tokens: int = 1_200,
+    chunk_size: int = 800,
+    chunk_overlap: int = 120,
+    encoding_name: str = "o200k_base",
+    use_cache: bool = True,
+    concurrency: int = 4,
+    batch_size: int = 16,
+    max_cost_usd: float | None = None,
+) -> list[TextChunk]:
+    """Evaluated (near-lossless) counterpart of stream_summarize_and_chunk_async
+    used when `summarization.method == 'evaluated'`. Walks `documents_dir` in
+    fixed-size batches, runs `evaluated_summarize_documents_async` per batch, and
+    flattens each doc's evaluated chunk summaries into TextChunks (one chunk per
+    stored summary piece -- NO re-chunk). Writes to the shared `eval_summaries/`
+    cache with the SAME key params register-documents uses, so a later
+    register-documents run reuses these summaries for free.
+
+    `batch_size <= 0` loads everything at once (tests / high-RAM)."""
+    from backend.app.services.evaluated_summarizer import (
+        evaluated_result_to_chunks,
+        evaluated_summarize_documents_async,
+    )
+
+    paths = list(ontology_io.iter_documents(documents_dir))
+    if not paths:
+        raise RuntimeError(f"No PDF/TXT documents found in {documents_dir}")
+
+    async def _summarize_batch(batch_docs: list[LoadedDocument]) -> list[TextChunk]:
+        results = await evaluated_summarize_documents_async(
+            batch_docs,
+            router,
+            threshold_tokens=threshold_tokens,
+            eval_rounds=eval_rounds,
+            questions_per_chunk=questions_per_chunk,
+            max_chunk_tokens=max_chunk_tokens,
+            overlap_tokens=overlap_tokens,
+            summary_chunk_max_tokens=summary_chunk_max_tokens,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            encoding_name=encoding_name,
+            concurrency=concurrency,
+            use_cache=use_cache,
+            max_cost_usd=max_cost_usd if max_cost_usd is not None else 1000.0,
+        )
+        out: list[TextChunk] = []
+        for r in results:
+            out.extend(evaluated_result_to_chunks(r))
+        return out
+
+    if batch_size <= 0:
+        docs = [document_io.load_document(p) for p in paths]
+        docs = [d for d in docs if d.text.strip()]
+        return await _summarize_batch(docs)
+
+    print(
+        f"[stream-loader] evaluated summarization: streaming {len(paths)} doc(s) "
+        f"in batches of {batch_size} (eval_rounds={eval_rounds})"
+    )
+    all_chunks: list[TextChunk] = []
+    total_batches = (len(paths) + batch_size - 1) // batch_size
+    for batch_idx in range(total_batches):
+        start = batch_idx * batch_size
+        batch_docs: list[LoadedDocument] = []
+        for p in paths[start : start + batch_size]:
+            try:
+                doc = document_io.load_document(p)
+            except Exception as exc:
+                print(f"[stream-loader] skipping {p.name}: {exc}")
+                continue
+            if doc.text.strip():
+                batch_docs.append(doc)
+        if not batch_docs:
+            continue
+        all_chunks.extend(await _summarize_batch(batch_docs))
+        del batch_docs
+        print(
+            f"[stream-loader] batch {batch_idx + 1}/{total_batches} done; "
+            f"chunks so far: {len(all_chunks)}"
+        )
+    return all_chunks
+
+
 # ---------- Stage 4: deterministic prune / extend ----------
 
 
@@ -2114,6 +2205,7 @@ async def _run_llm_stages(
     audit_path: Path,
     suggested_new_classes: list[dict[str, Any]] | None = None,
     extra_stage2_results: list[dict[str, Any]] | None = None,
+    single_pass_summaries: bool = False,
 ) -> dict[str, Any]:
     """Stages 1-3. Returns the merged + deduplicated match-results dict.
 
@@ -2138,20 +2230,45 @@ async def _run_llm_stages(
     max_doc_input_tokens = int(chunking_cfg.get("max_doc_input_tokens", 4_000))
     oversize_sub_chunk = int(chunking_cfg.get("oversize_doc_sub_chunk_tokens", 4_000))
     streaming_batch_size = int(chunking_cfg.get("streaming_batch_size", 16))
+    _concurrency = int(expansion_cfg_for_concur.get("max_concurrent_llm_calls", 4))
 
-    chunks = await stream_summarize_and_chunk_async(
-        documents_dir=documents_dir,
-        router=router,
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        encoding_name=encoding,
-        threshold_tokens=threshold_tokens,
-        max_doc_input_tokens=max_doc_input_tokens,
-        oversize_doc_sub_chunk_tokens=oversize_sub_chunk,
-        use_cache=use_cache,
-        concurrency=int(expansion_cfg_for_concur.get("max_concurrent_llm_calls", 4)),
-        batch_size=streaming_batch_size,
-    )
+    # Method: evaluated (near-lossless, new default) vs single_pass (legacy).
+    # `single_pass_summaries=True` (CLI --single-pass-summaries) forces legacy.
+    sum_cfg = app_cfg.get("summarization", {}) or {}
+    method = "single_pass" if single_pass_summaries else sum_cfg.get("method", "evaluated")
+
+    if method == "evaluated":
+        chunks = await stream_evaluated_summarize_and_chunk_async(
+            documents_dir=documents_dir,
+            router=router,
+            threshold_tokens=threshold_tokens,
+            eval_rounds=int(sum_cfg.get("eval_rounds", 3)),
+            questions_per_chunk=int(sum_cfg.get("questions_per_chunk", 12)),
+            max_chunk_tokens=int(sum_cfg.get("max_chunk_tokens", 12_000)),
+            overlap_tokens=int(sum_cfg.get("overlap_tokens", 500)),
+            summary_chunk_max_tokens=int(sum_cfg.get("summary_chunk_max_tokens", 1_200)),
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            encoding_name=encoding,
+            use_cache=use_cache,
+            concurrency=_concurrency,
+            batch_size=streaming_batch_size,
+            max_cost_usd=max_cost_usd,
+        )
+    else:
+        chunks = await stream_summarize_and_chunk_async(
+            documents_dir=documents_dir,
+            router=router,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            encoding_name=encoding,
+            threshold_tokens=threshold_tokens,
+            max_doc_input_tokens=max_doc_input_tokens,
+            oversize_doc_sub_chunk_tokens=oversize_sub_chunk,
+            use_cache=use_cache,
+            concurrency=_concurrency,
+            batch_size=streaming_batch_size,
+        )
     print(f"[llm] produced {len(chunks)} chunk(s)")
     if not chunks:
         raise RuntimeError("No chunks produced from documents (empty after chunking)")
@@ -2350,6 +2467,7 @@ async def prune_and_expand_async(
     suggested_new_classes: Path | None = None,
     extract_tables: bool = False,
     table_vision: bool = True,
+    single_pass_summaries: bool = False,
 ) -> Path:
     return await _run(
         "prune-expand",
@@ -2362,6 +2480,7 @@ async def prune_and_expand_async(
         suggestions_path=suggested_new_classes,
         extract_tables=extract_tables,
         table_vision=table_vision,
+        single_pass_summaries=single_pass_summaries,
     )
 
 
@@ -2376,6 +2495,7 @@ async def build_async(
     suggested_new_classes: Path | None = None,
     extract_tables: bool = False,
     table_vision: bool = True,
+    single_pass_summaries: bool = False,
 ) -> Path:
     # build = merge + prune-expand chained. Merge first (sync), then drive the
     # async LLM pipeline against the just-written version folder.
@@ -2393,6 +2513,7 @@ async def build_async(
         suggestions_path=suggested_new_classes,
         extract_tables=extract_tables,
         table_vision=table_vision,
+        single_pass_summaries=single_pass_summaries,
     )
 
 
@@ -2408,6 +2529,7 @@ async def _run(
     *,
     extract_tables: bool = False,
     table_vision: bool = True,
+    single_pass_summaries: bool = False,
 ) -> Path:
     settings = get_settings()
     app_cfg = settings.app_config
@@ -2516,6 +2638,7 @@ async def _run(
         audit_path=audit_path,
         suggested_new_classes=suggested or None,
         extra_stage2_results=[table_mining_stage2] if table_mining_stage2 else None,
+        single_pass_summaries=single_pass_summaries,
     )
 
     # Inject user-suggested classes that the LLM didn't already propose. These

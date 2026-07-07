@@ -59,6 +59,39 @@ chunking:
   encoding: o200k_base
 
 # -----------------------------------------------------------------------------
+# Document summarization (ingestion). `method: evaluated` (default) runs the
+# near-lossless, section-structured summarizer with an evaluator feedback loop
+# (summarize -> question-gen -> evaluate -> revise); `single_pass` uses the older
+# one-shot document_summarize. Per-task models live in models.yaml.
+# -----------------------------------------------------------------------------
+summarization:
+  # evaluated | single_pass. register-documents/prune-expand --single-pass-summaries
+  # override to the legacy one-shot summarizer. When `evaluated`, BOTH prune-expand
+  # and register-documents run the same evaluated summarizer and share the
+  # eval_summaries/ cache, so prune-expand warms it and register-documents reuses
+  # the summaries for free (keep chunking.summarization_threshold_tokens the same
+  # for both -- it decides which docs get summarized; it is NOT in the cache key).
+  method: evaluated
+  # Evaluator revise rounds per chunk (register-documents --eval-rounds overrides).
+  # Higher = more fidelity + more cost (~6-9 LLM calls/chunk at 3).
+  eval_rounds: 3
+  # Source-derived questions generated per chunk to audit preservation.
+  questions_per_chunk: 12
+  # Source window (tokens) summarized per evaluated chunk.
+  max_chunk_tokens: 12000
+  # Token overlap between adjacent source windows.
+  overlap_tokens: 500
+  # Cap on each STORED summary chunk (the evaluated per-chunk summary is split on
+  # its section headers into pieces <= this many tokens, so retrieval embeddings
+  # stay sharp and the synthesis prompt isn't truncated away). Lossless: all
+  # content is retained across the pieces.
+  summary_chunk_max_tokens: 1200
+  # Auto rollup layers for artifact Summaries (generate-artifacts --type Summary).
+  summary_rollup_rounds: 2
+  # Reuse the on-disk summary cache (~/.cache/.../doc_summaries/).
+  use_summary_cache: true
+
+# -----------------------------------------------------------------------------
 # Embeddings — provider/model lives in models.yaml; these are runtime params.
 # -----------------------------------------------------------------------------
 embeddings:
@@ -166,6 +199,11 @@ qa:
   # out from the seed nodes over graph_relationships. Higher = broader
   # evidence but more candidates + cost. `query --hops N` overrides per-run.
   hops: 3
+  # Max characters of each evidence item's text placed in the answer-synthesis
+  # prompt. Raised from the old hard-coded 600 so richer (e.g. evaluated-summary)
+  # chunks aren't clipped down to ~150 tokens at synthesis. ~30 chunks x 1500
+  # chars ~= 11k tokens of chunk-context for deep_research -- fine for gpt-4.1.
+  evidence_char_cap: 1500
 
 # -----------------------------------------------------------------------------
 # Background jobs (arq).

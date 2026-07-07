@@ -27,14 +27,20 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from backend.app.core.config import get_settings
 from backend.app.db.graph_version import bump_version, current_version
 from backend.app.db.models.artifacts import IntelligenceArtifact
 from backend.app.db.models.documents import Chunk, Document
 from backend.app.db.models.graph import GraphRelationship
 from backend.app.db.session import session_scope
 from backend.app.services.chunking import chunk_documents
-from backend.app.services.document_io import load_documents
+from backend.app.services.document_io import LoadedDocument, load_documents
 from backend.app.services.embeddings import Embedder
+from backend.app.services.evaluated_summarizer import (
+    evaluated_result_to_chunks,
+    evaluated_summarize_documents_async,
+    get_encoder,
+)
 from backend.app.services.llm_router import LLMRouter
 from backend.app.services.pipeline_llm import summarize_long_documents_async
 from backend.app.services.predicates import (
@@ -205,6 +211,8 @@ async def ingest_documents_folder(
     extract_tables: bool = False,
     table_vision: bool = True,
     full_text_chunks: bool = False,
+    summarization_method: str | None = None,
+    eval_rounds: int | None = None,
 ) -> IngestSummary:
     """Ingest every supported file in `folder`. See module docstring.
 
@@ -286,30 +294,60 @@ async def ingest_documents_folder(
 
     router = LLMRouter()
     cost_before = router.total_cost_usd
-    print(
-        f"[ingest] summarizing (threshold={summarization_threshold} tok, "
-        f"concurrency={concurrency}) ..."
-    )
-    summarized = await summarize_long_documents_async(
-        fresh,
-        router,
-        threshold_tokens=summarization_threshold,
-        concurrency=concurrency,
-        model_name="gpt-4o-mini",
-    )
-    summary.summarization_cost_usd = router.total_cost_usd - cost_before
-    print(
-        f"[ingest] summarization done: ${summary.summarization_cost_usd:.4f}"
-    )
 
-    # Chunk every summarized doc.
+    _sum_cfg = get_settings().app_config.get("summarization", {})
+    method = summarization_method or _sum_cfg.get("method", "evaluated")
+    rounds = eval_rounds if eval_rounds is not None else _sum_cfg.get("eval_rounds", 3)
+
     chunks_by_doc: list[list[Any]] = []
-    for sdoc in summarized:
-        cs = list(
-            chunk_documents([sdoc], chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    if method == "evaluated":
+        print(
+            f"[ingest] evaluated summarization (eval_rounds={rounds}, "
+            f"threshold={summarization_threshold} tok, concurrency={concurrency}) ..."
         )
-        chunks_by_doc.append(cs)
-        summary.per_doc_chunks.append(len(cs))
+        ev_results = await evaluated_summarize_documents_async(
+            fresh,
+            router,
+            threshold_tokens=summarization_threshold,
+            eval_rounds=rounds,
+            questions_per_chunk=_sum_cfg.get("questions_per_chunk", 12),
+            max_chunk_tokens=_sum_cfg.get("max_chunk_tokens", 12000),
+            overlap_tokens=_sum_cfg.get("overlap_tokens", 500),
+            summary_chunk_max_tokens=_sum_cfg.get("summary_chunk_max_tokens", 1200),
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            concurrency=concurrency,
+            use_cache=_sum_cfg.get("use_summary_cache", True),
+        )
+        # Each evaluated chunk summary becomes exactly one kind='summary' chunk.
+        summarized = [LoadedDocument(path=r.path, text=r.combined) for r in ev_results]
+        _enc = get_encoder()
+        for r in ev_results:
+            cs = evaluated_result_to_chunks(r, _enc)
+            chunks_by_doc.append(cs)
+            summary.per_doc_chunks.append(len(cs))
+    else:
+        print(
+            f"[ingest] single-pass summarizing (threshold={summarization_threshold} tok, "
+            f"concurrency={concurrency}) ..."
+        )
+        summarized = await summarize_long_documents_async(
+            fresh,
+            router,
+            threshold_tokens=summarization_threshold,
+            concurrency=concurrency,
+            model_name="gpt-4o-mini",
+        )
+        # Chunk every summarized doc (paragraph-first).
+        for sdoc in summarized:
+            cs = list(
+                chunk_documents([sdoc], chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+            )
+            chunks_by_doc.append(cs)
+            summary.per_doc_chunks.append(len(cs))
+
+    summary.summarization_cost_usd = router.total_cost_usd - cost_before
+    print(f"[ingest] summarization done: ${summary.summarization_cost_usd:.4f}")
 
     all_chunk_texts: list[str] = []
     for cs in chunks_by_doc:

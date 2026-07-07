@@ -150,6 +150,16 @@ def build_parser() -> argparse.ArgumentParser:
             "tables. Effective only when --tables is set."
         ),
     )
+    p_pe.add_argument(
+        "--single-pass-summaries", action="store_true",
+        help=(
+            "Summarize documents with the legacy one-shot document_summarize "
+            "instead of the default EVALUATED summarizer (summarize -> "
+            "question-gen -> evaluate -> revise). The evaluated path is higher "
+            "fidelity and its summaries are cached so register-documents reuses "
+            "them for free; use this to fall back to the cheaper single-pass."
+        ),
+    )
     p_pe.set_defaults(func=_cmd_prune_expand)
 
     p_build = sub.add_parser(
@@ -169,6 +179,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-table-vision",
         dest="table_vision", action="store_false", default=True,
         help="Disable vision-LLM route for complex tables (uses pdfplumber-only).",
+    )
+    p_build.add_argument(
+        "--single-pass-summaries", action="store_true",
+        help="Use the legacy one-shot document summarizer instead of the default "
+             "evaluated summarizer (see prune-expand --single-pass-summaries).",
     )
     p_build.set_defaults(func=_cmd_build)
 
@@ -433,6 +448,23 @@ def build_parser() -> argparse.ArgumentParser:
             "check `db-size`. Default: OFF."
         ),
     )
+    p_reg.add_argument(
+        "--single-pass-summaries", action="store_true",
+        help=(
+            "Use the legacy one-shot document_summarize instead of the default "
+            "EVALUATED summarizer (summarize -> question-gen -> evaluate -> revise). "
+            "The evaluated path is higher-fidelity but ~6-9 LLM calls per chunk; "
+            "use this to fall back to the cheaper single-pass summary."
+        ),
+    )
+    p_reg.add_argument(
+        "--eval-rounds", type=int, default=None,
+        help=(
+            "Evaluator revise rounds per chunk for the evaluated summarizer "
+            "(default from config summarization.eval_rounds = 3). Higher = more "
+            "fidelity + more cost. Ignored with --single-pass-summaries."
+        ),
+    )
     p_reg.set_defaults(func=_cmd_register_documents)
 
     p_del = sub.add_parser(
@@ -618,6 +650,43 @@ def build_parser() -> argparse.ArgumentParser:
             "complete, but ~18x more LLM calls + more DB rows. Requires the corpus "
             "was ingested with --full-text-chunks. Default: summary."
         ),
+    )
+    # ---- Hierarchical clustered rollups (post-processing over existing artifacts) ----
+    p_art.add_argument(
+        "--rollup", action="store_true",
+        help=(
+            "After the base stages, cluster semantically-similar artifacts and "
+            "mint NEW lossless rollup artifacts (originals retained; linked via "
+            "viao:referencesArtifact). Gives retrieval a coarse-to-fine layer. "
+            "Uses gpt-4.1 (artifact_merge). Smoke-test with --scope-iri/--limit "
+            "+ --rollup-layers 1 and check db-size before a full run."
+        ),
+    )
+    p_art.add_argument(
+        "--rollup-layers", type=int, default=2,
+        help="Rollup hierarchy depth: leaves -> L1 -> L2 ... (default 2).",
+    )
+    p_art.add_argument(
+        "--rollup-threshold", type=float, default=0.35,
+        help="Max L2 embedding distance for two artifacts to cluster "
+             "(smaller = tighter/fewer merges). Default 0.35; tune per corpus.",
+    )
+    p_art.add_argument(
+        "--rollup-min-cluster", type=int, default=2,
+        help="Minimum artifacts in a cluster to produce a rollup (default 2).",
+    )
+    p_art.add_argument(
+        "--rollup-max-neighbors", type=int, default=25,
+        help="Max same-type neighbors fetched per artifact when clustering "
+             "(default 25).",
+    )
+    p_art.add_argument(
+        "--rollup-type",
+        choices=("Claim", "Finding", "Observation", "Event", "Summary",
+                 "Insight", "Recommendation", "StructuredTable"),
+        default=None, action="append",
+        help="Artifact types to roll up (repeatable). Default = ALL types "
+             "except StructuredTable. Clustering is homogeneous within each type.",
     )
     p_art.set_defaults(func=_cmd_generate_artifacts)
 
@@ -960,6 +1029,7 @@ def _cmd_prune_expand(args: argparse.Namespace) -> int:
             suggested_new_classes=args.suggested_new_classes,
             extract_tables=getattr(args, "tables", False),
             table_vision=getattr(args, "table_vision", True),
+            single_pass_summaries=getattr(args, "single_pass_summaries", False),
         )
     )
     print(f"\nPRUNED+EXPANDED ontology written to: {version_dir}")
@@ -980,6 +1050,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
             suggested_new_classes=args.suggested_new_classes,
             extract_tables=getattr(args, "tables", False),
             table_vision=getattr(args, "table_vision", True),
+            single_pass_summaries=getattr(args, "single_pass_summaries", False),
         )
     )
     print(f"\nBUILT ontology written to: {version_dir}")
@@ -1190,6 +1261,10 @@ def _cmd_register_documents(args: argparse.Namespace) -> int:
             extract_tables=getattr(args, "tables", False),
             table_vision=getattr(args, "table_vision", True),
             full_text_chunks=getattr(args, "full_text_chunks", False),
+            summarization_method=(
+                "single_pass" if getattr(args, "single_pass_summaries", False) else None
+            ),
+            eval_rounds=getattr(args, "eval_rounds", None),
         )
     )
     return 0
@@ -1322,6 +1397,29 @@ def _cmd_generate_artifacts(args: argparse.Namespace) -> int:
                 top_insights=args.top_insights,
                 max_cost_usd=args.max_cost_usd,
                 theme_label=args.theme_label,
+            )
+        )
+        reset_engine_cache()
+
+    if getattr(args, "rollup", False):
+        from backend.app.services.db_artifact_rollup import (
+            ALL_ROLLUP_TYPES,
+            generate_rollups,
+        )
+        # A prior stage's asyncio.run loop is now dead; rebuild the engine fresh.
+        reset_engine_cache()
+        rollup_types = tuple(args.rollup_type) if args.rollup_type else ALL_ROLLUP_TYPES
+        asyncio.run(
+            generate_rollups(
+                types=rollup_types,
+                layers=args.rollup_layers,
+                threshold=args.rollup_threshold,
+                min_cluster=args.rollup_min_cluster,
+                max_neighbors=args.rollup_max_neighbors,
+                concurrency=args.concurrency,
+                max_cost_usd=args.max_cost_usd,
+                scope_document_iri=args.scope_iri,
+                verbose=True,
             )
         )
 

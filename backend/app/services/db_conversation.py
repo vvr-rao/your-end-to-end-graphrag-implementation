@@ -24,6 +24,7 @@ from typing import Any
 
 from sqlalchemy import select, text as sql_text
 
+from backend.app.core.config import get_settings
 from backend.app.db.models.conversation import Conversation, ConversationTurn
 from backend.app.db.session import session_scope
 from backend.app.services.db_artifact_gen import _extract_json
@@ -250,8 +251,12 @@ async def add_turn(
             if ans
         ]
         try:
+            _evidence_cap = int(
+                get_settings().app_config.get("qa", {}).get("evidence_char_cap", 600)
+            )
             sys_p, user_p = PROMPTS["answer_conversation_turn"](
                 resolved_query, result.evidence, prior_qa, base_mode=mode,
+                evidence_char_cap=_evidence_cap,
             )
             out = await router.chat(
                 "answer_conversation_turn", system=sys_p, user=user_p,
