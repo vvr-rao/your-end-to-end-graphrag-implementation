@@ -88,6 +88,11 @@ summarization:
   summary_chunk_max_tokens: 1200
   # Auto rollup layers for artifact Summaries (generate-artifacts --type Summary).
   summary_rollup_rounds: 2
+  # Revise passes per rollup cluster to guarantee lossless dedup: after each merge,
+  # an LLM evaluator lists any dropped facts and a reviser adds them back, up to
+  # this many rounds. Applies to ALL rollup types. 0 disables the loop (merge only).
+  # Each round adds LLM calls per cluster -- --max-cost-usd bounds the run.
+  rollup_eval_rounds: 1
   # Reuse the on-disk summary cache (~/.cache/.../doc_summaries/).
   use_summary_cache: true
 

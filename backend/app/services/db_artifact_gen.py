@@ -35,7 +35,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text as sql_text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from backend.app.core.config import get_settings
@@ -577,15 +577,17 @@ async def _auto_summary_rollup(max_cost_usd: float) -> float:
     summaries across the corpus). Config-driven layers (summary_rollup_rounds,
     default 2). Returns the rollup's total cost. No-op when rounds <= 0 or there
     is nothing new to cluster (generate_rollups is idempotent)."""
-    rounds = int(
-        get_settings().app_config.get("summarization", {}).get("summary_rollup_rounds", 2)
-    )
+    sum_cfg = get_settings().app_config.get("summarization", {})
+    rounds = int(sum_cfg.get("summary_rollup_rounds", 2))
     if rounds <= 0:
         return 0.0
+    eval_rounds = int(sum_cfg.get("rollup_eval_rounds", 1))
     from backend.app.services.db_artifact_rollup import generate_rollups
-    print(f"[generate-artifacts] auto Summary rollup ({rounds} layer(s)) ...")
+    print(f"[generate-artifacts] auto Summary rollup ({rounds} layer(s), "
+          f"loss-loop eval_rounds={eval_rounds}) ...")
     roll = await generate_rollups(
         types=("Summary",), layers=rounds, max_cost_usd=max_cost_usd,
+        eval_rounds=eval_rounds,
     )
     return roll.total_cost_usd
 
@@ -783,9 +785,11 @@ async def generate_document_summaries(
     summary.artifacts_inserted = len(art_payloads)
     summary.docs_summarized = len(art_payloads)
 
-    # ArtifactSource for every chunk of each doc + summarizes edge
+    # ArtifactSource for every chunk of each doc + summarizes edge + entity edges.
+    iri_to_text = {p["artifact_identifier"]: (p.get("text") or "") for p in art_payloads}
     source_payloads = []
     edge_payloads = []
+    n_entity_edges = 0
     for airi, doc_id in art_to_doc:
         aid = iri_to_id.get(airi)
         if not aid:
@@ -797,6 +801,20 @@ async def generate_document_summaries(
                 )
             )
             chunk_ids = [cid for (cid,) in r.all()]
+            # The doc's entities (linked to its chunks via chunk->assertsAbout->entity).
+            er = await session.execute(
+                sql_text("""
+                SELECT DISTINCT e.id, e.normalized_name
+                  FROM graphrag.entities e
+                  JOIN graphrag.graph_relationships gr ON gr.target_node_id = e.id
+                   AND gr.predicate_label = 'viao:assertsAbout'
+                   AND gr.target_node_type = 'entity'
+                  JOIN graphrag.chunks ch ON ch.id = gr.source_node_id
+                 WHERE ch.document_id = :doc
+                """),
+                {"doc": doc_id},
+            )
+            doc_entities = er.all()
         for cid in chunk_ids:
             source_payloads.append({"artifact_id": aid, "chunk_id": cid})
         edge_payloads.append({
@@ -815,6 +833,34 @@ async def generate_document_summaries(
             "graph_version": gv,
             "extra_metadata": {},
         })
+        # Summary -> assertsAbout -> entity, for entities whose name appears in the
+        # summary text. Makes Summaries (and their rollups, via inheritance) reachable
+        # through the entity graph -> they now surface in deep_research, not just
+        # artifact_only. Mirrors the per-chunk entity linker.
+        summary_lc = iri_to_text.get(airi, "").lower()
+        seen_ent: set[Any] = set()
+        for ent_id, nname in doc_entities:
+            if not nname or ent_id in seen_ent:
+                continue
+            if nname.lower() in summary_lc:
+                seen_ent.add(ent_id)
+                edge_payloads.append({
+                    "source_node_type": "intelligence_artifact",
+                    "source_node_id": aid,
+                    "target_node_type": "entity",
+                    "target_node_id": ent_id,
+                    "predicate_iri": VIAO_ASSERTS_ABOUT,
+                    "predicate_label": "viao:assertsAbout",
+                    "relationship_type": "assertsAbout",
+                    "relationship_source": "LLM_INFERENCE",
+                    "is_authoritative": True,
+                    "source_chunk_id": None,
+                    "source_document_id": doc_id,
+                    "source_artifact_id": aid,
+                    "graph_version": gv,
+                    "extra_metadata": {},
+                })
+                n_entity_edges += 1
 
     async with session_scope() as session:
         for i in range(0, len(source_payloads), 500):
@@ -842,7 +888,8 @@ async def generate_document_summaries(
     print(
         f"[generate-artifacts] Summary DONE: "
         f"docs={summary.docs_summarized} (verbatim, no re-summary), "
-        f"sources={summary.sources_inserted}, edges={summary.edges_inserted}, "
+        f"sources={summary.sources_inserted}, summarizes+entity edges="
+        f"{summary.edges_inserted} (of which assertsAbout->entity={n_entity_edges}), "
         f"cost=${summary.total_cost_usd:.4f}, "
         f"wall={summary.wall_seconds:.1f}s, "
         f"graph_version -> {summary.new_graph_version}"

@@ -64,6 +64,21 @@ def test_artifact_merge_registered() -> None:
     assert PROMPTS["artifact_merge"] is artifact_merge
 
 
+def test_merge_eval_revise_prompts_registered() -> None:
+    for k in ("artifact_merge_evaluate", "artifact_merge_revise"):
+        assert k in PROMPTS
+    # evaluate: returns the {complete, missing_items} contract + includes merged text
+    esys, euser = PROMPTS["artifact_merge_evaluate"](
+        "Claim", ["A owns 30% of B.", "B is in Ohio."], "A owns 30% of B.")
+    assert "complete" in esys and "missing_items" in esys
+    assert "B is in Ohio." in euser and "A owns 30% of B." in euser
+    # revise: includes the missing items + the {text, confidence} contract
+    rsys, ruser = PROMPTS["artifact_merge_revise"](
+        "Claim", ["A owns 30% of B.", "B is in Ohio."], "A owns 30% of B.", ["B is in Ohio."])
+    assert "text" in rsys and "confidence" in rsys
+    assert "B is in Ohio." in ruser
+
+
 def test_level_predicate_leaves_vs_rollups() -> None:
     leaf = _level_predicate(0)
     assert "IS DISTINCT FROM 'true'" in leaf

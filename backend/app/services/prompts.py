@@ -1796,6 +1796,73 @@ def artifact_merge(
     return system, user
 
 
+def artifact_merge_evaluate(
+    artifact_type: str, child_texts: list[str], merged_text: str
+) -> tuple[str, str]:
+    """Loss check for a rollup merge: does `merged_text` preserve EVERY distinct
+    fact from the child artifacts (duplicate removal only)? Returns JSON
+    {"complete": bool, "missing_items": [...]}. Pairs with the revise prompt in a
+    feedback loop. Ignores pure rephrasing -- flags only genuine omissions /
+    distortions. Use gpt-4.1 (instruction-following)."""
+    listing = "\n".join(f"  [{i + 1}] {t}" for i, t in enumerate(child_texts))
+    system = (
+        "You audit a MERGED artifact for information loss. The merge was supposed "
+        "to consolidate the source items by removing ONLY duplicate restatements, "
+        "losing nothing else. Your job: find every distinct piece of information "
+        "in the SOURCE ITEMS that is MISSING from or DISTORTED in the merged text.\n\n"
+        "RULES:\n"
+        "  - Check every named entity, person, organization, product, number, "
+        "percentage, statistic, date, dosage, measurement, qualifier, caveat, and "
+        "list item in the source items.\n"
+        "  - A pure rephrasing (same fact, different wording) is NOT a loss -- do "
+        "NOT flag it. Only flag information that is genuinely absent or changed.\n"
+        "  - A numeric/name/date that appears in a source item but nowhere in the "
+        "merged text IS a loss -- flag it verbatim.\n\n"
+        "Return ONLY JSON: {\"complete\": true|false, \"missing_items\": "
+        "[\"<the exact fact/entity/number/date/list-item that is missing or "
+        "distorted>\", ...]}. `complete` is true (and missing_items empty) ONLY "
+        "when nothing is lost."
+    )
+    user = (
+        f"SOURCE {artifact_type.upper()} ITEMS:\n{listing}\n\n"
+        f"MERGED {artifact_type.upper()} TEXT:\n{merged_text}\n\n"
+        "Return the evaluation JSON now."
+    )
+    return system, user
+
+
+def artifact_merge_revise(
+    artifact_type: str, child_texts: list[str], merged_text: str,
+    missing_items: list[str],
+) -> tuple[str, str]:
+    """Revise a merged rollup to ADD BACK the evaluator's missing_items, without
+    dropping anything already present (still duplicate-free). Returns JSON
+    {"text": ..., "confidence": ...} -- same shape as artifact_merge."""
+    listing = "\n".join(f"  [{i + 1}] {t}" for i, t in enumerate(child_texts))
+    missing = "\n".join(f"  - {m}" for m in missing_items)
+    system = (
+        "You REVISE a merged artifact to restore information that was dropped, "
+        "while keeping it duplicate-free.\n\n"
+        "RULES:\n"
+        "  - ADD BACK every item in MISSING ITEMS, using the wording from the "
+        "source items.\n"
+        "  - KEEP everything already correct in the current merged text -- do NOT "
+        "drop or shorten any existing fact.\n"
+        "  - Still remove only exact/near-exact duplicate restatements. "
+        "Completeness OVERRIDES brevity; the output may be long.\n"
+        "  - Neutral third-person prose. Do NOT invent anything not in the sources.\n\n"
+        "Return ONLY JSON: {\"text\": \"<the revised merged statement>\", "
+        "\"confidence\": <float 0-1>}."
+    )
+    user = (
+        f"SOURCE {artifact_type.upper()} ITEMS:\n{listing}\n\n"
+        f"CURRENT MERGED TEXT:\n{merged_text}\n\n"
+        f"MISSING ITEMS TO ADD BACK:\n{missing}\n\n"
+        "Return the revised merged JSON now."
+    )
+    return system, user
+
+
 def artifact_document_summary(chunks_text: str) -> tuple[str, str]:
     """Phase 2 Milestone E: per-document Summary artifact.
 
@@ -2291,8 +2358,10 @@ PROMPTS = {
     # Insight + Recommendation generation
     "insight_gen": insight_gen,
     "recommendation_gen": recommendation_gen,
-    # Artifact rollup (hierarchical clustered merge)
+    # Artifact rollup (hierarchical clustered merge) + lossless eval/revise loop
     "artifact_merge": artifact_merge,
+    "artifact_merge_evaluate": artifact_merge_evaluate,
+    "artifact_merge_revise": artifact_merge_revise,
     # Eval framework (LLM-as-judge)
     "judge_comprehensiveness": judge_comprehensiveness,
     "judge_no_hallucination": judge_no_hallucination,

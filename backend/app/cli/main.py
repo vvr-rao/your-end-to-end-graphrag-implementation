@@ -681,6 +681,13 @@ def build_parser() -> argparse.ArgumentParser:
              "(default 25).",
     )
     p_art.add_argument(
+        "--rollup-eval-rounds", type=int, default=None,
+        help="Lossless-merge revise passes per rollup cluster (default from "
+             "config summarization.rollup_eval_rounds = 1). After each merge an "
+             "LLM checks for dropped facts and a reviser adds them back. 0 = merge "
+             "only (faster, may lose data). Higher = safer + more LLM cost.",
+    )
+    p_art.add_argument(
         "--rollup-type",
         choices=("Claim", "Finding", "Observation", "Event", "Summary",
                  "Insight", "Recommendation", "StructuredTable"),
@@ -1408,7 +1415,14 @@ def _cmd_generate_artifacts(args: argparse.Namespace) -> int:
         )
         # A prior stage's asyncio.run loop is now dead; rebuild the engine fresh.
         reset_engine_cache()
+        from backend.app.core.config import get_settings
         rollup_types = tuple(args.rollup_type) if args.rollup_type else ALL_ROLLUP_TYPES
+        _cfg_eval = int(
+            get_settings().app_config.get("summarization", {}).get("rollup_eval_rounds", 1)
+        )
+        _eval_rounds = (
+            args.rollup_eval_rounds if args.rollup_eval_rounds is not None else _cfg_eval
+        )
         asyncio.run(
             generate_rollups(
                 types=rollup_types,
@@ -1419,6 +1433,7 @@ def _cmd_generate_artifacts(args: argparse.Namespace) -> int:
                 concurrency=args.concurrency,
                 max_cost_usd=args.max_cost_usd,
                 scope_document_iri=args.scope_iri,
+                eval_rounds=_eval_rounds,
                 verbose=True,
             )
         )

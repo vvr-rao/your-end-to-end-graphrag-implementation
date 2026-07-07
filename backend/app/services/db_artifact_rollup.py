@@ -68,6 +68,8 @@ class RollupGenSummary:
     rollups_inserted: int = 0
     references_edges: int = 0
     inherited_edges: int = 0
+    clusters_revised: int = 0
+    clusters_incomplete_after_loop: int = 0
     by_layer: dict[int, int] = field(default_factory=dict)
     by_type: dict[str, int] = field(default_factory=dict)
     llm_cost_usd: float = 0.0
@@ -233,9 +235,14 @@ async def generate_rollups(
     concurrency: int = 4,
     max_cost_usd: float = 5.0,
     scope_document_iri: str | None = None,
+    eval_rounds: int = 1,
     verbose: bool = False,
 ) -> RollupGenSummary:
-    """Build `layers` layers of clustered rollup artifacts across `types`."""
+    """Build `layers` layers of clustered rollup artifacts across `types`.
+
+    `eval_rounds`: after each merge, an LLM loss-check lists any dropped facts and
+    a reviser adds them back (up to `eval_rounds` passes) so the merge is lossless
+    (dedup only). 0 disables the loop."""
     t0 = time.time()
     summary = RollupGenSummary()
     router = LLMRouter()
@@ -325,12 +332,51 @@ async def generate_rollups(
                 if conf is None:
                     child_confs = [conf_map.get(i) or 0.0 for i in batch]
                     conf = max(child_confs) if child_confs else None
+
+                # Lossless eval->revise loop: the LLM merge over-compresses distinct
+                # inputs and drops facts, so verify the merged text preserves every
+                # distinct fact from the children and add back anything missing.
+                # +1 extra evaluation beyond the revise budget verifies the last revise.
+                revised = False
+                final_complete = None
+                if eval_rounds > 0:
+                    for round_idx in range(1, eval_rounds + 2):
+                        if cost_limit_hit.is_set():
+                            break
+                        esys, euser = PROMPTS["artifact_merge_evaluate"](
+                            atype, child_texts, text)
+                        try:
+                            eout = await router.chat(
+                                "artifact_merge_evaluate", system=esys, user=euser)
+                            ev = _extract_json(eout.text) or {}
+                        except Exception:
+                            break
+                        missing = ev.get("missing_items") or []
+                        if ev.get("complete") or not missing:
+                            final_complete = True
+                            break
+                        if round_idx > eval_rounds:
+                            final_complete = False  # out of budget, gaps remain
+                            break
+                        rsys, ruser = PROMPTS["artifact_merge_revise"](
+                            atype, child_texts, text, missing)
+                        try:
+                            rout = await router.chat(
+                                "artifact_merge_revise", system=rsys, user=ruser)
+                            rtext = ((_extract_json(rout.text) or {}).get("text") or "").strip()
+                            if rtext:
+                                text = rtext
+                                revised = True
+                        except Exception:
+                            break
+
                 if router.total_cost_usd - cost_before > max_cost_usd:
                     if not cost_limit_hit.is_set():
                         cost_limit_hit.set()
                         print(f"[rollup] HALT: cost cap ${max_cost_usd:.2f} reached")
                 return {"atype": atype, "batch": batch, "text": text,
-                        "conf": conf, "new_level": new_level}
+                        "conf": conf, "new_level": new_level,
+                        "revised": revised, "incomplete": final_complete is False}
 
         results = await asyncio.gather(*[
             _merge_one(a, b, tm, cm, nl) for (a, b, tm, cm, nl) in layer_clusters
@@ -338,6 +384,9 @@ async def generate_rollups(
         results = [r for r in results if r is not None]
         if not results:
             continue
+        summary.clusters_revised += sum(1 for r in results if r.get("revised"))
+        summary.clusters_incomplete_after_loop += sum(
+            1 for r in results if r.get("incomplete"))
 
         # Stage this step's rollup payloads. Insert per step so the NEXT step can
         # cluster over them.
@@ -507,6 +556,8 @@ async def generate_rollups(
         f"(by_layer={summary.by_layer}, by_type={summary.by_type}), "
         f"referencesArtifact_edges={summary.references_edges}, "
         f"inherited_entity/doc_edges={summary.inherited_edges}, "
+        f"loss-loop(revised={summary.clusters_revised}, "
+        f"still_incomplete={summary.clusters_incomplete_after_loop}), "
         f"cost=${summary.total_cost_usd:.4f}, wall={summary.wall_seconds:.1f}s, "
         f"graph_version -> {summary.new_graph_version}"
     )
