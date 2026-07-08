@@ -66,7 +66,7 @@ The retrieval layer reads from a typed library of **Intelligence Artifacts** —
 | **Finding** | `viao:Finding` | An analytical conclusion drawn (e.g. *"the trend suggests EV demand is accelerating in ASEAN"*). Goes beyond raw facts. | same prompt, single LLM call per chunk | gpt-4o-mini |
 | **Observation** | `viao:Observation` | A raw factual statement directly visible in the text (e.g. *"price rose 5% in March"*). The most concrete of the assertion types. | same prompt | gpt-4o-mini |
 | **Event** | `viao:Event` | A happening anchored to a date or date range (study publication, election, founding, regulation effective date, crisis incident). Carries `event_date` / `event_start_date` / `event_end_date` / `event_category` metadata. | same prompt | gpt-4o-mini |
-| **Summary** | `viao:Summary` | Condensed ~200-word representation of one Document. | `generate-artifacts` (per doc, once) | gpt-4o-mini |
+| **Summary** | `viao:Summary` | The document's lossless section-structured `text_summary` verbatim (produced at ingest by the evaluated summarizer — no extra LLM call here), then auto-rolled-up into higher-level Summary layers. | `generate-artifacts` (per doc, once; auto-rollup) | none (verbatim) · rollup uses gpt-4.1 |
 | **StructuredTable** | `viao:StructuredTable` | JSON-LD representation of a table extracted from a PDF (caption + columns + rows + cells). Full payload lives in `extra_metadata` JSONB. | `prune-expand --tables` writes JSON-LD; `register-documents --tables` ingests it | pdfplumber + gpt-4o-mini vision |
 | **Insight** | `viao:Insight` | Cross-cluster synthesis. Non-obvious pattern across many Claims/Findings tied to the same ontology class. **Opt-in** via `--type Insight`. | `generate-artifacts --type Insight` clusters by entity `class_id` | **gpt-4.1** |
 | **Recommendation** | `viao:Recommendation` | Actionable judgment derived from clustered Insights. **Opt-in** via `--type Recommendation`. | `generate-artifacts --type Recommendation` clusters Insights via embedding k-means | **gpt-4.1** |
@@ -301,6 +301,11 @@ Per-chunk LLM call (gpt-4o-mini) that mints `Entity` rows tied to existing `Onto
 
 ```bash
 uv run python -m backend.app.cli extract-entities --max-cost-usd 1.0
+
+# Mine the verbatim FULL-TEXT chunks instead of the summary chunks (see the
+# --from-fulltext note under "Full-text vs summary chunks" below). Requires the
+# corpus to have been ingested with register-documents --full-text-chunks.
+uv run python -m backend.app.cli extract-entities --from-fulltext --max-cost-usd 1.0
 ```
 
 ### 8. Generate intelligence artifacts
@@ -313,7 +318,41 @@ uv run python -m backend.app.cli generate-artifacts --max-cost-usd 2.0
 # Opt-in cross-cluster synthesis (gpt-4.1 — more expensive)
 uv run python -m backend.app.cli generate-artifacts --type Insight
 uv run python -m backend.app.cli generate-artifacts --type Recommendation
+
+# Generate artifacts from the verbatim FULL-TEXT chunks instead of summary chunks
+# (more complete, ~more LLM calls + rows). Needs register-documents --full-text-chunks.
+uv run python -m backend.app.cli generate-artifacts --from-fulltext --max-cost-usd 2.0
 ```
+
+#### Hierarchical rollups (`--rollup`)
+
+Rollups **consolidate near-duplicate artifacts** into new, higher-level "rollup" artifacts so a query can hit one merged artifact instead of scattering across a dozen redundant leaves. The originals are always **kept** — a rollup is purely additive, linked to its children via `viao:referencesArtifact`, and it **inherits its children's entity links** (`assertsAbout`) so it's reachable through the same graph walk as its leaves.
+
+Merging is **lossless — duplicate removal only**: after each merge an LLM checks the merged text for dropped facts and a reviser adds them back (`summarization.rollup_eval_rounds`, default 1; `0` disables).
+
+`Summary` artifacts are **rolled up automatically** during the default `generate-artifacts` run (2 layers, config `summarization.summary_rollup_rounds`). The `--rollup` flag additionally rolls up **all the other types** and can add *more* layers on top (it's additive — re-running adds layers until clusters are exhausted).
+
+```bash
+# Roll up ALL artifact types (Claim/Finding/Observation/Event/Insight/Recommendation
+# + more Summary layers). Additive; lossless (evaluate->revise loop).
+uv run python -m backend.app.cli generate-artifacts --rollup --rollup-layers 2 --max-cost-usd 2.0
+
+# Smoke a single document + one layer first (gpt-4.1 merge is paid)
+uv run python -m backend.app.cli generate-artifacts \
+  --rollup --rollup-layers 1 --scope-iri "<document IRI>" --max-cost-usd 0.30
+```
+
+Rollup flags (all optional):
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--rollup` | off | Turn on the clustered-rollup stage after the base artifacts. |
+| `--rollup-layers N` | 2 | Hierarchy depth: leaves → L1 → L2 … (additive on top of what exists). |
+| `--rollup-threshold F` | 0.35 | Max embedding distance for two artifacts to cluster (smaller = tighter/fewer merges). |
+| `--rollup-eval-rounds N` | config (1) | Lossless-merge revise passes per cluster (`0` = merge only, faster, may lose detail). |
+| `--rollup-type T` (repeatable) | all except `StructuredTable` | Restrict which artifact types to roll up. |
+| `--rollup-min-cluster N` | 2 | Minimum artifacts in a cluster to produce a rollup. |
+| `--rollup-max-neighbors N` | 25 | Max same-type neighbors fetched per artifact when clustering. |
 
 ### 9. Ask questions
 
@@ -460,9 +499,38 @@ The task → provider map is fully config-driven, so you can run the whole pipel
 
 **Embeddings always run on OpenAI** (`text-embedding-3-small` @ 1024 dim) in every preset — Anthropic has no embeddings API — so the Anthropic-only preset still requires `OPENAI_API_KEY`. Edit the model names in any preset to taste; the provider abstraction lives in `backend/app/services/llm_router.py`.
 
+#### OpenAI-only mode (no Groq / no Anthropic key)
+
+The **only** non-OpenAI task in the default preset is ontology-expansion Stage 1 (`chunk_classification` → Groq). The OpenAI-only preset simply repoints that task to `gpt-4o-mini`, so the entire pipeline — merge/prune-expand, ingestion, summarization, entity + artifact extraction, rollups, and retrieval — runs on OpenAI alone with just `OPENAI_API_KEY` set:
+
+```bash
+cp config/models.openai.example.yaml config/models.yaml
+# GROQ_API_KEY / ANTHROPIC_API_KEY are NOT needed in this mode.
+```
+
+That's the whole switch — no code changes. Every subcommand behaves identically; only the provider behind each task changes. (Groq stays available in the default preset because it's ~10× cheaper and fast for the high-volume Stage-1 tagging.)
+
 ### Full-text vs summary chunks
 
-By default documents are summarized, then the *summary* is chunked + embedded (smaller DB footprint). Pass `--full-text-chunks` to `register-documents` to *also* store verbatim full-text chunks: retrieval then runs over the original text (better recall + exact citations), while entity/artifact extraction continues to use the cheaper summary chunks. This increases DB size — smoke-test with `--limit` and check `db-size` before a full corpus run.
+By default documents are summarized, then the *summary* is chunked + embedded (smaller DB footprint). Pass `--full-text-chunks` to `register-documents` to *also* store verbatim full-text chunks (`chunks.kind = 'fulltext'`): retrieval then runs over the original text (better recall + exact citations), while entity/artifact extraction continues to use the cheaper summary chunks. This increases DB size — smoke-test with `--limit` and check `db-size` before a full corpus run.
+
+**`--from-fulltext` (the read side).** By default `extract-entities`, `enrich-time`, and `generate-artifacts` operate on the summary chunks (cheap). Pass `--from-fulltext` to point them at the verbatim full-text chunks instead — more complete entities/artifacts at the cost of more LLM calls + more rows. It only works if the corpus was ingested with `--full-text-chunks` (otherwise there are no `kind='fulltext'` chunks to read).
+
+**End-to-end example** — ingest with full-text chunks + tables, then run every downstream stage over the full-text chunks:
+
+```bash
+# 1. Ingest: store verbatim full-text chunks (in addition to summary chunks) + extract tables
+uv run python -m backend.app.cli register-documents \
+  --input source_documents/collection-of-pharma-docs --full-text-chunks --tables
+
+# 2. Run the downstream stages against the full-text chunks
+uv run python -m backend.app.cli extract-entities --from-fulltext
+uv run python -m backend.app.cli enrich-time --from-fulltext
+uv run python -m backend.app.cli generate-artifacts --from-fulltext
+
+# 3. (Optional) opt-in cross-cluster synthesis (gpt-4.1)
+uv run python -m backend.app.cli generate-artifacts --type Insight --type Recommendation
+```
 
 ## Source-document downloaders
 
@@ -540,3 +608,19 @@ The Stage 1 → Stage 2 narrowing is the whole reason this scales. Without it ev
 - Cross-file `owl:imports` — resolved to local copies via an IRI map (OASIS `catalog-v001.xml`, FIBO's HTTPS imports, OntoCAPE's `file:/C:/...` Windows-style imports).
 - HTTP(S) imports owlready2 doesn't already know about — stripped from the extracted copies so owlready2 doesn't hang on a TCP SYN trying to fetch them.
 - Per-file failures (defective XML, owlready2 incompatibility) — logged and skipped so one bad file doesn't kill the whole merge.
+
+## Changelog
+
+### v2 — 2026-07-07 · added support for OpenAI-only mode and additional enhanced Artifact Generation
+
+- **OpenAI-only mode** — a shipped preset (`config/models.openai.example.yaml`) runs the entire pipeline on OpenAI alone (no Groq/Anthropic key needed); Stage-1 ontology tagging is repointed to `gpt-4o-mini`. See [OpenAI-only mode](#openai-only-mode-no-groq--no-anthropic-key).
+- **Enhanced artifact generation**
+  - **Evaluated, near-lossless document summarizer** (summarize → question-gen → evaluate → revise loop) as the default ingestion summarizer, shared between `prune-expand` and `register-documents` via a common cache.
+  - **Hierarchical clustered rollups** (`--rollup`): consolidate near-duplicate artifacts into new, additive rollup artifacts that inherit their children's entity links; **lossless** merges guaranteed by an evaluate→revise loop. `Summary` artifacts auto-roll-up.
+  - **`artifact_only` retrieval mode** — answer purely from the intelligence-artifact layer.
+- **Retrieval improvements** — entity-driven **probe fan-out** for "compare A vs many" queries (one probe per discovered entity → balanced coverage), configurable synthesis truncation (`qa.evidence_char_cap`), and Summary artifacts now entity-linked so they surface in `deep_research`.
+- **Ingestion** — optional verbatim **full-text chunks** (`--full-text-chunks`) plus `--from-fulltext` on the extraction subcommands.
+
+### v1 — 2026-06-28 · initial release
+
+Initial end-to-end GraphRAG tool: document ingestion → OWL ontology merge / prune-expand → Postgres + pgvector knowledge graph → entity + intelligence-artifact extraction (`Claim`/`Finding`/`Observation`/`Event`/`Summary`/`Insight`/`Recommendation`/`StructuredTable`, backed by the VIAO ontology) → time/geography expansion → ontology-aware `simple_qa` / `deep_research` retrieval with automated evaluation → React UI + MCP server deployable to Render. Multi-LLM support (default Groq + OpenAI; Anthropic-only chat preset).
