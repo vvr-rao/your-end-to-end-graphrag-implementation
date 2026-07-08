@@ -2350,7 +2350,11 @@ async def _run_llm_stages(
             f"where Stage 1 returned no relevant IRIs"
         )
 
-    print(f"[stage2] proposing matches+new for {len(chunks) - skipped_empty} chunk(s) (OpenAI)")
+    _s2_spec = router.task_spec("class_proposal")
+    print(
+        f"[stage2] proposing matches+new for {len(chunks) - skipped_empty} chunk(s) "
+        f"({_s2_spec['provider']}:{_s2_spec['model']})"
+    )
     stage2_results: list[dict[str, Any] | None] = await asyncio.gather(
         *[
             _propose_one(i, c, iris)

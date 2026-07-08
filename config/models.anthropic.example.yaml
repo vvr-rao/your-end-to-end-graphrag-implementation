@@ -295,10 +295,10 @@ tasks:
 
   artifact_document_summary:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 90
+    model: claude-sonnet-4-6      # parity: OpenAI preset uses gpt-4.1 (instruction-following tier)
+    timeout: 120
     temperature: 0.2
-    max_tokens: 1024
+    max_tokens: 4096
 
   # Vision input is NOT wired for the Anthropic provider — keep on OpenAI.
   table_extract_vision:
