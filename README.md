@@ -285,6 +285,13 @@ uv run python -m backend.app.cli register-documents \
 # prune-expand --tables as StructuredTable artifacts
 uv run python -m backend.app.cli register-documents \
   --input source_documents/<your-corpus> --tables
+
+# Also store verbatim FULL-TEXT chunks (kind='fulltext') alongside the
+# default summary chunks — better retrieval recall + exact citations, at
+# the cost of DB size. Prereq for the downstream --from-fulltext flag.
+# See "Full-text vs summary chunks" below. Smoke-test + check db-size first.
+uv run python -m backend.app.cli register-documents \
+  --input source_documents/<your-corpus> --full-text-chunks
 ```
 
 ### 6. Enrich time
