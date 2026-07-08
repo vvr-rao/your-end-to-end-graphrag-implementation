@@ -412,13 +412,40 @@ async def retrieve_and_answer(
     # -------- step 9: multi-probe vector rerank --------
     probes = [resolved_query]
     if decompose:
-        sub_qs = await _query_decompose(router, resolved_query)
-        # Keep up to `max_probes` total. Always include original.
-        for sq in sub_qs:
-            if len(probes) >= max_probes:
-                break
-            if sq.strip() and sq.strip() != resolved_query.strip():
-                probes.append(sq)
+        _intent = (parsed.get("intent") or "").lower()
+        # Use the PARSED entity list (clean, distinct names the LLM extracted --
+        # e.g. Ozempic, Mounjaro, Trulicity, Victoza) rather than matched_entities,
+        # which holds many surface-form variants of the same drug (Ozempic pen,
+        # OZEMPIC, MOUNJARO KwikPen, ...). Dedupe case-insensitively, keep order.
+        _ent_names: list[str] = []
+        _seen_ent: set[str] = set()
+        for _n in (parsed.get("entities") or []):
+            _k = (_n or "").strip().lower()
+            if _k and _k not in _seen_ent:
+                _seen_ent.add(_k)
+                _ent_names.append(_n.strip())
+        _max_ent = int(
+            get_settings().app_config.get("qa", {}).get("max_entity_probes", 8)
+        )
+        # Comparison/enumeration over many entities: fan out ONE probe per entity
+        # so rerank surfaces each competitor evenly (not just the 1-2 a generic
+        # decompose named). Else fall back to the generic decompose.
+        if _use_entity_probes(_intent, len(_ent_names), _max_ent):
+            for p in await _entity_probes(router, resolved_query, _ent_names[:_max_ent]):
+                if p.strip() and p.strip() != resolved_query.strip():
+                    probes.append(p)
+            if verbose:
+                print(
+                    f"[query] entity-probe fan-out ({_intent}, "
+                    f"{len(_ent_names)} entities): {len(probes) - 1} per-entity probe(s)"
+                )
+        else:
+            sub_qs = await _query_decompose(router, resolved_query)
+            for sq in sub_qs:  # keep up to max_probes total; always include original
+                if len(probes) >= max_probes:
+                    break
+                if sq.strip() and sq.strip() != resolved_query.strip():
+                    probes.append(sq)
     if verbose:
         print(f"[query] probes ({len(probes)}): {probes}")
 
@@ -686,6 +713,34 @@ async def _query_decompose(router: LLMRouter, q: str) -> list[str]:
         return []
     sqs = parsed.get("sub_questions") or []
     return [s for s in sqs if isinstance(s, str) and s.strip()]
+
+
+def _use_entity_probes(intent: str, n_entities: int, max_entity_probes: int) -> bool:
+    """Trigger for per-entity probe fan-out: a comparison/enumeration query over
+    several entities. Otherwise the generic decompose path is used."""
+    return (
+        max_entity_probes > 0
+        and (intent or "").lower() in ("comparison", "enumeration")
+        and n_entities >= 3
+    )
+
+
+async def _entity_probes(
+    router: LLMRouter, q: str, entity_names: list[str]
+) -> list[str]:
+    """One focused probe per entity (comparison/enumeration fan-out), so vector
+    rerank surfaces each entity's evidence evenly. Returns [] on failure ->
+    caller falls back to the generic decompose probes."""
+    if not entity_names:
+        return []
+    sys_p, user_p = PROMPTS["entity_probes"](q, entity_names)
+    try:
+        out = await router.chat("entity_probes", system=sys_p, user=user_p)
+        parsed = _extract_json(out.text) or {}
+    except Exception:
+        return []
+    probes = parsed.get("probes") or []
+    return [p for p in probes if isinstance(p, str) and p.strip()]
 
 
 async def _plan_rounds(router: LLMRouter, q: str) -> dict[str, Any]:

@@ -1153,6 +1153,32 @@ def query_decompose(question: str) -> tuple[str, str]:
     return system, user
 
 
+def entity_probes(question: str, entity_names: list[str]) -> tuple[str, str]:
+    """Milestone F step 9a (comparison/enumeration): fan a 'compare one vs many'
+    question into ONE focused probe per entity, so vector rerank surfaces each
+    entity's evidence evenly (instead of only the 1-2 the generic decompose
+    happened to name). Returns JSON: {"probes": ["<aspect> for <entity>", ...]},
+    one probe per input entity, SAME ORDER."""
+    listing = "\n".join(f"  - {n}" for n in entity_names)
+    system = (
+        "The user asked a comparison/enumeration question spanning several "
+        "entities. For EACH entity listed, rewrite the question focused on JUST "
+        "that entity, preserving the question's ASPECT (e.g. side effects, "
+        "clinical trials, price, mechanism). Keep each probe short and specific.\n\n"
+        "EXAMPLE:\n"
+        "  QUESTION: 'Compare the side effects of Ozempic against its competitors'\n"
+        "  ENTITIES: Ozempic, Mounjaro, Trulicity\n"
+        "  A: {\"probes\": [\"Side effects of Ozempic\", \"Side effects of "
+        "Mounjaro\", \"Side effects of Trulicity\"]}\n\n"
+        "Return ONE probe per entity, in the SAME ORDER as the entity list. "
+        "Return ONLY {\"probes\": [\"...\", ...]}."
+    )
+    user = (
+        f"QUESTION: {question}\n\nENTITIES:\n{listing}\n\nReturn the JSON now."
+    )
+    return system, user
+
+
 def retrieval_rounds_plan(question: str) -> tuple[str, str]:
     """Iterative-retrieval planner (deep_research only). Decides whether the
     question needs TWO sequential retrieval rounds: a BRIDGE round to discover
@@ -2348,6 +2374,7 @@ PROMPTS = {
     "question_parse": question_parse,
     "concept_expansion": concept_expansion,
     "query_decompose": query_decompose,
+    "entity_probes": entity_probes,
     "retrieval_rounds_plan": retrieval_rounds_plan,
     "chunk_relevance_filter": chunk_relevance_filter,
     "answer_simple_qa": answer_simple_qa,

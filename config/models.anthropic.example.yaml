@@ -176,6 +176,15 @@ tasks:
     max_tokens: 1024
     response_format: json_object
 
+  # Per-entity probe fan-out (cheap templating -> haiku).
+  entity_probes:
+    provider: anthropic
+    model: claude-haiku-4-5
+    timeout: 30
+    temperature: 0.0
+    max_tokens: 1024
+    response_format: json_object
+
   chunk_relevance_filter:
     provider: anthropic
     model: claude-haiku-4-5

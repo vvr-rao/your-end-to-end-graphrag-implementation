@@ -209,6 +209,12 @@ qa:
   # chunks aren't clipped down to ~150 tokens at synthesis. ~30 chunks x 1500
   # chars ~= 11k tokens of chunk-context for deep_research -- fine for gpt-4.1.
   evidence_char_cap: 1500
+  # For comparison/enumeration queries over multiple entities ("compare A vs its
+  # competitors"), retrieval fans out ONE vector probe per matched entity so each
+  # gets even representation (instead of only the 1-2 a generic decompose named).
+  # Caps how many per-entity probes are generated -- each is one extra rerank pass
+  # (sequential on the pooler). 0 disables the fan-out (generic decompose only).
+  max_entity_probes: 8
 
 # -----------------------------------------------------------------------------
 # Background jobs (arq).
