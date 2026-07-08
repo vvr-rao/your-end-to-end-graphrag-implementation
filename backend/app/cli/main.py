@@ -15,8 +15,33 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import sys
 from pathlib import Path
+
+
+class _BenignAsyncTeardownFilter(logging.Filter):
+    """Drop the harmless 'Event loop is closed' noise asyncio logs when an async
+    HTTP client (httpx/anyio, used by the OpenAI/Groq/Anthropic SDKs) is
+    garbage-collected AFTER a CLI stage's `asyncio.run()` loop has already closed.
+    The work completed successfully -- this is teardown cleanup, not a failure.
+    Only this exact case is suppressed; real errors still surface."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        exc = record.exc_info[1] if record.exc_info else None
+        if isinstance(exc, RuntimeError) and "Event loop is closed" in str(exc):
+            return False
+        msg = record.getMessage()
+        if "Event loop is closed" in msg and "never retrieved" in msg:
+            return False
+        return True
+
+
+def _silence_benign_asyncio_teardown() -> None:
+    """Install the filter on the asyncio logger (idempotent)."""
+    lg = logging.getLogger("asyncio")
+    if not any(isinstance(f, _BenignAsyncTeardownFilter) for f in lg.filters):
+        lg.addFilter(_BenignAsyncTeardownFilter())
 
 
 def _add_output_dir(p: argparse.ArgumentParser) -> None:
@@ -2128,6 +2153,7 @@ def _cmd_render_takedown(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _silence_benign_asyncio_teardown()
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.func(args)
