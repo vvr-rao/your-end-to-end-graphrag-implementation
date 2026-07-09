@@ -44,7 +44,12 @@ from typing import Any
 
 from backend.app.core.config import get_settings
 from backend.app.services import table_cache, table_jsonld
-from backend.app.services.llm_router import LLMRouter
+from backend.app.services.llm_router import (
+    LLMRouter,
+    _anthropic_accepts_temperature,
+    _strip_json_fences,
+)
+from backend.app.services.llm_router import _estimate_cost as _estimate_cost_by_model
 from backend.app.services.prompts import PROMPTS
 
 
@@ -113,6 +118,7 @@ def _hash_pdf_streaming(path: Path) -> tuple[str, str]:
 # (sockets + TLS contexts) per call -- previously this accumulated ~10
 # MB per call until GC ran, contributing to OOM on 1000+-call runs.
 _VISION_CLIENT: Any = None
+_ANTHROPIC_VISION_CLIENT: Any = None
 
 
 def _get_vision_client() -> Any:
@@ -128,21 +134,36 @@ def _get_vision_client() -> Any:
     return _VISION_CLIENT
 
 
+def _get_anthropic_vision_client() -> Any:
+    """Return the shared `AsyncAnthropic` client for the vision route,
+    creating it on first use. Used when `table_extract_vision.provider`
+    is `anthropic` (fully OpenAI-free table extraction)."""
+    global _ANTHROPIC_VISION_CLIENT
+    if _ANTHROPIC_VISION_CLIENT is None:
+        settings = get_settings()
+        if not settings.anthropic_api_key:
+            return None
+        from anthropic import AsyncAnthropic
+
+        _ANTHROPIC_VISION_CLIENT = AsyncAnthropic(api_key=settings.anthropic_api_key)
+    return _ANTHROPIC_VISION_CLIENT
+
+
 async def close_vision_client() -> None:
-    """Explicitly close the shared vision client + drop the module-level
-    reference. Call this once after all table extraction work is done so
+    """Explicitly close the shared vision client(s) + drop the module-level
+    references. Call this once after all table extraction work is done so
     the connection pool + TLS contexts get released before downstream
     phases (LLM stages) start consuming memory."""
-    global _VISION_CLIENT
-    client = _VISION_CLIENT
+    global _VISION_CLIENT, _ANTHROPIC_VISION_CLIENT
+    clients = [c for c in (_VISION_CLIENT, _ANTHROPIC_VISION_CLIENT) if c is not None]
     _VISION_CLIENT = None
-    if client is None:
-        return
-    try:
-        # AsyncOpenAI client has a `close()` coroutine since openai>=1.0.
-        await client.close()
-    except Exception:
-        pass
+    _ANTHROPIC_VISION_CLIENT = None
+    for client in clients:
+        try:
+            # AsyncOpenAI / AsyncAnthropic both expose an async close().
+            await client.close()
+        except Exception:
+            pass
 
 
 # ---------- Complexity heuristic ----------------------------------------------
@@ -430,45 +451,17 @@ def _caption_hint(page: Any, bbox: tuple[float, float, float, float]) -> str | N
 # ---------- Vision LLM path: cropped PNG → JSON-LD ----------------------------
 
 
-async def _extract_table_via_vision(
-    page: Any,
-    bbox: tuple[float, float, float, float],
+async def _vision_call_openai(
+    system: str,
+    user: str,
+    png_b64: str,
     *,
-    doc_sha: str,
-    table_index: int,
-    page_number: int,
-    caption_hint: str | None,
-    router: LLMRouter,
-) -> tuple[dict[str, Any] | None, float]:
-    """Render the table region to PNG, send to gpt-4o-mini vision, parse
-    JSON back into a StructuredTable payload. Returns (payload, cost_usd)
-    or (None, 0.0) on any failure (caller logs + drops)."""
-    settings = get_settings()
-    if not settings.openai_api_key:
-        return None, 0.0
-
-    spec = settings.models_config.get("tasks", {}).get("table_extract_vision", {})
-    model = spec.get("model", _DEFAULT_VISION_MODEL)
-    timeout = int(spec.get("timeout", _DEFAULT_VISION_TIMEOUT))
-    temperature = float(spec.get("temperature", _DEFAULT_VISION_TEMP))
-    max_tokens = int(spec.get("max_tokens", _DEFAULT_VISION_MAX_TOKENS))
-
-    # Render the cropped region to PNG bytes.
-    try:
-        img = page.crop(bbox).to_image(resolution=_RENDER_DPI)
-        png_buf = io.BytesIO()
-        img.save(png_buf, format="PNG")
-        png_b64 = base64.b64encode(png_buf.getvalue()).decode("ascii")
-    except Exception:
-        return None, 0.0
-
-    system, user = PROMPTS["table_extract_vision"](
-        page_number=page_number, caption_hint=caption_hint,
-    )
-
-    # Reuse the module-level shared client. Creating a new one per call
-    # (the original implementation) leaks ~10 MB of connection-pool +
-    # TLS state per request until GC notices.
+    model: str,
+    timeout: int,
+    temperature: float,
+    max_tokens: int,
+) -> tuple[str | None, float]:
+    """OpenAI vision call. Returns (json_text, cost_usd) or (None, 0.0)."""
     client = _get_vision_client()
     if client is None:
         return None, 0.0
@@ -483,9 +476,7 @@ async def _extract_table_via_vision(
                         {"type": "text", "text": user},
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/png;base64,{png_b64}",
-                            },
+                            "image_url": {"url": f"data:image/png;base64,{png_b64}"},
                         },
                     ],
                 },
@@ -497,14 +488,127 @@ async def _extract_table_via_vision(
         )
     except Exception:
         return None, 0.0
-
     text = (resp.choices[0].message.content or "").strip()
+    return text, _estimate_cost(resp)
+
+
+async def _vision_call_anthropic(
+    system: str,
+    user: str,
+    png_b64: str,
+    *,
+    model: str,
+    timeout: int,
+    temperature: float,
+    max_tokens: int,
+) -> tuple[str | None, float]:
+    """Anthropic vision call (base64 image content block). Returns
+    (json_text, cost_usd) or (None, 0.0). Anthropic has no
+    response_format=json_object, so we instruct bare JSON in the system
+    prompt and strip any ```json fences before returning."""
+    client = _get_anthropic_vision_client()
+    if client is None:
+        return None, 0.0
+    sys_prompt = (
+        f"{system}\n\nOutput only a single valid JSON object. "
+        "Do not include any prose, explanation, or markdown code fences."
+    )
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": sys_prompt,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": png_b64,
+                        },
+                    },
+                    {"type": "text", "text": user},
+                ],
+            }
+        ],
+        "timeout": timeout,
+    }
+    # Opus 4.6+/Fable/Mythos 400 on sampling params; Sonnet/Haiku accept them.
+    if _anthropic_accepts_temperature(model):
+        kwargs["temperature"] = temperature
+    try:
+        resp = await client.messages.create(**kwargs)
+    except Exception:
+        return None, 0.0
+    text = "".join(
+        b.text for b in resp.content if getattr(b, "type", None) == "text"
+    ).strip()
+    text = _strip_json_fences(text)
+    usage = getattr(resp, "usage", None)
+    in_tok = getattr(usage, "input_tokens", None) if usage else None
+    out_tok = getattr(usage, "output_tokens", None) if usage else None
+    cost = _estimate_cost_by_model(model, in_tok, out_tok) or 0.0
+    return text, cost
+
+
+async def _extract_table_via_vision(
+    page: Any,
+    bbox: tuple[float, float, float, float],
+    *,
+    doc_sha: str,
+    table_index: int,
+    page_number: int,
+    caption_hint: str | None,
+    router: LLMRouter,
+) -> tuple[dict[str, Any] | None, float]:
+    """Render the table region to PNG, send to gpt-4o-mini vision, parse
+    JSON back into a StructuredTable payload. Returns (payload, cost_usd)
+    or (None, 0.0) on any failure (caller logs + drops)."""
+    settings = get_settings()
+
+    spec = settings.models_config.get("tasks", {}).get("table_extract_vision", {})
+    provider = str(spec.get("provider", "openai")).lower()
+    model = spec.get("model", _DEFAULT_VISION_MODEL)
+    timeout = int(spec.get("timeout", _DEFAULT_VISION_TIMEOUT))
+    temperature = float(spec.get("temperature", _DEFAULT_VISION_TEMP))
+    max_tokens = int(spec.get("max_tokens", _DEFAULT_VISION_MAX_TOKENS))
+
+    # Render the cropped region to PNG bytes (shared across providers).
+    try:
+        img = page.crop(bbox).to_image(resolution=_RENDER_DPI)
+        png_buf = io.BytesIO()
+        img.save(png_buf, format="PNG")
+        png_b64 = base64.b64encode(png_buf.getvalue()).decode("ascii")
+    except Exception:
+        return None, 0.0
+
+    system, user = PROMPTS["table_extract_vision"](
+        page_number=page_number, caption_hint=caption_hint,
+    )
+
+    # Dispatch to the provider configured in models.yaml. Both helpers
+    # return (json_text, cost_usd) or (None, 0.0) on any failure. The
+    # anthropic path keeps table extraction fully OpenAI-free.
+    if provider == "anthropic":
+        text, cost = await _vision_call_anthropic(
+            system, user, png_b64, model=model, timeout=timeout,
+            temperature=temperature, max_tokens=max_tokens,
+        )
+    else:
+        text, cost = await _vision_call_openai(
+            system, user, png_b64, model=model, timeout=timeout,
+            temperature=temperature, max_tokens=max_tokens,
+        )
+    if text is None:
+        return None, 0.0
+
     try:
         body = json.loads(text)
     except json.JSONDecodeError:
         return None, 0.0
 
-    cost = _estimate_cost(resp)
     payload = _vision_body_to_jsonld(
         body,
         doc_sha=doc_sha,

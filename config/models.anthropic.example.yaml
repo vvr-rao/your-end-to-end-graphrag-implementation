@@ -302,9 +302,9 @@ tasks:
 
   # Vision input is NOT wired for the Anthropic provider — keep on OpenAI.
   table_extract_vision:
-    provider: openai
-    model: gpt-4o-mini
-    timeout: 90
+    provider: anthropic          # Anthropic vision (base64 PNG) -- keeps --tables fully OpenAI-free
+    model: claude-haiku-4-5
+    timeout: 120
     temperature: 0.0
     max_tokens: 4096
     response_format: json_object
