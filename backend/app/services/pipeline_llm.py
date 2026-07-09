@@ -2312,8 +2312,22 @@ async def _run_llm_stages(
     )
     stage1_results = await asyncio.gather(*[_classify_one(c) for c in chunks])
 
+    # Stage-2 progress heartbeat: class_proposal fires one LLM call per chunk
+    # with no per-chunk output, so under rate limiting the run can look frozen
+    # for a long time. Count completions and log every `stage2_log_every`.
+    stage2_done = 0
+    stage2_total = 0
+    stage2_log_every = 1
+    stage2_over_budget = False
+
     async def _propose_one(idx: int, chunk: TextChunk, iris: list[str]) -> dict[str, Any] | None:
+        nonlocal stage2_done, stage2_over_budget
         async with sem:
+            # Cost short-circuit: once the cap is crossed, stop paying for
+            # further Stage-2 calls (queued chunks return None). Bounds the
+            # overshoot to ~concurrency in-flight calls instead of all of them.
+            if stage2_over_budget:
+                return None
             res = await _propose_for_chunk(
                 router,
                 loaded_ontology,
@@ -2338,6 +2352,11 @@ async def _run_llm_stages(
                         {"demotions": demotions},
                     )
                 _append_audit(audit_path, idx, "class_proposal", chunk.source_name, res)
+            stage2_done += 1
+            if stage2_done == stage2_total or stage2_done % stage2_log_every == 0:
+                print(f"[stage2]   {stage2_done}/{stage2_total} chunks proposed")
+            if max_cost_usd is not None and router.total_cost_usd > max_cost_usd:
+                stage2_over_budget = True
             return res
 
     # Skip Stage 2 for chunks where Stage 1 returned no relevant branches --
@@ -2351,8 +2370,21 @@ async def _run_llm_stages(
         )
 
     _s2_spec = router.task_spec("class_proposal")
+    stage2_total = len(chunks) - skipped_empty
+    stage2_log_every = max(1, stage2_total // 50)
+    # Cost gate BEFORE the expensive Stage-2 fan-out: if summarization +
+    # Stage 1 already blew the budget, abort here instead of paying for
+    # hundreds of Stage-2 calls first (the old check ran only AFTER Stage 2,
+    # so a blown budget still paid for every Stage-2 call before aborting).
+    if max_cost_usd is not None and router.total_cost_usd > max_cost_usd:
+        raise RuntimeError(
+            f"Cost cap reached before Stage 2: ${router.total_cost_usd:.4f} > "
+            f"${max_cost_usd:.4f} (summarization + Stage 1). Stage 2 "
+            f"({stage2_total} calls) was NOT started, so no further spend. "
+            "Re-run with a higher --max-cost-usd to lift the cap."
+        )
     print(
-        f"[stage2] proposing matches+new for {len(chunks) - skipped_empty} chunk(s) "
+        f"[stage2] proposing matches+new for {stage2_total} chunk(s) "
         f"({_s2_spec['provider']}:{_s2_spec['model']})"
     )
     stage2_results: list[dict[str, Any] | None] = await asyncio.gather(
