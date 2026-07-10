@@ -373,7 +373,15 @@ async def extract_entities(
                 cand_iris = {c["iri"] for c in candidates}
 
                 system, user = PROMPTS["entity_extract"](txt, candidates)
-                out = await router.chat("entity_extract", system=system, user=user)
+                # Parse-retry: Anthropic has no JSON-grammar mode, so Haiku
+                # occasionally emits an unparseable response. Re-ask once
+                # (non-deterministic -> a retry usually parses) before failing.
+                parsed = None
+                for _attempt in range(2):
+                    out = await router.chat("entity_extract", system=system, user=user)
+                    parsed = _extract_json(out.text)
+                    if isinstance(parsed, dict):
+                        break
             except Exception as exc:
                 print(f"[extract-entities] chunk {chunk_iri} call failed: {exc}")
                 summary.chunks_failed += 1
@@ -382,9 +390,8 @@ async def extract_entities(
                     progress_state["fail"] += 1
                 return
 
-            parsed = _extract_json(out.text)
             if not isinstance(parsed, dict):
-                print(f"[extract-entities] chunk {chunk_iri} unparseable response")
+                print(f"[extract-entities] chunk {chunk_iri} unparseable response (after retry)")
                 summary.chunks_failed += 1
                 async with progress_lock:
                     progress_state["done"] += 1

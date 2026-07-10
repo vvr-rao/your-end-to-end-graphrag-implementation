@@ -203,7 +203,7 @@ tasks:
     model: gpt-4o-mini
     timeout: 60
     temperature: 0.0
-    max_tokens: 2048
+    max_tokens: 8192          # entity-grounded artifact JSON on dense chunks exceeds 2048 -> truncation
     response_format: json_object
 
   # Same config as artifact_chunk_extract -- just a different prompt
@@ -214,7 +214,7 @@ tasks:
     model: gpt-4o-mini
     timeout: 60
     temperature: 0.0
-    max_tokens: 2048
+    max_tokens: 8192          # entity-grounded artifact JSON on dense chunks exceeds 2048 -> truncation
     response_format: json_object
 
   # Milestone C: per-chunk named-entity extraction. JSON mode for

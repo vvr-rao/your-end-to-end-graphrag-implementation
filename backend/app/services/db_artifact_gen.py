@@ -290,7 +290,14 @@ async def generate_per_chunk_artifacts(
                 system, user = PROMPTS["artifact_chunk_extract"](text)
                 task_name = "artifact_chunk_extract"
             try:
-                out = await router.chat(task_name, system=system, user=user)
+                # Parse-retry: re-ask once on an unparseable response (Anthropic
+                # has no JSON-grammar mode; Haiku occasionally malforms JSON).
+                parsed = None
+                for _attempt in range(2):
+                    out = await router.chat(task_name, system=system, user=user)
+                    parsed = _extract_json(out.text)
+                    if isinstance(parsed, dict):
+                        break
             except Exception as exc:
                 print(f"[generate-artifacts] chunk {chunk_iri} LLM failed: {exc}")
                 summary.chunks_failed += 1
@@ -298,9 +305,8 @@ async def generate_per_chunk_artifacts(
                     progress_state["done"] += 1
                     progress_state["fail"] += 1
                 return
-            parsed = _extract_json(out.text)
             if not isinstance(parsed, dict):
-                print(f"[generate-artifacts] chunk {chunk_iri} unparseable response")
+                print(f"[generate-artifacts] chunk {chunk_iri} unparseable response (after retry)")
                 summary.chunks_failed += 1
                 async with progress_lock:
                     progress_state["done"] += 1
