@@ -400,7 +400,7 @@ async def generate_per_chunk_artifacts(
                     # time_scope metadata captured by the updated
                     # artifact_chunk_extract_with_entities prompt. Stored
                     # in extra_metadata JSONB so deep_research can use them
-                    # in the KEY CLAIMS + KEY INSIGHTS sections.
+                    # in the CLAIMS + KEY INSIGHTS sections.
                     raw_ev_status = (item.get("evidence_status") or "").strip().lower()
                     if raw_ev_status not in ("backed", "partial", "unbacked"):
                         raw_ev_status = None  # leave null rather than guess

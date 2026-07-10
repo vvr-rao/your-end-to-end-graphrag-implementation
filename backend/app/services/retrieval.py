@@ -25,8 +25,8 @@ Persists `retrieval_runs` (1 row) + `retrieval_evidence` (top-K rows).
 Two modes (2026-06-13 redesign):
   - simple_qa     -- tight 1-3 sentence direct answer; top_k=20.
   - deep_research -- structured 7-section output (SPECIFICS / ANALYSIS
-                     / ANSWER / CONTRADICTIONS / KEY CLAIMS /
-                     COVERAGE IMBALANCE / KEY INSIGHTS); top_k=30;
+                     / ANSWER / CONTRADICTIONS / CLAIMS /
+                     DATA COVERAGE MISMATCH / KEY INSIGHTS); top_k=30;
                      default mode.
 
 The summarize/insights/knowledge_gaps/exhaustive_search modes were

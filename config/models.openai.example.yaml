@@ -157,7 +157,7 @@ tasks:
     model: gpt-4o-mini
     timeout: 60
     temperature: 0.0
-    max_tokens: 2048
+    max_tokens: 8192          # dense chunks w/ many entities (50 candidate classes) exceed 2048 -> truncation
     response_format: json_object
 
   question_parse:
@@ -212,7 +212,7 @@ tasks:
     model: gpt-4.1
     timeout: 180
     temperature: 0.1
-    max_tokens: 4096
+    max_tokens: 8192          # 7-section deep_research answers over evidence-rich corpora exceed 4096
 
   follow_up_resolution:
     provider: openai

@@ -6,8 +6,8 @@ CLI's `query --json` output.
 Two modes (2026-06-13 redesign):
   - simple_qa     -- tight 1-3 sentence direct answer.
   - deep_research -- structured 7-section output (SPECIFICS /
-                     ANALYSIS / ANSWER / CONTRADICTIONS / KEY CLAIMS /
-                     COVERAGE IMBALANCE / KEY INSIGHTS). DEFAULT.
+                     ANALYSIS / ANSWER / CONTRADICTIONS / CLAIMS /
+                     DATA COVERAGE MISMATCH / KEY INSIGHTS). DEFAULT.
 """
 from __future__ import annotations
 
