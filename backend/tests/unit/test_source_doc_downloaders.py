@@ -120,6 +120,19 @@ def test_websearch_extract_text_strips_scripts_and_collapses_blanks() -> None:
     assert "\n\n\n" not in text  # no triple blanks
 
 
+def test_websearch_looks_like_pdf_detection() -> None:
+    # Content-Type is primary.
+    assert websearch_mod._looks_like_pdf("application/pdf", b"anything", "http://x/y")
+    # %PDF magic bytes win even when the server mislabels it as HTML.
+    assert websearch_mod._looks_like_pdf("text/html", b"%PDF-1.5\n...", "http://x/doc")
+    # URL path fallback when the type is missing/wrong and no body sniff.
+    assert websearch_mod._looks_like_pdf("", b"", "https://x/reports/annual.PDF?sequence=1")
+    # A real HTML page is NOT a PDF (this is the bug: it used to be text-extracted
+    # for PDFs; HTML must still go the .txt route).
+    assert not websearch_mod._looks_like_pdf("text/html", b"<html><body>hi</body></html>", "http://x/page")
+    assert not websearch_mod._looks_like_pdf("", b"<!doctype html>", "http://x/page")
+
+
 # ---------- EDGAR filing index parse -----------------------------------------
 
 
