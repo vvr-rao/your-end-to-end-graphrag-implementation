@@ -261,6 +261,31 @@ tasks:
     max_tokens: 8192
     response_format: json_object
 
+  # Summary rollup uses a MORE CAPABLE model than the short-artifact merge:
+  # gpt-5.4 gives measurably higher retention on the 9-section Summary,
+  # while Claim/Finding/Observation/Event merges are handled perfectly by
+  # the cheaper artifact_merge* (gpt-4.1) -- so no premium is paid there.
+  summary_merge:
+    provider: anthropic
+    model: claude-sonnet-4-6
+    timeout: 180
+    temperature: 0.2
+    max_tokens: 8192
+    response_format: json_object
+  summary_merge_evaluate:
+    provider: anthropic
+    model: claude-sonnet-4-6
+    timeout: 120
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+  summary_merge_revise:
+    provider: anthropic
+    model: claude-sonnet-4-6
+    timeout: 180
+    temperature: 0.2
+    max_tokens: 8192
+    response_format: json_object
   judge_comprehensiveness:
     provider: anthropic
     model: claude-sonnet-4-6

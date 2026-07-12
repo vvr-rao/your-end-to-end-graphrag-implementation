@@ -247,26 +247,51 @@ tasks:
   # Artifact rollup (clustered merge) + lossless evaluate->revise loop.
   artifact_merge:
     provider: openai
+    model: gpt-4.1
+    timeout: 180
+    temperature: 0.2
+    max_tokens: 8192
+    response_format: json_object
+  artifact_merge_evaluate:
+    provider: openai
+    model: gpt-4.1
+    timeout: 120
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+  artifact_merge_revise:
+    provider: openai
+    model: gpt-4.1
+    timeout: 180
+    temperature: 0.2
+    max_tokens: 8192
+    response_format: json_object
+
+  # Summary rollup uses a MORE CAPABLE model than the short-artifact merge:
+  # gpt-5.4 gives measurably higher retention on the 9-section Summary,
+  # while Claim/Finding/Observation/Event merges are handled perfectly by
+  # the cheaper artifact_merge* (gpt-4.1) -- so no premium is paid there.
+  summary_merge:
+    provider: openai
     model: gpt-5.4
     timeout: 180
     temperature: 0.2
     max_tokens: 16384
     response_format: json_object
-  artifact_merge_evaluate:
+  summary_merge_evaluate:
     provider: openai
     model: gpt-5.4
     timeout: 120
     temperature: 0.0
     max_tokens: 8192
     response_format: json_object
-  artifact_merge_revise:
+  summary_merge_revise:
     provider: openai
     model: gpt-5.4
     timeout: 180
     temperature: 0.2
     max_tokens: 16384
     response_format: json_object
-
   judge_comprehensiveness:
     provider: openai
     model: gpt-4.1

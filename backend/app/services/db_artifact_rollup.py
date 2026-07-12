@@ -249,7 +249,6 @@ async def generate_rollups(
     router = LLMRouter()
     cost_before = router.total_cost_usd
     embedder = Embedder()
-    merge_model = router.task_spec("artifact_merge").get("model")
 
     async with session_scope() as session:
         gv = await current_version(session)
@@ -313,9 +312,18 @@ async def generate_rollups(
                 if cost_limit_hit.is_set():
                     return None
                 child_texts = [text_map[i] for i in batch]
+                # Type-aware model: the section-structured Summary rollup uses the
+                # more capable `summary_merge*` tasks (gpt-5.4 -- measurably higher
+                # retention); short prose artifacts (Claim/Finding/Observation/Event)
+                # use the cheaper `artifact_merge*` (gpt-4.1), which merges them
+                # perfectly, so paying more there is waste. Prompt builder is shared
+                # (already Summary-aware); only the router task/model differs.
+                _fam = "summary_merge" if atype == "Summary" else "artifact_merge"
+                merge_task, eval_task, revise_task = _fam, f"{_fam}_evaluate", f"{_fam}_revise"
+                model_name = router.task_spec(merge_task).get("model")
                 system, user = PROMPTS["artifact_merge"](atype, child_texts)
                 try:
-                    out = await router.chat("artifact_merge", system=system, user=user)
+                    out = await router.chat(merge_task, system=system, user=user)
                 except Exception as exc:
                     print(f"[rollup] merge failed ({atype}, {len(batch)} items): {exc}")
                     return None
@@ -348,7 +356,7 @@ async def generate_rollups(
                             atype, child_texts, text)
                         try:
                             eout = await router.chat(
-                                "artifact_merge_evaluate", system=esys, user=euser)
+                                eval_task, system=esys, user=euser)
                             ev = _extract_json(eout.text) or {}
                         except Exception:
                             break
@@ -375,7 +383,7 @@ async def generate_rollups(
                             atype, child_texts, text, missing)
                         try:
                             rout = await router.chat(
-                                "artifact_merge_revise", system=rsys, user=ruser)
+                                revise_task, system=rsys, user=ruser)
                             rtext = ((_extract_json(rout.text) or {}).get("text") or "").strip()
                             if rtext:
                                 text = rtext
@@ -388,7 +396,7 @@ async def generate_rollups(
                         cost_limit_hit.set()
                         print(f"[rollup] HALT: cost cap ${max_cost_usd:.2f} reached")
                 return {"atype": atype, "batch": batch, "text": text,
-                        "conf": conf, "new_level": new_level,
+                        "conf": conf, "new_level": new_level, "model_name": model_name,
                         "revised": revised, "incomplete": final_complete is False}
 
         results = await asyncio.gather(*[
@@ -416,7 +424,7 @@ async def generate_rollups(
                 "title": None,
                 "text": res["text"],
                 "confidence": res["conf"],
-                "model_name": merge_model,
+                "model_name": res["model_name"],
                 "prompt_version": "artifact_merge@v1",
                 "status": "ACTIVE",
                 "graph_version": gv,
