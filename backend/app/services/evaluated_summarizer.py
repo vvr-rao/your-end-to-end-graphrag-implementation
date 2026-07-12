@@ -317,6 +317,8 @@ async def evaluated_summarize_documents_async(
     enc = get_encoder(encoding_name)
     model = router.task_spec("evaluated_summary_chunk").get("model", "")
     cost_before = router.total_cost_usd
+    cache_read_before = router.cache_read_tokens
+    input_before = router.total_input_tokens
     cost_hit = asyncio.Event()
     sem = asyncio.Semaphore(concurrency)
     cache_dir = _cache_dir() if use_cache else None
@@ -399,9 +401,13 @@ async def evaluated_summarize_documents_async(
     t0 = time.time()
     results = await asyncio.gather(*[_one(d) for d in documents])
     n_sum = sum(1 for r in results if r.summarized)
+    cache_read = router.cache_read_tokens - cache_read_before
+    input_delta = router.total_input_tokens - input_before
+    hit_pct = (100.0 * cache_read / input_delta) if input_delta else 0.0
     print(
         f"[evaluated-summary] {len(results)} doc(s): {n_sum} summarized "
         f"(eval_rounds={eval_rounds}), cost=${router.total_cost_usd - cost_before:.4f}, "
+        f"prompt-cache-hit={hit_pct:.0f}% ({cache_read:,}/{input_delta:,} input tok), "
         f"wall={time.time() - t0:.1f}s"
     )
     return list(results)

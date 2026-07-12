@@ -708,7 +708,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_art.add_argument(
         "--rollup-eval-rounds", type=int, default=None,
         help="Lossless-merge revise passes per rollup cluster (default from "
-             "config summarization.rollup_eval_rounds = 1). After each merge an "
+             "config summarization.rollup_eval_rounds = 2). After each merge an "
              "LLM checks for dropped facts and a reviser adds them back. 0 = merge "
              "only (faster, may lose data). Higher = safer + more LLM cost.",
     )
@@ -1443,7 +1443,7 @@ def _cmd_generate_artifacts(args: argparse.Namespace) -> int:
         from backend.app.core.config import get_settings
         rollup_types = tuple(args.rollup_type) if args.rollup_type else ALL_ROLLUP_TYPES
         _cfg_eval = int(
-            get_settings().app_config.get("summarization", {}).get("rollup_eval_rounds", 1)
+            get_settings().app_config.get("summarization", {}).get("rollup_eval_rounds", 2)
         )
         _eval_rounds = (
             args.rollup_eval_rounds if args.rollup_eval_rounds is not None else _cfg_eval

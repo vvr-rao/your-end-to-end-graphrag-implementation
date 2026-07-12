@@ -64,6 +64,7 @@ class Provider(Protocol):
 _PRICING_PER_1K = {
     "gpt-4.1": (0.0025, 0.010),
     "gpt-4.1-mini": (0.0004, 0.0016),
+    "gpt-5.4": (0.0025, 0.015),        # $2.50 in / $15 out per 1M (cached in $0.25)
     "gpt-5.4-mini": (0.00075, 0.0045),
     "gpt-4o": (0.0025, 0.010),
     "gpt-4o-mini": (0.00015, 0.00060),
@@ -102,6 +103,15 @@ def _estimate_cost(
     )
 
 
+# OpenAI GPT-5.x and o-series models reject `max_tokens` and non-default
+# `temperature`: they require `max_completion_tokens` and omit sampling params.
+_OPENAI_COMPLETION_TOKEN_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+
+
+def _openai_uses_completion_tokens(model: str) -> bool:
+    return model.startswith(_OPENAI_COMPLETION_TOKEN_PREFIXES)
+
+
 class OpenAIProvider:
     def __init__(self, api_key: str) -> None:
         self._client = AsyncOpenAI(api_key=api_key)
@@ -129,10 +139,14 @@ class OpenAIProvider:
                 {"role": "system", "content": sys_content},
                 {"role": "user", "content": user},
             ],
-            "temperature": temperature,
-            "max_tokens": max_tokens,
             "timeout": timeout,
         }
+        if _openai_uses_completion_tokens(model):
+            # gpt-5.x / o-series: no `max_tokens`, no non-default temperature.
+            kwargs["max_completion_tokens"] = max_tokens
+        else:
+            kwargs["temperature"] = temperature
+            kwargs["max_tokens"] = max_tokens
         if response_format == "json_object":
             kwargs["response_format"] = {"type": "json_object"}
         resp = await self._client.chat.completions.create(**kwargs)
@@ -340,10 +354,33 @@ class LLMRouter:
         self._tasks = mc.get("tasks", {})
         self._retry = mc.get("defaults", {}).get("retries", {})
         self._total_cost_usd = 0.0
+        # Prompt-cache accounting across all calls (see cache_hit_rate).
+        self._cache_read_tokens = 0     # input served from cache
+        self._cache_write_tokens = 0    # input written to cache
+        self._input_full_tokens = 0     # uncached, full-price input
 
     @property
     def total_cost_usd(self) -> float:
         return self._total_cost_usd
+
+    @property
+    def cache_read_tokens(self) -> int:
+        return self._cache_read_tokens
+
+    @property
+    def cache_write_tokens(self) -> int:
+        return self._cache_write_tokens
+
+    @property
+    def total_input_tokens(self) -> int:
+        """All input tokens processed = uncached + cache-read + cache-write."""
+        return self._input_full_tokens + self._cache_read_tokens + self._cache_write_tokens
+
+    @property
+    def cache_hit_rate(self) -> float:
+        """Fraction of input tokens served from the prompt cache (0.0-1.0)."""
+        tot = self.total_input_tokens
+        return (self._cache_read_tokens / tot) if tot else 0.0
 
     def task_spec(self, task: str) -> dict[str, Any]:
         if task not in self._tasks:
@@ -377,6 +414,15 @@ class LLMRouter:
                 )
                 if result.cost_usd:
                     self._total_cost_usd += result.cost_usd
+                # Prompt-cache accounting. OpenAI reports prompt_tokens INCLUDING
+                # the cached portion; Anthropic reports input_tokens EXCLUDING it.
+                read = result.cache_read_tokens or 0
+                write = result.cache_write_tokens or 0
+                prompt = result.prompt_tokens or 0
+                full = (prompt - read) if result.provider == "openai" else prompt
+                self._cache_read_tokens += read
+                self._cache_write_tokens += write
+                self._input_full_tokens += max(0, full)
                 return result
         raise RuntimeError(f"LLM call for task '{task}' exhausted retries")
 

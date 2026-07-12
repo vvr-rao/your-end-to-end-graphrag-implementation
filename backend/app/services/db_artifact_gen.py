@@ -587,7 +587,7 @@ async def _auto_summary_rollup(max_cost_usd: float) -> float:
     rounds = int(sum_cfg.get("summary_rollup_rounds", 2))
     if rounds <= 0:
         return 0.0
-    eval_rounds = int(sum_cfg.get("rollup_eval_rounds", 1))
+    eval_rounds = int(sum_cfg.get("rollup_eval_rounds", 2))
     from backend.app.services.db_artifact_rollup import generate_rollups
     print(f"[generate-artifacts] auto Summary rollup ({rounds} layer(s), "
           f"loss-loop eval_rounds={eval_rounds}) ...")

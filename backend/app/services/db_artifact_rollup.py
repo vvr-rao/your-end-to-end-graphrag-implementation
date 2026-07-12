@@ -46,6 +46,7 @@ from backend.app.db.session import session_scope
 from backend.app.services import retrieval_sql
 from backend.app.services.db_artifact_gen import _artifact_iri, _extract_json
 from backend.app.services.embeddings import Embedder
+from backend.app.services.evaluated_summarizer import check_section_coverage
 from backend.app.services.llm_router import LLMRouter
 from backend.app.services.predicates import VIAO_REFERENCES_ARTIFACT
 from backend.app.services.prompts import PROMPTS
@@ -351,13 +352,25 @@ async def generate_rollups(
                             ev = _extract_json(eout.text) or {}
                         except Exception:
                             break
-                        missing = ev.get("missing_items") or []
-                        if ev.get("complete") or not missing:
+                        missing = list(ev.get("missing_items") or [])
+                        # Deterministic guard: a merged SUMMARY must retain all 9
+                        # section headers. Missing headers are non-negotiable and
+                        # override the LLM's 'complete' verdict, forcing a revise.
+                        missing_secs = (
+                            [c for c, ok in check_section_coverage(text).items() if not ok]
+                            if atype == "Summary" else []
+                        )
+                        if (ev.get("complete") or not missing) and not missing_secs:
                             final_complete = True
                             break
                         if round_idx > eval_rounds:
                             final_complete = False  # out of budget, gaps remain
                             break
+                        missing = missing + [
+                            f"the '{s}' section header is missing -- emit it "
+                            "(write 'None identified.' if the section is empty)"
+                            for s in missing_secs
+                        ]
                         rsys, ruser = PROMPTS["artifact_merge_revise"](
                             atype, child_texts, text, missing)
                         try:

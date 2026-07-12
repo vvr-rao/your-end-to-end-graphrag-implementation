@@ -1771,6 +1771,27 @@ def recommendation_gen(
     return system, user
 
 
+# The 9 canonical Summary sections, in order -- kept in sync with the per-doc
+# evaluated summarizer (evaluated_summary_chunk). Summary ROLLUPS must preserve
+# this same structure; a merged Summary missing any header is treated as
+# incomplete (see db_artifact_rollup's deterministic coverage guard).
+_SUMMARY_ROLLUP_FORMAT_RULE = (
+    "  - OUTPUT FORMAT: the merged Summary MUST stay section-structured. Emit "
+    "ALL of these headers, each on its own line, in this EXACT order, even when "
+    "a section is empty:\n"
+    "        CLAIMS\n        EVIDENCE\n        FINDINGS\n        OBSERVATIONS\n"
+    "        EVENTS\n        ENTITIES\n        DATES\n"
+    "        REGULATORY / SAFETY / WARNINGS\n        LISTS\n"
+    "    Under each header, merge the corresponding content from EVERY input "
+    "summary (dedup within the section). If a section has no content across all "
+    "inputs, still emit its header and write 'None identified.'\n"
+)
+_MERGE_PROSE_RULE = (
+    "  - Neutral third-person prose. Do NOT invent anything not present in the "
+    "inputs.\n"
+)
+
+
 def artifact_merge(
     artifact_type: str, child_texts: list[str]
 ) -> tuple[str, str]:
@@ -1807,8 +1828,8 @@ def artifact_merge(
         "  - If two inputs CONFLICT (different numbers/claims for the same "
         "thing), keep BOTH and note the discrepancy; do not pick one or "
         "average them.\n"
-        "  - Neutral third-person prose. Do NOT invent anything not present "
-        "in the inputs.\n\n"
+        + (_SUMMARY_ROLLUP_FORMAT_RULE if artifact_type == "Summary" else _MERGE_PROSE_RULE)
+        + "\n"
         "Return ONLY JSON: {\"text\": \"<the merged statement>\", "
         "\"confidence\": <float 0-1>}. `confidence` should reflect the "
         "strongest support across the merged items."
@@ -1842,7 +1863,12 @@ def artifact_merge_evaluate(
         "  - A pure rephrasing (same fact, different wording) is NOT a loss -- do "
         "NOT flag it. Only flag information that is genuinely absent or changed.\n"
         "  - A numeric/name/date that appears in a source item but nowhere in the "
-        "merged text IS a loss -- flag it verbatim.\n\n"
+        "merged text IS a loss -- flag it verbatim.\n"
+        + ("  - The merged text is a SUMMARY and MUST keep all 9 section headers "
+           "(CLAIMS, EVIDENCE, FINDINGS, OBSERVATIONS, EVENTS, ENTITIES, DATES, "
+           "REGULATORY / SAFETY / WARNINGS, LISTS). Flag any MISSING header as a "
+           "missing item.\n" if artifact_type == "Summary" else "")
+        + "\n"
         "Return ONLY JSON: {\"complete\": true|false, \"missing_items\": "
         "[\"<the exact fact/entity/number/date/list-item that is missing or "
         "distorted>\", ...]}. `complete` is true (and missing_items empty) ONLY "
@@ -1875,7 +1901,11 @@ def artifact_merge_revise(
         "drop or shorten any existing fact.\n"
         "  - Still remove only exact/near-exact duplicate restatements. "
         "Completeness OVERRIDES brevity; the output may be long.\n"
-        "  - Neutral third-person prose. Do NOT invent anything not in the sources.\n\n"
+        + (_SUMMARY_ROLLUP_FORMAT_RULE + "  - Do NOT invent anything not in the "
+           "sources.\n" if artifact_type == "Summary"
+           else "  - Neutral third-person prose. Do NOT invent anything not in "
+                "the sources.\n")
+        + "\n"
         "Return ONLY JSON: {\"text\": \"<the revised merged statement>\", "
         "\"confidence\": <float 0-1>}."
     )

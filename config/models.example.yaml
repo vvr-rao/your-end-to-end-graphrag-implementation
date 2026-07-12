@@ -377,24 +377,24 @@ tasks:
   # merge/revise gives room to avoid over-compression.
   artifact_merge:
     provider: openai
-    model: gpt-4.1
+    model: gpt-5.4
     timeout: 180
     temperature: 0.2
-    max_tokens: 8192
+    max_tokens: 16384
     response_format: json_object
   artifact_merge_evaluate:
     provider: openai
-    model: gpt-4.1
+    model: gpt-5.4
     timeout: 120
     temperature: 0.0
-    max_tokens: 4096
+    max_tokens: 8192
     response_format: json_object
   artifact_merge_revise:
     provider: openai
-    model: gpt-4.1
+    model: gpt-5.4
     timeout: 180
     temperature: 0.2
-    max_tokens: 8192
+    max_tokens: 16384
     response_format: json_object
 
   # ---------------------------------------------------------------------------
