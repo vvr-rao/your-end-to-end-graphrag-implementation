@@ -1,9 +1,11 @@
-"""Free web search + plain-text extraction CLI.
+"""Free web search + per-result download CLI.
 
-Hits DuckDuckGo's JS-free HTML endpoint, takes the top-N results, fetches
-each result page, extracts visible text with BeautifulSoup, and saves
-one .txt per result into a destination folder. Also writes an `_index.json`
-manifest listing every result with its URL + saved filename + char count.
+Hits DuckDuckGo's JS-free HTML endpoint, takes the top-N results, and fetches
+each result URL. **PDF responses are saved verbatim as `.pdf`** (raw bytes --
+the ingestion pipeline reads PDFs natively); **HTML pages** are text-extracted
+with BeautifulSoup and saved as `.txt`. One file per result into a destination
+folder, plus an `_index.json` manifest listing every result with its URL +
+saved filename + size + kind.
 
 Usage:
     uv run python source_documents/websearch_download.py \\
@@ -80,6 +82,17 @@ def _extract_ddg_results(html: str, max_results: int) -> list[dict]:
     return out
 
 
+def _looks_like_pdf(content_type: str, body: bytes, url: str) -> bool:
+    """True when a fetched response is a PDF. Content-Type (already normalized
+    to the bare lowercase type) is primary; fall back to the `%PDF` magic bytes
+    and the URL path, since some servers mislabel or omit the content type."""
+    return (
+        content_type == "application/pdf"
+        or body[:5] == b"%PDF-"
+        or urlparse(url).path.lower().endswith(".pdf")
+    )
+
+
 def _extract_text_from_html(html: str) -> str:
     """Return readable text from a result page's HTML. Strips script/style/
     nav/footer and collapses whitespace runs."""
@@ -121,28 +134,51 @@ def _fetch_and_save(
     output: Path,
     overwrite: bool,
 ) -> dict:
-    """Fetch one result URL, extract text, save to a numbered .txt file.
-    Returns a dict with metadata for the index file (filename/chars/error)."""
+    """Fetch one result URL and save it: PDFs verbatim as `.pdf` (raw bytes),
+    HTML as text-extracted `.txt`. Returns a dict of metadata for the index."""
     url = result["url"]
     title = result["title"]
-    fname = f"{idx:03d}_{safe_filename(title, max_len=80)}.txt"
-    dest = output / fname
-    record = {"index": idx, "url": url, "title": title, "filename": fname}
-    if dest.exists() and not overwrite:
-        record["status"] = "skip_exists"
-        record["chars"] = dest.stat().st_size
-        print(f"  [{idx}/{total}] skip (exists): {fname}")
-        return record
+    stem = f"{idx:03d}_{safe_filename(title, max_len=80)}"
+    record = {"index": idx, "url": url, "title": title}
+    # The extension depends on the response content-type (known only after the
+    # fetch), so skip when EITHER a .pdf or .txt for this stem already exists.
+    if not overwrite:
+        for ext in (".pdf", ".txt"):
+            existing = output / f"{stem}{ext}"
+            if existing.exists():
+                record.update(filename=existing.name, status="skip_exists",
+                              chars=existing.stat().st_size)
+                print(f"  [{idx}/{total}] skip (exists): {existing.name}")
+                return record
     print(f"  [{idx}/{total}] {url}")
     try:
         resp = session.get(url, timeout=20)
         resp.raise_for_status()
     except Exception as e:  # noqa: BLE001
-        record["status"] = "fetch_failed"
-        record["error"] = f"{type(e).__name__}: {e}"
+        record.update(filename=None, status="fetch_failed",
+                      error=f"{type(e).__name__}: {e}")
         print(f"    -> {record['error']}")
         return record
-    # Save body even for non-HTML content-types (we still get_text it).
+
+    # Decide PDF vs HTML. Content-Type is primary; fall back to the %PDF magic
+    # bytes and the URL path, since some servers mislabel or omit the type.
+    content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    body = resp.content
+    if _looks_like_pdf(content_type, body, url):
+        # Save the RAW PDF bytes. Do NOT run a PDF through the HTML text
+        # extractor -- that decoded binary as text and produced garbled `.txt`.
+        fname = f"{stem}.pdf"
+        dest = output / fname
+        dest.write_bytes(body)
+        record.update(filename=fname, kind="pdf",
+                      content_type=content_type or "application/pdf",
+                      status="ok", chars=dest.stat().st_size)
+        print(f"    -> saved PDF ({dest.stat().st_size:,} bytes)")
+        return record
+
+    # HTML / text: extract readable text and save as `.txt` (original behavior).
+    fname = f"{stem}.txt"
+    dest = output / fname
     text = _extract_text_from_html(resp.text)
     header = (
         f"URL: {url}\n"
@@ -152,8 +188,9 @@ def _fetch_and_save(
         f"---\n\n"
     )
     dest.write_text(header + text, encoding="utf-8")
-    record["status"] = "ok"
-    record["chars"] = dest.stat().st_size
+    record.update(filename=fname, kind="text",
+                  content_type=content_type or "text/html",
+                  status="ok", chars=dest.stat().st_size)
     return record
 
 
