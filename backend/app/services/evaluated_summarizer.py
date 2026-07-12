@@ -189,15 +189,21 @@ async def _summarize_chunk_with_eval(
 ) -> tuple[str, dict[str, Any]]:
     """Summarize one source window with the question/evaluate/revise loop.
     Returns (summary, audit)."""
-    sys_p, usr_p = PROMPTS["evaluated_summary_chunk"](source_text)
-    out = await router.chat("evaluated_summary_chunk", system=sys_p, user=usr_p)
+    sys_p, usr_p = PROMPTS["evaluated_summary_chunk"]()
+    # Source goes as cache_prefix (cached leading block) -- reused across this
+    # window's summarize/question-gen/revise calls at cache-read price.
+    out = await router.chat(
+        "evaluated_summary_chunk", system=sys_p, user=usr_p, cache_prefix=source_text
+    )
     summary = (out.text or "").strip()
 
     # Generate the question set once; reuse across rounds so each round checks
     # whether the previous revision actually closed the gaps.
-    qsys, qusr = PROMPTS["summary_question_gen"](num_questions, source_text)
+    qsys, qusr = PROMPTS["summary_question_gen"](num_questions)
     try:
-        q_out = await router.chat("summary_question_gen", system=qsys, user=qusr)
+        q_out = await router.chat(
+            "summary_question_gen", system=qsys, user=qusr, cache_prefix=source_text
+        )
         questions = _extract_json(q_out.text) or {"questions": []}
     except Exception as exc:
         return summary, {"passed": None, "rounds": 0, "error": f"question_gen: {exc!r}"}
@@ -227,10 +233,12 @@ async def _summarize_chunk_with_eval(
             break
         missing_total += len(missing)
         rsys, rusr = PROMPTS["summary_revise"](
-            source_text, summary, json.dumps(evaluation, ensure_ascii=False)
+            summary, json.dumps(evaluation, ensure_ascii=False)
         )
         try:
-            r_out = await router.chat("summary_revise", system=rsys, user=rusr)
+            r_out = await router.chat(
+                "summary_revise", system=rsys, user=rusr, cache_prefix=source_text
+            )
             revised = (r_out.text or "").strip()
             if revised:
                 summary = revised

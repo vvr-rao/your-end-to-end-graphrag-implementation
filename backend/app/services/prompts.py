@@ -2223,10 +2223,16 @@ Do not add external knowledge.
 """.strip()
 
 
-def evaluated_summary_chunk(source_text: str) -> tuple[str, str]:
-    """Near-lossless, section-structured summary of one source chunk."""
+def evaluated_summary_chunk() -> tuple[str, str]:
+    """Near-lossless, section-structured summary of one source chunk.
+
+    The source is supplied out-of-band as the router's `cache_prefix` (a cached
+    leading block) so it is reused across a window's calls at cache-read price;
+    this builder carries only the instruction and references the source above.
+    """
     user = (
-        "Summarize the source chunk below using lossless compression.\n\n"
+        "Summarize the SOURCE CHUNK provided in the system context above using "
+        "lossless compression.\n\n"
         "Rules:\n"
         "1. Preserve ALL distinct information.\n"
         "2. Remove only duplicate or redundant wording.\n"
@@ -2251,14 +2257,12 @@ def evaluated_summary_chunk(source_text: str) -> tuple[str, str]:
         "named study. DATES must capture every distinct date, date range, fiscal "
         "period, or deadline. LISTS must confirm every source list/table/enumeration "
         'is represented (enumerate them or state "all list items preserved above").\n\n'
-        "Return only the compressed summary.\n\n"
-        "SOURCE CHUNK:\n"
-        + source_text
+        "Return only the compressed summary."
     )
     return _SUMMARIZER_SYSTEM, user
 
 
-def summary_question_gen(num_questions: int, source_text: str) -> tuple[str, str]:
+def summary_question_gen(num_questions: int) -> tuple[str, str]:
     """Generate source-derived coverage questions (JSON) used to audit the summary."""
     system = (
         "You are an evaluator that tests whether a summary preserved all source "
@@ -2269,7 +2273,8 @@ def summary_question_gen(num_questions: int, source_text: str) -> tuple[str, str
         "completeness of lists. Do not ask questions that require external knowledge."
     )
     user = (
-        f"Generate {num_questions} high-coverage questions from the source text.\n"
+        f"Generate {num_questions} high-coverage questions from the SOURCE TEXT "
+        "provided in the system context above.\n"
         "Include questions that test the explicit CLAIMS, EVIDENCE, FINDINGS, "
         "OBSERVATIONS, EVENTS, ENTITIES (named people/organizations/products/"
         "jurisdictions), DATES (specific dates, ranges, fiscal periods), regulatory/"
@@ -2278,9 +2283,7 @@ def summary_question_gen(num_questions: int, source_text: str) -> tuple[str, str
         "at least one probes whether specific dates are preserved, when the source "
         "contains them.\n"
         'Return valid JSON only, with this schema:\n'
-        '{"questions": [{"question": "...", "expected_answer": "..."}]}\n\n'
-        "SOURCE TEXT:\n"
-        + source_text
+        '{"questions": [{"question": "...", "expected_answer": "..."}]}'
     )
     return system, user
 
@@ -2320,10 +2323,11 @@ def summary_evaluate(questions_json: str, summary_text: str) -> tuple[str, str]:
     return system, user
 
 
-def summary_revise(
-    source_text: str, summary_text: str, evaluation_json: str
-) -> tuple[str, str]:
-    """Revise a summary to close the evaluator's reported gaps."""
+def summary_revise(summary_text: str, evaluation_json: str) -> tuple[str, str]:
+    """Revise a summary to close the evaluator's reported gaps.
+
+    Source is supplied out-of-band via the router's `cache_prefix`.
+    """
     user = (
         "Revise the summary to fix the evaluator's findings.\n\n"
         "Rules:\n"
@@ -2336,9 +2340,8 @@ def summary_revise(
         "LISTS sections (keep all headers, in order).\n"
         "6. Add back any missing regulatory/safety/warning information, any missing "
         "named entities, any missing dates, and any missing list items.\n\n"
-        "ORIGINAL SOURCE CHUNK:\n"
-        + source_text
-        + "\n\nCURRENT SUMMARY:\n"
+        "Use the ORIGINAL SOURCE CHUNK provided in the system context above.\n\n"
+        "CURRENT SUMMARY:\n"
         + summary_text
         + "\n\nEVALUATOR FINDINGS:\n"
         + evaluation_json

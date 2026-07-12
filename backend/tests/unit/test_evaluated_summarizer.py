@@ -86,8 +86,16 @@ def test_summarizer_prompts_registered() -> None:
     for k in ("evaluated_summary_chunk", "summary_question_gen",
               "summary_evaluate", "summary_revise"):
         assert k in PROMPTS
-    s, u = PROMPTS["evaluated_summary_chunk"]("hello source")
-    assert "CLAIMS" in s and "hello source" in u
+    # Source is supplied out-of-band via the router's cache_prefix (a cached
+    # leading block), so the builders take no source arg and reference the source
+    # in the system context rather than inlining it.
+    s, u = PROMPTS["evaluated_summary_chunk"]()
+    assert "CLAIMS" in u and "SOURCE CHUNK provided in the system context above" in u
+    _qs, qu = PROMPTS["summary_question_gen"](5)
+    assert "SOURCE TEXT provided in the system context above" in qu
+    _rs, ru = PROMPTS["summary_revise"]("CURRENT SUMMARY", '{"passed": false}')
+    assert "ORIGINAL SOURCE CHUNK provided in the system context above" in ru
+    assert "CURRENT SUMMARY" in ru
 
 
 def test_evaluated_result_to_chunks() -> None:

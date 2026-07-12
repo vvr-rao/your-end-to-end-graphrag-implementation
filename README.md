@@ -143,6 +143,52 @@ Documents above `chunking.summarization_threshold_tokens` (default 2,000 tokens 
 
 The prompt lives in `document_summarize` at [prompts.py:711-792](backend/app/services/prompts.py#L711-L792). After editing, **bump `_DOC_SUMMARY_PROMPT_VERSION`** at [pipeline_llm.py:1518](backend/app/services/pipeline_llm.py#L1518) to invalidate the on-disk summary cache so old summaries get regenerated under the new rules.
 
+## Summarization model comparison
+
+The summarizer model is the dominant cost driver of ingestion, so we benchmarked several candidates on the **evaluated (near-lossless) summarizer** path.
+
+**Test set** — 3 representative real-world documents, one from each of the corpora YEGI targets:
+
+- **EDGAR** — a SEC annual-report filing (10-K), ~147K tokens (dense financial tables + MD&A).
+- **DailyMed** — an FDA structured drug label, ~17K tokens (clinical/regulatory prose).
+- **Web** — a public industry report (IEA-style market outlook), ~98K tokens.
+
+Total **261,984 source tokens → 24 windows** of 12K tokens each, `eval_rounds=3`. Metrics:
+
+- **Compression** = `1 − summary_tokens / source_tokens` (higher = more redundancy removed; the goal is dedup, *not* data loss).
+- **Evaluator pass** = fraction of windows whose summary satisfied the strict 12-question, source-derived preservation check within the 3-revision budget (a self-graded proxy for fidelity).
+- **Corpus est.** = projected cost on a ~4.84M-token corpus.
+
+| Model | Provider | Cost (3 docs) | Corpus est. | Compression | Evaluator pass | Verdict |
+|---|---|--:|--:|--:|--:|---|
+| gpt-4.1 | OpenAI | ~$6.5 † | ~$120–150 | high | baseline | Original. Strong, but ~6–7× the cost of mini. |
+| gpt-4o-mini | OpenAI | ‡ | ~$11 | — | — | Cheapest, but **rejected**: weaker instruction-following, drops the required section structure. |
+| **gpt-4.1-mini** | **OpenAI** | **$1.04** | **~$20** | **67%** | **17/24 (71%)** | **✅ Best** — cheap, faithful, compact, no truncation. |
+| gpt-5.4-mini | OpenAI | $4.33–4.75 | ~$80–88 | 19–29% | 13–17/24 | Verbose; ~4× the cost with **no fidelity gain** over 4.1-mini. |
+| Haiku 4.5 | Anthropic | $6.70–7.28 | ~$135 | 18–36% ¶ | 4–8/24 | **Worst**: expands output (larger than source on some docs), lowest fidelity, rate-limit-bound. |
+| Claude Sonnet 4.6 | Anthropic | ‡ | ~$120 | ~48% (full corpus) | works well | **Anthropic-mode default** — solid, but Anthropic-tier priced. |
+
+† estimated (not run head-to-head on the 3 docs). ‡ not part of the 3-doc benchmark: gpt-4o-mini was ruled out earlier for weaker instruction-following; Sonnet 4.6 is validated by a full end-to-end Anthropic-mode corpus run (~48% compression, works well). ¶ negative compression (summary *larger* than source) on 2 of 3 docs once output caps were raised — the revise-to-add loop makes Haiku bloat rather than summarize.
+
+Summarization also uses **provider prompt caching** — the 12K source block is cached and reused across each window's summarize / question-gen / revise calls (OpenAI's automatic prefix cache at 0.5×; Anthropic's explicit `cache_control` at 0.1× read), which cuts summarizer input cost. This runs automatically in both `prune-expand` and `register-documents`.
+
+### Recommendation
+
+**For the best results, use `gpt-4.1-mini` for summarization** (the default in the OpenAI-only and Groq+OpenAI presets) **together with the full-text chunk workflow** on the downstream stages:
+
+```bash
+# Ingest: summary chunks (gpt-4.1-mini) for cheap vector retrieval + embedding,
+# AND verbatim full-text chunks so extraction runs against the complete source.
+uv run python -m backend.app.cli register-documents --full-text-chunks --documents-dir source_documents/<corpus>
+
+# Downstream stages mine the verbatim full-text chunks (not the compressed summary):
+uv run python -m backend.app.cli enrich-time        --from-fulltext
+uv run python -m backend.app.cli extract-entities   --from-fulltext
+uv run python -m backend.app.cli generate-artifacts --from-fulltext
+```
+
+Why this combo wins: gpt-4.1-mini produces near-lossless, section-structured summaries at ~1/6–1/7 the cost of gpt-4.1 — ideal for the embedded/retrieved layer — while `--full-text-chunks` + `--from-fulltext` run entity extraction, temporal enrichment, and artifact generation against the **complete original text** instead of the compressed summary, maximizing extraction fidelity. **Trade-off:** full-text chunks increase DB size — mind the 500 MB Supabase free-tier cap and smoke-test with `db-size` before a full run. (Anthropic-only mode keeps Claude Sonnet 4.6 as the summarizer; embeddings are always OpenAI.)
+
 ## Usage guide
 
 ### 1. Clone + install

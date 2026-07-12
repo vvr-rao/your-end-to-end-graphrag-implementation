@@ -34,6 +34,11 @@ class ChatResult:
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     cost_usd: float | None = None
+    # Prompt-cache accounting (best-effort; providers that support caching populate
+    # these). cache_read_tokens = input tokens served from cache (cheap);
+    # cache_write_tokens = input tokens written to cache (small premium).
+    cache_read_tokens: int | None = None
+    cache_write_tokens: int | None = None
 
 
 class Provider(Protocol):
@@ -49,6 +54,7 @@ class Provider(Protocol):
         max_tokens: int,
         timeout: int,
         response_format: str | None,
+        cache_prefix: str | None = None,
     ) -> ChatResult: ...
 
 
@@ -57,6 +63,8 @@ class Provider(Protocol):
 # because its price isn't here (defaults to 0 cost in that case).
 _PRICING_PER_1K = {
     "gpt-4.1": (0.0025, 0.010),
+    "gpt-4.1-mini": (0.0004, 0.0016),
+    "gpt-5.4-mini": (0.00075, 0.0045),
     "gpt-4o": (0.0025, 0.010),
     "gpt-4o-mini": (0.00015, 0.00060),
     "llama-3.3-70b-versatile": (0.00059, 0.00079),
@@ -68,13 +76,30 @@ _PRICING_PER_1K = {
 }
 
 
-def _estimate_cost(model: str, prompt_tokens: int | None, completion_tokens: int | None) -> float | None:
-    if prompt_tokens is None and completion_tokens is None:
+def _estimate_cost(
+    model: str,
+    prompt_tokens: int | None,
+    completion_tokens: int | None,
+    *,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    cache_read_mult: float = 0.1,
+    cache_write_mult: float = 1.25,
+) -> float | None:
+    """Rough cost. `prompt_tokens` is the FULL-PRICE (uncached) input; cache_read /
+    cache_write are billed at their provider multipliers (Anthropic: 0.1x read /
+    1.25x write; OpenAI: 0.5x read / 1.0x write). Callers pass the split + mults."""
+    if prompt_tokens is None and completion_tokens is None and not cache_read_tokens and not cache_write_tokens:
         return None
     if model not in _PRICING_PER_1K:
         return 0.0
     in_price, out_price = _PRICING_PER_1K[model]
-    return ((prompt_tokens or 0) / 1000.0) * in_price + ((completion_tokens or 0) / 1000.0) * out_price
+    return (
+        ((prompt_tokens or 0) / 1000.0) * in_price
+        + (cache_read_tokens / 1000.0) * in_price * cache_read_mult
+        + (cache_write_tokens / 1000.0) * in_price * cache_write_mult
+        + ((completion_tokens or 0) / 1000.0) * out_price
+    )
 
 
 class OpenAIProvider:
@@ -91,11 +116,17 @@ class OpenAIProvider:
         max_tokens: int,
         timeout: int,
         response_format: str | None,
+        cache_prefix: str | None = None,
     ) -> ChatResult:
+        # Tier A -- source-first ordering. OpenAI AUTOMATICALLY caches identical
+        # leading prefixes (>=1024 tokens); putting the large stable source before
+        # the (varying) task instruction lets that source be reused across a
+        # window's calls at 0.5x input price. No explicit cache_control needed.
+        sys_content = f"{cache_prefix}\n\n===END SOURCE===\n\n{system}" if cache_prefix else system
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": [
-                {"role": "system", "content": system},
+                {"role": "system", "content": sys_content},
                 {"role": "user", "content": user},
             ],
             "temperature": temperature,
@@ -110,13 +141,23 @@ class OpenAIProvider:
         usage = resp.usage
         prompt_tokens = getattr(usage, "prompt_tokens", None) if usage else None
         completion_tokens = getattr(usage, "completion_tokens", None) if usage else None
+        details = getattr(usage, "prompt_tokens_details", None) if usage else None
+        cached = (getattr(details, "cached_tokens", 0) or 0) if details is not None else 0
+        uncached = (prompt_tokens or 0) - cached
         return ChatResult(
             text=text,
             model=model,
             provider="openai",
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
-            cost_usd=_estimate_cost(model, prompt_tokens, completion_tokens),
+            cache_read_tokens=cached,
+            cache_write_tokens=0,
+            # OpenAI cached input is billed at 0.5x, no write premium.
+            cost_usd=_estimate_cost(
+                model, uncached, completion_tokens,
+                cache_read_tokens=cached, cache_read_mult=0.5,
+                cache_write_tokens=0, cache_write_mult=1.0,
+            ),
         )
 
 
@@ -134,11 +175,15 @@ class GroqProvider:
         max_tokens: int,
         timeout: int,
         response_format: str | None,
+        cache_prefix: str | None = None,
     ) -> ChatResult:
+        # Groq has no prompt caching; keep source-first ordering for correctness
+        # (harmless -- no cost benefit).
+        sys_content = f"{cache_prefix}\n\n===END SOURCE===\n\n{system}" if cache_prefix else system
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": [
-                {"role": "system", "content": system},
+                {"role": "system", "content": sys_content},
                 {"role": "user", "content": user},
             ],
             "temperature": temperature,
@@ -211,6 +256,7 @@ class AnthropicProvider:
         max_tokens: int,
         timeout: int,
         response_format: str | None,
+        cache_prefix: str | None = None,
     ) -> ChatResult:
         # Anthropic takes the system prompt as a top-level arg, not a message.
         sys_prompt = system
@@ -219,10 +265,22 @@ class AnthropicProvider:
                 f"{system}\n\nOutput only a single valid JSON object. "
                 "Do not include any prose, explanation, or markdown code fences."
             )
+        # Tier B -- explicit prompt caching. Anthropic has NO automatic cache, so
+        # place the large stable source as a leading system block with
+        # cache_control; the (varying) task instruction is a second, uncached
+        # block AFTER the breakpoint, so the cached [source] prefix hits across a
+        # window's calls (summarize / question-gen / revise) within the 5-min TTL.
+        if cache_prefix:
+            kwargs_system: Any = [
+                {"type": "text", "text": cache_prefix, "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": sys_prompt},
+            ]
+        else:
+            kwargs_system = sys_prompt
         kwargs: dict[str, Any] = {
             "model": model,
             "max_tokens": max_tokens,
-            "system": sys_prompt,
+            "system": kwargs_system,
             "messages": [{"role": "user", "content": user}],
             "timeout": timeout,
         }
@@ -238,15 +296,24 @@ class AnthropicProvider:
         if response_format == "json_object":
             text = _strip_json_fences(text)
         usage = resp.usage
+        # Anthropic reports uncached input separately from cache read/write.
         prompt_tokens = getattr(usage, "input_tokens", None) if usage else None
         completion_tokens = getattr(usage, "output_tokens", None) if usage else None
+        cache_write = (getattr(usage, "cache_creation_input_tokens", 0) or 0) if usage else 0
+        cache_read = (getattr(usage, "cache_read_input_tokens", 0) or 0) if usage else 0
         return ChatResult(
             text=text,
             model=model,
             provider="anthropic",
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
-            cost_usd=_estimate_cost(model, prompt_tokens, completion_tokens),
+            cache_read_tokens=cache_read,
+            cache_write_tokens=cache_write,
+            # Anthropic: read 0.1x, write 1.25x (the _estimate_cost defaults).
+            cost_usd=_estimate_cost(
+                model, prompt_tokens, completion_tokens,
+                cache_read_tokens=cache_read, cache_write_tokens=cache_write,
+            ),
         )
 
 
@@ -283,7 +350,9 @@ class LLMRouter:
             raise KeyError(f"Unknown task: {task}. Available: {sorted(self._tasks)}")
         return self._tasks[task]
 
-    async def chat(self, task: str, *, system: str, user: str) -> ChatResult:
+    async def chat(
+        self, task: str, *, system: str, user: str, cache_prefix: str | None = None
+    ) -> ChatResult:
         spec = self.task_spec(task)
         provider_name = spec["provider"]
         if provider_name not in self._providers:
@@ -292,7 +361,7 @@ class LLMRouter:
                 f"Check that {provider_name.upper()}_API_KEY is set."
             )
         provider = self._providers[provider_name]
-        retryer = self._make_retryer()
+        retryer = self._make_retryer(task, provider_name, spec.get("model", ""))
 
         async for attempt in retryer:
             with attempt:
@@ -304,19 +373,39 @@ class LLMRouter:
                     max_tokens=int(spec.get("max_tokens", 4096)),
                     timeout=int(spec.get("timeout", 120)),
                     response_format=spec.get("response_format"),
+                    cache_prefix=cache_prefix,
                 )
                 if result.cost_usd:
                     self._total_cost_usd += result.cost_usd
                 return result
         raise RuntimeError(f"LLM call for task '{task}' exhausted retries")
 
-    def _make_retryer(self) -> tenacity.AsyncRetrying:
+    def _make_retryer(
+        self, task: str = "", provider: str = "", model: str = ""
+    ) -> tenacity.AsyncRetrying:
+        max_attempts = int(self._retry.get("max_attempts", 5))
+
+        def _log_retry(retry_state: tenacity.RetryCallState) -> None:
+            # Surface otherwise-silent transient failures + backoff — especially
+            # provider 429 rate limits (e.g. Anthropic RateLimitError) that made a
+            # run look "stuck" with no visibility. `before_sleep` fires only when a
+            # retry is scheduled. WARNING level so it shows without explicit logging
+            # config (Python's last-resort handler prints WARNING+ to stderr).
+            exc = retry_state.outcome.exception() if retry_state.outcome else None
+            sleep_s = getattr(retry_state.next_action, "sleep", 0.0)
+            log.warning(
+                "retry task=%s provider=%s model=%s attempt=%d/%d err=%s wait=%.1fs",
+                task, provider, model, retry_state.attempt_number, max_attempts,
+                (f"{type(exc).__name__}: {exc}"[:160] if exc else "?"), sleep_s,
+            )
+
         return tenacity.AsyncRetrying(
-            stop=tenacity.stop_after_attempt(int(self._retry.get("max_attempts", 5))),
+            stop=tenacity.stop_after_attempt(max_attempts),
             wait=tenacity.wait_exponential(
                 multiplier=float(self._retry.get("initial_wait_seconds", 1)),
                 max=float(self._retry.get("max_wait_seconds", 30)),
             ),
             retry=tenacity.retry_if_exception_type(Exception),
             reraise=True,
+            before_sleep=_log_retry,
         )
