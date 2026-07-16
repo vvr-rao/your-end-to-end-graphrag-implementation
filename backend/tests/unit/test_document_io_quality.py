@@ -57,3 +57,48 @@ def test_whitespace_free_text_is_not_flagged() -> None:
     perfectly readable. Word-break heuristics flagged it; legibility must not."""
     nbsp_text = HEALTHY.replace(" ", "\xa0")
     assert check_extraction_quality(Path("tsla.pdf"), nbsp_text) is None
+
+
+def test_load_document_warns_on_garbled_pdf(tmp_path, capsys, monkeypatch) -> None:
+    """The guard must fire on load_document() -- the function the streaming
+    loaders (prune-expand, register-documents) actually call per path. It was
+    originally only in load_documents(), which those paths never touch, so the
+    real ingestion routes were unguarded."""
+    from backend.app.services import document_io
+
+    document_io._WARNED_UNREADABLE.clear()
+    p = tmp_path / "garbled.pdf"
+    p.write_bytes(b"%PDF-1.6 fake")
+    monkeypatch.setattr(document_io, "read_pdf", lambda _p: GARBLED)
+
+    doc = document_io.load_document(p)
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "does not look like language" in out
+    assert doc.text == GARBLED  # still returned; caller decides
+
+
+def test_load_document_warns_only_once_per_path(tmp_path, capsys, monkeypatch) -> None:
+    """Batched/streamed loaders re-load the same doc; don't spam the log."""
+    from backend.app.services import document_io
+
+    document_io._WARNED_UNREADABLE.clear()
+    p = tmp_path / "garbled2.pdf"
+    p.write_bytes(b"%PDF-1.6 fake")
+    monkeypatch.setattr(document_io, "read_pdf", lambda _p: GARBLED)
+
+    document_io.load_document(p)
+    capsys.readouterr()
+    document_io.load_document(p)
+    assert "WARNING" not in capsys.readouterr().out
+
+
+def test_load_document_silent_on_healthy_pdf(tmp_path, capsys, monkeypatch) -> None:
+    from backend.app.services import document_io
+
+    document_io._WARNED_UNREADABLE.clear()
+    p = tmp_path / "good.pdf"
+    p.write_bytes(b"%PDF-1.6 fake")
+    monkeypatch.setattr(document_io, "read_pdf", lambda _p: HEALTHY)
+
+    document_io.load_document(p)
+    assert "WARNING" not in capsys.readouterr().out

@@ -122,13 +122,41 @@ def read_pdf(path: Path) -> str:
     return "\n\n".join(pages)
 
 
-def load_document(path: Path) -> LoadedDocument:
+def load_document(path: Path, *, warn_unreadable: bool = True) -> LoadedDocument:
+    """Load one document. Warns (once per path) when the extracted text is not
+    language -- see check_extraction_quality.
+
+    The guard lives HERE, not only in `load_documents`, because the streaming
+    loaders that every large-corpus path uses call this function per path and
+    never touch the directory walker. Putting the check only in the walker left
+    the real ingestion routes unguarded.
+    """
     suffix = path.suffix.lower()
     if suffix == ".pdf":
-        return LoadedDocument(path=path, text=read_pdf(path))
-    if suffix == ".txt":
-        return LoadedDocument(path=path, text=read_text_file(path))
-    raise ValueError(f"Unsupported document type: {path} (expected .pdf or .txt)")
+        doc = LoadedDocument(path=path, text=read_pdf(path))
+    elif suffix == ".txt":
+        doc = LoadedDocument(path=path, text=read_text_file(path))
+    else:
+        raise ValueError(f"Unsupported document type: {path} (expected .pdf or .txt)")
+    if warn_unreadable:
+        _warn_once_if_unreadable(path, doc.text)
+    return doc
+
+
+# Paths already warned about, so a doc re-loaded across stages/batches does not
+# spam the log.
+_WARNED_UNREADABLE: set[str] = set()
+
+
+def _warn_once_if_unreadable(path: Path, text: str) -> str | None:
+    key = str(path)
+    if key in _WARNED_UNREADABLE:
+        return None
+    warning = check_extraction_quality(path, text)
+    if warning:
+        _WARNED_UNREADABLE.add(key)
+        print(f"[document_io] WARNING: {warning}")
+    return warning
 
 
 def load_documents(documents_dir: Path) -> Iterator[LoadedDocument]:
@@ -143,17 +171,17 @@ def load_documents(documents_dir: Path) -> Iterator[LoadedDocument]:
     unreadable: list[str] = []
     for path in iter_documents(documents_dir):
         try:
-            doc = load_document(path)
+            # load_document already warns once per path; capture the verdict here
+            # for the end-of-walk summary without emitting a second message.
+            doc = load_document(path, warn_unreadable=False)
         except Exception as exc:
             print(f"[document_io] skipping {path}: {exc}")
             continue
         if not doc.text.strip():
             print(f"[document_io] skipping {path}: no extractable text")
             continue
-        warning = check_extraction_quality(path, doc.text)
-        if warning:
+        if _warn_once_if_unreadable(path, doc.text) is not None:
             unreadable.append(path.name)
-            print(f"[document_io] WARNING: {warning}")
         yield doc
 
     if unreadable:
