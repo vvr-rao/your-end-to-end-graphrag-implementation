@@ -1771,6 +1771,27 @@ def recommendation_gen(
     return system, user
 
 
+# The 9 canonical Summary sections, in order -- kept in sync with the per-doc
+# evaluated summarizer (evaluated_summary_chunk). Summary ROLLUPS must preserve
+# this same structure; a merged Summary missing any header is treated as
+# incomplete (see db_artifact_rollup's deterministic coverage guard).
+_SUMMARY_ROLLUP_FORMAT_RULE = (
+    "  - OUTPUT FORMAT: the merged Summary MUST stay section-structured. Emit "
+    "ALL of these headers, each on its own line, in this EXACT order, even when "
+    "a section is empty:\n"
+    "        CLAIMS\n        EVIDENCE\n        FINDINGS\n        OBSERVATIONS\n"
+    "        EVENTS\n        ENTITIES\n        DATES\n"
+    "        REGULATORY / SAFETY / WARNINGS\n        LISTS\n"
+    "    Under each header, merge the corresponding content from EVERY input "
+    "summary (dedup within the section). If a section has no content across all "
+    "inputs, still emit its header and write 'None identified.'\n"
+)
+_MERGE_PROSE_RULE = (
+    "  - Neutral third-person prose. Do NOT invent anything not present in the "
+    "inputs.\n"
+)
+
+
 def artifact_merge(
     artifact_type: str, child_texts: list[str]
 ) -> tuple[str, str]:
@@ -1807,8 +1828,8 @@ def artifact_merge(
         "  - If two inputs CONFLICT (different numbers/claims for the same "
         "thing), keep BOTH and note the discrepancy; do not pick one or "
         "average them.\n"
-        "  - Neutral third-person prose. Do NOT invent anything not present "
-        "in the inputs.\n\n"
+        + (_SUMMARY_ROLLUP_FORMAT_RULE if artifact_type == "Summary" else _MERGE_PROSE_RULE)
+        + "\n"
         "Return ONLY JSON: {\"text\": \"<the merged statement>\", "
         "\"confidence\": <float 0-1>}. `confidence` should reflect the "
         "strongest support across the merged items."
@@ -1842,7 +1863,12 @@ def artifact_merge_evaluate(
         "  - A pure rephrasing (same fact, different wording) is NOT a loss -- do "
         "NOT flag it. Only flag information that is genuinely absent or changed.\n"
         "  - A numeric/name/date that appears in a source item but nowhere in the "
-        "merged text IS a loss -- flag it verbatim.\n\n"
+        "merged text IS a loss -- flag it verbatim.\n"
+        + ("  - The merged text is a SUMMARY and MUST keep all 9 section headers "
+           "(CLAIMS, EVIDENCE, FINDINGS, OBSERVATIONS, EVENTS, ENTITIES, DATES, "
+           "REGULATORY / SAFETY / WARNINGS, LISTS). Flag any MISSING header as a "
+           "missing item.\n" if artifact_type == "Summary" else "")
+        + "\n"
         "Return ONLY JSON: {\"complete\": true|false, \"missing_items\": "
         "[\"<the exact fact/entity/number/date/list-item that is missing or "
         "distorted>\", ...]}. `complete` is true (and missing_items empty) ONLY "
@@ -1875,7 +1901,11 @@ def artifact_merge_revise(
         "drop or shorten any existing fact.\n"
         "  - Still remove only exact/near-exact duplicate restatements. "
         "Completeness OVERRIDES brevity; the output may be long.\n"
-        "  - Neutral third-person prose. Do NOT invent anything not in the sources.\n\n"
+        + (_SUMMARY_ROLLUP_FORMAT_RULE + "  - Do NOT invent anything not in the "
+           "sources.\n" if artifact_type == "Summary"
+           else "  - Neutral third-person prose. Do NOT invent anything not in "
+                "the sources.\n")
+        + "\n"
         "Return ONLY JSON: {\"text\": \"<the revised merged statement>\", "
         "\"confidence\": <float 0-1>}."
     )
@@ -1967,10 +1997,21 @@ def table_extract_vision(
     fills those in deterministically). Corpus-agnostic.
     """
     system = (
-        "You extract structured tabular data from an image of a single "
-        "table that has been cropped out of a PDF page. The table may "
-        "contain multi-row headers, merged cells, or nested sub-tables. "
-        "Output strictly valid JSON in this exact shape:\n"
+        "You extract structured tabular data from an image cropped out of a PDF "
+        "page. The crop USUALLY contains one table (possibly with multi-row "
+        "headers, merged cells, or nested sub-tables) -- but the table detector "
+        "is imperfect, so it sometimes hands you a crop with NO table in it: "
+        "running prose, a page fragment, a heading, a chart, or blank space.\n\n"
+        "IF THE IMAGE DOES NOT CONTAIN A REAL TABLE, or you cannot read its "
+        "cells with confidence, you MUST return exactly:\n"
+        '{"no_table": true}\n'
+        "and nothing else. This is a CORRECT, EXPECTED answer -- it is always "
+        "better than guessing. NEVER invent columns, rows, or values that you "
+        "cannot actually read in the image. NEVER emit placeholder or example "
+        "data (e.g. 'Category A'/'Category B', round illustrative figures, or a "
+        "plausible-looking table of a kind you would expect on such a page). "
+        "Every value you output must be legible in the image itself.\n\n"
+        "Otherwise, output strictly valid JSON in this exact shape:\n"
         "{\n"
         '  "caption": "<short caption / heading describing the table, '
         'or null if absent>",\n'
@@ -2008,7 +2049,9 @@ def table_extract_vision(
         "them as cellValue strings.\n"
         "  6. Every cell's columnIndex must reference a real column "
         "from the columns list.\n"
-        "  7. No prose, no markdown, no comments — JSON only."
+        "  7. No prose, no markdown, no comments — JSON only.\n"
+        '  8. Transcribe ONLY what is visible. If in doubt, return '
+        '{"no_table": true} rather than a guess.'
     )
     bits: list[str] = []
     if page_number is not None:
@@ -2016,7 +2059,8 @@ def table_extract_vision(
     if caption_hint:
         bits.append(f"caption_hint (from heading above the table): {caption_hint}")
     user = (
-        "Extract the table from the attached image as JSON per the rules.\n"
+        "Extract the table from the attached image as JSON per the rules. "
+        'If the image contains no readable table, return {"no_table": true}.\n'
         + ("\n".join(bits) + "\n\n" if bits else "")
         + "Return the JSON object only."
     )
@@ -2223,10 +2267,16 @@ Do not add external knowledge.
 """.strip()
 
 
-def evaluated_summary_chunk(source_text: str) -> tuple[str, str]:
-    """Near-lossless, section-structured summary of one source chunk."""
+def evaluated_summary_chunk() -> tuple[str, str]:
+    """Near-lossless, section-structured summary of one source chunk.
+
+    The source is supplied out-of-band as the router's `cache_prefix` (a cached
+    leading block) so it is reused across a window's calls at cache-read price;
+    this builder carries only the instruction and references the source above.
+    """
     user = (
-        "Summarize the source chunk below using lossless compression.\n\n"
+        "Summarize the SOURCE CHUNK provided in the system context above using "
+        "lossless compression.\n\n"
         "Rules:\n"
         "1. Preserve ALL distinct information.\n"
         "2. Remove only duplicate or redundant wording.\n"
@@ -2251,14 +2301,12 @@ def evaluated_summary_chunk(source_text: str) -> tuple[str, str]:
         "named study. DATES must capture every distinct date, date range, fiscal "
         "period, or deadline. LISTS must confirm every source list/table/enumeration "
         'is represented (enumerate them or state "all list items preserved above").\n\n'
-        "Return only the compressed summary.\n\n"
-        "SOURCE CHUNK:\n"
-        + source_text
+        "Return only the compressed summary."
     )
     return _SUMMARIZER_SYSTEM, user
 
 
-def summary_question_gen(num_questions: int, source_text: str) -> tuple[str, str]:
+def summary_question_gen(num_questions: int) -> tuple[str, str]:
     """Generate source-derived coverage questions (JSON) used to audit the summary."""
     system = (
         "You are an evaluator that tests whether a summary preserved all source "
@@ -2269,7 +2317,8 @@ def summary_question_gen(num_questions: int, source_text: str) -> tuple[str, str
         "completeness of lists. Do not ask questions that require external knowledge."
     )
     user = (
-        f"Generate {num_questions} high-coverage questions from the source text.\n"
+        f"Generate {num_questions} high-coverage questions from the SOURCE TEXT "
+        "provided in the system context above.\n"
         "Include questions that test the explicit CLAIMS, EVIDENCE, FINDINGS, "
         "OBSERVATIONS, EVENTS, ENTITIES (named people/organizations/products/"
         "jurisdictions), DATES (specific dates, ranges, fiscal periods), regulatory/"
@@ -2278,9 +2327,7 @@ def summary_question_gen(num_questions: int, source_text: str) -> tuple[str, str
         "at least one probes whether specific dates are preserved, when the source "
         "contains them.\n"
         'Return valid JSON only, with this schema:\n'
-        '{"questions": [{"question": "...", "expected_answer": "..."}]}\n\n'
-        "SOURCE TEXT:\n"
-        + source_text
+        '{"questions": [{"question": "...", "expected_answer": "..."}]}'
     )
     return system, user
 
@@ -2320,10 +2367,11 @@ def summary_evaluate(questions_json: str, summary_text: str) -> tuple[str, str]:
     return system, user
 
 
-def summary_revise(
-    source_text: str, summary_text: str, evaluation_json: str
-) -> tuple[str, str]:
-    """Revise a summary to close the evaluator's reported gaps."""
+def summary_revise(summary_text: str, evaluation_json: str) -> tuple[str, str]:
+    """Revise a summary to close the evaluator's reported gaps.
+
+    Source is supplied out-of-band via the router's `cache_prefix`.
+    """
     user = (
         "Revise the summary to fix the evaluator's findings.\n\n"
         "Rules:\n"
@@ -2336,9 +2384,8 @@ def summary_revise(
         "LISTS sections (keep all headers, in order).\n"
         "6. Add back any missing regulatory/safety/warning information, any missing "
         "named entities, any missing dates, and any missing list items.\n\n"
-        "ORIGINAL SOURCE CHUNK:\n"
-        + source_text
-        + "\n\nCURRENT SUMMARY:\n"
+        "Use the ORIGINAL SOURCE CHUNK provided in the system context above.\n\n"
+        "CURRENT SUMMARY:\n"
         + summary_text
         + "\n\nEVALUATOR FINDINGS:\n"
         + evaluation_json

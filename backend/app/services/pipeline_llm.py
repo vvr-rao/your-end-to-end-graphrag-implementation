@@ -2589,6 +2589,14 @@ async def _run(
 
     router = LLMRouter(settings)
 
+    # Pre-flight: surface unreadable documents BEFORE the first paid stage.
+    # Text extraction can yield confident gibberish (subsetted /Type0 fonts with
+    # no /ToUnicode CMap), and every downstream stage will happily pay to process
+    # it. The check is local CPU only -- no LLM, page-sampled -- so it costs
+    # seconds and can save an entire run.
+    if documents_dir.exists():
+        document_io.preflight_documents(documents_dir)
+
     # Phase 2a v2 (Option B): table extraction runs in PER-PDF SUBPROCESS
     # workers. Each worker exits before the next starts, so the kernel
     # reclaims all per-PDF memory unconditionally and the parent process
@@ -2798,4 +2806,23 @@ async def _run(
             "llm_total_cost_usd": round(router.total_cost_usd, 6),
         },
     )
+    # Per-task spend breakdown. manifest/stats already carry the TOTAL, but a
+    # total alone can't answer "where did the money go?" after the fact -- and at
+    # tens of dollars a run, that is the question worth answering.
+    versioning.write_cost_report(version_dir, router.cost_report())
+    _print_cost_summary(router)
     return version_dir
+
+
+def _print_cost_summary(router: LLMRouter) -> None:
+    """Print the run's spend, biggest task first, so it is visible without
+    digging through the run folder."""
+    rep = router.cost_report()
+    by_task = rep["by_task"]
+    print(f"\n[cost] LLM total: ${rep['total_cost_usd']:.2f} "
+          f"across {rep['total_calls']:,} calls "
+          f"(prompt-cache hit {rep['prompt_cache']['cache_hit_rate'] * 100:.0f}%)")
+    for task, row in list(by_task.items())[:8]:
+        share = (row["cost_usd"] / rep["total_cost_usd"] * 100) if rep["total_cost_usd"] else 0.0
+        print(f"[cost]   ${row['cost_usd']:>7.2f}  {share:>4.0f}%  {row['calls']:>4} call(s)  "
+              f"{task} ({row['model']})")

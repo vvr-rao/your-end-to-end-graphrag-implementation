@@ -81,6 +81,12 @@ def write_stats(version_dir: Path, stats: dict[str, Any]) -> None:
     (version_dir / "stats.json").write_text(json.dumps(stats, indent=2))
 
 
+def write_cost_report(version_dir: Path, report: dict[str, Any]) -> None:
+    """Persist the run's LLM spend broken down per task (see LLMRouter.cost_report).
+    stats/manifest carry only the total; this answers where the money went."""
+    (version_dir / "cost.json").write_text(json.dumps(report, indent=2))
+
+
 def ensure_audit_log(version_dir: Path) -> Path:
     """Create an empty llm_audit.jsonl so downstream tooling can rely on the file
     existing even for LLM-free operations (merge)."""

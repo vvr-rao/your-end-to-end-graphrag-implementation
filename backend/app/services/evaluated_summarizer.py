@@ -189,15 +189,21 @@ async def _summarize_chunk_with_eval(
 ) -> tuple[str, dict[str, Any]]:
     """Summarize one source window with the question/evaluate/revise loop.
     Returns (summary, audit)."""
-    sys_p, usr_p = PROMPTS["evaluated_summary_chunk"](source_text)
-    out = await router.chat("evaluated_summary_chunk", system=sys_p, user=usr_p)
+    sys_p, usr_p = PROMPTS["evaluated_summary_chunk"]()
+    # Source goes as cache_prefix (cached leading block) -- reused across this
+    # window's summarize/question-gen/revise calls at cache-read price.
+    out = await router.chat(
+        "evaluated_summary_chunk", system=sys_p, user=usr_p, cache_prefix=source_text
+    )
     summary = (out.text or "").strip()
 
     # Generate the question set once; reuse across rounds so each round checks
     # whether the previous revision actually closed the gaps.
-    qsys, qusr = PROMPTS["summary_question_gen"](num_questions, source_text)
+    qsys, qusr = PROMPTS["summary_question_gen"](num_questions)
     try:
-        q_out = await router.chat("summary_question_gen", system=qsys, user=qusr)
+        q_out = await router.chat(
+            "summary_question_gen", system=qsys, user=qusr, cache_prefix=source_text
+        )
         questions = _extract_json(q_out.text) or {"questions": []}
     except Exception as exc:
         return summary, {"passed": None, "rounds": 0, "error": f"question_gen: {exc!r}"}
@@ -227,10 +233,12 @@ async def _summarize_chunk_with_eval(
             break
         missing_total += len(missing)
         rsys, rusr = PROMPTS["summary_revise"](
-            source_text, summary, json.dumps(evaluation, ensure_ascii=False)
+            summary, json.dumps(evaluation, ensure_ascii=False)
         )
         try:
-            r_out = await router.chat("summary_revise", system=rsys, user=rusr)
+            r_out = await router.chat(
+                "summary_revise", system=rsys, user=rusr, cache_prefix=source_text
+            )
             revised = (r_out.text or "").strip()
             if revised:
                 summary = revised
@@ -309,6 +317,8 @@ async def evaluated_summarize_documents_async(
     enc = get_encoder(encoding_name)
     model = router.task_spec("evaluated_summary_chunk").get("model", "")
     cost_before = router.total_cost_usd
+    cache_read_before = router.cache_read_tokens
+    input_before = router.total_input_tokens
     cost_hit = asyncio.Event()
     sem = asyncio.Semaphore(concurrency)
     cache_dir = _cache_dir() if use_cache else None
@@ -342,23 +352,60 @@ async def evaluated_summarize_documents_async(
                 )
 
         windows = _token_windows(doc.text, max_chunk_tokens, overlap_tokens, enc)
-        window_summaries: list[str] = []
-        audits: list[dict[str, Any]] = []
-        for w in windows:
+        n_win = len(windows)
+        print(f"[evaluated-summary] {doc.name}: {n_tok:,} tok -> {n_win} window(s), summarizing...")
+        # Windows are independent: each is summarized standalone and the results are
+        # concatenated in source order below. Run them concurrently (throttled by the
+        # shared `sem`) rather than sequentially, so a single large doc can occupy
+        # several concurrency slots instead of one -- the difference between a 40-window
+        # doc taking hours (serial) vs minutes. Nothing here defends against the process
+        # being SUSPENDED mid-call (asyncio timers use a monotonic clock that freezes
+        # with the process); speed + visible progress just make that state obvious and
+        # short-lived rather than a silent multi-hour stall.
+        summ_by_idx: dict[int, str] = {}
+        audit_by_idx: dict[int, dict[str, Any]] = {}
+        failed_windows = 0
+        done = 0
+
+        async def _run_window(i: int, w: str) -> None:
+            nonlocal failed_windows, done
             if cost_hit.is_set():
-                break
+                return
+            err: Exception | None = None
             async with sem:
                 if cost_hit.is_set():
-                    break
-                summ, audit = await _summarize_chunk_with_eval(
-                    router, w, num_questions=questions_per_chunk, eval_rounds=eval_rounds,
-                )
-            if summ.strip():
-                window_summaries.append(summ)
-                audits.append(audit)
-            if router.total_cost_usd - cost_before > max_cost_usd and not cost_hit.is_set():
+                    return
+                try:
+                    summ, audit = await _summarize_chunk_with_eval(
+                        router, w, num_questions=questions_per_chunk, eval_rounds=eval_rounds,
+                    )
+                except Exception as exc:
+                    # A window whose every retry failed must not take down the document
+                    # or the surrounding gather. It is counted instead: the doc is left
+                    # incomplete below and therefore NOT cached, so a re-run retries it
+                    # rather than serving a summary that silently dropped this window's
+                    # source content.
+                    err = exc
+                    failed_windows += 1
+            if err is None and summ.strip():
+                summ_by_idx[i] = summ
+                audit_by_idx[i] = audit
+            # `done` counts every window that reaches an outcome (ok or failed), so
+            # progress is a single monotonic X/N regardless of completion order.
+            done += 1
+            spent = router.total_cost_usd - cost_before
+            status = (f"FAILED (src window #{i + 1}): {type(err).__name__}: {err}"[:120]
+                      if err is not None else "done")
+            print(f"[evaluated-summary] {doc.name}: window {done}/{n_win} {status} "
+                  f"(${spent:.2f} so far)")
+            if spent > max_cost_usd and not cost_hit.is_set():
                 cost_hit.set()
                 print(f"[evaluated-summary] HALT: cost cap ${max_cost_usd:.2f} reached")
+
+        await asyncio.gather(*[_run_window(i, w) for i, w in enumerate(windows)])
+        # Reassemble in source order (gather completes out of order).
+        window_summaries: list[str] = [summ_by_idx[i] for i in sorted(summ_by_idx)]
+        audits: list[dict[str, Any]] = [audit_by_idx[i] for i in sorted(audit_by_idx)]
 
         # Size-cap: split each window summary on section headers into stored chunks.
         stored: list[str] = []
@@ -375,7 +422,12 @@ async def evaluated_summarize_documents_async(
             )
 
         combined = "\n\n".join(window_summaries)
-        if cache_dir is not None:
+        # Persist only a COMPLETE doc. A partial summary -- a window that failed every
+        # retry, or a cost-cap halt that broke the loop early -- is indistinguishable
+        # from a good one once written, so caching it would make the loss permanent:
+        # every later run takes the cache hit and never re-summarizes the doc.
+        complete = failed_windows == 0 and len(window_summaries) == len(windows)
+        if cache_dir is not None and complete:
             _cache_save(cache_dir / f"{key}.json", stored)
         return EvaluatedDocSummary(
             path=doc.path, chunk_summaries=stored, combined=combined,
@@ -384,6 +436,8 @@ async def evaluated_summarize_documents_async(
                 "summarized": True, "source_tokens": n_tok,
                 "windows": len(windows), "stored_chunks": len(stored),
                 "windows_passed": sum(1 for a in audits if a.get("passed")),
+                "failed_windows": failed_windows,
+                "complete": complete, "cached": complete,
                 "per_window": audits,
             },
         )
@@ -391,9 +445,13 @@ async def evaluated_summarize_documents_async(
     t0 = time.time()
     results = await asyncio.gather(*[_one(d) for d in documents])
     n_sum = sum(1 for r in results if r.summarized)
+    cache_read = router.cache_read_tokens - cache_read_before
+    input_delta = router.total_input_tokens - input_before
+    hit_pct = (100.0 * cache_read / input_delta) if input_delta else 0.0
     print(
         f"[evaluated-summary] {len(results)} doc(s): {n_sum} summarized "
         f"(eval_rounds={eval_rounds}), cost=${router.total_cost_usd - cost_before:.4f}, "
+        f"prompt-cache-hit={hit_pct:.0f}% ({cache_read:,}/{input_delta:,} input tok), "
         f"wall={time.time() - t0:.1f}s"
     )
     return list(results)

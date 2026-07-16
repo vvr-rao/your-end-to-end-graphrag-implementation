@@ -123,27 +123,27 @@ tasks:
   # ---------------------------------------------------------------------------
   evaluated_summary_chunk:
     provider: openai
-    model: gpt-4.1              # groq: llama-3.3-70b-versatile
+    model: gpt-4.1-mini              # groq: llama-3.3-70b-versatile
     timeout: 180
     temperature: 0.0
     max_tokens: 8192
   summary_question_gen:
     provider: openai
-    model: gpt-4.1              # groq: llama-3.3-70b-versatile
+    model: gpt-4.1-mini              # groq: llama-3.3-70b-versatile
     timeout: 120
     temperature: 0.0
     max_tokens: 4096
     response_format: json_object
   summary_evaluate:
     provider: openai
-    model: gpt-4.1              # groq: llama-3.3-70b-versatile
+    model: gpt-4.1-mini              # groq: llama-3.3-70b-versatile
     timeout: 120
     temperature: 0.0
     max_tokens: 4096
     response_format: json_object
   summary_revise:
     provider: openai
-    model: gpt-4.1              # groq: llama-3.3-70b-versatile
+    model: gpt-4.1-mini              # groq: llama-3.3-70b-versatile
     timeout: 180
     temperature: 0.0
     max_tokens: 8192
@@ -405,6 +405,31 @@ tasks:
   # headers / sub-tables). gpt-4o-mini vision suffices: tables are small,
   # the schema is fixed, no synthesis is required.
   # ---------------------------------------------------------------------------
+  # Summary rollup uses a MORE CAPABLE model than the short-artifact merge:
+  # gpt-5.4 gives measurably higher retention on the 9-section Summary,
+  # while Claim/Finding/Observation/Event merges are handled perfectly by
+  # the cheaper artifact_merge* (gpt-4.1) -- so no premium is paid there.
+  summary_merge:
+    provider: openai
+    model: gpt-5.4
+    timeout: 180
+    temperature: 0.2
+    max_tokens: 16384
+    response_format: json_object
+  summary_merge_evaluate:
+    provider: openai
+    model: gpt-5.4
+    timeout: 120
+    temperature: 0.0
+    max_tokens: 8192
+    response_format: json_object
+  summary_merge_revise:
+    provider: openai
+    model: gpt-5.4
+    timeout: 180
+    temperature: 0.2
+    max_tokens: 16384
+    response_format: json_object
   table_extract_vision:
     provider: openai
     model: gpt-4o-mini
