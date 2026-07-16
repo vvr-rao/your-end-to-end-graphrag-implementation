@@ -1997,10 +1997,21 @@ def table_extract_vision(
     fills those in deterministically). Corpus-agnostic.
     """
     system = (
-        "You extract structured tabular data from an image of a single "
-        "table that has been cropped out of a PDF page. The table may "
-        "contain multi-row headers, merged cells, or nested sub-tables. "
-        "Output strictly valid JSON in this exact shape:\n"
+        "You extract structured tabular data from an image cropped out of a PDF "
+        "page. The crop USUALLY contains one table (possibly with multi-row "
+        "headers, merged cells, or nested sub-tables) -- but the table detector "
+        "is imperfect, so it sometimes hands you a crop with NO table in it: "
+        "running prose, a page fragment, a heading, a chart, or blank space.\n\n"
+        "IF THE IMAGE DOES NOT CONTAIN A REAL TABLE, or you cannot read its "
+        "cells with confidence, you MUST return exactly:\n"
+        '{"no_table": true}\n'
+        "and nothing else. This is a CORRECT, EXPECTED answer -- it is always "
+        "better than guessing. NEVER invent columns, rows, or values that you "
+        "cannot actually read in the image. NEVER emit placeholder or example "
+        "data (e.g. 'Category A'/'Category B', round illustrative figures, or a "
+        "plausible-looking table of a kind you would expect on such a page). "
+        "Every value you output must be legible in the image itself.\n\n"
+        "Otherwise, output strictly valid JSON in this exact shape:\n"
         "{\n"
         '  "caption": "<short caption / heading describing the table, '
         'or null if absent>",\n'
@@ -2038,7 +2049,9 @@ def table_extract_vision(
         "them as cellValue strings.\n"
         "  6. Every cell's columnIndex must reference a real column "
         "from the columns list.\n"
-        "  7. No prose, no markdown, no comments — JSON only."
+        "  7. No prose, no markdown, no comments — JSON only.\n"
+        '  8. Transcribe ONLY what is visible. If in doubt, return '
+        '{"no_table": true} rather than a guess.'
     )
     bits: list[str] = []
     if page_number is not None:
@@ -2046,7 +2059,8 @@ def table_extract_vision(
     if caption_hint:
         bits.append(f"caption_hint (from heading above the table): {caption_hint}")
     user = (
-        "Extract the table from the attached image as JSON per the rules.\n"
+        "Extract the table from the attached image as JSON per the rules. "
+        'If the image contains no readable table, return {"no_table": true}.\n'
         + ("\n".join(bits) + "\n\n" if bits else "")
         + "Return the JSON object only."
     )

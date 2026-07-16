@@ -609,6 +609,17 @@ async def _extract_table_via_vision(
     except json.JSONDecodeError:
         return None, 0.0
 
+    # The detector hands vision crops that contain no table (prose, page
+    # fragments, wide multi-column layouts). The prompt used to assert "this
+    # image contains a table" with no way to disagree, so the model complied the
+    # only way it could -- by inventing one. Audit of 46 vision tables: 17%
+    # fabricated outright (an IEA EV-policy page yielding an "EPA | Total Budget
+    # | Employees" table), mean 53% of numbers not present on their own page.
+    # pdfplumber over the same doc: 0% fabricated. Fabrications are worse than
+    # noise -- they are well-formed, embedded, and citable as fact.
+    if not isinstance(body, dict) or body.get("no_table") is True:
+        return None, cost
+
     payload = _vision_body_to_jsonld(
         body,
         doc_sha=doc_sha,
@@ -616,7 +627,44 @@ async def _extract_table_via_vision(
         page_number=page_number,
         caption_hint=caption_hint,
     )
+    if payload is not None and _looks_fabricated(payload):
+        return None, cost
     return payload, cost
+
+
+# Placeholder tokens a model reaches for when asked to describe a table it
+# cannot actually read. Real financial/policy tables do not label their rows
+# "Category A". Backstop for models that ignore the no_table instruction.
+_PLACEHOLDER_LABELS = (
+    "category a", "category b", "category c",
+    "column 1", "column 2", "column 3",
+    "row 1", "row 2", "row 3",
+    "item 1", "item 2",
+    "value 1", "value 2",
+    "example", "placeholder", "lorem ipsum",
+)
+
+
+def _looks_fabricated(payload: dict[str, Any]) -> bool:
+    """True when an extracted table shows the signature of invented content."""
+    labels: list[str] = []
+    for col in payload.get("columns", []) or []:
+        v = col.get("columnLabel")
+        if isinstance(v, str):
+            labels.append(v.strip().lower())
+    for row in payload.get("rows", []) or []:
+        v = row.get("rowLabel")
+        if isinstance(v, str):
+            labels.append(v.strip().lower())
+        for cell in row.get("cells", []) or []:
+            cv = cell.get("cellValue")
+            if isinstance(cv, str):
+                labels.append(cv.strip().lower())
+    if not labels:
+        return False
+    hits = sum(1 for lab in labels if lab in _PLACEHOLDER_LABELS)
+    # Two independent placeholder tokens is not a coincidence.
+    return hits >= 2
 
 
 def _vision_body_to_jsonld(
