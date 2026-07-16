@@ -44,7 +44,11 @@ from typing import Any
 # Bump when the extractor's routing logic or vision prompt changes
 # materially. Lower bumps (cosmetic) are OK to skip; on the wire what
 # matters is "do the JSON-LD payloads we'd produce now differ".
-EXTRACTOR_VERSION = "p2a-1"
+# p2a-2: vision prompt gained a {"no_table": true} escape + placeholder-drop
+# backstop. Without this bump, cached p2a-1 payloads (which contain fabricated
+# tables invented from single-header-cell crops) would keep being served and the
+# fix would never run.
+EXTRACTOR_VERSION = "p2a-2"
 
 
 @dataclass
