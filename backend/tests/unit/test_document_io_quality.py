@@ -102,3 +102,43 @@ def test_load_document_silent_on_healthy_pdf(tmp_path, capsys, monkeypatch) -> N
 
     document_io.load_document(p)
     assert "WARNING" not in capsys.readouterr().out
+
+
+def test_preflight_flags_garbled_and_is_silent_on_healthy(tmp_path, capsys, monkeypatch) -> None:
+    """Pre-flight must catch unreadable docs BEFORE any paid stage. Previously the
+    warning came from load_document() inside the summarizer -- i.e. after table
+    extraction + mining had already spent money on the noise."""
+    from backend.app.services import document_io
+
+    document_io._WARNED_UNREADABLE.clear()
+    (tmp_path / "good.txt").write_text(HEALTHY)
+    (tmp_path / "bad.txt").write_text(GARBLED)
+
+    flagged = document_io.preflight_documents(tmp_path)
+    out = capsys.readouterr().out
+    assert flagged == ["bad.txt"]
+    assert "bad.txt" in out and "processed as NOISE" in out
+    assert "good.txt" not in out
+
+
+def test_preflight_suppresses_the_later_duplicate_warning(tmp_path, capsys, monkeypatch) -> None:
+    """Once preflight warns, ingestion must not repeat it for the same file."""
+    from backend.app.services import document_io
+
+    document_io._WARNED_UNREADABLE.clear()
+    p = tmp_path / "bad.txt"
+    p.write_text(GARBLED)
+
+    document_io.preflight_documents(tmp_path)
+    capsys.readouterr()
+    document_io.load_document(p)
+    assert "WARNING" not in capsys.readouterr().out
+
+
+def test_preflight_ignores_unopenable_files(tmp_path, capsys) -> None:
+    """A corrupt file is the loader's problem to report; preflight stays quiet."""
+    from backend.app.services import document_io
+
+    document_io._WARNED_UNREADABLE.clear()
+    (tmp_path / "broken.pdf").write_bytes(b"not a pdf at all")
+    assert document_io.preflight_documents(tmp_path) == []

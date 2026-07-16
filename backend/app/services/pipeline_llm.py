@@ -2589,6 +2589,14 @@ async def _run(
 
     router = LLMRouter(settings)
 
+    # Pre-flight: surface unreadable documents BEFORE the first paid stage.
+    # Text extraction can yield confident gibberish (subsetted /Type0 fonts with
+    # no /ToUnicode CMap), and every downstream stage will happily pay to process
+    # it. The check is local CPU only -- no LLM, page-sampled -- so it costs
+    # seconds and can save an entire run.
+    if documents_dir.exists():
+        document_io.preflight_documents(documents_dir)
+
     # Phase 2a v2 (Option B): table extraction runs in PER-PDF SUBPROCESS
     # workers. Each worker exits before the next starts, so the kernel
     # reclaims all per-PDF memory unconditionally and the parent process

@@ -159,6 +159,55 @@ def _warn_once_if_unreadable(path: Path, text: str) -> str | None:
     return warning
 
 
+def preflight_documents(documents_dir: Path, *, sample_pages: int = 10) -> list[str]:
+    """Cheap, LLM-free scan for documents whose text will not extract as language.
+
+    Runs BEFORE any paid stage. Without it the warning surfaces from
+    load_document() deep inside the summarizer -- i.e. AFTER table extraction and
+    table-concept mining have already spent real money and ~40 minutes on a
+    document that is noise.
+
+    Reads only the first `sample_pages` pages of each PDF: a broken font encoding
+    affects the whole document, so a sample decides it, and sampling keeps this
+    to seconds instead of re-extracting 700-page PDFs. Returns the names of
+    unreadable documents (also printed).
+    """
+    from backend.app.services.ontology_io import iter_documents
+
+    unreadable: list[str] = []
+    for path in iter_documents(documents_dir):
+        try:
+            if path.suffix.lower() == ".pdf":
+                reader = PdfReader(str(path))
+                parts: list[str] = []
+                for page in reader.pages[:sample_pages]:
+                    try:
+                        parts.append(page.extract_text() or "")
+                    except Exception:
+                        continue
+                text = "\n".join(parts)
+            elif path.suffix.lower() == ".txt":
+                text = read_text_file(path)
+            else:
+                continue
+        except Exception:
+            # A file we cannot even open is the loader's problem to report, not
+            # preflight's -- stay silent rather than double-warn.
+            continue
+        warning = check_extraction_quality(path, text)
+        if warning:
+            unreadable.append(path.name)
+            _WARNED_UNREADABLE.add(str(path))  # don't warn again during ingestion
+            print(f"[preflight] WARNING: {warning}")
+
+    if unreadable:
+        print(f"[preflight] *** {len(unreadable)} document(s) will be processed as "
+              f"NOISE: {', '.join(unreadable[:5])}{' ...' if len(unreadable) > 5 else ''}")
+        print("[preflight] *** Re-source or OCR them, or remove them from the corpus. "
+              "Continuing -- but every downstream stage will pay to process them.\n")
+    return unreadable
+
+
 def load_documents(documents_dir: Path) -> Iterator[LoadedDocument]:
     """Walk documents_dir and yield each .pdf/.txt as a LoadedDocument.
 
