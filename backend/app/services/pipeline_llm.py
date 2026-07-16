@@ -2798,4 +2798,23 @@ async def _run(
             "llm_total_cost_usd": round(router.total_cost_usd, 6),
         },
     )
+    # Per-task spend breakdown. manifest/stats already carry the TOTAL, but a
+    # total alone can't answer "where did the money go?" after the fact -- and at
+    # tens of dollars a run, that is the question worth answering.
+    versioning.write_cost_report(version_dir, router.cost_report())
+    _print_cost_summary(router)
     return version_dir
+
+
+def _print_cost_summary(router: LLMRouter) -> None:
+    """Print the run's spend, biggest task first, so it is visible without
+    digging through the run folder."""
+    rep = router.cost_report()
+    by_task = rep["by_task"]
+    print(f"\n[cost] LLM total: ${rep['total_cost_usd']:.2f} "
+          f"across {rep['total_calls']:,} calls "
+          f"(prompt-cache hit {rep['prompt_cache']['cache_hit_rate'] * 100:.0f}%)")
+    for task, row in list(by_task.items())[:8]:
+        share = (row["cost_usd"] / rep["total_cost_usd"] * 100) if rep["total_cost_usd"] else 0.0
+        print(f"[cost]   ${row['cost_usd']:>7.2f}  {share:>4.0f}%  {row['calls']:>4} call(s)  "
+              f"{task} ({row['model']})")

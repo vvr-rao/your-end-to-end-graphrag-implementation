@@ -358,10 +358,50 @@ class LLMRouter:
         self._cache_read_tokens = 0     # input served from cache
         self._cache_write_tokens = 0    # input written to cache
         self._input_full_tokens = 0     # uncached, full-price input
+        # Per-task spend, so a run can report WHERE the money went, not just a
+        # total. Only ~$0.64 of a ~$10 prune-expand was previously recoverable
+        # after the fact (a couple of tasks self-report into llm_audit.jsonl);
+        # everything else vanished with the terminal scrollback.
+        self._cost_by_task: dict[str, float] = {}
+        self._calls_by_task: dict[str, int] = {}
 
     @property
     def total_cost_usd(self) -> float:
         return self._total_cost_usd
+
+    @property
+    def cost_by_task(self) -> dict[str, float]:
+        """Spend per task name, descending. Empty until calls are made."""
+        return dict(sorted(self._cost_by_task.items(), key=lambda kv: -kv[1]))
+
+    @property
+    def calls_by_task(self) -> dict[str, int]:
+        """Successful call count per task name."""
+        return dict(self._calls_by_task)
+
+    def cost_report(self) -> dict[str, Any]:
+        """Serializable spend summary for persisting alongside a run's outputs."""
+        by_task = self.cost_by_task
+        return {
+            "total_cost_usd": round(self._total_cost_usd, 6),
+            "total_calls": sum(self._calls_by_task.values()),
+            "prompt_cache": {
+                "cache_read_tokens": self._cache_read_tokens,
+                "cache_write_tokens": self._cache_write_tokens,
+                "full_price_input_tokens": self._input_full_tokens,
+                "total_input_tokens": self.total_input_tokens,
+                "cache_hit_rate": round(self.cache_hit_rate, 4),
+            },
+            "by_task": {
+                t: {
+                    "cost_usd": round(c, 6),
+                    "calls": self._calls_by_task.get(t, 0),
+                    "model": self._tasks.get(t, {}).get("model"),
+                    "provider": self._tasks.get(t, {}).get("provider"),
+                }
+                for t, c in by_task.items()
+            },
+        }
 
     @property
     def cache_read_tokens(self) -> int:
@@ -414,6 +454,8 @@ class LLMRouter:
                 )
                 if result.cost_usd:
                     self._total_cost_usd += result.cost_usd
+                    self._cost_by_task[task] = self._cost_by_task.get(task, 0.0) + result.cost_usd
+                self._calls_by_task[task] = self._calls_by_task.get(task, 0) + 1
                 # Prompt-cache accounting. OpenAI reports prompt_tokens INCLUDING
                 # the cached portion; Anthropic reports input_tokens EXCLUDING it.
                 read = result.cache_read_tokens or 0
