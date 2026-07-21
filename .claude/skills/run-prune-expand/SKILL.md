@@ -18,38 +18,40 @@ re-attach by reading its status/log — you do not hold the process.
 - The database step can run in parallel or after; prune-expand itself does NOT
   need the DB (it writes a version folder on disk). DB import happens later.
 
-## Step 0 — Ask what to build (NEVER auto-discover)
-You MUST get two things from the user **explicitly**. Do not guess, do not scan
-their existing corpuses/folders and pick one, do not assume a default path.
+## Step 0 — Start with the MERGE: choose an ontology source (never auto-pick)
+If the user asks "where do I start / what do I do first", tell them plainly: we
+**start by building the ontology (a MERGE), then run prune-expand against a
+document corpus.** First decide where the ontology comes from. Offer these four,
+suggest based on their corpus, and CONFIRM — never choose silently, never scan
+their folders and pick one:
 
-**(a) Which domain — suggest, then confirm.** We support three domains, each with
-a domain ontology, plus an "other" path that uses only the core ontologies. Ask
-which fits their corpus and confirm:
+**1. A supported domain** — pharma, manufacturing / supply chain, or finance. If
+they accept, use the matching ontology and tell them how it's obtained:
 
-| Domain | Ontology | Download status (verified 2026-07-21) |
+| Domain | Ontology | How it's obtained (verified 2026-07-21) |
 |---|---|---|
-| **Pharma / clinical** | OCRe | Bundled in repo (BioPortal-gated upstream); real download if `BIOPORTAL_API_KEY` is set |
-| **Finance** | FIBO | **Real direct download** from EDM Council (also bundled as fallback) |
-| **Manufacturing supply chain** | OntoCAPE | **NOT bundled** (GPL + RWTH form-gated) — the fetcher tells the user where to place the zip |
-| **Other / none of these** | (none) | Core ontologies only — see Step 1 |
+| Pharma / clinical | OCRe | Bundled in the repo; real download if `BIOPORTAL_API_KEY` is set |
+| Finance | FIBO | Downloaded live from EDM Council (bundled fallback) |
+| Manufacturing / supply chain | OntoCAPE | **NOT bundled** — `fetch_ontology.py` prints the RWTH form URL + where to drop the zip; **pause until they supply it**, don't substitute another ontology |
 
-If the user picks manufacturing and OntoCAPE isn't present, `fetch_ontology.py`
-exits with instructions (the RWTH form URL + the path to drop the zip). Relay
-those and pause until they've supplied it — don't fall back to another ontology.
+**2. Another domain** — no domain ontology; merge the 7 core ontologies only. Still
+fully works, just without a domain-specific starting vocabulary.
 
-Suggest based on what the corpus looks like, e.g. *"These look like clinical
-trial documents — I suggest the OCRe ontology. Good?"* Never pick silently.
+**3. Their own ontology** — we accept `.owl` and `.rdf` (also `.ttl`, `.xml`, or a
+`.zip` of these). Ask them to place the file somewhere and give you the path.
+**WARN about size:** very large ontologies (hundreds of MB) are slow to import —
+owlready2 walks imports — and can exceed memory; smoke-test a big one before
+committing to a full run.
 
-**(b) Where the corpus is — ask for the path. There is NO default.**
-```bash
-DOCS="<path the user gives you>"      # REQUIRED — ask; never assume source_documents/
-[ -d "$DOCS" ] || { echo "corpus folder not found: $DOCS — ask the user to confirm the path"; }
-ls "$DOCS" | head    # show them what you found so they confirm it's the right corpus
-```
+**4. Modify a previously generated ontology** — ask for the prior version folder
+this tool produced (`output_ontologies/v*-.../`). Read "Step 1c — Re-ingesting an
+edited ontology" first: whether their hand-edits are honored depends on HOW it's
+fed back.
 
-## Step 1 — Fetch domain ontology + merge (fast, foreground, no LLM)
-**The 7 core ontologies below are ALWAYS merged**, for every domain including
-"other". They are pinned by name (not globbed) so the set is explicit and stable:
+The 7 core ontologies are ALWAYS merged in, on every path.
+
+## Step 1 — Merge (fast, foreground, no LLM)
+The 7 core ontologies, pinned by name (not globbed) so the set is explicit:
 ```bash
 CORE=(
   source_ontologies/core_ontologies/viao_intelligence_artifact_ontology_v2.owl
@@ -61,17 +63,15 @@ CORE=(
   source_ontologies/core_ontologies/domain_concepts.owl
 )
 ```
-For a supported domain, fetch its ontology (downloads FIBO for real; OCRe/OntoCAPE
-fall back to the vendored copy with an explanation). The fetcher prints the
-ready-to-merge path as its LAST line:
+Set `DOMAIN_FILE` according to the Step-0 choice:
 ```bash
-# domain is one of: pharma | finance | manufacturing  (from Step 0)
-DOMAIN_FILE=$(uv run python source_ontologies/fetch_ontology.py <domain> | tail -1)
+# Path 1 (supported domain) — fetch it; the ready-to-merge path is the LAST line:
+DOMAIN_FILE=$(uv run python source_ontologies/fetch_ontology.py <pharma|finance|manufacturing> | tail -1)
+# Path 2 (another domain):     DOMAIN_FILE=""                       # core only
+# Path 3 (their own ontology): DOMAIN_FILE="<path the user gave>"   # .owl/.rdf/.ttl/.xml/.zip
+# Path 4 (modify existing):    usually re-merge the edited merged.owl — see Step 1c
 ```
-For the **"other"** path, skip the fetch — `DOMAIN_FILE` stays empty and only the
-core ontologies are merged.
-
-Build the merge args (core + domain if present) and run:
+Build the args (core + domain if present) and run:
 ```bash
 args=(); for f in "${CORE[@]}" ${DOMAIN_FILE:+"$DOMAIN_FILE"}; do args+=(--ontology "$f"); done
 uv run python -m backend.app.cli merge "${args[@]}" --output-dir output_ontologies
@@ -79,14 +79,52 @@ MERGE_DIR=$(ls -dt output_ontologies/v*-merge/ 2>/dev/null | head -1); echo "$ME
 ```
 Merge is deterministic. If it errors on a specific ontology, report which
 `--ontology` input failed. Large zips like FIBO are slow (~4 min for full FIBO) —
-that's expected owlready2 import-walking, not a hang.
+expected owlready2 import-walking, not a hang.
 
-## Step 2 — Decide on tables (cost note)
-Ask the user whether to extract structured tables (`--tables`, opt-in, default
-OFF). It adds ~$0.02–0.04 per typical 10-K in vision costs but makes financial
-tables retrievable. On this corpus, pdfplumber alone is fabrication-free; the
-vision route adds nested-table coverage at some cost. `--no-table-vision` keeps
-tables via pdfplumber only (free). Match the flags to the user's answer.
+## Step 1b — Report the result + ask the user to verify in Protégé
+Tell the user WHERE the merged ontology is, and have them eyeball it in a
+third-party tool BEFORE any paid step:
+```bash
+echo "Merged ontology written to: $MERGE_DIR/merged.owl"
+```
+Say: *"Open `$MERGE_DIR/merged.owl` in Protégé (https://protege.stanford.edu/) to
+check the class hierarchy looks right before we run the paid prune-expand."* Pause
+for their confirmation.
+
+## Step 1c — Re-ingesting an edited ontology (IMPORTANT — silent-edit-loss gotcha)
+A version folder holds TWO representations: **`merged.json`** (the fast machine
+path downstream steps read BY DEFAULT) and **`merged.owl`** (what a human edits in
+Protégé). They can diverge. If a user edits `merged.owl` and feeds the folder back:
+- `prune-expand --input <folder>` alone reads `merged.json` → **the `.owl` edits are
+  silently ignored.**
+- `prune-expand --input <folder> --use-owl` re-parses the edited `merged.owl` → edits
+  honored, and it writes a fresh, consistent folder.
+- Universal + safest: re-run `merge --ontology <edited_merged.owl>` (plus the 7
+  core) → a new folder with `merged.json` regenerated FROM the edited OWL,
+  consistent for EVERY downstream step (prune-expand AND `db-init`).
+So on Path 4, if they hand-edited the OWL, **re-merge it (or pass `--use-owl`);
+never just resubmit the folder and assume the edits took.**
+
+## Step 1d — Ask for the corpus (now that the ontology is ready)
+```bash
+DOCS="<path the user gives you>"   # REQUIRED — ask; never assume source_documents/, never scan+pick
+[ -d "$DOCS" ] || echo "corpus folder not found: $DOCS — ask the user to confirm the path"
+ls "$DOCS" | head                  # show them what you found so they confirm the corpus
+```
+
+## Step 2 — Mention the `--tables` option and ask what they prefer
+Proactively tell the user that prune-expand has an optional `--tables` flag, and
+ask their preference — don't silently pick. Lay out the trade-off:
+- **Without `--tables` (default):** faster and free; tables inside PDFs get read as
+  run-on text and lose their row/column structure.
+- **With `--tables`:** extracts structured tables from PDFs so their rows/columns
+  become retrievable. Costs ~$0.02–0.04 per typical 10-K (vision). Worth it for
+  data-heavy corpora — financial filings, spec sheets, anything numeric.
+- **`--tables --no-table-vision`:** tables via pdfplumber only — free, but loses
+  nested / merged-cell tables.
+
+Only matters for PDF corpora (no effect on plain text). Set the flags in Step 3
+to match their answer.
 
 ## Step 3 — Launch prune-expand DETACHED
 ```bash

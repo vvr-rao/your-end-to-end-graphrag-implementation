@@ -32,24 +32,28 @@ preconditions pass.
 
 ## Starting from zero ("where do I start?" / "what do I do first?")
 Assume the user knows nothing about this app. Don't dump the whole pipeline on
-them. Orient in 2–3 sentences, then ask the ONE question that sets everything up:
+them. Orient in 2–3 sentences, then tell them the natural starting point:
 
-> This tool turns a folder of your documents into a queryable knowledge graph you
-> can ask questions against. To point it at the right vocabulary, tell me — what
-> kind of documents are you working with?
+> This tool turns a folder of your documents into a queryable knowledge graph. The
+> best place to start is building the **ontology** — a MERGE — and then we run
+> **prune-expand** against your documents to grow it. Let's start with the merge:
+> where should the ontology come from?
 
-Offer the supported domains and the fallback:
-- **Pharma / clinical research** → uses the OCRe ontology (bundled)
-- **Finance** → uses FIBO (downloaded live from EDM Council)
-- **Manufacturing supply chain** → uses OntoCAPE (not bundled — you'll be asked to
-  supply the zip, since RWTH gates its download)
-- **Something else** → no domain ontology; we build with the core ontologies
-  only (still fully works — you just don't get a domain-specific starting
-  vocabulary)
+Offer the four ontology sources (the **run-prune-expand** skill drives this — hand
+off to it). Suggest based on what they tell you, and confirm; never pick silently:
+- **A supported domain** — Pharma → OCRe (bundled), Finance → FIBO (downloaded
+  live), Manufacturing/supply chain → OntoCAPE (not bundled; you'll be told how to
+  supply it).
+- **Another domain** → no domain ontology; merge the core ontologies only.
+- **Their own ontology** → we accept `.owl` / `.rdf` (and `.ttl`/`.xml`/`.zip`);
+  ask for a path and warn that very large ontologies are slow/memory-heavy.
+- **Modify a previously generated ontology** → ask for the prior version folder
+  (note the edit-and-resubmit gotcha the skill explains).
 
-Then walk the sequence below in order, one step at a time, confirming each before
-moving on. Never race ahead to a paid step. If they ask what a step does or costs,
-answer (or hand to **app-help**) before running it.
+After the merge, give them the output location and ask them to verify `merged.owl`
+in a third-party tool (Protégé) before the paid prune-expand. THEN ask for the
+corpus, mention the `--tables` option and ask their preference, and run
+prune-expand. Walk it one step at a time; never race ahead to a paid step.
 
 ## The sequence
 
@@ -64,11 +68,13 @@ deploy-ready. Bring up docker Postgres if needed, then migrate + verify. Can run
 concurrently with step 3 (prune-expand doesn't need the DB).
 
 ### 3. Merge + prune-expand  →  invoke skill **run-prune-expand**
-**Suggest** a domain ontology and confirm (OCRe for pharma is the download-wired
-suggestion today; FIBO/OntoCAPE vendored), **ask** for the corpus folder path,
-then merge with VIAO + core and launch prune-expand **detached**, monitoring to
-completion. This is the first multi-hour paid step. Capture the resulting
-`v*-prune-expand/` folder.
+Pick the ontology source (supported domain / other→core-only / their own .owl-.rdf
+/ modify an existing folder), merge with the 7 core ontologies, then **report the
+output and have them verify `merged.owl` in Protégé**. Next **ask** for the corpus
+path, **mention the `--tables` flag and ask their preference**, then launch
+prune-expand **detached**, monitoring to completion. First multi-hour paid step;
+capture the resulting `v*-prune-expand/` folder. Note the edit-and-resubmit gotcha
+(hand-edited `merged.owl` needs `--use-owl` or a re-merge, or edits are ignored).
 
 ### 4. Load the ontology into the DB
 Once both the DB (step 2) and the prune-expand folder (step 3) are ready:
