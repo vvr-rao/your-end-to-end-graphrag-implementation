@@ -30,6 +30,42 @@ I have tested this using open source data and common ontologies from Pharma, Fin
 
 **New in v3.** YEGI includes a set of [Claude Code](https://claude.com/claude-code) skills so you can build the whole system by talking to Claude instead of running each CLI command yourself. Clone the repo, open Claude Code inside it, and say **"where do I start"** (or "build the app").
 
+### Prerequisites
+
+A `git clone` gets you everything in the repo — the skills, config templates, the credential firewall, the durable-run harness, and the bundled OCRe + FIBO ontologies. You supply a few things the clone can't:
+
+**Install once** (per machine):
+
+- **[Claude Code](https://claude.com/claude-code)** — the build skills only run inside it.
+- **[uv](https://github.com/astral-sh/uv)** — runs the app and manages Python 3.12+ for you, so you don't install Python separately (`brew install uv`, or the official installer).
+- **Git** — to clone (on macOS, `xcode-select --install` provides git and a base `python3`).
+- **[Docker Desktop](https://www.docker.com/products/docker-desktop/)** — **only if** you want the local database; not needed with a hosted Postgres (Supabase).
+
+**Provide** (your own inputs — the skills create `.env` from the template; you fill in the secrets, never in chat):
+
+- **API keys** in `.env`: `OPENAI_API_KEY` (always — embeddings run on OpenAI), plus `GROQ_API_KEY` / `ANTHROPIC_API_KEY` for those modes, and `RENDER_API_KEY` if you deploy.
+- **A database**: a Supabase (or any Postgres) connection string, or let the skill spin up a local docker-compose Postgres.
+
+**Do you need Docker?** Only for a local DB:
+
+| Database choice | Docker needed? |
+|---|---|
+| Supabase / any hosted Postgres | No |
+| Local docker-compose Postgres | Yes |
+
+If you plan to deploy to Render, use a hosted Postgres from the start — the deployed app can't reach a local Docker DB — so that path needs no Docker at all.
+
+**First run:** Claude Code will ask you to approve the repo's `.claude/settings.json` (it carries the SessionStart progress hook and the credential-firewall deny rules). Approve it so the cross-session tracker and `.env` protection take effect.
+
+Then it's chat-and-go:
+
+```bash
+git clone <your-fork-or-this-repo>
+cd your-end-to-end-graphrag-implementation
+uv sync            # one-time dependency install
+# open Claude Code here, then say:  "where do I start"
+```
+
 Claude then walks you through, one step at a time:
 
 1. **Pick an LLM mode** — Groq+OpenAI, OpenAI-only, or Anthropic+OpenAI — and activate the matching config preset.
