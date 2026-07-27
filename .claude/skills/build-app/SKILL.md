@@ -89,19 +89,21 @@ uv run python -m backend.app.cli db-init --input "$PE_DIR"     # idempotent upse
 uv run python -m backend.app.cli db-status
 ```
 
-### 5+. Corpus ingestion & deploy  →  same detached pattern
+### 5. Corpus ingestion  →  same detached pattern
 These reuse the exact Step-3 harness pattern (`run_detached.sh` + `job_status.sh`).
-When you reach them, smoke-test with `--limit` first, check the result with the
-user, then scale up to the full corpus:
+Smoke-test with `--limit` first, check the result with the user, then scale up to
+the full corpus. Run each via the harness (long) or directly (short), monitor, and
+surface errors — the orchestration is identical to step 3:
 - `register-documents --documents <dir> [--tables]` — chunk + embed (long, paid).
 - `extract-entities` — entities/relationships per chunk (long, paid).
 - `enrich-time` — temporal enrichment (short).
 - `generate-artifacts` — Claims/Findings/Insights/etc. (long, paid).
-- `render-init` / `render-deploy --wait` / `render-status` — deploy (needs a
-  Supabase DB, not local; walk the user through Render's manual bits).
 
-For any of these today: run the CLI directly (or via the harness if long),
-monitor, and surface errors — the orchestration pattern is identical to step 3.
+### 6. Deploy to Render  →  invoke skill **deploy**
+Guides the user through forking the repo, setting `RENDER_API_KEY` + generating a
+`BEARER_TOKEN` in `.env`, `render-init` to create the backend + frontend services,
+monitoring the build, and the final manual UI token paste. Requires a **cloud**
+DB (not the local docker one). Records `deploy` (with URLs) to the tracker.
 
 ## General questions
 If the user asks what the app does, what a step costs, or how a tool works rather
