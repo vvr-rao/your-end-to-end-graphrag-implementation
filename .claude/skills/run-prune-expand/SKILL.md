@@ -130,7 +130,7 @@ to match their answer.
 ## Step 3 — Launch prune-expand DETACHED
 ```bash
 RUN_ID="prune_expand_$(date -u +%Y%m%d_%H%M%S)"
-scripts/run_detached.sh "$RUN_ID" \
+python3 scripts/run_detached.py "$RUN_ID" \
   uv run python -m backend.app.cli prune-expand \
     --input "$MERGE_DIR" \
     --documents "$DOCS" \
@@ -145,7 +145,7 @@ after a crash reuses everything already computed — it does not re-pay.
 
 ## Step 4 — Monitor (re-attach any time, even after a session death)
 ```bash
-scripts/job_status.sh "$RUN_ID" 40      # state + last 40 log lines
+python3 scripts/job_status.py "$RUN_ID" 40      # state + last 40 log lines
 ```
 Watch for:
 - **`[preflight] WARNING: ... does not look like language`** — a garbled/

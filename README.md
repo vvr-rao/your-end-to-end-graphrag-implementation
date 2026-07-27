@@ -48,6 +48,10 @@ What makes it safe and resumable:
 
 Render deploys from **your** GitHub repository via the `render.yaml` blueprint, so to deploy you must **fork this repo to your own GitHub account** (or push a copy there), then point Claude / `render-init` at your fork. You can build and run everything locally without forking — the fork is only needed for the Render deploy step.
 
+### Platform support
+
+The Claude Code build flow works on **Linux and macOS** natively. The durable-run harness that keeps long jobs alive across a closed session is pure Python (`scripts/run_detached.py`, using the OS session/process-group primitives) — no `setsid` or bash dependency — so detached jobs behave identically on both. On **Windows, use [WSL2](https://learn.microsoft.com/windows/wsl/install)**: the skills drive POSIX shell commands, and WSL2 also gives the smoothest Docker / Postgres / `uv` experience (native Windows under Git Bash is best-effort, not guaranteed). Everywhere, Python 3.12+ must be available as `python3`. Caching is filesystem-based under `~/.cache/…` and works on every platform.
+
 ## UI
 
 ![Screenshot of the React UI showing a conversation thread with a simple_qa answer and a follow-up in deep_research mode](images/screenshot.png)
@@ -691,7 +695,7 @@ The Stage 1 → Stage 2 narrowing is the whole reason this scales. Without it ev
 ### v3 — 2026-07-27 · Claude Code extension: build the whole app by chatting
 
 - **Claude Code skills** — clone the repo, open Claude Code, and build end-to-end conversationally (LLM mode → database → ontology merge → prune-expand → ingestion → deploy). See [Build it by chatting with Claude Code](#build-it-by-chatting-with-claude-code).
-- **Durable-run harness** — long, paid steps run detached (`scripts/run_detached.sh`) so they survive a closed/killed session; monitor with `scripts/job_status.sh`.
+- **Durable-run harness** — long, paid steps run detached (`scripts/run_detached.py`) so they survive a closed/killed session; monitor with `scripts/job_status.py`. Pure-Python (no `setsid`/bash), so it works on Linux and macOS alike; Windows via WSL2 (see [Platform support](#platform-support)).
 - **Cross-session progress tracker** — completed steps are recorded to disk and resurfaced at the start of each session, so a restarted session knows what you did last ("what's the status" / "what did we do last").
 - **Verified ontology downloads** — FIBO downloads live from EDM Council; OCRe ships bundled (its upstream is gated); a small registry (`source_ontologies/fetch_ontology.py`) handles fetching with vendored fallbacks.
 - **Credential firewall** — Claude is blocked from reading `.env` / secret files; keys are only presence-checked, never shown in chat.
