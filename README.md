@@ -15,6 +15,8 @@ _Requires Python 3.12+. CI runs the test suite on CPython 3.12, 3.13, and 3.14._
 
 Three surfaces, one process: REST at `/`, MCP at `/mcp`, and a React UI hosted on Render alongside the backend on Postgres.
 
+> **v3 — 2026-07-27:** YEGI now ships as a **Claude Code extension**. Clone the repo, open [Claude Code](https://claude.com/claude-code), and _chat_ your way through the entire build — choose an LLM mode, set up the database, merge ontologies, run prune-expand, ingest documents, and deploy — with the long steps run and monitored for you. See **[Build it by chatting with Claude Code](#build-it-by-chatting-with-claude-code)**.
+
 I have tested this using open source data and common ontologies from Pharma, Finance and Manufacturing and Supply Chain domains.
 <div align="center">
 
@@ -23,6 +25,28 @@ I have tested this using open source data and common ontologies from Pharma, Fin
 </div>
 
 
+
+## Build it by chatting with Claude Code
+
+**New in v3.** YEGI includes a set of [Claude Code](https://claude.com/claude-code) skills so you can build the whole system by talking to Claude instead of running each CLI command yourself. Clone the repo, open Claude Code inside it, and say **"where do I start"** (or "build the app").
+
+Claude then walks you through, one step at a time:
+
+1. **Pick an LLM mode** — Groq+OpenAI, OpenAI-only, or Anthropic+OpenAI — and activate the matching config preset.
+2. **Set up the database** — paste your own Postgres/Supabase connection string, or let Claude bring up a local docker-compose Postgres automatically.
+3. **Merge the ontology** — choose a supported domain (Pharma → OCRe, Finance → FIBO, Manufacturing / Supply-chain → OntoCAPE), bring your own `.owl` / `.rdf`, or use just the core ontologies. Claude fetches the domain ontology and merges it with the core set, then asks you to eyeball the result in Protégé.
+4. **prune-expand → ingest → enrich → generate artifacts** — the long, paid steps run **detached** (they survive a closed session) and Claude monitors them, reporting progress and cost.
+5. **Deploy to Render.**
+
+What makes it safe and resumable:
+
+- **Credentials never touch the chat.** You put API keys and the DB URL in `.env` yourself; Claude is blocked from reading secret files and only checks that a key is *present*.
+- **Long jobs survive a killed session.** Steps that run for hours are detached — close Claude Code and they keep going.
+- **Cross-session memory.** Progress is tracked on disk, so a *new* session knows what you did last. Ask **"what's the status"** or **"what did we do last"** and Claude resumes where you left off.
+
+### Deploying to Render — fork the repo first
+
+Render deploys from **your** GitHub repository via the `render.yaml` blueprint, so to deploy you must **fork this repo to your own GitHub account** (or push a copy there), then point Claude / `render-init` at your fork. You can build and run everything locally without forking — the fork is only needed for the Render deploy step.
 
 ## UI
 
@@ -663,6 +687,14 @@ The Stage 1 → Stage 2 narrowing is the whole reason this scales. Without it ev
 - Per-file failures (defective XML, owlready2 incompatibility) — logged and skipped so one bad file doesn't kill the whole merge.
 
 ## Changelog
+
+### v3 — 2026-07-27 · Claude Code extension: build the whole app by chatting
+
+- **Claude Code skills** — clone the repo, open Claude Code, and build end-to-end conversationally (LLM mode → database → ontology merge → prune-expand → ingestion → deploy). See [Build it by chatting with Claude Code](#build-it-by-chatting-with-claude-code).
+- **Durable-run harness** — long, paid steps run detached (`scripts/run_detached.sh`) so they survive a closed/killed session; monitor with `scripts/job_status.sh`.
+- **Cross-session progress tracker** — completed steps are recorded to disk and resurfaced at the start of each session, so a restarted session knows what you did last ("what's the status" / "what did we do last").
+- **Verified ontology downloads** — FIBO downloads live from EDM Council; OCRe ships bundled (its upstream is gated); a small registry (`source_ontologies/fetch_ontology.py`) handles fetching with vendored fallbacks.
+- **Credential firewall** — Claude is blocked from reading `.env` / secret files; keys are only presence-checked, never shown in chat.
 
 ### v2 — 2026-07-07 · added support for OpenAI-only mode and additional enhanced Artifact Generation
 
