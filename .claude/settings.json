@@ -27,5 +27,17 @@
       "Bash(printenv *)",
       "Bash(env)"
     ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 scripts/build_state.py show --quiet-if-empty"
+          }
+        ]
+      }
+    ]
   }
 }

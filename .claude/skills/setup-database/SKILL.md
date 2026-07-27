@@ -78,8 +78,12 @@ Step 3.
 ```bash
 uv run python -m backend.app.cli db-init
 ```
+On success, record it for the cross-session tracker (`local` or `external`):
+```bash
+python3 scripts/build_state.py record database kind=<local|external>
+```
 - Success looks like: alembic upgrade to head + a db-status report (schema
-  present, tables listed, size well under the 500 MB cap).
+  present, tables listed, size comfortably within the database's storage limit).
 - If it fails to connect: the fix is almost always `DATABASE_URL` in `.env`
   (typo, wrong host, direct-vs-pooler for Supabase, or pgvector not enabled).
   Point the user back to `.env`; never ask for the string in chat.

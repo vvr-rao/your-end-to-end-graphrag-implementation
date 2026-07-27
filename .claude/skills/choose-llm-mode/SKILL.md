@@ -53,6 +53,7 @@ cp config/models.<chosen>.example.yaml config/models.yaml
 Confirm it landed:
 ```bash
 grep -m1 -A2 'chunk_classification:' config/models.yaml | grep provider:
+python3 scripts/build_state.py record llm-mode mode=<chosen>   # cross-session tracker
 ```
 (`models.yaml` has no secrets — reading it is fine and expected.)
 

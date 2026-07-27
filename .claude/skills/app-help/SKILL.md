@@ -10,15 +10,15 @@ description: >
 # App help — what this project is and how to use it
 
 Answer from this overview and, when needed, by reading the code (the CLI parser
-`backend/app/cli/main.py`, `README.md`, and `CLAUDE.local.md` are the best
-sources). Prefer showing the real subcommand/flag over describing it.
+`backend/app/cli/main.py` and `README.md` are the best sources). Prefer showing
+the real subcommand/flag over describing it.
 
 ## What it is
 An end-to-end GraphRAG platform: ingest PDF/PPTX/DOCX/TXT, merge/curate an OWL
 ontology, expand it via LLM analysis of the documents, persist everything in
 Postgres + pgvector, and serve ontology-aware hybrid retrieval QA over REST, an
-MCP server, and a React UI (deployable to Render). Postgres is external (Supabase)
-in prod; local dev uses docker-compose.
+MCP server, and a React UI (deployable to Render). Postgres can be a hosted
+instance (e.g. Supabase) or a local docker-compose database.
 
 ## Supported domains
 Out of the box the app targets three domains, each with a domain ontology, plus a
@@ -64,13 +64,14 @@ domain_concepts) is ALWAYS merged in as well.
   browse routes. Bearer-token auth (`.env`).
 - **MCP** — the same routes auto-exposed as MCP tools at `/mcp` (Streamable HTTP)
   via fastapi-mcp. Tool names come from each route's `operation_id`.
-- **UI** — React + Vite (Phase 3), deployed alongside on Render.
+- **UI** — React + Vite, deployed alongside on Render.
 
 ## Costs & constraints (be upfront)
-- Cheapest-viable-model per task; `gpt-4o-mini` default, escalate to `gpt-4.1`
-  only for synthesis. prune-expand on a real corpus can run **hours** and cost
-  tens of dollars — smoke-test first, report, then scale on approval.
-- **500 MB** Supabase free-tier DB cap (`db-size` warns at 400 MB).
+- The app uses a cheapest-viable-model-per-task configuration to keep costs down.
+  prune-expand and the corpus steps on a real corpus can run **hours** and cost
+  tens of dollars — smoke-test with `--limit` first, check the result, then scale.
+- Keep an eye on database size with `db-size` / `db-status`; free-tier Postgres
+  plans often cap around 500 MB, so watch headroom as the corpus grows.
 - Long steps run **detached** (`scripts/run_detached.sh`) so they survive a
   killed session; monitor with `scripts/job_status.sh`.
 - Some steps have known caveats worth mentioning: garbled/unreadable PDFs are

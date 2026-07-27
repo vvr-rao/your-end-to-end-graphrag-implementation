@@ -101,3 +101,6 @@ reference/
 # Durable-run harness working dir: per-job logs + status for detached CLI runs
 # (scripts/run_detached.sh). Machine-local run state, never committed.
 .runs/
+
+# Per-user build-progress tracker (cross-session state; not repo content)
+.build/

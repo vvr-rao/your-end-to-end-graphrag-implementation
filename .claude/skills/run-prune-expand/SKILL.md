@@ -86,6 +86,7 @@ Tell the user WHERE the merged ontology is, and have them eyeball it in a
 third-party tool BEFORE any paid step:
 ```bash
 echo "Merged ontology written to: $MERGE_DIR/merged.owl"
+python3 scripts/build_state.py record merge path="$MERGE_DIR"   # cross-session tracker
 ```
 Say: *"Open `$MERGE_DIR/merged.owl` in Protégé (https://protege.stanford.edu/) to
 check the class hierarchy looks right before we run the paid prune-expand."* Pause
@@ -163,7 +164,10 @@ regardless of whether Claude is alive.
 Completion sentinels are written only on success into the new version folder:
 ```bash
 PE_DIR=$(ls -dt output_ontologies/v*-prune-expand/ 2>/dev/null | head -1)
-ls "$PE_DIR"/{stats.json,manifest.json,cost.json} 2>/dev/null && echo "COMPLETE: $PE_DIR"
+if ls "$PE_DIR"/{stats.json,manifest.json,cost.json} >/dev/null 2>&1; then
+  echo "COMPLETE: $PE_DIR"
+  python3 scripts/build_state.py record prune-expand path="$PE_DIR"   # cross-session tracker
+fi
 # report the actual spend
 python3 -c "import json,sys; d=json.load(open('$PE_DIR/cost.json')); print('cost report:', json.dumps(d, indent=2))" 2>/dev/null
 ```

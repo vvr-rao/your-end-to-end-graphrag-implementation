@@ -28,7 +28,12 @@ preconditions pass.
   `scripts/job_status.sh`, so a killed session never kills the work.
 - **Bulk/paid runs are opt-in.** Smoke-test with `--limit` first where available,
   report cost, and get explicit go-ahead before a full corpus run.
-- Watch the **500 MB** DB cap (`db-size` / db-status) as data grows.
+- Watch database size (`db-size` / `db-status`) as data grows — free-tier Postgres
+  plans often cap around 500 MB, so keep an eye on headroom.
+- **Progress is tracked across sessions** in `.build/state.jsonl` (via
+  `scripts/build_state.py`); each step records itself as it completes, and a
+  SessionStart hook resurfaces it after a restart. If the user asks "what's the
+  status / what did we do last / where were we", use the **build-status** skill.
 
 ## Starting from zero ("where do I start?" / "what do I do first?")
 Assume the user knows nothing about this app. Don't dump the whole pipeline on
@@ -84,10 +89,10 @@ uv run python -m backend.app.cli db-init --input "$PE_DIR"     # idempotent upse
 uv run python -m backend.app.cli db-status
 ```
 
-### 5+. Corpus ingestion & deploy  →  (next — same detached pattern)
-These reuse the exact Step-3 harness pattern (`run_detached.sh` + `job_status.sh`)
-and are the next to be wired up. When you reach them, smoke-test with `--limit`
-first, report, then scale on approval:
+### 5+. Corpus ingestion & deploy  →  same detached pattern
+These reuse the exact Step-3 harness pattern (`run_detached.sh` + `job_status.sh`).
+When you reach them, smoke-test with `--limit` first, check the result with the
+user, then scale up to the full corpus:
 - `register-documents --documents <dir> [--tables]` — chunk + embed (long, paid).
 - `extract-entities` — entities/relationships per chunk (long, paid).
 - `enrich-time` — temporal enrichment (short).
