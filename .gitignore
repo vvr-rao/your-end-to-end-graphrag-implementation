@@ -60,6 +60,19 @@ source_ontologies/*/
 # Whitelist core_ontologies/ specifically (user-curated core ontologies meant to ship with the repo).
 !source_ontologies/core_ontologies/
 !source_ontologies/core_ontologies/**
+# Vendor the OCRe + FIBO domain zips so a fresh clone can build the pharma/finance
+# domains: OCRe cannot be auto-downloaded (upstream Google Code is dead; PURL ->
+# BioPortal needs an API key), and FIBO is vendored as a fallback in case the live
+# download is unavailable. Track ONLY these specific zips -- the pattern un-ignores
+# each dir, re-ignores its contents, then un-ignores the one zip, so the huge raw
+# neighbours (pharma_ontologies/dron.owl 670M, hp.owl 73M) stay ignored. OntoCAPE
+# is intentionally NOT vendored (GPL + RWTH form-gated) -- users supply it themselves.
+!source_ontologies/pharma_ontologies/
+source_ontologies/pharma_ontologies/*
+!source_ontologies/pharma_ontologies/OCRe.zip
+!source_ontologies/finance_ontologies/
+source_ontologies/finance_ontologies/*
+!source_ontologies/finance_ontologies/prod.rdf.zip
 output_ontologies/*/
 
 # Source documents: only the top-level notes.md + the bundled downloader
@@ -84,3 +97,10 @@ eval_questions/*.txt
 
 # Reference materials (notebooks, scratch) — local-only, not part of source code
 reference/
+
+# Durable-run harness working dir: per-job logs + status for detached CLI runs
+# (scripts/run_detached.sh). Machine-local run state, never committed.
+.runs/
+
+# Per-user build-progress tracker (cross-session state; not repo content)
+.build/
