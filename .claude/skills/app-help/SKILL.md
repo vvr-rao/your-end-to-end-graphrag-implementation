@@ -72,8 +72,9 @@ domain_concepts) is ALWAYS merged in as well.
   tens of dollars — smoke-test with `--limit` first, check the result, then scale.
 - Keep an eye on database size with `db-size` / `db-status`; free-tier Postgres
   plans often cap around 500 MB, so watch headroom as the corpus grows.
-- Long steps run **detached** (`scripts/run_detached.sh`) so they survive a
-  killed session; monitor with `scripts/job_status.sh`.
+- Long steps run **detached** (`scripts/run_detached.py`) so they survive a
+  killed session; monitor with `scripts/job_status.py`. The harness is pure
+  Python, so it works on **Linux and macOS**; on **Windows use WSL2**.
 - Some steps have known caveats worth mentioning: garbled/unreadable PDFs are
   flagged by a preflight check before paid work; structured-table extraction is
   opt-in (`--tables`).

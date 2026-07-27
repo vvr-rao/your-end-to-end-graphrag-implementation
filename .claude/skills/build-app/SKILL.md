@@ -24,8 +24,8 @@ preconditions pass.
   confirm — do not silently pick one. And ASK for the corpus folder path — never
   scan their existing folders/corpuses and choose one yourself. There is no
   default documents path.
-- **Long steps run detached** via `scripts/run_detached.sh` and are monitored via
-  `scripts/job_status.sh`, so a killed session never kills the work.
+- **Long steps run detached** via `scripts/run_detached.py` and are monitored via
+  `scripts/job_status.py`, so a killed session never kills the work.
 - **Bulk/paid runs are opt-in.** Smoke-test with `--limit` first where available,
   report cost, and get explicit go-ahead before a full corpus run.
 - Watch database size (`db-size` / `db-status`) as data grows — free-tier Postgres
@@ -90,7 +90,7 @@ uv run python -m backend.app.cli db-status
 ```
 
 ### 5. Corpus ingestion  →  same detached pattern
-These reuse the exact Step-3 harness pattern (`run_detached.sh` + `job_status.sh`).
+These reuse the exact Step-3 harness pattern (`run_detached.py` + `job_status.py`).
 Smoke-test with `--limit` first, check the result with the user, then scale up to
 the full corpus. Run each via the harness (long) or directly (short), monitor, and
 surface errors — the orchestration is identical to step 3:
