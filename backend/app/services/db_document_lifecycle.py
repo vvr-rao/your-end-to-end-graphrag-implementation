@@ -1,9 +1,11 @@
 """Milestone B lifecycle: delete + update + list helpers.
 
-Soft delete (default): mark document + its chunks as DELETED, sweep
-dependent artifacts to STALE. Hard delete: row removal cascades via
-ON DELETE CASCADE on chunks; FK on graph_relationships sets the
-source_document_id / source_chunk_id columns to NULL.
+Soft delete (default): mark document + its chunks as DELETED. Hard delete: row
+removal cascades via ON DELETE CASCADE on chunks; FK on graph_relationships sets
+the source_document_id / source_chunk_id columns to NULL. BOTH paths first sweep
+fully-dependent artifacts (all sources in this doc) to STALE, so retrieval
+excludes them either way (hard delete would otherwise leave them ACTIVE with
+their evidence gone).
 
 Update: insert a new versioned row that supersedes the old one; old
 goes DELETED, chunks for the new doc get freshly ingested.
@@ -84,6 +86,18 @@ async def delete_document(iri: str, *, hard: bool = False) -> dict[str, Any]:
         )
         chunk_count = chunk_count_result.scalar_one()
 
+        # Fully-dependent artifacts (ALL sources in this doc) go STALE on BOTH the
+        # soft AND hard paths. On a hard delete the doc row is removed and the
+        # ArtifactSource rows cascade away, but the artifact row itself does NOT --
+        # so without this it would be left ACTIVE with its evidence gone. Mark it
+        # STALE before removing the doc so retrieval excludes it either way.
+        if stale_ids:
+            await session.execute(
+                sql_update(IntelligenceArtifact).where(
+                    IntelligenceArtifact.id.in_(stale_ids)
+                ).values(status="STALE")
+            )
+
         if hard:
             await session.execute(sql_delete(Document).where(Document.id == doc_id))
             mode = "HARD"
@@ -99,12 +113,6 @@ async def delete_document(iri: str, *, hard: bool = False) -> dict[str, Any]:
                     status="DELETED", is_deleted=True, deleted_at=now
                 )
             )
-            if stale_ids:
-                await session.execute(
-                    sql_update(IntelligenceArtifact).where(
-                        IntelligenceArtifact.id.in_(stale_ids)
-                    ).values(status="STALE")
-                )
             mode = "SOFT"
 
         new_version = await bump_version(session)

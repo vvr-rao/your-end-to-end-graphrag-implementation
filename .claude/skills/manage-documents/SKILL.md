@@ -64,7 +64,8 @@ uv run python -m backend.app.cli delete-document --iri "<doc-iri>" --hard
   rows remain. Artifacts whose ALL sources were in it → **STALE**; mixed-source
   artifacts stay `ACTIVE`. Retrieval excludes DELETED/STALE rows immediately.
 - **`--hard`** is irreversible — the row and its chunks are removed via cascade.
-  **Get explicit user confirmation before using it.**
+  It also runs the same STALE sweep (fully-dependent artifacts → STALE) so nothing
+  is left pointing at deleted evidence. **Get explicit user confirmation first.**
 
 Record the action, e.g. `uv run python scripts/build_state.py record delete-document iri=<iri> mode=<soft|hard>`.
 
