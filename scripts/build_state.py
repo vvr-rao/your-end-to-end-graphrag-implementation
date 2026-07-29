@@ -21,11 +21,13 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-STATE = ROOT / ".build" / "state.jsonl"
+# Env override lets tests isolate the tracker instead of touching the real one.
+STATE = Path(os.environ.get("YEGI_STATE_FILE") or (ROOT / ".build" / "state.jsonl"))
 
 # Canonical pipeline order (step key -> human label). Used to suggest "next".
 ORDER: list[tuple[str, str]] = [
@@ -59,6 +61,22 @@ def _records() -> list[dict]:
     return out
 
 
+def record_step(step: str, details: dict | None = None, note: str | None = None) -> dict:
+    """Append one step record to the tracker. Importable by the skill helpers so
+    they record themselves directly instead of shelling out."""
+    rec: dict = {
+        "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "step": step,
+        "details": details or {},
+    }
+    if note:
+        rec["note"] = note
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    with STATE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec) + "\n")
+    return rec
+
+
 def record(argv: list[str]) -> None:
     if not argv:
         sys.exit("usage: build_state.py record <step> [key=value ...] [--note text]")
@@ -76,16 +94,7 @@ def record(argv: list[str]) -> None:
             k, v = a.split("=", 1)
             details[k] = v
         i += 1
-    rec: dict = {
-        "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
-        "step": step,
-        "details": details,
-    }
-    if note:
-        rec["note"] = note
-    STATE.parent.mkdir(parents=True, exist_ok=True)
-    with STATE.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(rec) + "\n")
+    record_step(step, details, note)
     print(f"[build-state] recorded: {step}" + (f"  {details}" if details else ""))
 
 

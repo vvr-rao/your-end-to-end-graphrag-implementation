@@ -51,43 +51,24 @@ fed back.
 The 7 core ontologies are ALWAYS merged in, on every path.
 
 ## Step 1 — Merge (fast, foreground, no LLM)
-The 7 core ontologies, pinned by name (not globbed) so the set is explicit:
+One command merges the pinned 7 core ontologies + your Step-0 choice, records the
+merge, and prints the version folder as its LAST line. Use the flag matching Step 0:
 ```bash
-CORE=(
-  source_ontologies/core_ontologies/viao_intelligence_artifact_ontology_v2.owl
-  source_ontologies/core_ontologies/foaf.rdf
-  source_ontologies/core_ontologies/org.ttl
-  source_ontologies/core_ontologies/geography_ontology.owl
-  source_ontologies/core_ontologies/time.ttl
-  source_ontologies/core_ontologies/skos.rdf
-  source_ontologies/core_ontologies/domain_concepts.owl
-)
+# Path 1 — a supported domain (fetches OCRe / FIBO / OntoCAPE):
+MERGE_DIR=$(uv run python scripts/merge_ontology.py --domain <pharma|finance|manufacturing> | tail -1)
+# Path 2 — another domain (core ontologies only):
+MERGE_DIR=$(uv run python scripts/merge_ontology.py --core-only | tail -1)
+# Path 3 — the user's own ontology (.owl/.rdf/.ttl/.xml/.zip; repeat --ontology for several):
+MERGE_DIR=$(uv run python scripts/merge_ontology.py --ontology "<path the user gave>" | tail -1)
+# Path 4 — modify a previously generated ontology: see Step 1c
 ```
-Set `DOMAIN_FILE` according to the Step-0 choice:
-```bash
-# Path 1 (supported domain) — fetch it; the ready-to-merge path is the LAST line:
-DOMAIN_FILE=$(uv run python source_ontologies/fetch_ontology.py <pharma|finance|manufacturing> | tail -1)
-# Path 2 (another domain):     DOMAIN_FILE=""                       # core only
-# Path 3 (their own ontology): DOMAIN_FILE="<path the user gave>"   # .owl/.rdf/.ttl/.xml/.zip
-# Path 4 (modify existing):    usually re-merge the edited merged.owl — see Step 1c
-```
-Build the args (core + domain if present) and run:
-```bash
-args=(); for f in "${CORE[@]}" ${DOMAIN_FILE:+"$DOMAIN_FILE"}; do args+=(--ontology "$f"); done
-uv run python -m backend.app.cli merge "${args[@]}" --output-dir output_ontologies
-MERGE_DIR=$(ls -dt output_ontologies/v*-merge/ 2>/dev/null | head -1); echo "$MERGE_DIR"
-```
-Merge is deterministic. If it errors on a specific ontology, report which
-`--ontology` input failed. Large zips like FIBO are slow (~4 min for full FIBO) —
-expected owlready2 import-walking, not a hang.
+The 7 core ontologies are always included. Merge is deterministic; if a specific
+input fails, the error names it. Large zips like FIBO are slow (~4 min) — expected
+owlready2 import-walking, not a hang.
 
-## Step 1b — Report the result + ask the user to verify in Protégé
-Tell the user WHERE the merged ontology is, and have them eyeball it in a
-third-party tool BEFORE any paid step:
-```bash
-echo "Merged ontology written to: $MERGE_DIR/merged.owl"
-python3 scripts/build_state.py record merge path="$MERGE_DIR"   # cross-session tracker
-```
+## Step 1b — Verify in Protégé before spending
+`merge_ontology.py` already recorded the merge to the tracker and printed
+`$MERGE_DIR`. Have the user eyeball the result before the paid step:
 Say: *"Open `$MERGE_DIR/merged.owl` in Protégé (https://protege.stanford.edu/) to
 check the class hierarchy looks right before we run the paid prune-expand."* Pause
 for their confirmation.
@@ -100,18 +81,18 @@ Protégé). They can diverge. If a user edits `merged.owl` and feeds the folder 
   silently ignored.**
 - `prune-expand --input <folder> --use-owl` re-parses the edited `merged.owl` → edits
   honored, and it writes a fresh, consistent folder.
-- Universal + safest: re-run `merge --ontology <edited_merged.owl>` (plus the 7
-  core) → a new folder with `merged.json` regenerated FROM the edited OWL,
-  consistent for EVERY downstream step (prune-expand AND `db-init`).
-So on Path 4, if they hand-edited the OWL, **re-merge it (or pass `--use-owl`);
-never just resubmit the folder and assume the edits took.**
+- Universal + safest: re-merge the edited OWL —
+  `uv run python scripts/merge_ontology.py --ontology <edited_merged.owl>` — which
+  regenerates `merged.json` FROM the edited OWL, consistent for EVERY downstream
+  step (prune-expand AND `db-init`).
+So on Path 4, if they hand-edited the OWL, **re-merge it (or pass `--use-owl` to
+prune-expand); never just resubmit the folder and assume the edits took.**
 
 ## Step 1d — Ask for the corpus (now that the ontology is ready)
-```bash
-DOCS="<path the user gives you>"   # REQUIRED — ask; never assume source_documents/, never scan+pick
-[ -d "$DOCS" ] || echo "corpus folder not found: $DOCS — ask the user to confirm the path"
-ls "$DOCS" | head                  # show them what you found so they confirm the corpus
-```
+Ask the user for the path to their documents folder — **REQUIRED, no default,
+never scan their folders and pick one.** Confirm the folder exists and list its
+contents back to them (use your own file-listing tools) so they confirm it's the
+right corpus. Hold the confirmed path as `DOCS` for Step 3.
 
 ## Step 2 — Mention the `--tables` option and ask what they prefer
 Proactively tell the user that prune-expand has an optional `--tables` flag, and
@@ -128,15 +109,15 @@ Only matters for PDF corpora (no effect on plain text). Set the flags in Step 3
 to match their answer.
 
 ## Step 3 — Launch prune-expand DETACHED
+Choose a fresh, unique `RUN_ID` (e.g. `prune_expand_<date+time>`), then launch it
+detached via the harness:
 ```bash
-RUN_ID="prune_expand_$(date -u +%Y%m%d_%H%M%S)"
-python3 scripts/run_detached.py "$RUN_ID" \
+uv run python scripts/run_detached.py <RUN_ID> \
   uv run python -m backend.app.cli prune-expand \
-    --input "$MERGE_DIR" \
-    --documents "$DOCS" \
+    --input "<MERGE_DIR>" \
+    --documents "<DOCS>" \
     --output-dir output_ontologies \
     --tables            # include only if the user opted in; add --no-table-vision to skip vision
-echo "$RUN_ID"
 ```
 The harness runs this command **unchanged**, so the two-tier table cache
 (`output_ontologies/.../tables/` + `~/.cache/.../tables/`) and the evaluated-
@@ -145,7 +126,7 @@ after a crash reuses everything already computed — it does not re-pay.
 
 ## Step 4 — Monitor (re-attach any time, even after a session death)
 ```bash
-python3 scripts/job_status.py "$RUN_ID" 40      # state + last 40 log lines
+uv run python scripts/job_status.py <RUN_ID> 40      # state + last 40 log lines
 ```
 Watch for:
 - **`[preflight] WARNING: ... does not look like language`** — a garbled/
@@ -161,23 +142,17 @@ Do not block the session waiting. Check back periodically; the job runs
 regardless of whether Claude is alive.
 
 ## Step 5 — Confirm completion + report
-Completion sentinels are written only on success into the new version folder:
+One command checks the success sentinels (`stats/manifest/cost.json`, written only
+on success), prints the cost, records `prune-expand`, and prints the folder:
 ```bash
-PE_DIR=$(ls -dt output_ontologies/v*-prune-expand/ 2>/dev/null | head -1)
-if ls "$PE_DIR"/{stats.json,manifest.json,cost.json} >/dev/null 2>&1; then
-  echo "COMPLETE: $PE_DIR"
-  python3 scripts/build_state.py record prune-expand path="$PE_DIR"   # cross-session tracker
-fi
-# report the actual spend
-python3 -c "import json,sys; d=json.load(open('$PE_DIR/cost.json')); print('cost report:', json.dumps(d, indent=2))" 2>/dev/null
+PE_DIR=$(uv run python scripts/pe_report.py | tail -1)
 ```
-Also confirm caches populated (sanity):
-```bash
-ls ~/.cache/your-end-to-end-graphrag-implementation/eval_summaries/ 2>/dev/null | wc -l
-```
-Report: version-folder path, total cost, any preflight warnings, and that a
-re-run would hit caches. Hand `PE_DIR` back to the orchestrator — the ontology
-import into the DB is `db-init --input "$PE_DIR"` (run after setup-database).
+If it reports NOT complete, the run is still going or DIED — check Step 4's
+`job_status.py` and the log tail before re-launching (caches make a re-run cheap).
+
+Report: version-folder path, total cost, any preflight warnings, and that a re-run
+would hit caches. Hand `PE_DIR` to the orchestrator — the ontology import into the
+DB is the first step of the **ingest-corpus** skill (`db-init --input "$PE_DIR"`).
 
 ## Notes
 - prune-expand `--input` also accepts any prior version folder containing

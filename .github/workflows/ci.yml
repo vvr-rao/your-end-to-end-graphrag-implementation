@@ -35,3 +35,31 @@ jobs:
         # live Postgres -- DB/large-ontology tests are @slow or self-skip.
         # Coverage is printed to the CI log only; not published anywhere.
         run: uv run --python ${{ matrix.python-version }} pytest --cov --cov-report=term-missing
+
+  cross-platform-helpers:
+    # Verify the cross-platform skill helpers + durable-run harness on all three
+    # OSes. Scoped to the helper tests (not the full suite) so it proves the
+    # portable building blocks without depending on the whole suite being
+    # OS-portable. This is what lets the build flow claim macOS + Windows support.
+    name: helpers (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --dev --python 3.12
+
+      - name: Test skill helpers + durable harness (cross-platform)
+        run: uv run --python 3.12 pytest backend/tests/unit/test_skill_helpers.py -v

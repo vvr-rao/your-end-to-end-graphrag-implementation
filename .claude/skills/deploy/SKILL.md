@@ -29,7 +29,7 @@ no dashboard blueprint click-through required).
 and tells Render to build from it, so `origin` must be a repo on the user's own
 GitHub account:
 ```bash
-git remote -v | grep '^origin'
+git remote get-url origin
 ```
 If `origin` is the upstream project rather than the user's account, stop and tell
 them to **fork it on GitHub**, then either clone their fork or
@@ -38,9 +38,10 @@ straightaway; a private fork requires the user to connect GitHub in the Render
 dashboard first.
 
 **(b) DATABASE_URL points at a CLOUD database, not the local docker one.** The
-deployed backend cannot reach a laptop's localhost. Check the build tracker:
+deployed backend cannot reach a laptop's localhost. Check the build tracker and
+look at the `database` line:
 ```bash
-python3 scripts/build_state.py show | grep -iE "database"
+uv run python scripts/build_state.py show
 ```
 If the database step was recorded `kind=local`, **STOP**: a local docker DB won't
 work in production. The user must set `DATABASE_URL` to a cloud Postgres (e.g. a
@@ -50,9 +51,7 @@ deploying (see **setup-database**).
 
 **(c) Required secrets present** (presence-check only — never print a value):
 ```bash
-for k in DATABASE_URL OPENAI_API_KEY BEARER_TOKEN RENDER_API_KEY; do
-  grep -q "^$k=." .env 2>/dev/null && echo "  $k: present" || echo "  $k: MISSING"
-done
+uv run python scripts/check_env.py DATABASE_URL OPENAI_API_KEY BEARER_TOKEN RENDER_API_KEY
 ```
 
 ## Step 1 — BEARER_TOKEN (the app's own API auth)
@@ -105,7 +104,7 @@ do themselves — you cannot. Tell them to:
 Once both services are live, read the URLs from `render-status` and record the
 step for the cross-session tracker:
 ```bash
-python3 scripts/build_state.py record deploy backend=<backend-url> frontend=<frontend-url>
+uv run python scripts/build_state.py record deploy backend=<backend-url> frontend=<frontend-url>
 ```
 Report both URLs and note the backend serves REST at `/`, MCP at `/mcp`, and a
 health check at `/health`, and that the UI needs the bearer token pasted (Step 5).

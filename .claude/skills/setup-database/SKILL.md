@@ -54,15 +54,12 @@ Ensure the env file exists either way:
 3. Go to Step 3.
 
 ## Step 2b — Local docker-compose database (automatic)
+Bring Postgres (pgvector/pgvector:pg16) up and wait until it's healthy:
 ```bash
-# Start Postgres (pgvector/pgvector:pg16). Redis also comes up for arq.
-docker compose up -d postgres
-# Wait until it reports healthy (compose healthcheck: pg_isready).
-for i in $(seq 1 30); do
-  h=$(docker inspect --format '{{.State.Health.Status}}' ontologist-postgres 2>/dev/null || echo none)
-  echo "postgres health: $h"; [ "$h" = healthy ] && break; sleep 2
-done
+uv run python scripts/db_up.py
 ```
+(Requires Docker Desktop running. The helper runs `docker compose up -d postgres`
+and polls the container health cross-platform.)
 Then tell the user to set this **exact, non-secret local** line in `.env` (they
 paste it — keep `.env` owned by them; you may display this value because it is a
 throwaway local credential):
@@ -80,7 +77,7 @@ uv run python -m backend.app.cli db-init
 ```
 On success, record it for the cross-session tracker (`local` or `external`):
 ```bash
-python3 scripts/build_state.py record database kind=<local|external>
+uv run python scripts/build_state.py record database kind=<local|external>
 ```
 - Success looks like: alembic upgrade to head + a db-status report (schema
   present, tables listed, size comfortably within the database's storage limit).

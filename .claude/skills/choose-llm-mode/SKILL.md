@@ -19,16 +19,9 @@ copy it into place, and confirm the required API keys are present in `.env` —
 - **Never** read `.env` with the Read tool (it is denied) and never `cat`/print it.
 - **Never** ask the user to paste a key into the chat. Keys go in `.env` only,
   edited by the user in their own editor.
-- Check for a key using ONLY a quiet check that prints no value. A key counts as
-  configured when it is present, non-empty, AND not a template placeholder (the
-  `.env.example` placeholders are empty or end in `...`, e.g. `sk-...`, `gsk_...`):
-  ```bash
-  key_configured() {  # $1 = var name; exit 0 if a REAL value is set. Prints nothing.
-    grep -qE "^$1=.+" .env && ! grep -qE "^$1=.*\.\.\.[[:space:]]*$" .env
-  }
-  ```
-  A blank `ANTHROPIC_API_KEY=` fails `.+` (MISSING); a placeholder `sk-...` matches
-  the second grep and is rejected (MISSING); a real `sk-proj-…` passes (present).
+- Presence is checked by a helper that reads `.env` and returns only present/MISSING,
+  never a value: `uv run python scripts/check_env.py KEY [KEY ...]`. A key counts as
+  configured only when present, non-empty, AND not a `...placeholder...`.
 - If you ever need to show the user what to edit, show the **variable name**,
   never a value.
 
@@ -37,40 +30,28 @@ Present these three options (AskUserQuestion). Embeddings ALWAYS run on OpenAI
 (`text-embedding-3-small`); Anthropic/Voyage are not used for embeddings. So
 **every mode requires `OPENAI_API_KEY`.**
 
-| Mode | Preset file | Keys required in `.env` | Notes |
+| Mode | `<mode>` arg | Keys required in `.env` | Notes |
 |---|---|---|---|
-| **Groq + OpenAI** (default) | `config/models.example.yaml` | `OPENAI_API_KEY`, `GROQ_API_KEY` | Groq runs chunk_classification (best disambiguation); OpenAI everything else. |
-| **OpenAI only** | `config/models.openai.example.yaml` | `OPENAI_API_KEY` | Simplest; one provider. chunk_classification → `gpt-4.1-mini`. |
-| **Anthropic + OpenAI** | `config/models.anthropic.example.yaml` | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` | Claude for chat (haiku cheap tasks / sonnet synthesis); OpenAI for embeddings only. |
+| **Groq + OpenAI** (default) | `groq-openai` | `OPENAI_API_KEY`, `GROQ_API_KEY` | Groq runs chunk_classification (best disambiguation); OpenAI everything else. |
+| **OpenAI only** | `openai` | `OPENAI_API_KEY` | Simplest; one provider. chunk_classification → `gpt-4.1-mini`. |
+| **Anthropic + OpenAI** | `anthropic` | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` | Claude for chat (haiku cheap tasks / sonnet synthesis); OpenAI for embeddings only. |
 
-## Step 2 — Activate the preset
+## Step 2 — Activate the mode (one command)
 ```bash
-# .env scaffolding (safe: template has placeholders, no real secrets)
-[ -f .env ] || cp .env.example .env
-# copy the chosen preset into the active config
-cp config/models.<chosen>.example.yaml config/models.yaml
+uv run python scripts/select_llm_mode.py <mode>   # groq-openai | openai | anthropic
 ```
-Confirm it landed:
-```bash
-grep -m1 -A2 'chunk_classification:' config/models.yaml | grep provider:
-python3 scripts/build_state.py record llm-mode mode=<chosen>   # cross-session tracker
-```
-(`models.yaml` has no secrets — reading it is fine and expected.)
+This scaffolds `.env` + `config/config.yaml` from the templates if missing, copies
+the matching `models.*.example.yaml` into `config/models.yaml`, presence-checks the
+mode's required keys (values never shown), and records `llm-mode` to the tracker.
+It exits non-zero and names any missing keys.
 
-## Step 3 — Verify required keys are present (presence only)
-Using the `key_configured` helper above, check each key the chosen mode needs.
-Example for Anthropic+OpenAI mode:
-```bash
-key_configured() { grep -qE "^$1=.+" .env && ! grep -qE "^$1=.*\.\.\.[[:space:]]*$" .env; }
-for k in OPENAI_API_KEY ANTHROPIC_API_KEY; do
-  if key_configured "$k"; then echo "$k: present"; else echo "$k: MISSING"; fi
-done
-```
-- If all present → report ready, hand back to the orchestrator.
-- If any MISSING → tell the user exactly which variable(s) to fill in `.env`
-  (by name), e.g. *"Open `.env` in your editor and set `ANTHROPIC_API_KEY=...`.
-  I can't see or accept the value — add it there and tell me when done."* Then
-  re-run the presence check. Do not proceed to any paid step until keys pass.
+## Step 3 — Handle missing keys
+- If the helper reports all keys present → report ready, hand back to the orchestrator.
+- If it names any MISSING → tell the user exactly which variable(s) to fill in
+  `.env` (by name), e.g. *"Open `.env` in your editor and set `ANTHROPIC_API_KEY=`
+  to your key. I can't see or accept the value — add it there and tell me when
+  done."* Then re-check with `uv run python scripts/check_env.py OPENAI_API_KEY
+  ANTHROPIC_API_KEY`. Do not proceed to any paid step until keys pass.
 
 ## Notes
 - A wrong/expired key cannot be detected by presence check — only a real call

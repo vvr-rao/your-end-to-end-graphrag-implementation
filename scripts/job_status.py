@@ -35,7 +35,8 @@ def _root() -> Path:
     return Path.cwd()
 
 
-RUNS = _root() / ".runs"
+# Env override lets tests isolate runs instead of touching the real .runs/.
+RUNS = Path(os.environ.get("YEGI_RUNS_DIR") or (_root() / ".runs"))
 
 
 def _pid_alive(pid: int) -> bool:

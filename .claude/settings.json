@@ -34,7 +34,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 scripts/build_state.py show --quiet-if-empty"
+            "command": "uv run python scripts/build_state.py show --quiet-if-empty"
           }
         ]
       }

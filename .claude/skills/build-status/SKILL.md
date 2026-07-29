@@ -16,7 +16,7 @@ whenever the user explicitly asks about status or wants to continue.
 
 ## Report status
 ```bash
-python3 scripts/build_state.py show
+uv run python scripts/build_state.py show
 ```
 Relay it plainly: the recent steps, the **last operation** (and its artifact
 path), and the **suggested next step**. Then offer to continue from there.
@@ -45,4 +45,4 @@ The tracker records what the assistant has confirmed completing. If the user did
 something outside these skills (e.g. ran a CLI command themselves), it won't be in
 the log — check the actual artifacts (`output_ontologies/`, `db-status`) if the
 user says they did something the tracker doesn't show, and record it with
-`python3 scripts/build_state.py record <step> path=<...>` once confirmed.
+`uv run python scripts/build_state.py record <step> path=<...>` once confirmed.
