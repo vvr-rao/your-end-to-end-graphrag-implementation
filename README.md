@@ -86,7 +86,7 @@ Render deploys from **your** GitHub repository via the `render.yaml` blueprint, 
 
 ### Platform support
 
-The Claude Code build flow works on **Linux and macOS** natively. The durable-run harness that keeps long jobs alive across a closed session is pure Python (`scripts/run_detached.py`, using the OS session/process-group primitives) — no `setsid` or bash dependency — so detached jobs behave identically on both. On **Windows, use [WSL2](https://learn.microsoft.com/windows/wsl/install)**: the skills drive POSIX shell commands, and WSL2 also gives the smoothest Docker / Postgres / `uv` experience (native Windows under Git Bash is best-effort, not guaranteed). Everywhere, Python 3.12+ must be available as `python3`. Caching is filesystem-based under `~/.cache/…` and works on every platform.
+The Claude Code build flow works natively on **Linux and macOS**. The skills drive small cross-platform **Python helpers** (invoked with `uv run python`) instead of shell scripts, and the durable-run harness (`scripts/run_detached.py`) uses the OS's own process-session primitives — no `setsid`, no bash arrays, no `python3`-only commands — so the moving parts are portable and exercised by CI on Linux, macOS, and Windows. On **Windows**, [WSL2](https://learn.microsoft.com/windows/wsl/install) is the smoothest path (a full Linux environment, plus better Docker / Postgres / `uv` support); native Windows runs under Git Bash (which Claude Code uses for its shell there) and the helpers/harness are Windows-CI-tested, but the end-to-end conversational flow isn't, so treat native Windows as best-effort. `uv` and Python 3.12+ are required everywhere. Caching is filesystem-based under `~/.cache/…` and works on every platform.
 
 ## UI
 

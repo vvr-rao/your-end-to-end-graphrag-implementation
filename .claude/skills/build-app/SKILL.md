@@ -3,7 +3,7 @@ name: build-app
 description: >
   Guide a user through building the whole GraphRAG app end-to-end after a git
   clone — pick LLM mode, set up the database, merge ontologies, run prune-expand,
-  load the ontology, then (next) ingest documents and deploy. Orchestrates the
+  load the ontology, ingest documents, and deploy. Orchestrates the
   other skills and the durable-run harness. Use when a user wants to "build",
   "set up", or "get started with" this app.
 ---
@@ -81,25 +81,14 @@ prune-expand **detached**, monitoring to completion. First multi-hour paid step;
 capture the resulting `v*-prune-expand/` folder. Note the edit-and-resubmit gotcha
 (hand-edited `merged.owl` needs `--use-owl` or a re-merge, or edits are ignored).
 
-### 4. Load the ontology into the DB
-Once both the DB (step 2) and the prune-expand folder (step 3) are ready:
-```bash
-PE_DIR=$(ls -dt output_ontologies/v*-prune-expand/ | head -1)
-uv run python -m backend.app.cli db-init --input "$PE_DIR"     # idempotent upsert
-uv run python -m backend.app.cli db-status
-```
+### 4. Load ontology + ingest the corpus  →  invoke skill **ingest-corpus**
+The corpus half, symmetric with run-prune-expand: it loads the prune-expand
+ontology into the DB (`db-init --input`), then chunks+embeds the documents,
+extracts entities, enriches time, and generates intelligence artifacts — the long
+paid steps run detached and monitored via the same harness, with `--limit`
+smoke-tests, the 500 MB DB-size guardrail, and a tracker record per step.
 
-### 5. Corpus ingestion  →  same detached pattern
-These reuse the exact Step-3 harness pattern (`run_detached.py` + `job_status.py`).
-Smoke-test with `--limit` first, check the result with the user, then scale up to
-the full corpus. Run each via the harness (long) or directly (short), monitor, and
-surface errors — the orchestration is identical to step 3:
-- `register-documents --documents <dir> [--tables]` — chunk + embed (long, paid).
-- `extract-entities` — entities/relationships per chunk (long, paid).
-- `enrich-time` — temporal enrichment (short).
-- `generate-artifacts` — Claims/Findings/Insights/etc. (long, paid).
-
-### 6. Deploy to Render  →  invoke skill **deploy**
+### 5. Deploy to Render  →  invoke skill **deploy**
 Guides the user through forking the repo, setting `RENDER_API_KEY` + generating a
 `BEARER_TOKEN` in `.env`, `render-init` to create the backend + frontend services,
 monitoring the build, and the final manual UI token paste. Requires a **cloud**

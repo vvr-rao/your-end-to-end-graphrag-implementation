@@ -57,8 +57,13 @@ def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _runs_root() -> Path:
+    # Env override lets tests isolate runs instead of touching the real .runs/.
+    return Path(os.environ.get("YEGI_RUNS_DIR") or (ROOT / ".runs"))
+
+
 def _run_dir(run_id: str) -> Path:
-    return ROOT / ".runs" / run_id
+    return _runs_root() / run_id
 
 
 def _launch(run_id: str, cmd: list[str]) -> int:
