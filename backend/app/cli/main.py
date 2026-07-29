@@ -722,6 +722,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_art.set_defaults(func=_cmd_generate_artifacts)
 
+    p_regen = sub.add_parser(
+        "regenerate-stale-artifacts",
+        help=(
+            "Regenerate artifacts for documents whose OLD versions left STALE "
+            "artifacts behind (from update / soft-delete): regenerate scoped to "
+            "the ACTIVE successor document, then retire the stale rows."
+        ),
+    )
+    p_regen.add_argument(
+        "--dry-run", action="store_true",
+        help="Report how many STALE artifacts + updated docs would be acted on; no writes.",
+    )
+    p_regen.add_argument(
+        "--max-cost-usd", type=float, default=10.0,
+        help="Cost cap passed to the scoped regeneration.",
+    )
+    p_regen.add_argument("--concurrency", type=int, default=4)
+    p_regen.add_argument(
+        "--no-retire", dest="retire", action="store_false", default=True,
+        help="Regenerate but keep the STALE rows instead of retiring them (status -> DELETED).",
+    )
+    p_regen.set_defaults(func=_cmd_regenerate_stale_artifacts)
+
     # ---------- Phase 2: Milestone F (retrieval + answer synthesis) ----------
     p_q = sub.add_parser(
         "query",
@@ -1463,6 +1486,21 @@ def _cmd_generate_artifacts(args: argparse.Namespace) -> int:
             )
         )
 
+    return 0
+
+
+def _cmd_regenerate_stale_artifacts(args: argparse.Namespace) -> int:
+    from backend.app.services.db_artifact_gen import regenerate_stale_artifacts
+
+    result = asyncio.run(
+        regenerate_stale_artifacts(
+            dry_run=args.dry_run,
+            max_cost_usd=args.max_cost_usd,
+            concurrency=args.concurrency,
+            retire=args.retire,
+        )
+    )
+    _print_json(result)
     return 0
 
 

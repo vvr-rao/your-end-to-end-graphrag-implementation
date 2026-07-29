@@ -46,10 +46,11 @@ Replaces a document's content. **No-op if the new file's sha256 matches the old.
 ```bash
 uv run python -m backend.app.cli update-document --iri "<doc-iri>" --path "<new-file>"
 ```
-Effect (by design): a new version supersedes the old, the old document → `DELETED`,
-and artifacts whose **ALL** sources were in that document → **STALE** (mixed-source
-artifacts stay `ACTIVE`). Then re-run register/extract/generate so the new content
-is chunked, mined, and re-covered. See "Stale artifacts" below.
+Effect (by design): the new file is ingested as a new version that supersedes the
+old, the old document → `DELETED`, and artifacts whose **ALL** sources were in that
+document → **STALE** (mixed-source artifacts stay `ACTIVE`). Follow up with
+`extract-entities` (covers the new chunks) and **`regenerate-stale-artifacts`**
+(regenerates artifacts for the new version + retires the stale rows) — see below.
 
 ## Delete a document
 ```bash
@@ -67,14 +68,30 @@ uv run python -m backend.app.cli delete-document --iri "<doc-iri>" --hard
 
 Record the action, e.g. `uv run python scripts/build_state.py record delete-document iri=<iri> mode=<soft|hard>`.
 
-## Stale artifacts (the follow-on that bites)
+## Stale artifacts (the follow-on)
 After an update or soft-delete, artifacts that depended **entirely** on the
 affected document are set `status='STALE'` (mixed-source ones stay `ACTIVE`).
-Retrieval simply **skips STALE rows**, so answers won't cite them — but the rows
-persist. **There is currently no one-command `regenerate-stale-artifacts`.**
-Regeneration is manual: re-run `generate-artifacts` (optionally `--rollup`) so
-fresh artifacts replace the stale coverage. **Tell the user this explicitly** — so
-they know stale artifacts linger (excluded from retrieval) until regenerated.
+Retrieval **skips STALE rows**, so answers won't cite them — but the rows persist
+as tombstones. Two distinct cases:
+
+- **Added a NEW document** → re-run `generate-artifacts` (ingest-corpus Step 5): it
+  processes the new ACTIVE chunks and creates fresh artifacts for them. It does NOT
+  touch STALE rows (it skips chunks that already have an artifact of that type, and
+  only reads ACTIVE chunks) — that's fine, a brand-new doc has no stale rows.
+- **Updated an existing document** → run **`regenerate-stale-artifacts`** (below).
+  Re-running `generate-artifacts` alone would leave the old STALE rows behind.
+
+## Regenerate stale artifacts (after updates)
+```bash
+uv run python -m backend.app.cli regenerate-stale-artifacts --dry-run        # preview, no writes
+uv run python -m backend.app.cli regenerate-stale-artifacts [--max-cost-usd <cap>]
+```
+It traces each STALE artifact to its origin document, finds the ACTIVE version that
+**superseded** it, regenerates artifacts scoped to that new version (idempotent —
+reuses the normal generators), and then **retires** the stale rows (`status ->
+DELETED`). STALE artifacts from a plain delete (no successor version) have nothing
+to regenerate from — they are simply retired. Run `--dry-run` first to see how many
+stale artifacts and updated documents it will act on.
 
 ## Notes
 - `list-documents --status STALE` and `--status DELETED` show what a change left

@@ -35,7 +35,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import func, select, text as sql_text
+from sqlalchemy import func, select, text as sql_text, update as sql_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from backend.app.core.config import get_settings
@@ -906,3 +906,103 @@ async def generate_document_summaries(
     summary.total_cost_usd += await _auto_summary_rollup(max_cost_usd)
 
     return summary
+
+
+async def regenerate_stale_artifacts(
+    *,
+    dry_run: bool = False,
+    types: tuple[str, ...] = _DEFAULT_PER_CHUNK_TYPES,
+    concurrency: int = 4,
+    max_cost_usd: float = 10.0,
+    retire: bool = True,
+) -> dict[str, Any]:
+    """Regenerate artifacts for documents whose OLD versions left STALE artifacts.
+
+    A soft-delete or update marks an artifact STALE when its ENTIRE evidence base
+    was in the affected document (mixed-source artifacts stay ACTIVE). Those STALE
+    rows are excluded from retrieval but otherwise linger. This command:
+
+      1. finds STALE artifacts and traces each to its origin document (via its
+         source chunks' document_id);
+      2. finds the ACTIVE successor document -- the one that SUPERSEDED the origin
+         (i.e. the doc was UPDATED, not merely deleted);
+      3. regenerates artifacts SCOPED to each successor, reusing the normal
+         per-chunk + summary generators (idempotent -- already-covered chunks are
+         skipped); and
+      4. retires the STALE rows (status -> DELETED) so they stop cluttering.
+
+    STALE artifacts from a plain delete (no successor version) have nothing to
+    regenerate from -- they are simply retired.
+
+    With dry_run=True, reports what it WOULD do and writes nothing.
+    """
+    # 1 + 2: trace stale artifacts -> origin docs -> ACTIVE successors.
+    async with session_scope() as session:
+        stale_rows = await session.execute(
+            select(IntelligenceArtifact.id).where(IntelligenceArtifact.status == "STALE")
+        )
+        stale_ids = [r[0] for r in stale_rows.all()]
+        if not stale_ids:
+            print("[regenerate-stale] no STALE artifacts -- nothing to do.")
+            return {"stale": 0, "successors": 0, "regenerated_docs": [], "retired": 0}
+
+        origin_rows = await session.execute(
+            select(Chunk.document_id)
+            .join(ArtifactSource, ArtifactSource.chunk_id == Chunk.id)
+            .where(ArtifactSource.artifact_id.in_(stale_ids))
+            .distinct()
+        )
+        origin_doc_ids = [r[0] for r in origin_rows.all() if r[0] is not None]
+
+        successor_iris: list[str] = []
+        if origin_doc_ids:
+            succ_rows = await session.execute(
+                select(Document.document_identifier).where(
+                    Document.supersedes_document_id.in_(origin_doc_ids),
+                    Document.status == "ACTIVE",
+                )
+            )
+            successor_iris = [r[0] for r in succ_rows.all()]
+
+    print(
+        f"[regenerate-stale] {len(stale_ids)} STALE artifact(s); "
+        f"{len(successor_iris)} updated document(s) to regenerate from."
+    )
+    if dry_run:
+        print("[regenerate-stale] dry-run: no writes.")
+        return {
+            "stale": len(stale_ids),
+            "successors": len(successor_iris),
+            "regenerated_docs": successor_iris,
+            "retired": 0,
+        }
+
+    # 3: regenerate artifacts scoped to each ACTIVE successor (reuse tested paths).
+    for iri in successor_iris:
+        await generate_per_chunk_artifacts(
+            scope_document_iri=iri, types=types,
+            concurrency=concurrency, max_cost_usd=max_cost_usd,
+        )
+        await generate_document_summaries(
+            scope_document_iri=iri, concurrency=concurrency, max_cost_usd=max_cost_usd,
+        )
+
+    # 4: retire the STALE tombstones (already excluded from retrieval; this clears
+    # them so they don't accumulate). Status flip only -- reversible, no FK games.
+    retired = 0
+    if retire:
+        async with session_scope() as session:
+            await session.execute(
+                sql_update(IntelligenceArtifact)
+                .where(IntelligenceArtifact.id.in_(stale_ids))
+                .values(status="DELETED")
+            )
+        retired = len(stale_ids)
+        print(f"[regenerate-stale] retired {retired} STALE artifact(s) -> DELETED.")
+
+    return {
+        "stale": len(stale_ids),
+        "successors": len(successor_iris),
+        "regenerated_docs": successor_iris,
+        "retired": retired,
+    }
