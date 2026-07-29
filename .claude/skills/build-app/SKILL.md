@@ -94,6 +94,11 @@ Guides the user through forking the repo, setting `RENDER_API_KEY` + generating 
 monitoring the build, and the final manual UI token paste. Requires a **cloud**
 DB (not the local docker one). Records `deploy` (with URLs) to the tracker.
 
+## After the build — changing the corpus
+If the user later wants to **add, update, or delete documents** in an already-built
+graph — invoke skill **manage-documents** (idempotent adds, soft/hard delete, and
+the STALE-artifact follow-on).
+
 ## General questions
 If the user asks what the app does, what a step costs, or how a tool works rather
 than asking to build — invoke skill **app-help**.

@@ -52,7 +52,7 @@ otherwise ask — never scan+pick). Discuss the options with the user:
 ```bash
 # choose a fresh RUN_ID, e.g. register_docs_<date+time>
 uv run python scripts/run_detached.py <RUN_ID> \
-  uv run python -m backend.app.cli register-documents --documents "<DOCS>" [--tables] [--full-text-chunks]
+  uv run python -m backend.app.cli register-documents --input "<DOCS>" [--tables] [--full-text-chunks]
 uv run python scripts/job_status.py <RUN_ID> 40      # monitor
 ```
 On completion, check `db-size`, then record (fill counts from the run output):

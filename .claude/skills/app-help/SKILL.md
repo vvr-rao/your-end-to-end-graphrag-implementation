@@ -82,4 +82,5 @@ domain_concepts) is ALWAYS merged in as well.
 ## How to help
 - "What does X do / cost / support?" → answer here or from `--help`/README.
 - "Build it / run step X" → hand off to **build-app** (or the specific skill).
+- "Add / update / delete a document" (after the build) → hand off to **manage-documents**.
 - Keep credentials out of chat; never read `.env`.
