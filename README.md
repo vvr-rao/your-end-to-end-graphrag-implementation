@@ -243,7 +243,7 @@ Summarization also uses **provider prompt caching** — the 12K source block is 
 ```bash
 # Ingest: summary chunks (gpt-4.1-mini) for cheap vector retrieval + embedding,
 # AND verbatim full-text chunks so extraction runs against the complete source.
-uv run python -m backend.app.cli register-documents --full-text-chunks --documents-dir source_documents/<corpus>
+uv run python -m backend.app.cli register-documents --full-text-chunks --input source_documents/<corpus>
 
 # Downstream stages mine the verbatim full-text chunks (not the compressed summary):
 uv run python -m backend.app.cli enrich-time        --from-fulltext
