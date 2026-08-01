@@ -34,10 +34,8 @@ Ask the user (AskUserQuestion):
 > already know you want to deploy, give me a **Supabase** connection string now
 > and we build once.
 
-Ensure the env file exists either way:
-```bash
-[ -f .env ] || cp .env.example .env
-```
+Ensure a `.env` file exists (create it by copying `.env.example` if it's missing —
+`select_llm_mode.py` also does this scaffolding). Then the user edits `.env`.
 
 ## Step 2a — External database (Supabase or any Postgres)
 1. Ask the user to open `.env` in their editor and set `DATABASE_URL`. For

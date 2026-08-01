@@ -32,11 +32,16 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
 - **Record each step** so the cross-session tracker can resume after a restart.
 
 ## Step 1 — Load the ontology into the DB
-```bash
-PE_DIR=$(uv run python scripts/latest_run_dir.py prune-expand)
-uv run python -m backend.app.cli db-init --input "$PE_DIR"   # idempotent upsert
+First get the prune-expand folder path (the helper prints it):
+```
+uv run python scripts/latest_run_dir.py prune-expand
+```
+Then, substituting that printed path for `<PE_DIR>`, load it and record the step
+(db-init is an idempotent upsert):
+```
+uv run python -m backend.app.cli db-init --input "<PE_DIR>"
 uv run python -m backend.app.cli db-status
-uv run python scripts/build_state.py record db-init path="$PE_DIR"
+uv run python scripts/build_state.py record db-init path="<PE_DIR>"
 ```
 (If the user hand-edited the ontology, re-merge first — see run-prune-expand
 Step 1c — so `merged.json` reflects the edits before this import.)
@@ -48,12 +53,11 @@ otherwise ask — never scan+pick). Discuss the options with the user:
 - `--full-text-chunks` — additionally store verbatim full-text chunks (better recall
   + exact citations) at the cost of DB size. Prereq for `--from-fulltext` later.
 
-**Smoke-test** with `--limit 5`, review, then scale. Launch detached:
-```bash
-# choose a fresh RUN_ID, e.g. register_docs_<date+time>
-uv run python scripts/run_detached.py <RUN_ID> \
-  uv run python -m backend.app.cli register-documents --input "<DOCS>" [--tables] [--full-text-chunks]
-uv run python scripts/job_status.py <RUN_ID> 40      # monitor
+**Smoke-test** with `--limit 5`, review, then scale. Launch detached (single-line
+command; choose a fresh `RUN_ID`, e.g. `register_docs_<date+time>`):
+```
+uv run python scripts/run_detached.py <RUN_ID> uv run python -m backend.app.cli register-documents --input "<DOCS>" [--tables] [--full-text-chunks]
+uv run python scripts/job_status.py <RUN_ID> 40
 ```
 On completion, check `db-size`, then record (fill counts from the run output):
 ```bash
@@ -62,10 +66,10 @@ uv run python scripts/build_state.py record register-documents docs=<n> chunks=<
 
 ## Step 3 — extract-entities (entities + relationships; long, paid)
 Mints entities/relationships per chunk — **no new ontology classes**. Add
-`--from-fulltext` only if you ingested `--full-text-chunks` in Step 2.
-```bash
-uv run python scripts/run_detached.py <RUN_ID> \
-  uv run python -m backend.app.cli extract-entities [--limit 5] [--from-fulltext] [--max-cost-usd <cap>]
+`--from-fulltext` only if you ingested `--full-text-chunks` in Step 2. Single-line
+launch:
+```
+uv run python scripts/run_detached.py <RUN_ID> uv run python -m backend.app.cli extract-entities [--limit 5] [--from-fulltext] [--max-cost-usd <cap>]
 uv run python scripts/job_status.py <RUN_ID> 40
 uv run python scripts/build_state.py record extract-entities entities=<n>
 ```
@@ -82,9 +86,9 @@ uv run python scripts/build_state.py record enrich-time instances=<n>
 Per-chunk `Claim`/`Finding`/`Observation`/`Event` + per-doc `Summary`. Opt-in
 cross-cluster `Insight`/`Recommendation` via `--type` (gpt-4.1 — more expensive),
 and `--rollup` for hierarchical consolidation. `--from-fulltext` if available.
-```bash
-uv run python scripts/run_detached.py <RUN_ID> \
-  uv run python -m backend.app.cli generate-artifacts [--limit 5] [--type Insight --type Recommendation] [--rollup] [--from-fulltext] [--max-cost-usd <cap>]
+Single-line launch:
+```
+uv run python scripts/run_detached.py <RUN_ID> uv run python -m backend.app.cli generate-artifacts [--limit 5] [--type Insight --type Recommendation] [--rollup] [--from-fulltext] [--max-cost-usd <cap>]
 uv run python scripts/job_status.py <RUN_ID> 40
 uv run python -m backend.app.cli db-size
 uv run python scripts/build_state.py record generate-artifacts artifacts=<n>

@@ -51,15 +51,17 @@ fed back.
 The 7 core ontologies are ALWAYS merged in, on every path.
 
 ## Step 1 — Merge (fast, foreground, no LLM)
-One command merges the pinned 7 core ontologies + your Step-0 choice, records the
-merge, and prints the version folder as its LAST line. Use the flag matching Step 0:
-```bash
+Run ONE of the following, matching the Step-0 choice. Each merges the pinned 7 core
+ontologies + your choice, records the merge, and **prints the version-folder path on
+its last line** — read that path from the command output and use it as `MERGE_DIR`
+in Step 3 (no shell-variable capture needed, so this works in any shell):
+```
 # Path 1 — a supported domain (fetches OCRe / FIBO / OntoCAPE):
-MERGE_DIR=$(uv run python scripts/merge_ontology.py --domain <pharma|finance|manufacturing> | tail -1)
+uv run python scripts/merge_ontology.py --domain <pharma|finance|manufacturing>
 # Path 2 — another domain (core ontologies only):
-MERGE_DIR=$(uv run python scripts/merge_ontology.py --core-only | tail -1)
+uv run python scripts/merge_ontology.py --core-only
 # Path 3 — the user's own ontology (.owl/.rdf/.ttl/.xml/.zip; repeat --ontology for several):
-MERGE_DIR=$(uv run python scripts/merge_ontology.py --ontology "<path the user gave>" | tail -1)
+uv run python scripts/merge_ontology.py --ontology "<path the user gave>"
 # Path 4 — modify a previously generated ontology: see Step 1c
 ```
 The 7 core ontologies are always included. Merge is deterministic; if a specific
@@ -67,9 +69,9 @@ input fails, the error names it. Large zips like FIBO are slow (~4 min) — expe
 owlready2 import-walking, not a hang.
 
 ## Step 1b — Verify in Protégé before spending
-`merge_ontology.py` already recorded the merge to the tracker and printed
-`$MERGE_DIR`. Have the user eyeball the result before the paid step:
-Say: *"Open `$MERGE_DIR/merged.owl` in Protégé (https://protege.stanford.edu/) to
+`merge_ontology.py` already recorded the merge to the tracker and printed the merge
+folder path (`MERGE_DIR`). Have the user eyeball the result before the paid step:
+Say: *"Open `<MERGE_DIR>/merged.owl` in Protégé (https://protege.stanford.edu/) to
 check the class hierarchy looks right before we run the paid prune-expand."* Pause
 for their confirmation.
 
@@ -109,15 +111,11 @@ Only matters for PDF corpora (no effect on plain text). Set the flags in Step 3
 to match their answer.
 
 ## Step 3 — Launch prune-expand DETACHED
-Choose a fresh, unique `RUN_ID` (e.g. `prune_expand_<date+time>`), then launch it
-detached via the harness:
-```bash
-uv run python scripts/run_detached.py <RUN_ID> \
-  uv run python -m backend.app.cli prune-expand \
-    --input "<MERGE_DIR>" \
-    --documents "<DOCS>" \
-    --output-dir output_ontologies \
-    --tables            # include only if the user opted in; add --no-table-vision to skip vision
+Choose a fresh, unique `RUN_ID` (e.g. `prune_expand_<date+time>`). Launch it detached
+via the harness as a **single-line command** (works in any shell). Append `--tables`
+only if the user opted in, and `--no-table-vision` to skip vision:
+```
+uv run python scripts/run_detached.py <RUN_ID> uv run python -m backend.app.cli prune-expand --input "<MERGE_DIR>" --documents "<DOCS>" --output-dir output_ontologies
 ```
 The harness runs this command **unchanged**, so the two-tier table cache
 (`output_ontologies/.../tables/` + `~/.cache/.../tables/`) and the evaluated-
@@ -142,17 +140,19 @@ Do not block the session waiting. Check back periodically; the job runs
 regardless of whether Claude is alive.
 
 ## Step 5 — Confirm completion + report
-One command checks the success sentinels (`stats/manifest/cost.json`, written only
-on success), prints the cost, records `prune-expand`, and prints the folder:
-```bash
-PE_DIR=$(uv run python scripts/pe_report.py | tail -1)
+Run this — it checks the success sentinels (`stats/manifest/cost.json`, written only
+on success), prints the cost, records `prune-expand`, and **prints the folder on its
+last line** (read it from the output as `PE_DIR`):
+```
+uv run python scripts/pe_report.py
 ```
 If it reports NOT complete, the run is still going or DIED — check Step 4's
 `job_status.py` and the log tail before re-launching (caches make a re-run cheap).
 
 Report: version-folder path, total cost, any preflight warnings, and that a re-run
-would hit caches. Hand `PE_DIR` to the orchestrator — the ontology import into the
-DB is the first step of the **ingest-corpus** skill (`db-init --input "$PE_DIR"`).
+would hit caches. Hand the prune-expand folder path to the orchestrator — the
+ontology import into the DB is the first step of the **ingest-corpus** skill
+(`db-init --input <prune-expand-folder>`).
 
 ## Notes
 - prune-expand `--input` also accepts any prior version folder containing
