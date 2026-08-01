@@ -26,11 +26,10 @@ uv run python -m backend.app.cli list-documents --status ACTIVE  # or STALE / DE
 ## Add documents to an existing graph
 `register-documents` is **idempotent — it skips any doc already ingested (matched
 by sha256)**, so pointing it at a folder containing new files adds only the new
-ones. Smoke-test a big batch with `--limit` first, then launch detached:
-```bash
-# choose a fresh RUN_ID, e.g. add_docs_<date+time>
-uv run python scripts/run_detached.py <RUN_ID> \
-  uv run python -m backend.app.cli register-documents --input "<folder-with-new-docs>" [--tables] [--full-text-chunks]
+ones. Smoke-test a big batch with `--limit` first, then launch detached (single-line
+command; choose a fresh `RUN_ID`, e.g. `add_docs_<date+time>`):
+```
+uv run python scripts/run_detached.py <RUN_ID> uv run python -m backend.app.cli register-documents --input "<folder-with-new-docs>" [--tables] [--full-text-chunks]
 uv run python scripts/job_status.py <RUN_ID> 40
 ```
 **Then fold them into the graph.** New docs create chunks but NOT yet entities or
