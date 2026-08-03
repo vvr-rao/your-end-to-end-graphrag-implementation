@@ -32,12 +32,18 @@ command; choose a fresh `RUN_ID`, e.g. `add_docs_<date+time>`):
 uv run python scripts/run_detached.py <RUN_ID> uv run python -m backend.app.cli register-documents --input "<folder-with-new-docs>" [--tables] [--full-text-chunks]
 uv run python scripts/job_status.py <RUN_ID> 40
 ```
+**Match the corpus's full-text setting.** If the corpus was originally ingested with
+`--full-text-chunks` (check the tracker: `register-documents … fulltext=yes`), pass
+`--full-text-chunks` here too, so the new docs get full-text chunks like the rest.
+
 **Then fold them into the graph.** New docs create chunks but NOT yet entities or
 artifacts. Re-run the extraction steps — each is idempotent and processes only the
-new, unprocessed chunks: `extract-entities` (skips chunks that already have edges),
-`enrich-time`, `generate-artifacts`. See **ingest-corpus** Steps 3–5. Record it:
-```bash
-uv run python scripts/build_state.py record add-documents docs=<n>
+new, unprocessed chunks: `extract-entities`, `enrich-time`, `generate-artifacts`
+(see **ingest-corpus** Steps 3–5). **If the corpus is full-text (`fulltext=yes`),
+run all three with `--from-fulltext`** — the same consistency rule as the initial
+ingest. Record it:
+```
+uv run python scripts/build_state.py record add-documents docs=<n> fulltext=<yes|no>
 ```
 
 ## Update (replace) a document
