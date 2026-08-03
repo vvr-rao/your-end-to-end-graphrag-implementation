@@ -89,7 +89,14 @@ def _add_llm_flags(p: argparse.ArgumentParser) -> None:
         default=None,
         help="Override expansion.max_cost_usd; aborts if projected cost exceeds this cap",
     )
-    p.add_argument("--dry-run", action="store_true", help="Plan only; no LLM calls and no writes")
+    p.add_argument(
+        "--dry-run", action="store_true",
+        help=(
+            "Plan only; no writes. Documents are still SUMMARIZED first (this makes "
+            "LLM calls, so cost is LOW but NOT ZERO -- cached after the first run), "
+            "then it stops before the class-proposal / expansion LLM stages."
+        ),
+    )
     p.add_argument(
         "--use-owl",
         action="store_true",
