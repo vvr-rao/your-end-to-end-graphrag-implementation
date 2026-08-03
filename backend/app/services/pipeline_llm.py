@@ -2274,7 +2274,10 @@ async def _run_llm_stages(
         raise RuntimeError("No chunks produced from documents (empty after chunking)")
 
     if dry_run:
-        print("[llm] --dry-run: stopping before any LLM calls")
+        # Summarization above already ran (and may have cost a little); we stop
+        # here, before the class-proposal / expansion LLM stages.
+        print("[llm] --dry-run: summarization done; stopping before the expansion "
+              "LLM stages (no writes). Note: dry-run cost is LOW but not zero.")
         return {"MATCHES FOUND": [], "MATCH NOT FOUND": [], "MATCH NOT FOUND RELATIONS": []}
 
     expansion_cfg = app_cfg.get("expansion", {}) or {}
