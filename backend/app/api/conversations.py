@@ -46,10 +46,11 @@ class TurnRequest(BaseModel):
         None, ge=1, le=100,
         description="Defaults to 30 for deep_research, 20 for simple_qa.",
     )
-    hops: int = 2
+    # Bounds mirror QARequest (qa.py); TurnRequest was missing them.
+    hops: int = Field(2, ge=0, le=4)
     max_cost_usd: float = Field(0.20, gt=0.0, le=10.0)
     decompose: bool = True
-    max_probes: int = 5
+    max_probes: int = Field(5, ge=1, le=8)
     history_window: int = Field(3, ge=0, le=10)
 
 
@@ -88,6 +89,12 @@ class ConversationListItem(BaseModel):
     "",
     response_model=list[ConversationListItem],
     operation_id="conversation_list",
+    summary="List conversations",
+    description=(
+        "List existing conversations, newest first, with their IRIs and turn "
+        "counts. Use this to find a conversation IRI to resume via "
+        "conversation_show or conversation_turn."
+    ),
 )
 async def conversation_list(
     limit: int = Query(50, ge=1, le=200),
@@ -97,7 +104,17 @@ async def conversation_list(
     return [ConversationListItem(**row) for row in rows]
 
 
-@router.post("", response_model=StartResponse, operation_id="conversation_start")
+@router.post(
+    "",
+    response_model=StartResponse,
+    operation_id="conversation_start",
+    summary="Start a new conversation",
+    description=(
+        "Create a conversation and return its IRI. Pass that IRI to "
+        "conversation_turn to ask questions with follow-up resolution against "
+        "the conversation's history."
+    ),
+)
 async def conversation_start(req: StartRequest) -> StartResponse:
     out = await start_conversation(title=req.title)
     return StartResponse(iri=out["iri"], id=out["id"], title=out.get("title"))
@@ -107,16 +124,26 @@ async def conversation_start(req: StartRequest) -> StartResponse:
     "/{iri:path}/turns",
     response_model=TurnResponse,
     operation_id="conversation_turn",
+    summary="Ask a question within a conversation",
+    description=(
+        "Ask a question in an existing conversation. Unlike qa_ask, follow-ups "
+        "are resolved against the conversation's history, so pronouns and "
+        "elliptical questions ('what about 2024?') work. `iri` is the FULL "
+        "conversation IRI including its '#' fragment, from conversation_start "
+        "or conversation_list. `question` is required."
+    ),
 )
 async def conversation_turn(
-    iri: str = Path(..., description="Conversation IRI."),
-    req: TurnRequest | None = None,
+    # `req` must NOT be Optional. An optional body makes FastAPI emit
+    # {"anyOf": [{"$ref": ...}, {"type": "null"}]}, and fastapi-mcp only reads
+    # body properties from a schema with a top-level "properties" key
+    # (openapi/convert.py:181) -- anyOf has none. The result was an MCP tool
+    # exposing only {"iri"}, with question/mode/top_k missing entirely, so an
+    # agent had no way to ask anything. qa_ask works precisely because its body
+    # is required, which emits a plain $ref that the resolver expands in place.
+    req: TurnRequest,
+    iri: str = Path(..., description="Conversation IRI (full IRI, including '#')."),
 ) -> TurnResponse:
-    if req is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="request body required",
-        )
     try:
         out = await add_turn(
             conversation_iri=iri,
@@ -140,6 +167,12 @@ async def conversation_turn(
     "/{iri:path}",
     response_model=ConversationView,
     operation_id="conversation_show",
+    summary="Replay a conversation's turns",
+    description=(
+        "Return a conversation with all its turns -- questions, answers and "
+        "citations -- in order. `iri` is the FULL conversation IRI including "
+        "its '#' fragment."
+    ),
 )
 async def conversation_show(iri: str) -> ConversationView:
     try:

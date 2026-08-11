@@ -14,6 +14,7 @@ be picked up by MCP automatically.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from urllib.parse import quote
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -63,7 +64,38 @@ app.include_router(conv_routes.router)
 app.include_router(trace.router)
 app.include_router(browse.router)
 
-mcp = FastApiMCP(
+class _QuotingFastApiMCP(FastApiMCP):
+    """Percent-encode path parameters before httpx parses the URL.
+
+    fastapi-mcp 0.4.0 substitutes path params by raw string replacement
+    (server.py:515: `path.replace(f"{{{name}}}", str(value))`) and hands the
+    result straight to httpx. Every IRI in this system carries a '#'
+    (…/entities#glp-1-93a560…), and in a URL a bare '#' starts the fragment,
+    which is never transmitted. The server saw
+    `/entities/https://veerla-ramrao.ai/ontology/entities` and correctly 404'd.
+
+    That broke all six IRI-taking tools: document_get, entity_get, class_get,
+    artifact_get, conversation_show, and conversation_turn -- the last
+    returning 405 rather than 404 because the truncation also ate its trailing
+    `/turns`, leaving `POST /conversations/{iri}`, which only accepts GET.
+
+    safe="/:" keeps the path separators and the scheme colon intact, so
+    Starlette's `{iri:path}` converter still matches and decodes the IRI
+    whole. httpx preserves existing percent-encodings, so this does not
+    double-encode.
+
+    `_request` is private API; pyproject pins fastapi-mcp==0.4.0 and
+    tests/unit/test_mcp_iri_routing.py fails loudly if this override stops
+    being called.
+    """
+
+    async def _request(self, client, method, path, query, headers, body):  # type: ignore[override]
+        return await super()._request(
+            client, method, quote(path, safe="/:"), query, headers, body
+        )
+
+
+mcp = _QuotingFastApiMCP(
     app,
     name="your-end-to-end-graphrag-implementation",
     description="Ontology + document GraphRAG operations exposed as MCP tools.",

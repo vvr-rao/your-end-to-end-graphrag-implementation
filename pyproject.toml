@@ -11,7 +11,12 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
     "python-multipart>=0.0.20",         # multipart file upload
-    "fastapi-mcp>=0.4",
+    # Pinned exactly: backend/app/main.py subclasses FastApiMCP and overrides
+    # the private `_request` to percent-encode path params (0.4.0 interpolates
+    # them raw, so a '#' in an IRI truncates the URL). An upgrade could rename
+    # that hook; tests/unit/test_mcp_iri_routing.py catches it, but the pin
+    # makes the coupling explicit.
+    "fastapi-mcp==0.4.0",
     # DB / migrations
     "sqlalchemy[asyncio]>=2.0.36",
     "asyncpg>=0.30",

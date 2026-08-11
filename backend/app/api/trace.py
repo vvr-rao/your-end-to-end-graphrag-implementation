@@ -17,7 +17,17 @@ from backend.app.db.session import session_scope
 router = APIRouter(prefix="/retrieval_runs", tags=["trace"])
 
 
-@router.get("/{run_id}", operation_id="trace_retrieval_run")
+@router.get(
+    "/{run_id}",
+    operation_id="trace_retrieval_run",
+    summary="Trace how one answer was produced",
+    description=(
+        "Given a retrieval run UUID (returned by qa_ask and conversation_turn), "
+        "return the full evidence chain: the parsed question, seed nodes, graph "
+        "traversal, and every artifact and chunk that fed the answer, back to "
+        "the original documents."
+    ),
+)
 async def trace_retrieval_run(run_id: str) -> dict[str, Any]:
     try:
         ruid = uuid.UUID(run_id)

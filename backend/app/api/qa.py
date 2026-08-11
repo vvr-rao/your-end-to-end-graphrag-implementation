@@ -71,7 +71,19 @@ class QAResponse(BaseModel):
     graph_version: int
 
 
-@router.post("", response_model=QAResponse, operation_id="qa_ask")
+@router.post(
+    "",
+    response_model=QAResponse,
+    operation_id="qa_ask",
+    summary="Ask a one-off question of the knowledge graph",
+    description=(
+        "Run ontology-aware hybrid retrieval and return a grounded answer with "
+        "citations back to source documents. Stateless -- for multi-turn "
+        "follow-ups use conversation_start then conversation_turn. Modes: "
+        "'deep_research' (structured 7-section answer) or 'simple_qa' (a tight "
+        "1-3 sentence answer)."
+    ),
+)
 async def qa_ask(req: QARequest) -> QAResponse:
     if req.mode not in _VALID_MODES:
         raise HTTPException(
