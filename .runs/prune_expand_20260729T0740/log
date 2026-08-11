@@ -1,0 +1,56 @@
+[prune-expand] loading prior version: output_ontologies/v20260729T073708Z-merge
+[prune-expand] table extraction: scanning source_documents/collection-of-pharma-docs-subset for PDFs (vision=ON, isolation=subprocess)
+[tables/worker] scanning 1 PDF(s) under source_documents/collection-of-pharma-docs-subset (concurrency=1, vision=ON, isolation=subprocess)
+[worker] result: n_tables=38 source=cache cost=$0.0000
+[tables/worker] folder progress: 1/1 done (3s, running totals: tables=38 cost=$0.0000 failures=0)
+[tables/worker] folder DONE: 38 tables across 1 PDF(s) (0 cache-hits, 0 failed), 3s, cost=$0.0000
+[prune-expand] table extraction done: 38 tables across 1 PDF(s) (0 cache-hits, 0 failed), cost $0.0000
+[prune-expand] table extraction memory released; proceeding to LLM stages
+[table-mining] classifying 38 table(s) into 6 anchor bucket(s)
+[table-mining] done: 0 reused, 4 new proposed, 0 dropped (bad parent_iri), from 38 tables
+[llm] top-level branches surfaced: 124
+[stream-loader] evaluated summarization: streaming 4 doc(s) in batches of 8 (eval_rounds=3)
+[evaluated-summary] 4 doc(s): 4 summarized (eval_rounds=3), cost=$0.0000, prompt-cache-hit=0% (0/0 input tok), wall=0.1s
+[stream-loader] batch 1/1 done; chunks so far: 15
+[llm] produced 15 chunk(s)
+[stage2-filter] known_places=282 (from ontology + config), extra_suffixes=off, extra_tail_words=off
+[stage1] classifying 15 chunk(s) (openai:gpt-4.1-mini, concurrency=4)
+[stage2] proposing matches+new for 15 chunk(s) (openai:gpt-4.1)
+[stage2]   1/15 chunks proposed
+[stage2]   2/15 chunks proposed
+[stage2]   3/15 chunks proposed
+[stage2]   4/15 chunks proposed
+[stage2]   5/15 chunks proposed
+[stage2]   6/15 chunks proposed
+[stage2]   7/15 chunks proposed
+[stage2]   8/15 chunks proposed
+[stage2]   9/15 chunks proposed
+[stage2]   10/15 chunks proposed
+[stage2]   11/15 chunks proposed
+[stage2]   12/15 chunks proposed
+[stage2]   13/15 chunks proposed
+[stage2]   14/15 chunks proposed
+[stage2]   15/15 chunks proposed
+[stage2] 15/15 chunks produced a usable JSON response (Stage 1 surfaced no branches for 0 other chunks; those were skipped)
+[stage2] merged 1 extra Stage-2 result(s) from table mining
+[stage3] merging+dedup: 23 matches, 145 new class proposals, 181 new relation proposals
+[stage4] detected 23 IRIs from MATCHES FOUND
+[stage4] pruned to 443 kept classes (full IS-A hierarchy of detected + relationship partners) (342 forced by 3 protected prefix(es))
+[stage4] created 171 new classes from MATCH NOT FOUND, 312 new instances from MATCH NOT FOUND INSTANCES, 100 new relations from MATCH NOT FOUND RELATIONS, 1 relation(s) skipped (unresolved endpoints)
+[stage4]   skipped relation: RANGE garbage: 'changes in activity, weight, stress, illness, diet, fever, trauma, infection, surgery, or other medicines' -> {'LABEL': 'requiresAdjustmentWith', 'DESCRIPTION': 'Dosage and other diabetes medicines may need adjustment due to changes in activity, weight, stress, illness, diet, fever, trauma, infection, surgery, or other medicines.', 'DOMAIN': 'DiabetesMedicine', 'RANGE': 'changes in activity, weight, stress, illness, diet, fever, trauma, infection, surgery, or other medicines'}
+[stage4-G] concept_grouping: 90 orphan class(es) to group
+[stage4-G] concept-grouping re-homed 82 class(es) under 6 new concept class(es)
+[stage4-H] classification_audit: 14 suspicious class(es) to review (out of 619 total)
+[stage4-H] processing 1 batch(es) of <= 50
+[stage4-H] DONE: 14 decisions applied (kept=0, rehomed=14, converted=0, noop=0), 1 LLM call(s), cost $0.0006
+[prune-expand] entity counts: before={'classes': 757, 'object_properties': 303, 'data_properties': 124, 'instances': 39}, after={'classes': 619, 'object_properties': 294, 'data_properties': 84, 'instances': 316}
+
+[cost] LLM total: $1.47 across 71 calls (prompt-cache hit 27%)
+[cost]   $   1.25    85%    15 call(s)  class_proposal (gpt-4.1)
+[cost]   $   0.14    10%     1 call(s)  match_dedup (gpt-4.1)
+[cost]   $   0.04     3%     1 call(s)  concept_grouping (gpt-4.1)
+[cost]   $   0.03     2%    15 call(s)  chunk_classification (gpt-4.1-mini)
+[cost]   $   0.01     0%    38 call(s)  table_concept_grouping (gpt-4o-mini)
+[cost]   $   0.00     0%     1 call(s)  classification_audit (gpt-4o-mini)
+
+PRUNED+EXPANDED ontology written to: output_ontologies/v20260729T073959Z-prune-expand

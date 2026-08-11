@@ -1,0 +1,1 @@
+uv run python -m backend.app.cli prune-expand --input output_ontologies/v20260727T140854Z-merge/ --documents source_documents/collection-of-pharma-docs-subset --output-dir output_ontologies --tables --max-cost-usd 5 

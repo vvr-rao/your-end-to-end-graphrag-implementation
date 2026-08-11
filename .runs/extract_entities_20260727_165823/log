@@ -1,0 +1,22 @@
+[extract-entities] 15 chunk(s) to process (top-50 candidate classes per chunk, concurrency=4)
+[extract-entities] progress: 1/15 chunk(s) (6.7%), ok=1 fail=0, cost=$0.0008, rate=0.1/s, ETA=1.7 min
+[extract-entities] progress: 2/15 chunk(s) (13.3%), ok=2 fail=0, cost=$0.0016, rate=0.2/s, ETA=0.9 min
+[extract-entities] progress: 3/15 chunk(s) (20.0%), ok=3 fail=0, cost=$0.0024, rate=0.3/s, ETA=0.6 min
+[extract-entities] progress: 4/15 chunk(s) (26.7%), ok=4 fail=0, cost=$0.0032, rate=0.4/s, ETA=0.4 min
+[extract-entities] progress: 5/15 chunk(s) (33.3%), ok=5 fail=0, cost=$0.0038, rate=0.4/s, ETA=0.4 min
+[extract-entities] progress: 6/15 chunk(s) (40.0%), ok=6 fail=0, cost=$0.0046, rate=0.4/s, ETA=0.4 min
+[extract-entities] progress: 7/15 chunk(s) (46.7%), ok=7 fail=0, cost=$0.0054, rate=0.5/s, ETA=0.3 min
+[extract-entities] progress: 8/15 chunk(s) (53.3%), ok=8 fail=0, cost=$0.0062, rate=0.5/s, ETA=0.2 min
+[extract-entities] progress: 9/15 chunk(s) (60.0%), ok=9 fail=0, cost=$0.0070, rate=0.5/s, ETA=0.2 min
+[extract-entities] progress: 10/15 chunk(s) (66.7%), ok=10 fail=0, cost=$0.0079, rate=0.4/s, ETA=0.2 min
+[extract-entities] progress: 11/15 chunk(s) (73.3%), ok=11 fail=0, cost=$0.0089, rate=0.5/s, ETA=0.1 min
+[extract-entities] progress: 12/15 chunk(s) (80.0%), ok=12 fail=0, cost=$0.0098, rate=0.4/s, ETA=0.1 min
+[extract-entities] progress: 13/15 chunk(s) (86.7%), ok=13 fail=0, cost=$0.0109, rate=0.5/s, ETA=0.1 min
+[extract-entities] progress: 14/15 chunk(s) (93.3%), ok=14 fail=0, cost=$0.0116, rate=0.5/s, ETA=0.0 min
+[extract-entities] progress: 15/15 chunk(s) (100.0%), ok=15 fail=0, cost=$0.0125, rate=0.5/s, ETA=0.0 min
+[extract-entities] LLM done: $0.0125, 15 success / 0 failed
+[extract-entities] embedded + inserted 84 new entity(ies): $0.0000
+[link-tables] entity lookup: 70 canonical name(s) + 1 short-form variant(s); 0 ambiguous variant(s) dropped
+[link-tables] scanning 38 table(s) for name matches against 71 entity name(s)...
+[link-tables] inserted 3 table->entity edge(s) (0 duplicate(s) skipped)
+[extract-entities] DONE: entities (minted=84, reused=0), chunk_entity_edges=165, type_edges=84, tables_scanned=38, table_entity_edges=3, cost=$0.0125, wall=63.6s, graph_version -> 3

@@ -1,0 +1,4 @@
+[enrich-time] 15 chunk(s) to scan
+[enrich-time] 19 distinct time identifier(s) from 8 chunk(s); 7 chunk(s) had no dates
+[enrich-time] upserting 61 time_instance row(s)
+[enrich-time] DONE: instances=61 (parents+=20, gaps+=24), chunk_edges=29, parent_edges=52, wall=39.2s, graph_version -> 4

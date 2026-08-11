@@ -1,0 +1,1 @@
+uv run python -m backend.app.cli register-documents --input source_documents/collection-of-pharma-docs-subset --tables --full-text-chunks 
