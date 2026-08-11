@@ -59,9 +59,13 @@ tasks:
   match_dedup:
     provider: openai
     model: gpt-4.1
-    timeout: 120
+    timeout: 300
     temperature: 0.0
-    max_tokens: 4096
+    # Dedup echoes the whole deduplicated batch back, so output size tracks
+    # input size. At 4096 the JSON truncated mid-object, the parse returned
+    # nothing, and the stage silently passed its input through undeduplicated.
+    # pipeline_llm._dedup sizes its batches against this value.
+    max_tokens: 32768
     response_format: json_object
 
   # ---------------------------------------------------------------------------
@@ -104,9 +108,10 @@ tasks:
   document_summarize:
     provider: openai
     model: gpt-4o-mini
-    timeout: 120
+    timeout: 600
     temperature: 0.0
     max_tokens: 4096
+    stream: true
 
   # ---------------------------------------------------------------------------
   # Evaluated (near-lossless) document summarizer -- the new DEFAULT ingestion
@@ -124,9 +129,10 @@ tasks:
   evaluated_summary_chunk:
     provider: openai
     model: gpt-4.1-mini              # groq: llama-3.3-70b-versatile
-    timeout: 180
+    timeout: 600
     temperature: 0.0
     max_tokens: 8192
+    stream: true
   summary_question_gen:
     provider: openai
     model: gpt-4.1-mini              # groq: llama-3.3-70b-versatile
@@ -144,9 +150,10 @@ tasks:
   summary_revise:
     provider: openai
     model: gpt-4.1-mini              # groq: llama-3.3-70b-versatile
-    timeout: 180
+    timeout: 600
     temperature: 0.0
     max_tokens: 8192
+    stream: true
 
   # ---------------------------------------------------------------------------
   # Layer H (classification audit): post-Stage-4 misclassification pass.
