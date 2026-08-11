@@ -27,7 +27,7 @@ tasks:
   chunk_classification:
     provider: openai
     model: gpt-4.1-mini
-    timeout: 180
+    timeout: 300
     temperature: 0.0
     max_tokens: 8192
     response_format: json_object
@@ -35,7 +35,7 @@ tasks:
   class_proposal:
     provider: openai
     model: gpt-4.1
-    timeout: 180
+    timeout: 1200
     temperature: 0.0
     max_tokens: 32768
     response_format: json_object
@@ -43,7 +43,7 @@ tasks:
   match_dedup:
     provider: openai
     model: gpt-4.1
-    timeout: 300
+    timeout: 1200
     temperature: 0.0
     # Dedup echoes the whole deduplicated batch back, so output size tracks
     # input size. At 4096 the JSON truncated mid-object, the parse returned
@@ -55,7 +55,7 @@ tasks:
   concept_grouping:
     provider: openai
     model: gpt-4.1
-    timeout: 240
+    timeout: 300
     temperature: 0.0
     max_tokens: 8192
     response_format: json_object
@@ -63,7 +63,7 @@ tasks:
   compact_description:
     provider: openai
     model: gpt-4o-mini
-    timeout: 60
+    timeout: 90
     temperature: 0.0
     max_tokens: 2048
     response_format: json_object
@@ -96,14 +96,14 @@ tasks:
   summary_question_gen:
     provider: openai
     model: gpt-4.1-mini
-    timeout: 120
+    timeout: 150
     temperature: 0.0
     max_tokens: 4096
     response_format: json_object
   summary_evaluate:
     provider: openai
     model: gpt-4.1-mini
-    timeout: 120
+    timeout: 150
     temperature: 0.0
     max_tokens: 4096
     response_format: json_object
@@ -118,7 +118,7 @@ tasks:
   classification_audit:
     provider: openai
     model: gpt-4o-mini
-    timeout: 90
+    timeout: 150
     temperature: 0.0
     max_tokens: 4096
     response_format: json_object
@@ -146,7 +146,7 @@ tasks:
   artifact_chunk_extract:
     provider: openai
     model: gpt-4o-mini
-    timeout: 60
+    timeout: 300
     temperature: 0.0
     max_tokens: 8192          # entity-grounded artifact JSON on dense chunks exceeds 2048 -> truncation
     response_format: json_object
@@ -154,7 +154,7 @@ tasks:
   artifact_chunk_extract_with_entities:
     provider: openai
     model: gpt-4o-mini
-    timeout: 60
+    timeout: 300
     temperature: 0.0
     max_tokens: 8192          # entity-grounded artifact JSON on dense chunks exceeds 2048 -> truncation
     response_format: json_object
@@ -162,7 +162,7 @@ tasks:
   entity_extract:
     provider: openai
     model: gpt-4o-mini
-    timeout: 60
+    timeout: 300
     temperature: 0.0
     max_tokens: 8192          # dense chunks w/ many entities (50 candidate classes) exceed 2048 -> truncation
     response_format: json_object
@@ -170,7 +170,7 @@ tasks:
   question_parse:
     provider: openai
     model: gpt-4o-mini
-    timeout: 30
+    timeout: 60
     temperature: 0.0
     max_tokens: 1024
     response_format: json_object
@@ -178,7 +178,7 @@ tasks:
   concept_expansion:
     provider: openai
     model: gpt-4o-mini
-    timeout: 30
+    timeout: 60
     temperature: 0.0
     max_tokens: 1024
     response_format: json_object
@@ -186,7 +186,7 @@ tasks:
   query_decompose:
     provider: openai
     model: gpt-4o-mini
-    timeout: 30
+    timeout: 60
     temperature: 0.0
     max_tokens: 1024
     response_format: json_object
@@ -194,7 +194,7 @@ tasks:
   entity_probes:
     provider: openai
     model: gpt-4o-mini
-    timeout: 30
+    timeout: 60
     temperature: 0.0
     max_tokens: 1024
     response_format: json_object
@@ -202,7 +202,7 @@ tasks:
   chunk_relevance_filter:
     provider: openai
     model: gpt-4o-mini
-    timeout: 60
+    timeout: 150
     temperature: 0.0
     max_tokens: 4096
     response_format: json_object
@@ -217,14 +217,14 @@ tasks:
   answer_deep_research:
     provider: openai
     model: gpt-4.1
-    timeout: 180
+    timeout: 300
     temperature: 0.1
     max_tokens: 8192          # 7-section deep_research answers over evidence-rich corpora exceed 4096
 
   follow_up_resolution:
     provider: openai
     model: gpt-4o-mini
-    timeout: 30
+    timeout: 60
     temperature: 0.0
     max_tokens: 512
 
@@ -255,21 +255,21 @@ tasks:
   artifact_merge:
     provider: openai
     model: gpt-4.1
-    timeout: 180
+    timeout: 300
     temperature: 0.2
     max_tokens: 8192
     response_format: json_object
   artifact_merge_evaluate:
     provider: openai
     model: gpt-4.1
-    timeout: 120
+    timeout: 150
     temperature: 0.0
     max_tokens: 4096
     response_format: json_object
   artifact_merge_revise:
     provider: openai
     model: gpt-4.1
-    timeout: 180
+    timeout: 300
     temperature: 0.2
     max_tokens: 8192
     response_format: json_object
@@ -281,21 +281,21 @@ tasks:
   summary_merge:
     provider: openai
     model: gpt-5.4
-    timeout: 180
+    timeout: 600
     temperature: 0.2
     max_tokens: 16384
     response_format: json_object
   summary_merge_evaluate:
     provider: openai
     model: gpt-5.4
-    timeout: 120
+    timeout: 300
     temperature: 0.0
     max_tokens: 8192
     response_format: json_object
   summary_merge_revise:
     provider: openai
     model: gpt-5.4
-    timeout: 180
+    timeout: 600
     temperature: 0.2
     max_tokens: 16384
     response_format: json_object
@@ -326,7 +326,7 @@ tasks:
   judge_consistency:
     provider: openai
     model: gpt-4.1
-    timeout: 60
+    timeout: 90
     temperature: 0.0
     max_tokens: 2048
     response_format: json_object
@@ -341,7 +341,7 @@ tasks:
   table_extract_vision:
     provider: openai
     model: gpt-4o-mini
-    timeout: 90
+    timeout: 150
     temperature: 0.0
     max_tokens: 4096
     response_format: json_object
@@ -349,7 +349,7 @@ tasks:
   table_concept_grouping:
     provider: openai
     model: gpt-4o-mini
-    timeout: 60
+    timeout: 90
     temperature: 0.0
     max_tokens: 2048
     response_format: json_object
