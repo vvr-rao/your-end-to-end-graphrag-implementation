@@ -50,6 +50,7 @@ from backend.app.services.chunking import TextChunk, chunk_documents
 from backend.app.services.document_io import LoadedDocument
 from backend.app.services.llm_router import LLMRouter
 from backend.app.services.prompts import PROMPTS
+from backend.app.services.token_budget import batch_by_token_budget, count_tokens
 from backend.app.services.suggestions import (
     load_suggested_classes,
     merge_suggestions_into_results,
@@ -823,21 +824,185 @@ def _filter_entity_shaped_classes(
 # ---------- Stage 3: dedup ----------
 
 
+_DEDUP_KEYS = (
+    "MATCH NOT FOUND",
+    "MATCH NOT FOUND RELATIONS",
+    "MATCH NOT FOUND INSTANCES",
+)
+
+# Share of the model's output budget one dedup batch may claim. Dedup echoes
+# its input back, so output size tracks input size and the OUTPUT cap -- not
+# the context window -- is the binding constraint. 0.6 leaves room for the
+# response being somewhat larger than the request (merged DESCRIPTIONs, an
+# added common parent from rule 4).
+_DEDUP_INPUT_SHARE = 0.6
+
+# Modest: dedup batches are large, and the point is to finish reliably rather
+# than fast. Matches the fan-out used by the other batched stages.
+_DEDUP_CONCURRENCY = 4
+
+
+class DedupFailedError(RuntimeError):
+    """Dedup could not complete, so the ontology must not be written.
+
+    This used to be a caught-and-printed warning that returned the input
+    unchanged. The run then "succeeded" while emitting proposals that had
+    never been deduplicated -- 757 classes became 4,942, 3,007 of them
+    orphans needing synthetic parents, and entity extraction downstream
+    reused only 48 of 4,422 minted entities because duplicate classes
+    crowded the fixed top-50 candidate list. A stopped run is far cheaper.
+    """
+
+
+def _existing_concept_names(matches_found: list[dict[str, Any]]) -> list[str]:
+    """Local names of already-matched classes, for dedup rule 1.
+
+    MATCHES FOUND entries carry {IRI, TEXT_SNIPPET}; the snippets are the
+    bulk of the payload and the model only needs to know which concepts
+    exist, so send local names alone.
+    """
+    names: list[str] = []
+    seen: set[str] = set()
+    for entry in matches_found or []:
+        iri = str(entry.get("IRI", "") or "")
+        local = iri.rsplit("#", 1)[-1].rsplit("/", 1)[-1].strip()
+        key = local.lower()
+        if local and key not in seen:
+            seen.add(key)
+            names.append(local)
+    return names
+
+
+def _dedup_merge_key(kind: str, entry: dict[str, Any]) -> str:
+    """Deterministic identity for cross-batch collapse.
+
+    Batching splits duplicate pairs across requests, so no single LLM call
+    sees both halves. This second, free pass catches the exact-match subset
+    of what the split hid.
+    """
+    def norm(v: Any) -> str:
+        return " ".join(str(v or "").split()).strip().lower()
+
+    if kind == "MATCH NOT FOUND RELATIONS":
+        # Same LABEL with different endpoints is a DIFFERENT relation.
+        return f"{norm(entry.get('LABEL'))}|{norm(entry.get('DOMAIN'))}|{norm(entry.get('RANGE'))}"
+    if kind == "MATCH NOT FOUND INSTANCES":
+        return norm(entry.get("CANONICAL_FORM") or entry.get("LABEL"))
+    return norm(entry.get("LABEL"))
+
+
+def _merge_dedup_batches(
+    per_batch: list[dict[str, Any]], existing: set[str]
+) -> dict[str, list[dict[str, Any]]]:
+    """Collapse per-batch results, first occurrence wins."""
+    out: dict[str, list[dict[str, Any]]] = {k: [] for k in _DEDUP_KEYS}
+    seen: dict[str, set[str]] = {k: set() for k in _DEDUP_KEYS}
+    for result in per_batch:
+        for key in _DEDUP_KEYS:
+            for entry in result.get(key) or []:
+                if not isinstance(entry, dict):
+                    continue
+                ident = _dedup_merge_key(key, entry)
+                if not ident or ident in seen[key]:
+                    continue
+                # Belt-and-braces on rule 6: never let an already-existing
+                # class re-enter as a "new" proposal.
+                if key == "MATCH NOT FOUND" and ident in existing:
+                    continue
+                seen[key].add(ident)
+                out[key].append(entry)
+    return out
+
+
+def _plan_dedup_batches(
+    merged_results: dict[str, Any], existing_concepts: list[str], max_tokens: int
+) -> list[dict[str, Any]]:
+    """Split the proposal set into batches that fit `max_tokens` of output.
+
+    The three proposal lists are batched independently: they are deduplicated
+    against each other only within their own kind, so a batch never needs to
+    mix them.
+    """
+    budget = max(1, int(max_tokens * _DEDUP_INPUT_SHARE))
+    # Rule 1 needs the existing-concept list in EVERY batch, so it is fixed
+    # overhead that has to come out of the per-batch budget.
+    overhead = count_tokens(json.dumps(existing_concepts, ensure_ascii=False))
+    per_batch_budget = max(1, budget - overhead)
+
+    batches: list[dict[str, Any]] = []
+    for key in _DEDUP_KEYS:
+        items = [e for e in (merged_results.get(key) or []) if isinstance(e, dict)]
+        if not items:
+            continue
+        for group in batch_by_token_budget(
+            items,
+            render=lambda e: json.dumps(e, ensure_ascii=False, default=str),
+            max_tokens=per_batch_budget,
+        ):
+            batches.append({key: group})
+    return batches
+
+
 async def _dedup(router: LLMRouter, merged_results: dict[str, Any]) -> dict[str, Any]:
-    """Stage 3: collapse duplicate MATCH NOT FOUND across chunks."""
-    if not merged_results.get("MATCH NOT FOUND"):
-        # Nothing to dedup; skip the LLM call.
-        return merged_results
-    system, user = PROMPTS["match_dedup"](merged_results)
-    try:
-        result = await router.chat("match_dedup", system=system, user=user)
-    except Exception as exc:
-        print(f"[stage3] dedup failed: {exc} — returning merged results unchanged")
-        return merged_results
-    cleaned = extract_json_from_output(result.text)
-    if not cleaned:
-        return merged_results
-    return cleaned
+    """Stage 3: collapse duplicate MATCH NOT FOUND across chunks.
+
+    Batched: the whole merged set in one request crossed gpt-4.1's context
+    limit at ~90-100 documents. Raises DedupFailedError if any batch fails,
+    rather than silently returning un-deduplicated input.
+    """
+    if not any(merged_results.get(k) for k in _DEDUP_KEYS):
+        return merged_results  # nothing to dedup; skip the LLM call
+
+    matches_found = merged_results.get("MATCHES FOUND", [])
+    existing_concepts = _existing_concept_names(matches_found)
+    max_tokens = int(router.task_spec("match_dedup").get("max_tokens", 4096))
+    batches = _plan_dedup_batches(merged_results, existing_concepts, max_tokens)
+    n = len(batches)
+    if n > 1:
+        print(f"[stage3] dedup: {n} batches (output budget {max_tokens} tok/batch)")
+
+    cost_before = router.total_cost_usd
+    results: list[dict[str, Any]] = [None] * n  # type: ignore[list-item]
+    failures: list[str] = []
+    sem = asyncio.Semaphore(_DEDUP_CONCURRENCY)
+
+    async def _one(i: int, batch: dict[str, Any]) -> None:
+        system, user = PROMPTS["match_dedup"](batch, existing_concepts)
+        async with sem:
+            try:
+                out = await router.chat("match_dedup", system=system, user=user)
+            except Exception as exc:
+                failures.append(f"batch {i + 1}/{n}: {exc}")
+                return
+        cleaned = extract_json_from_output(out.text)
+        if not isinstance(cleaned, dict):
+            # Almost always a response truncated at max_tokens. Previously
+            # indistinguishable from "nothing to do" -- both returned the
+            # input unchanged.
+            failures.append(f"batch {i + 1}/{n}: response was not parseable JSON")
+            return
+        results[i] = cleaned
+
+    await asyncio.gather(*[_one(i, b) for i, b in enumerate(batches)])
+
+    if failures:
+        raise DedupFailedError(
+            f"{len(failures)}/{n} dedup batch(es) failed; refusing to emit an "
+            f"un-deduplicated ontology. Failures: " + "; ".join(failures[:5])
+        )
+
+    merged = _merge_dedup_batches(
+        [r for r in results if r], {c.lower() for c in existing_concepts}
+    )
+    merged["MATCHES FOUND"] = matches_found  # never sent, never modified
+    spent = router.total_cost_usd - cost_before
+    before = sum(len(merged_results.get(k) or []) for k in _DEDUP_KEYS)
+    after = sum(len(merged[k]) for k in _DEDUP_KEYS)
+    print(
+        f"[stage3] dedup DONE: {before} -> {after} proposals "
+        f"({n} batch(es), ${spent:.4f})"
+    )
+    return merged
 
 
 # ---------- Layer G: top-level concept grouping (one LLM call) ----------

@@ -39,10 +39,31 @@ def test_class_identification_with_suggestions() -> None:
     assert "SUGGESTED NEW CLASSES" in sys_
 
 
-def test_match_dedup_skips_when_no_proposals_is_not_in_prompt() -> None:
+def test_match_dedup_prompt_carries_the_proposal_keys() -> None:
     sys_, user = match_dedup({"MATCHES FOUND": [], "MATCH NOT FOUND": []})
     assert "MATCH NOT FOUND" in sys_
-    assert '"MATCHES FOUND"' in user or "MATCHES FOUND" in user
+    assert '"MATCH NOT FOUND"' in user
+    assert '"MATCH NOT FOUND RELATIONS"' in user
+    assert '"MATCH NOT FOUND INSTANCES"' in user
+
+
+def test_match_dedup_never_sends_matches_found() -> None:
+    """Rule 6 forbids modifying MATCHES FOUND, so round-tripping it is pure
+    cost -- and its TEXT_SNIPPETs were the bulkiest part of the payload that
+    overflowed the context window. Only the concept NAMES go, as context."""
+    sys_, user = match_dedup(
+        {
+            "MATCHES FOUND": [
+                {"IRI": "http://ex.org/onto#Aspirin", "TEXT_SNIPPET": "x" * 5000}
+            ],
+            "MATCH NOT FOUND": [{"LABEL": "Ibuprofen"}],
+        },
+        ["Aspirin"],
+    )
+    assert '"MATCHES FOUND"' not in user
+    assert "x" * 100 not in user, "TEXT_SNIPPET must not be sent"
+    assert "Aspirin" in user  # as an EXISTING_CONCEPTS name
+    assert "EXISTING_CONCEPTS" in sys_
 
 
 def test_prompts_registry_covers_core_phase1_tasks() -> None:
