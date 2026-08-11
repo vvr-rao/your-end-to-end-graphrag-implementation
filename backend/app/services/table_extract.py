@@ -1055,6 +1055,28 @@ async def extract_tables_async(
     return TableExtractionResult(tables=payloads, manifest=manifest)
 
 
+def _find_pdfs(folder: Path) -> list[Path]:
+    """Every PDF under `folder`, recursively and case-insensitively.
+
+    Must match how documents themselves are discovered -- ontology_io
+    .iter_documents walks with rglob and lowercases the suffix. These two
+    used `glob("*.pdf")`, so pointing --input at a corpus whose PDFs sit one
+    level down ingested every document while extracting tables from none of
+    them, and returned {} without a word. A paid, opt-in feature did nothing
+    and said nothing.
+    """
+    pdfs = sorted(
+        p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() == ".pdf"
+    )
+    if not pdfs:
+        print(
+            f"[tables] WARNING: no PDFs found under {folder} -- table "
+            f"extraction was requested but has nothing to do. Check the path.",
+            flush=True,
+        )
+    return pdfs
+
+
 async def extract_tables_for_paths_subprocess(
     pdf_paths: list[Path],
     *,
@@ -1111,7 +1133,7 @@ async def extract_tables_for_folder_subprocess(
 
     `concurrency=1` is the safe default; raise it on roomier hosts."""
     folder = Path(folder)
-    pdfs = sorted(folder.glob("*.pdf"))
+    pdfs = _find_pdfs(folder)
     if limit is not None:
         pdfs = pdfs[:limit]
     if not pdfs:
@@ -1256,7 +1278,7 @@ async def extract_tables_for_folder_async(
     Returns a mapping of doc-path-str -> TableExtractionResult. Used by
     the prune-expand integration to batch-process a corpus folder."""
     folder = Path(folder)
-    pdfs = sorted(folder.glob("*.pdf"))
+    pdfs = _find_pdfs(folder)
     if limit is not None:
         pdfs = pdfs[:limit]
     if not pdfs:

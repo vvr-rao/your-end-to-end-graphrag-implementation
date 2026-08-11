@@ -39,6 +39,23 @@ _DEPENDENT_TABLES: tuple[str, ...] = (
     "conversation_turns",
 )
 
+# Rows that belong to the ontology itself rather than to user data, and so
+# must not block an ontology replace.
+#
+# clear-corpus deliberately PRESERVES ontology-sourced edges
+# (`DELETE ... WHERE relationship_source <> 'ONTOLOGY'`), but this guard
+# counted those same preserved rows and refused the wipe -- making
+# clear-corpus followed by `db-init --mode replace` a dead end, with the
+# suggested recovery ("delete the dependent rows first") having no command
+# behind it. The replace truncates the ontology tables anyway, so these rows
+# are its own to remove.
+#
+# IS DISTINCT FROM rather than <>: the latter is NULL-unsafe. The column is
+# NOT NULL today, so this is free insurance rather than a live fix.
+_DEP_COUNT_FILTER: dict[str, str] = {
+    "graph_relationships": " WHERE relationship_source IS DISTINCT FROM 'ONTOLOGY'",
+}
+
 
 async def wipe_ontology_tables(*, confirm: bool = False) -> dict[str, int]:
     """Truncate the 4 ontology tables. Returns row counts before wipe.
@@ -50,7 +67,9 @@ async def wipe_ontology_tables(*, confirm: bool = False) -> dict[str, int]:
         # Guard 1: dependent tables must be empty.
         nonempty_deps: list[tuple[str, int]] = []
         for tbl in _DEPENDENT_TABLES:
-            r = await session.execute(text(f"SELECT count(*) FROM graphrag.{tbl}"))
+            r = await session.execute(
+                text(f"SELECT count(*) FROM graphrag.{tbl}{_DEP_COUNT_FILTER.get(tbl, '')}")
+            )
             n = int(r.scalar_one())
             if n > 0:
                 nonempty_deps.append((tbl, n))
@@ -58,8 +77,8 @@ async def wipe_ontology_tables(*, confirm: bool = False) -> dict[str, int]:
             details = ", ".join(f"{t}={n}" for t, n in nonempty_deps)
             raise RuntimeError(
                 f"refusing to wipe ontology tables -- dependent tables "
-                f"have data ({details}). Delete documents + artifacts "
-                f"first."
+                f"have data ({details}). Run `clear-corpus --yes` to remove "
+                f"documents, chunks, entities and artifacts first."
             )
 
         # Guard 2: caller must have confirmed.

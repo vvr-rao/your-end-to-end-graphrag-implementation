@@ -1255,11 +1255,15 @@ def _cmd_db_init(args: argparse.Namespace) -> int:
             reset_engine_cache()
         except RuntimeError as exc:
             print(f"\n[db-init] WIPE REFUSED: {exc}")
-            print("[db-init] Either delete the dependent rows first, "
-                  "or use --mode upsert.")
+            print("[db-init] Either clear the corpus first, or use --mode upsert.")
             return 1
         print()
     else:
+        # `--mode replace` without `--input` used to fall through here and do
+        # nothing at all -- no wipe, no import, no warning. Say so.
+        if args.input is None and args.mode == "replace" and not args.dry_run:
+            print("[db-init] --mode replace requires --input (the wipe only runs "
+                  "as part of an import); nothing was wiped.")
         if args.input is not None and not args.dry_run:
             print("=" * 64)
             print("DB-INIT: step 2/4 -- mode=upsert, no wipe needed")
