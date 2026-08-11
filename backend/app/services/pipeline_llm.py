@@ -50,6 +50,7 @@ from backend.app.services.chunking import TextChunk, chunk_documents
 from backend.app.services.document_io import LoadedDocument
 from backend.app.services.llm_router import LLMRouter
 from backend.app.services.prompts import PROMPTS
+from backend.app.services.semantic_grouping import order_by_semantic_cluster
 from backend.app.services.token_budget import batch_by_token_budget, count_tokens
 from backend.app.services.suggestions import (
     load_suggested_classes,
@@ -914,7 +915,21 @@ def _merge_dedup_batches(
     return out
 
 
-def _plan_dedup_batches(
+def _cluster_text(key: str, entry: dict[str, Any]) -> str:
+    """What to embed when deciding which items belong in the same batch.
+
+    Label carries most of the signal; the description disambiguates same-named
+    concepts from different domains. Relations are identified by their endpoints
+    as much as their verb, so those go in too.
+    """
+    label = str(entry.get("LABEL") or entry.get("CANONICAL_FORM") or "")
+    desc = " ".join(str(entry.get("DESCRIPTION") or "").split()[:25])
+    if key == "MATCH NOT FOUND RELATIONS":
+        return f"{label} ({entry.get('DOMAIN')} -> {entry.get('RANGE')}): {desc}"
+    return f"{label}: {desc}"
+
+
+async def _plan_dedup_batches(
     merged_results: dict[str, Any], existing_concepts: list[str], max_tokens: int
 ) -> list[dict[str, Any]]:
     """Split the proposal set into batches that fit `max_tokens` of output.
@@ -922,6 +937,12 @@ def _plan_dedup_batches(
     The three proposal lists are batched independently: they are deduplicated
     against each other only within their own kind, so a batch never needs to
     mix them.
+
+    Within a kind, items are first ordered by semantic cluster so that
+    near-duplicates land in the SAME request. Without this, batching quietly
+    reintroduces duplicates: the LLM can only collapse what one call sees, and
+    the deterministic post-merge catches exact string matches only -- so
+    'USA' and 'United States' in different batches both survive.
     """
     budget = max(1, int(max_tokens * _DEDUP_INPUT_SHARE))
     # Rule 1 needs the existing-concept list in EVERY batch, so it is fixed
@@ -934,11 +955,14 @@ def _plan_dedup_batches(
         items = [e for e in (merged_results.get(key) or []) if isinstance(e, dict)]
         if not items:
             continue
-        for group in batch_by_token_budget(
-            items,
+        groups = batch_by_token_budget(
+            await order_by_semantic_cluster(
+                items, render=lambda e, k=key: _cluster_text(k, e)
+            ),
             render=lambda e: json.dumps(e, ensure_ascii=False, default=str),
             max_tokens=per_batch_budget,
-        ):
+        )
+        for group in groups:
             batches.append({key: group})
     return batches
 
@@ -956,7 +980,7 @@ async def _dedup(router: LLMRouter, merged_results: dict[str, Any]) -> dict[str,
     matches_found = merged_results.get("MATCHES FOUND", [])
     existing_concepts = _existing_concept_names(matches_found)
     max_tokens = int(router.task_spec("match_dedup").get("max_tokens", 4096))
-    batches = _plan_dedup_batches(merged_results, existing_concepts, max_tokens)
+    batches = await _plan_dedup_batches(merged_results, existing_concepts, max_tokens)
     n = len(batches)
     if n > 1:
         print(f"[stage3] dedup: {n} batches (output budget {max_tokens} tok/batch)")
