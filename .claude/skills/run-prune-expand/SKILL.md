@@ -161,6 +161,18 @@ Say it plainly, e.g.
 > is also capping your concurrency at ~19 of 32, so I'd raise that to 16-32.
 > **None of this reduces the bill** — same tokens, less waiting."*
 
+**If `tpm_check.py` cannot read memory** (it prints "skipping memory-based
+advice" on an unrecognised platform), fall back to the OS's own command --
+and note that these are NOT interchangeable:
+
+| OS | Command | Gotcha |
+|---|---|---|
+| Linux | `free -m` | "available", not "free" |
+| macOS | `vm_stat` + `sysctl -n hw.memsize` | **Do NOT use "Pages free" alone** -- macOS parks most RAM in `inactive` (evictable), so free-only under-reports several-fold. Add free + inactive + speculative, times the page size from the header. |
+| Windows | `powershell -c "Get-CimInstance Win32_OperatingSystem \| Select FreePhysicalMemory,TotalVisibleMemorySize"` | values are in KB |
+
+`free -m` does not exist on macOS, so never issue it unconditionally.
+
 **Memory rules:**
 - If free RAM is under ~1.2 GB, say so and suggest closing other applications
   (an IDE easily holds 1.5+ GB) before a long paid run.

@@ -97,25 +97,114 @@ def suggest(tpm: int | None, rpm: int | None) -> int | None:
     return max(1, min(by_tokens, by_requests, 128))
 
 
-def _mem_mb() -> tuple[int, int]:
-    """(MemAvailable, MemTotal) in MB. (-1, -1) if unreadable (non-Linux)."""
+def _mem_linux() -> tuple[int, int]:
     vals = {}
-    try:
-        for line in open("/proc/meminfo"):
-            k, _, rest = line.partition(":")
-            if k in ("MemAvailable", "MemTotal"):
-                vals[k] = int(rest.split()[0]) // 1024
-    except OSError:
-        return -1, -1
+    for line in open("/proc/meminfo"):
+        k, _, rest = line.partition(":")
+        if k in ("MemAvailable", "MemTotal"):
+            vals[k] = int(rest.split()[0]) // 1024
     return vals.get("MemAvailable", -1), vals.get("MemTotal", -1)
 
 
-def _has_swap() -> bool:
+def parse_vm_stat(text: str, page_size: int) -> int:
+    """MB genuinely reclaimable, from macOS `vm_stat`.
+
+    free + inactive + speculative: inactive pages are evictable, so counting
+    only 'free' understates available memory several-fold on macOS.
+    """
+    total_pages = 0
+    for key in ("Pages free", "Pages inactive", "Pages speculative"):
+        for line in text.splitlines():
+            if line.startswith(key + ":"):
+                total_pages += int(line.split(":")[1].strip().rstrip("."))
+                break
+    return (total_pages * page_size) // (1024 * 1024)
+
+
+def _mem_macos() -> tuple[int, int]:
+    import subprocess
+
+    total = int(subprocess.run(["sysctl", "-n", "hw.memsize"],
+                               capture_output=True, text=True).stdout.strip())
+    vm = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
+    page = 4096
+    if "page size of" in vm:
+        page = int(vm.split("page size of")[1].split("bytes")[0].strip())
+    return parse_vm_stat(vm, page), total // (1024 * 1024)
+
+
+def _mem_windows() -> tuple[int, int]:
+    import ctypes
+
+    class _MemStatus(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+    st = _MemStatus()
+    st.dwLength = ctypes.sizeof(_MemStatus)
+    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))  # type: ignore[attr-defined]
+    mb = 1024 * 1024
+    return st.ullAvailPhys // mb, st.ullTotalPhys // mb
+
+
+def _mem_mb() -> tuple[int, int]:
+    """(available, total) MB on Linux, macOS or Windows. (-1,-1) if unknown.
+
+    Prefers psutil when the user happens to have it; otherwise uses each
+    platform's own interface rather than adding a dependency for one function.
+    """
     try:
-        with open("/proc/swaps") as fh:
-            return len(fh.read().strip().splitlines()) > 1
-    except OSError:
-        return False
+        import psutil  # optional, not a project dependency
+
+        vm = psutil.virtual_memory()
+        return vm.available // (1024 * 1024), vm.total // (1024 * 1024)
+    except Exception:
+        pass
+    try:
+        if sys.platform.startswith("linux"):
+            return _mem_linux()
+        if sys.platform == "darwin":
+            return _mem_macos()
+        if sys.platform.startswith("win"):
+            return _mem_windows()
+    except Exception:
+        pass
+    return -1, -1
+
+
+def _has_swap() -> bool:
+    """Whether the OS can page out. False means an over-commit is a HARD KILL."""
+    try:
+        import psutil
+
+        return psutil.swap_memory().total > 0
+    except Exception:
+        pass
+    try:
+        if sys.platform.startswith("linux"):
+            with open("/proc/swaps") as fh:
+                return len(fh.read().strip().splitlines()) > 1
+        if sys.platform == "darwin":
+            import subprocess
+
+            out = subprocess.run(["sysctl", "-n", "vm.swapusage"],
+                                 capture_output=True, text=True).stdout
+            return "total = 0.00M" not in out and bool(out.strip())
+        if sys.platform.startswith("win"):
+            import ctypes
+
+            # Windows always has a page file unless explicitly disabled; treat
+            # a page-file total larger than physical RAM as "swap present".
+            avail, total = _mem_windows()
+            return total > 0
+    except Exception:
+        pass
+    return False
 
 
 # Measured on this project: one table_extract_worker subprocess (125-page
