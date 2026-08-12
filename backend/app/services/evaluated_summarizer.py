@@ -180,30 +180,60 @@ def _token_windows(text: str, max_tokens: int, overlap: int, enc) -> list[str]:
 # --------------------------------------------------------------------------- #
 # Per-chunk evaluator loop.
 # --------------------------------------------------------------------------- #
+class _NoLimit:
+    """Reusable no-op async context manager, for callers that self-throttle.
+
+    Must be REUSABLE: the chain below enters its limiter once per LLM call, and
+    an @asynccontextmanager generator can only be entered once -- the second
+    `async with` raises, which the chain's except-blocks would swallow, silently
+    truncating the summary. asyncio.Semaphore is reusable, so this must be too.
+    """
+
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
 async def _summarize_chunk_with_eval(
     router: LLMRouter,
     source_text: str,
     *,
     num_questions: int,
     eval_rounds: int,
+    sem: asyncio.Semaphore | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Summarize one source window with the question/evaluate/revise loop.
-    Returns (summary, audit)."""
+    Returns (summary, audit).
+
+    `sem` throttles EACH LLM call rather than the whole chain. The chain is 9
+    strictly sequential calls (summarize -> question-gen -> evaluate/revise
+    rounds), and almost all of that time is spent waiting on the network. When
+    the caller held one slot for the entire chain, a concurrency of N allowed
+    only N windows in flight -- so on a 139-window corpus, 4 slots meant 35
+    sequential rounds and a ~4-hour run at under 1% of the account's TPM.
+    Releasing between calls lets the same N slots cover far more windows.
+    """
+    limit: Any = sem if sem is not None else _NoLimit()
+
     sys_p, usr_p = PROMPTS["evaluated_summary_chunk"]()
     # Source goes as cache_prefix (cached leading block) -- reused across this
     # window's summarize/question-gen/revise calls at cache-read price.
-    out = await router.chat(
-        "evaluated_summary_chunk", system=sys_p, user=usr_p, cache_prefix=source_text
-    )
+    async with limit:
+        out = await router.chat(
+            "evaluated_summary_chunk", system=sys_p, user=usr_p, cache_prefix=source_text
+        )
     summary = (out.text or "").strip()
 
     # Generate the question set once; reuse across rounds so each round checks
     # whether the previous revision actually closed the gaps.
     qsys, qusr = PROMPTS["summary_question_gen"](num_questions)
     try:
-        q_out = await router.chat(
-            "summary_question_gen", system=qsys, user=qusr, cache_prefix=source_text
-        )
+        async with limit:
+            q_out = await router.chat(
+                "summary_question_gen", system=qsys, user=qusr, cache_prefix=source_text
+            )
         questions = _extract_json(q_out.text) or {"questions": []}
     except Exception as exc:
         return summary, {"passed": None, "rounds": 0, "error": f"question_gen: {exc!r}"}
@@ -218,7 +248,8 @@ async def _summarize_chunk_with_eval(
         rounds_run = round_idx
         esys, eusr = PROMPTS["summary_evaluate"](q_json, summary)
         try:
-            e_out = await router.chat("summary_evaluate", system=esys, user=eusr)
+            async with limit:
+                e_out = await router.chat("summary_evaluate", system=esys, user=eusr)
             evaluation = _extract_json(e_out.text) or {}
         except Exception:
             break
@@ -236,9 +267,10 @@ async def _summarize_chunk_with_eval(
             summary, json.dumps(evaluation, ensure_ascii=False)
         )
         try:
-            r_out = await router.chat(
-                "summary_revise", system=rsys, user=rusr, cache_prefix=source_text
-            )
+            async with limit:
+                r_out = await router.chat(
+                    "summary_revise", system=rsys, user=rusr, cache_prefix=source_text
+                )
             revised = (r_out.text or "").strip()
             if revised:
                 summary = revised
@@ -372,21 +404,25 @@ async def evaluated_summarize_documents_async(
             if cost_hit.is_set():
                 return
             err: Exception | None = None
-            async with sem:
-                if cost_hit.is_set():
-                    return
-                try:
-                    summ, audit = await _summarize_chunk_with_eval(
-                        router, w, num_questions=questions_per_chunk, eval_rounds=eval_rounds,
-                    )
-                except Exception as exc:
-                    # A window whose every retry failed must not take down the document
-                    # or the surrounding gather. It is counted instead: the doc is left
-                    # incomplete below and therefore NOT cached, so a re-run retries it
-                    # rather than serving a summary that silently dropped this window's
-                    # source content.
-                    err = exc
-                    failed_windows += 1
+            summ, audit = "", {}
+            # The semaphore is passed DOWN so it throttles each LLM call rather
+            # than being held across the whole 9-call chain. Holding it for the
+            # chain capped in-flight windows at `concurrency`, most of that time
+            # idle on network wait; releasing between calls lets the same limit
+            # cover many more windows.
+            try:
+                summ, audit = await _summarize_chunk_with_eval(
+                    router, w, num_questions=questions_per_chunk,
+                    eval_rounds=eval_rounds, sem=sem,
+                )
+            except Exception as exc:
+                # A window whose every retry failed must not take down the document
+                # or the surrounding gather. It is counted instead: the doc is left
+                # incomplete below and therefore NOT cached, so a re-run retries it
+                # rather than serving a summary that silently dropped this window's
+                # source content.
+                err = exc
+                failed_windows += 1
             if err is None and summ.strip():
                 summ_by_idx[i] = summ
                 audit_by_idx[i] = audit

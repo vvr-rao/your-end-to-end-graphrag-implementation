@@ -13,3 +13,9 @@
 {"ts": "2026-07-29T03:37:12-04:00", "step": "merge", "details": {"path": "/home/veerlaramrao/your-personal-ontologist/output_ontologies/v20260729T073708Z-merge"}}
 {"ts": "2026-07-29T03:46:20-04:00", "step": "prune-expand", "details": {"path": "/home/veerlaramrao/your-personal-ontologist/output_ontologies/v20260729T073959Z-prune-expand"}}
 {"ts": "2026-07-29T03:46:23-04:00", "step": "prune-expand", "details": {"path": "/home/veerlaramrao/your-personal-ontologist/output_ontologies/v20260729T073959Z-prune-expand"}}
+{"ts": "2026-08-11T16:12:29-04:00", "step": "llm-mode", "details": {"mode": "anthropic"}}
+{"ts": "2026-08-11T16:13:30-04:00", "step": "llm-mode", "details": {"mode": "openai"}}
+{"ts": "2026-08-11T16:16:12-04:00", "step": "llm-mode", "details": {"mode": "anthropic"}}
+{"ts": "2026-08-11T17:45:19-04:00", "step": "llm-mode", "details": {"mode": "openai"}}
+{"ts": "2026-08-11T17:47:38-04:00", "step": "llm-mode", "details": {"mode": "anthropic"}}
+{"ts": "2026-08-11T18:15:05-04:00", "step": "llm-mode", "details": {"mode": "openai"}}

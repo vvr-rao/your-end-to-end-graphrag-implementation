@@ -450,8 +450,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Token overlap between adjacent chunks.",
     )
     p_reg.add_argument(
-        "--concurrency", type=int, default=4,
-        help="Concurrent LLM calls for summarization.",
+        "--concurrency", type=int, default=None,
+        help=(
+            "Concurrent LLM calls for summarization. Defaults to "
+            "summarization.concurrency in config.yaml (which itself falls back "
+            "to expansion.max_concurrent_llm_calls). Wall time scales close to "
+            "linearly with this until you hit the model's TPM limit."
+        ),
     )
     p_reg.add_argument(
         "--tables", action="store_true",
@@ -1313,7 +1318,18 @@ def _cmd_clear_corpus(args: argparse.Namespace) -> int:
 
 
 def _cmd_register_documents(args: argparse.Namespace) -> int:
+    from backend.app.core.config import get_settings
     from backend.app.services.db_document_ingest import ingest_documents_folder
+
+    # --concurrency unset -> summarization.concurrency, else the old shared
+    # expansion cap. Keeps the CLI override authoritative when given.
+    _cfg = get_settings().app_config
+    _sum = (_cfg.get("summarization", {}) or {})
+    _exp = (_cfg.get("expansion", {}) or {})
+    concurrency = args.concurrency
+    if concurrency is None:
+        concurrency = int(_sum.get("concurrency", _exp.get("max_concurrent_llm_calls", 4)))
+    print(f"[register-documents] summarization concurrency = {concurrency}")
 
     asyncio.run(
         ingest_documents_folder(
@@ -1323,7 +1339,7 @@ def _cmd_register_documents(args: argparse.Namespace) -> int:
             summarization_threshold=args.summarization_threshold,
             chunk_size=args.chunk_size,
             chunk_overlap=args.chunk_overlap,
-            concurrency=args.concurrency,
+            concurrency=concurrency,
             extract_tables=getattr(args, "tables", False),
             table_vision=getattr(args, "table_vision", True),
             full_text_chunks=getattr(args, "full_text_chunks", False),

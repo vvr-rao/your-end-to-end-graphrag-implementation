@@ -2420,6 +2420,20 @@ async def _run_llm_stages(
     oversize_sub_chunk = int(chunking_cfg.get("oversize_doc_sub_chunk_tokens", 4_000))
     streaming_batch_size = int(chunking_cfg.get("streaming_batch_size", 16))
     _concurrency = int(expansion_cfg_for_concur.get("max_concurrent_llm_calls", 4))
+    # Summarization gets its OWN concurrency, independent of Stage 1/2.
+    #
+    # They run on different models with very different rate limits, so one
+    # number cannot suit both: class_proposal is gpt-4.1 at max_tokens=32768
+    # (a ~2M TPM tier), while the summarizer is gpt-4.1-mini (~10M TPM) making
+    # far smaller calls. Tying them together forced the summarizer down to
+    # Stage 2's safe value, and a 139-window corpus then took ~4 hours at under
+    # 1% of the account's throughput allowance.
+    #
+    # Defaults to max_concurrent_llm_calls when unset, so existing configs
+    # behave exactly as before.
+    _summ_concurrency = int(
+        (app_cfg.get("summarization", {}) or {}).get("concurrency", _concurrency)
+    )
 
     # Method: evaluated (near-lossless, new default) vs single_pass (legacy).
     # `single_pass_summaries=True` (CLI --single-pass-summaries) forces legacy.
@@ -2440,7 +2454,7 @@ async def _run_llm_stages(
             chunk_overlap=chunk_overlap,
             encoding_name=encoding,
             use_cache=use_cache,
-            concurrency=_concurrency,
+            concurrency=_summ_concurrency,
             batch_size=streaming_batch_size,
             max_cost_usd=max_cost_usd,
         )
@@ -2455,7 +2469,7 @@ async def _run_llm_stages(
             max_doc_input_tokens=max_doc_input_tokens,
             oversize_doc_sub_chunk_tokens=oversize_sub_chunk,
             use_cache=use_cache,
-            concurrency=_concurrency,
+            concurrency=_summ_concurrency,
             batch_size=streaming_batch_size,
         )
     print(f"[llm] produced {len(chunks)} chunk(s)")

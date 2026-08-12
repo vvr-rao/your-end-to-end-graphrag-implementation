@@ -72,6 +72,22 @@ summarization:
   # the summaries for free (keep chunking.summarization_threshold_tokens the same
   # for both -- it decides which docs get summarized; it is NOT in the cache key).
   method: evaluated
+  # Concurrent LLM calls for the summarizer, INDEPENDENT of
+  # expansion.max_concurrent_llm_calls (Stage 1/2 run on a different model with
+  # a different rate limit -- see pipeline_llm for why they must not share one
+  # number). Unset => falls back to max_concurrent_llm_calls.
+  #
+  # Sizing: a 1.6M-token corpus is ~139 windows (12k window - 500 overlap), each
+  # up to 9 sequential calls. Wall time ~= (139 / concurrency) * chain_time, so
+  # this value divides total runtime almost linearly until you hit a provider
+  # limit or local memory.
+  #
+  # Rate-limit check before raising: concurrency * (input+output tokens per call)
+  # * (60 / seconds_per_call) must stay under your model's TPM. At 32 concurrent
+  # with ~20k tokens per ~60s call that is ~640k TPM -- 6% of a 10M TPM tier.
+  # OpenAI tier 4 is 10M TPM for gpt-4.1-mini, so 32 is conservative there;
+  # LOWER it to 4-8 on tier 1-2, where 8 concurrent large calls already throttle.
+  concurrency: 8
   # Evaluator revise rounds per chunk (register-documents --eval-rounds overrides).
   # Higher = more fidelity + more cost (~6-9 LLM calls/chunk at 3).
   eval_rounds: 3
