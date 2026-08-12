@@ -16,6 +16,9 @@ import pytest
 from backend.app.cli.main import _resolve_concurrency
 
 STAGES = ["summarization", "entity_extraction", "artifact_generation", "evaluation"]
+# table_mining has no CLI flag (prune-expand is config-only), so it is checked
+# separately against config.example.yaml rather than through _resolve_concurrency.
+CONFIG_ONLY_STAGES = ["table_mining"]
 
 
 class _Settings:
@@ -89,5 +92,5 @@ def test_shipped_config_defines_every_stage() -> None:
 
     example = yaml.safe_load(open("config/config.example.yaml"))
     block = example.get("concurrency") or {}
-    missing = [s for s in STAGES if s not in block]
+    missing = [s for s in STAGES + CONFIG_ONLY_STAGES if s not in block]
     assert not missing, f"config.example.yaml is missing concurrency keys: {missing}"

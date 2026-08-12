@@ -2869,12 +2869,22 @@ async def _run(
         def _audit_table_mining(task: str, payload: dict[str, Any]) -> None:
             _append_audit(audit_path, -1, task, None, payload)
 
+        # Table mining runs only here (prune-expand --tables), and prune-expand
+        # has no --concurrency flag, so this is config-only.
+        _app_cfg = get_settings().app_config
+        _table_conc = int(
+            (_app_cfg.get("concurrency", {}) or {}).get(
+                "table_mining",
+                (_app_cfg.get("expansion", {}) or {}).get("max_concurrent_llm_calls", 4),
+            )
+        )
         table_mining_stage2 = await table_ontology_mining.mine_table_concepts_async(
             tables_dir=tables_dir,
             loaded_ontology=loaded,
             router=router,
             cache_dir=tables_dir,
             audit_callback=_audit_table_mining,
+            concurrency=_table_conc,
         )
 
     deduped = await _run_llm_stages(

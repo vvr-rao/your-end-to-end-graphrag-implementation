@@ -129,6 +129,7 @@ knobs in `config/config.yaml`, because the stages use different models:
 | Knob | Drives | Model / limit | Sane value |
 |---|---|---|---|
 | `concurrency.summarization` | evaluated summarizer | mini-class, ~10M TPM | 32 (tier 3+), 8 (tier 1-2) |
+| `concurrency.table_mining` | one call per table, `--tables` only | mini-class, ~10M TPM | 32 (tier 3+), 8 (tier 1-2) |
 | `expansion.max_concurrent_llm_calls` | Stage 1/2 `class_proposal` | gpt-4.1 @ 32k max_tokens, ~2M TPM | **leave at 4-8** |
 
 Summarization dominates wall time. It scales close to linearly: a 1.6M-token

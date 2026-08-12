@@ -296,11 +296,22 @@ concurrency:
   summarization: 32        # register-documents + prune-expand summarizer
   entity_extraction: 32    # extract-entities
   artifact_generation: 32  # generate-artifacts, regenerate-stale-artifacts
+  table_mining: 32         # prune-expand --tables (one LLM call per table)
   evaluation: 8            # evaluate-queries
 
 expansion:
   max_concurrent_llm_calls: 4   # Stage 1/2 of prune-expand — LEAVE LOW (see below)
 ```
+
+**Which commands take `--concurrency`** — five do; the rest are config-only:
+
+| Flag + config | Config only |
+|---|---|
+| `register-documents`, `extract-entities`, `generate-artifacts`, `regenerate-stale-artifacts`, `evaluate-queries` | **`prune-expand`**, `build`, `merge`, `enrich-time`, `query` |
+
+`prune-expand` is the notable one: it runs summarization, table mining *and*
+Stage 1/2, each with a different model and rate limit, so it takes all three
+from config rather than a single ambiguous flag.
 
 Wall time scales close to linearly with these. A 1.6M-token corpus took **~4
 hours** to summarize at concurrency 4 and is **~25 minutes** at 32:

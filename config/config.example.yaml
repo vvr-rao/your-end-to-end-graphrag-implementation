@@ -146,6 +146,10 @@ concurrency:
   entity_extraction: 8
   # generate-artifacts + regenerate-stale-artifacts
   artifact_generation: 8
+  # prune-expand --tables: one LLM call per extracted table
+  # (table_concept_grouping). Only runs during prune-expand, which has
+  # no --concurrency flag, so this is the ONLY way to set it.
+  table_mining: 8
   # evaluate-queries (the QA eval harness)
   evaluation: 4
 
