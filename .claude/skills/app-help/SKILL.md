@@ -89,6 +89,9 @@ domain_concepts) is ALWAYS merged in as well.
   throttle. `expansion.max_concurrent_llm_calls` is deliberately separate and
   should stay at 4-8 — it drives gpt-4.1 at 32k max_tokens against a ~2M TPM
   tier. See the README's "Tuning throughput" section.
+  Flags: most commands take `--concurrency N`; `prune-expand` and `build` take
+  three (`--summarization-concurrency`, `--table-mining-concurrency`,
+  `--expansion-concurrency`) since they drive three stages on different models.
 
 ## How to help
 - "What does X do / cost / support?" → answer here or from `--help`/README.

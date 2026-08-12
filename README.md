@@ -303,15 +303,36 @@ expansion:
   max_concurrent_llm_calls: 4   # Stage 1/2 of prune-expand — LEAVE LOW (see below)
 ```
 
-**Which commands take `--concurrency`** — five do; the rest are config-only:
+**Overriding per run.** Most commands take a single `--concurrency N`:
 
-| Flag + config | Config only |
+```bash
+uv run python -m backend.app.cli extract-entities --concurrency 48
+```
+
+`prune-expand` and `build` take **three separate flags**, because they drive
+three stages on models with different rate limits — one shared flag would
+re-create the conflation these knobs exist to remove:
+
+```bash
+uv run python -m backend.app.cli prune-expand --input <MERGE> --documents <DOCS> \
+  --summarization-concurrency 32 \
+  --table-mining-concurrency 32 \
+  --expansion-concurrency 4        # keep LOW: gpt-4.1 @ 32k against ~2M TPM
+```
+
+Both print what they resolved, so the value is never a mystery mid-run:
+
+```
+[llm] concurrency: summarization=32 expansion(stage1/2)=4
+[table-mining] concurrency = 32
+[extract-entities] concurrency = 32
+```
+
+| Command | Flags |
 |---|---|
-| `register-documents`, `extract-entities`, `generate-artifacts`, `regenerate-stale-artifacts`, `evaluate-queries` | **`prune-expand`**, `build`, `merge`, `enrich-time`, `query` |
-
-`prune-expand` is the notable one: it runs summarization, table mining *and*
-Stage 1/2, each with a different model and rate limit, so it takes all three
-from config rather than a single ambiguous flag.
+| `prune-expand`, `build` | `--summarization-concurrency`, `--table-mining-concurrency`, `--expansion-concurrency` |
+| `register-documents`, `extract-entities`, `generate-artifacts`, `regenerate-stale-artifacts`, `evaluate-queries` | `--concurrency` |
+| `merge`, `enrich-time`, `query` | none needed (no LLM fan-out) |
 
 Wall time scales close to linearly with these. A 1.6M-token corpus took **~4
 hours** to summarize at concurrency 4 and is **~25 minutes** at 32:

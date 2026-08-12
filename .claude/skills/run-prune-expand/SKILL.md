@@ -123,8 +123,21 @@ summary cache (`~/.cache/.../eval_summaries/`) work exactly as before. A re-run
 after a crash reuses everything already computed — it does not re-pay.
 
 ### Concurrency — check it before a multi-hour run, and tell the user
-`prune-expand` has **no `--concurrency` flag**; it is config-only. Two separate
-knobs in `config/config.yaml`, because the stages use different models:
+`prune-expand` takes **three separate flags**, one per stage, because the stages
+run on different models with different rate limits:
+
+```
+--summarization-concurrency N   --table-mining-concurrency N   --expansion-concurrency N
+```
+
+Each falls back to its config key when unset. Append them to the detached
+command above when the user wants a per-run value; otherwise edit
+`config/config.yaml`. The run prints what it resolved — quote it back:
+
+```
+[llm] concurrency: summarization=32 expansion(stage1/2)=4
+[table-mining] concurrency = 32
+```
 
 | Knob | Drives | Model / limit | Sane value |
 |---|---|---|---|

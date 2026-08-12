@@ -94,3 +94,44 @@ def test_shipped_config_defines_every_stage() -> None:
     block = example.get("concurrency") or {}
     missing = [s for s in STAGES + CONFIG_ONLY_STAGES if s not in block]
     assert not missing, f"config.example.yaml is missing concurrency keys: {missing}"
+
+
+# --------------------------------------------------------------------------- #
+# prune-expand / build take THREE separate flags, because they drive three
+# stages on models with different rate limits. One shared flag would
+# reintroduce exactly the conflation that pinned the mini-model stages to
+# gpt-4.1's safe value.
+# --------------------------------------------------------------------------- #
+PE_FLAGS = [
+    "--summarization-concurrency",
+    "--table-mining-concurrency",
+    "--expansion-concurrency",
+]
+
+
+@pytest.mark.parametrize("flag", PE_FLAGS)
+@pytest.mark.parametrize("command", ["prune-expand", "build"])
+def test_prune_expand_exposes_each_concurrency_flag(command, flag) -> None:
+    from backend.app.cli.main import build_parser
+
+    parser = build_parser()
+    actions = {
+        a.option_strings[0]
+        for sub in parser._subparsers._group_actions          # type: ignore[attr-defined]
+        for name, sp in sub.choices.items() if name == command
+        for a in sp._actions if a.option_strings
+    }
+    assert flag in actions, f"{command} is missing {flag}"
+
+
+def test_prune_expand_has_no_single_ambiguous_concurrency_flag() -> None:
+    """A bare --concurrency would be ambiguous across the three stages."""
+    from backend.app.cli.main import build_parser
+
+    parser = build_parser()
+    for sub in parser._subparsers._group_actions:            # type: ignore[attr-defined]
+        pe = sub.choices.get("prune-expand")
+        if pe is None:
+            continue
+        opts = {o for a in pe._actions for o in a.option_strings}
+        assert "--concurrency" not in opts

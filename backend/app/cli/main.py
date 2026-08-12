@@ -251,6 +251,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use the legacy one-shot document summarizer instead of the default "
              "evaluated summarizer (see prune-expand --single-pass-summaries).",
     )
+    for _p in (p_pe, p_build):
+        _p.add_argument(
+            "--summarization-concurrency", type=int, default=None, metavar="N",
+            help=(
+                "Concurrent LLM calls for the evaluated summarizer (mini-class "
+                "model, ~10M TPM on OpenAI tier 4). Dominates wall time: a "
+                "1.6M-token corpus is ~4h at 4 and ~25min at 32, at the same "
+                "cost. Unset => concurrency.summarization in config.yaml. "
+                "Use 32-64 on tier 3+, 4-8 on tier 1-2."
+            ),
+        )
+        _p.add_argument(
+            "--table-mining-concurrency", type=int, default=None, metavar="N",
+            help=(
+                "Concurrent LLM calls for table->ontology mining (one call per "
+                "extracted table; --tables only). Same model class as "
+                "summarization. Unset => concurrency.table_mining in config.yaml."
+            ),
+        )
+        _p.add_argument(
+            "--expansion-concurrency", type=int, default=None, metavar="N",
+            help=(
+                "Concurrent LLM calls for Stage 1/2 (chunk_classification, "
+                "class_proposal). SEPARATE ON PURPOSE: class_proposal runs on "
+                "gpt-4.1 at max_tokens=32768 against a ~2M TPM tier, where 32 "
+                "concurrent would be ~1.3M TPM. Keep this at 4-8 even when the "
+                "others are high. Unset => expansion.max_concurrent_llm_calls."
+            ),
+        )
+
     p_build.set_defaults(func=_cmd_build)
 
     p_sd = sub.add_parser(
@@ -1133,6 +1163,9 @@ def _cmd_prune_expand(args: argparse.Namespace) -> int:
             extract_tables=getattr(args, "tables", False),
             table_vision=getattr(args, "table_vision", True),
             single_pass_summaries=getattr(args, "single_pass_summaries", False),
+            summarization_concurrency=getattr(args, "summarization_concurrency", None),
+            table_mining_concurrency=getattr(args, "table_mining_concurrency", None),
+            expansion_concurrency=getattr(args, "expansion_concurrency", None),
         )
     )
     print(f"\nPRUNED+EXPANDED ontology written to: {version_dir}")
@@ -1154,6 +1187,9 @@ def _cmd_build(args: argparse.Namespace) -> int:
             extract_tables=getattr(args, "tables", False),
             table_vision=getattr(args, "table_vision", True),
             single_pass_summaries=getattr(args, "single_pass_summaries", False),
+            summarization_concurrency=getattr(args, "summarization_concurrency", None),
+            table_mining_concurrency=getattr(args, "table_mining_concurrency", None),
+            expansion_concurrency=getattr(args, "expansion_concurrency", None),
         )
     )
     print(f"\nBUILT ontology written to: {version_dir}")

@@ -2395,6 +2395,10 @@ async def _run_llm_stages(
     suggested_new_classes: list[dict[str, Any]] | None = None,
     extra_stage2_results: list[dict[str, Any]] | None = None,
     single_pass_summaries: bool = False,
+    # CLI overrides (prune-expand/build --summarization-concurrency /
+    # --expansion-concurrency). None => fall back to config.
+    summarization_concurrency: int | None = None,
+    expansion_concurrency: int | None = None,
 ) -> dict[str, Any]:
     """Stages 1-3. Returns the merged + deduplicated match-results dict.
 
@@ -2419,7 +2423,11 @@ async def _run_llm_stages(
     max_doc_input_tokens = int(chunking_cfg.get("max_doc_input_tokens", 4_000))
     oversize_sub_chunk = int(chunking_cfg.get("oversize_doc_sub_chunk_tokens", 4_000))
     streaming_batch_size = int(chunking_cfg.get("streaming_batch_size", 16))
-    _concurrency = int(expansion_cfg_for_concur.get("max_concurrent_llm_calls", 4))
+    _concurrency = int(
+        expansion_concurrency
+        if expansion_concurrency is not None
+        else expansion_cfg_for_concur.get("max_concurrent_llm_calls", 4)
+    )
     # Summarization gets its OWN concurrency, independent of Stage 1/2.
     #
     # They run on different models with very different rate limits, so one
@@ -2432,7 +2440,16 @@ async def _run_llm_stages(
     # Defaults to max_concurrent_llm_calls when unset, so existing configs
     # behave exactly as before.
     _summ_concurrency = int(
-        (app_cfg.get("summarization", {}) or {}).get("concurrency", _concurrency)
+        summarization_concurrency
+        if summarization_concurrency is not None
+        else (app_cfg.get("concurrency", {}) or {}).get(
+            "summarization",
+            (app_cfg.get("summarization", {}) or {}).get("concurrency", _concurrency),
+        )
+    )
+    print(
+        f"[llm] concurrency: summarization={_summ_concurrency} "
+        f"expansion(stage1/2)={_concurrency}"
     )
 
     # Method: evaluated (near-lossless, new default) vs single_pass (legacy).
@@ -2710,6 +2727,9 @@ async def prune_and_expand_async(
     extract_tables: bool = False,
     table_vision: bool = True,
     single_pass_summaries: bool = False,
+    summarization_concurrency: int | None = None,
+    table_mining_concurrency: int | None = None,
+    expansion_concurrency: int | None = None,
 ) -> Path:
     return await _run(
         "prune-expand",
@@ -2723,6 +2743,9 @@ async def prune_and_expand_async(
         extract_tables=extract_tables,
         table_vision=table_vision,
         single_pass_summaries=single_pass_summaries,
+        summarization_concurrency=summarization_concurrency,
+        table_mining_concurrency=table_mining_concurrency,
+        expansion_concurrency=expansion_concurrency,
     )
 
 
@@ -2738,6 +2761,9 @@ async def build_async(
     extract_tables: bool = False,
     table_vision: bool = True,
     single_pass_summaries: bool = False,
+    summarization_concurrency: int | None = None,
+    table_mining_concurrency: int | None = None,
+    expansion_concurrency: int | None = None,
 ) -> Path:
     # build = merge + prune-expand chained. Merge first (sync), then drive the
     # async LLM pipeline against the just-written version folder.
@@ -2756,6 +2782,9 @@ async def build_async(
         extract_tables=extract_tables,
         table_vision=table_vision,
         single_pass_summaries=single_pass_summaries,
+        summarization_concurrency=summarization_concurrency,
+        table_mining_concurrency=table_mining_concurrency,
+        expansion_concurrency=expansion_concurrency,
     )
 
 
@@ -2772,6 +2801,9 @@ async def _run(
     extract_tables: bool = False,
     table_vision: bool = True,
     single_pass_summaries: bool = False,
+    summarization_concurrency: int | None = None,
+    table_mining_concurrency: int | None = None,
+    expansion_concurrency: int | None = None,
 ) -> Path:
     settings = get_settings()
     app_cfg = settings.app_config
@@ -2873,11 +2905,14 @@ async def _run(
         # has no --concurrency flag, so this is config-only.
         _app_cfg = get_settings().app_config
         _table_conc = int(
-            (_app_cfg.get("concurrency", {}) or {}).get(
+            table_mining_concurrency
+            if table_mining_concurrency is not None
+            else (_app_cfg.get("concurrency", {}) or {}).get(
                 "table_mining",
                 (_app_cfg.get("expansion", {}) or {}).get("max_concurrent_llm_calls", 4),
             )
         )
+        print(f"[table-mining] concurrency = {_table_conc}")
         table_mining_stage2 = await table_ontology_mining.mine_table_concepts_async(
             tables_dir=tables_dir,
             loaded_ontology=loaded,
@@ -2899,6 +2934,8 @@ async def _run(
         suggested_new_classes=suggested or None,
         extra_stage2_results=[table_mining_stage2] if table_mining_stage2 else None,
         single_pass_summaries=single_pass_summaries,
+        summarization_concurrency=summarization_concurrency,
+        expansion_concurrency=expansion_concurrency,
     )
 
     # Inject user-suggested classes that the LLM didn't already propose. These
