@@ -51,10 +51,45 @@ async def wipe_corpus(*, confirm: bool = False) -> dict[str, int]:
         )
         n_classes = int(r.scalar_one())
         if n_classes == 0:
+            # An empty ontology has two very different causes, and the old
+            # message assumed the harmless one:
+            #
+            #  (a) never initialised      -> db-init --mode replace is right
+            #  (b) a `db-init --mode replace` WIPED the ontology and then its
+            #      import failed (bad path, missing merged.json, dead API key),
+            #      leaving an orphaned corpus behind
+            #
+            # In (b) the user is mid-recovery and this refusal was a dead end:
+            # clear-corpus won't run without an ontology, and they were not
+            # told that re-running db-init with a VALID folder is the way out.
+            # Detect it by looking for corpus rows that now reference nothing.
+            r2 = await session.execute(
+                text("SELECT count(*) FROM graphrag.documents")
+            )
+            n_docs = int(r2.scalar_one())
+            if n_docs:
+                # DO NOT tell the user to run `db-init --mode replace` here: its
+                # wipe guard refuses while documents exist, and this guard
+                # refuses while the ontology is empty. Each command pointing at
+                # the other is a closed loop with no CLI escape -- which is
+                # exactly what a failed replace used to strand people in.
+                # `--mode upsert` is the way out: it imports WITHOUT wiping, so
+                # it does not trip the dependent-table guard.
+                raise RuntimeError(
+                    f"refusing to clear corpus -- ontology_classes is empty but "
+                    f"{n_docs} document(s) remain. This is the state a FAILED "
+                    f"`db-init --mode replace` leaves behind: the wipe succeeded, "
+                    f"then the import failed, orphaning the corpus.\n"
+                    f"  RECOVER WITH:  db-init --input <valid prune-expand folder> "
+                    f"--mode upsert\n"
+                    f"  (`--mode replace` will NOT work here -- its wipe guard "
+                    f"refuses while documents exist, and this command refuses "
+                    f"while the ontology is empty. upsert imports without wiping.)"
+                )
             raise RuntimeError(
-                "refusing to clear corpus -- ontology_classes is empty. "
-                "Use `db-init --mode replace` if you want to re-import "
-                "the ontology too."
+                "refusing to clear corpus -- ontology_classes is empty and there "
+                "are no documents, so there is nothing to clear. Use "
+                "`db-init --mode replace` to import an ontology first."
             )
 
         if not confirm:

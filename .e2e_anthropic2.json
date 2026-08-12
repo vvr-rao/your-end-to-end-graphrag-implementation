@@ -1,0 +1,170 @@
+[
+  {
+    "name": "db-migrate",
+    "exit": 0,
+    "seconds": 9.8,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "db-status",
+    "exit": 0,
+    "seconds": 14.0,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "db-size",
+    "exit": 0,
+    "seconds": 6.7,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "summarize-descriptions",
+    "exit": 0,
+    "seconds": 8.6,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "prune-expand",
+    "exit": 0,
+    "seconds": 835.0,
+    "cost_seen": 5.09,
+    "err": ""
+  },
+  {
+    "name": "audit-classifications",
+    "exit": 0,
+    "seconds": 8.3,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "repair-output",
+    "exit": 0,
+    "seconds": 5.7,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "clear-corpus",
+    "exit": 0,
+    "seconds": 6.7,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "db-init(replace)",
+    "exit": 0,
+    "seconds": 18.1,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "import-ontology",
+    "exit": 0,
+    "seconds": 24.8,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "register-documents",
+    "exit": 1,
+    "seconds": 62.3,
+    "cost_seen": 0.0388,
+    "err": "2\\n\\n 4 mg: NDC 0169-4804-30 (30-ct plastic bottle)\\n- RYBELSUS R2 9 mg: NDC 0169-4809-30 (30-ct plastic bottle)', '[-0.020782470703125,-0.00811767578125,0.0203857421875,0.054534912109375,-0.041229248046875,0.0211334228515625,0.0269927978515625,0.027679443359375,0. ... (19082 characters truncated) ... 0.0140228271484375,0.002666473388671875,-0.0107421875,0.013031005859375,-0.0018310546875,0.0021076202392578125,-0.01459503173828125,-0.0233154296875]', 'ACTIVE', 1, False, '{\"original_text_bytes\": 110761, \"summary_text_bytes\": 49578}')]\n(Background on this error at: https://sqlalche.me/e/20/gkpj)"
+  },
+  {
+    "name": "list-documents",
+    "exit": 0,
+    "seconds": 11.2,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "extract-entities",
+    "exit": 0,
+    "seconds": 49.7,
+    "cost_seen": 0.0867,
+    "err": ""
+  },
+  {
+    "name": "enrich-time",
+    "exit": 0,
+    "seconds": 8.0,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "generate-artifacts",
+    "exit": 0,
+    "seconds": 754.2,
+    "cost_seen": 0.1545,
+    "err": ""
+  },
+  {
+    "name": "query(simple_qa)",
+    "exit": 0,
+    "seconds": 60.1,
+    "cost_seen": 0.0131,
+    "err": ""
+  },
+  {
+    "name": "query(deep_research)",
+    "exit": 0,
+    "seconds": 113.7,
+    "cost_seen": 0.0954,
+    "err": ""
+  },
+  {
+    "name": "query(artifact_only)",
+    "exit": 0,
+    "seconds": 105.1,
+    "cost_seen": 0.0719,
+    "err": ""
+  },
+  {
+    "name": "conversation start",
+    "exit": 0,
+    "seconds": 0.0,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "conversation turn",
+    "exit": 0,
+    "seconds": 49.8,
+    "cost_seen": 0.013,
+    "err": ""
+  },
+  {
+    "name": "conversation show",
+    "exit": 0,
+    "seconds": 11.4,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "delete-document(soft)",
+    "exit": 0,
+    "seconds": 39.7,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "regenerate-stale-artifacts",
+    "exit": 0,
+    "seconds": 13.7,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "db-size(final)",
+    "exit": 0,
+    "seconds": 5.4,
+    "cost_seen": 0.0,
+    "err": ""
+  }
+]
