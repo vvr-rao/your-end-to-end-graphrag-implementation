@@ -147,13 +147,28 @@ command above when the user wants a per-run value; otherwise edit
 
 Summarization dominates wall time. It scales close to linearly: a 1.6M-token
 corpus took **~4 hours at concurrency 4** and is **~25 minutes at 32**, at
-identical cost (same token volume; the prompt-cache hit rate drops slightly,
-measured 69% → 49%, about +2% spend).
+identical cost.
 
-**Before launching**, read the value and say it plainly, e.g. *"summarization
-concurrency is 32 — suits OpenAI tier 3+; I'll lower it to 8 if you're on tier
-1-2."* Do **not** raise `expansion.max_concurrent_llm_calls` to match — several
-concurrent 32k-token gpt-4.1 calls throttle and time out.
+**Before launching, check the headroom and recommend a value:**
+```
+uv run python scripts/tpm_check.py
+```
+It reads OpenAI's own rate-limit headers and suggests a concurrency per stage.
+Then say what you found and propose raising it, e.g.
+> *"Your gpt-4.1-mini limit is 10M TPM; summarization is set to 32, using well
+> under 1%. I can take it to 64-125 and cut wall time roughly proportionally.
+> **It won't cost less** — same tokens either way — it just finishes sooner."*
+
+Always state that concurrency buys **SPEED, not savings**. Users assume a
+tuning knob saves money; this one doesn't (it's ~2% *more*, from a slightly
+lower prompt-cache hit rate — measured 69% → 49% at 4 → 32).
+
+Measured at concurrency 32: **~0.5% sustained TPM** and **zero** burst pressure
+on the token bucket. On tier 3+ the provider limit is not the constraint.
+
+Do **not** raise `expansion.max_concurrent_llm_calls` to match — it drives
+gpt-4.1 at 32k max_tokens on a 5×-tighter tier, where concurrent large calls
+throttle and time out.
 
 Also relevant to throughput: `chunking.streaming_batch_size` (default 8) is a
 hard barrier — documents process in batches and batch N+1 cannot start until N

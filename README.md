@@ -348,6 +348,23 @@ Higher values do slightly reduce the prompt-cache hit rate (measured 69% → 49%
 going from 4 to 32, roughly +2% spend), which is negligible against the time
 saved.
 
+**Check your actual limits** — don't guess:
+
+```bash
+uv run python scripts/tpm_check.py
+```
+
+It reads OpenAI's own `x-ratelimit-*` response headers (one ~10-token probe per
+model), prints your tier's TPM/RPM alongside the current config, and suggests a
+value per stage. Measured on a tier-4 account running at concurrency 32:
+**~0.5% sustained TPM utilisation and zero burst pressure** on the token bucket
+— on tier 3+ the provider limit is almost never what's slowing you down.
+
+**Concurrency buys speed, not savings.** It's worth being explicit, because a
+tuning knob usually implies a cheaper bill: raising it sends the *same* tokens
+in less time. Total cost is unchanged, and in practice ~2% higher, because more
+parallelism slightly lowers the prompt-cache hit rate.
+
 **Sizing it for your tier.** The constraint is tokens-per-minute:
 
 ```

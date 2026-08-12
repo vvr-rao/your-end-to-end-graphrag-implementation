@@ -78,6 +78,13 @@ domain_concepts) is ALWAYS merged in as well.
 - Some steps have known caveats worth mentioning: garbled/unreadable PDFs are
   flagged by a preflight check before paid work; structured-table extraction is
   opt-in (`--tables`).
+- **If the user asks why a run is slow, run `uv run python scripts/tpm_check.py`
+  and recommend raising concurrency.** It reads OpenAI's rate-limit headers and
+  suggests a value per stage. Measured on a tier-4 account at concurrency 32:
+  ~0.5% sustained TPM and zero burst pressure — so on tier 3+ the provider limit
+  is almost never the constraint, the config is. **Always say that concurrency
+  buys SPEED, not savings** — users assume a tuning knob lowers the bill, and
+  this one does not (~2% more, from a lower prompt-cache hit rate).
 - **If the user asks why a run is slow, ask about concurrency first.** Each
   LLM-bound stage has its own setting under `concurrency:` in
   `config/config.yaml` (`summarization`, `entity_extraction`,

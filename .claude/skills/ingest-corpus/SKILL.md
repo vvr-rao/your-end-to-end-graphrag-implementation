@@ -38,22 +38,38 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
   The choice is stored in the tracker as `fulltext=yes|no` on the
   `register-documents` step — check it (`build_state.py show`) and apply
   `--from-fulltext` consistently across all three downstream steps.
-- **Concurrency drives wall time — tell the user before a long run.** Steps 2, 3
-  and 5 read `concurrency.{summarization,entity_extraction,artifact_generation}`
-  from `config/config.yaml`; each also takes `--concurrency N` to override for one
-  run. Wall time scales close to linearly with it: a 1.6M-token corpus took ~4
-  hours at 4 and is ~25 minutes at 32. **Cost is unchanged** (same token volume),
-  though a higher value slightly lowers the prompt-cache hit rate (measured
-  69% → 49% going 4 → 32, about +2% spend).
-  - Before launching a long paid step, state the current value and the provider
-    tier it suits, e.g. *"running at concurrency 32 — right for OpenAI tier 3+;
-    say the word and I'll drop it to 8 if you're on tier 1-2."*
-  - The default shipped in `config.example.yaml` is a conservative **8**. Raise it
-    for tier 3+; **lower to 4-8 on tier 1-2**, where several large concurrent
-    calls throttle and time out.
-  - Do NOT raise `expansion.max_concurrent_llm_calls` to match. That one drives
-    `class_proposal` on gpt-4.1 at `max_tokens: 32768` against a ~2M TPM tier;
-    4-8 is correct there. The stages above run on mini-class models (~10M TPM).
+- **Check rate-limit headroom and RECOMMEND raising concurrency. Do this before
+  every long paid step.** Run:
+  ```
+  uv run python scripts/tpm_check.py
+  ```
+  It reads OpenAI's own rate-limit headers and prints the tier's TPM/RPM per
+  model, the current config, and a suggested value per stage. Costs ~nothing
+  (one 10-token probe per model).
+
+  Then **tell the user what you found and propose a number**, e.g.
+  > *"Your gpt-4.1-mini limit is 10M TPM and we're set to 32 — that's using well
+  > under 1% of it. I can raise it to 64-125 and cut the wall time roughly
+  > proportionally. **This won't reduce cost at all** — the same tokens get sent
+  > either way; it only makes the run finish sooner. Want me to?"*
+
+  Be explicit every time that **concurrency buys SPEED, not savings.** Users
+  reasonably assume a tuning knob saves money; this one does not. If anything it
+  costs ~2% more, because a higher value slightly lowers the prompt-cache hit
+  rate (measured 69% → 49% going 4 → 32).
+
+- **The numbers.** Steps 2, 3 and 5 read
+  `concurrency.{summarization,entity_extraction,artifact_generation}` from
+  `config/config.yaml`; each also takes `--concurrency N` for a single run. Wall
+  time scales close to linearly: a 1.6M-token corpus took ~4 hours at 4 and is
+  ~25 minutes at 32. Measured utilisation at 32 was **~0.5% sustained** on a 10M
+  TPM tier, with **zero** burst pressure on the token bucket — so on tier 3+ the
+  limit is not the constraint, our setting is.
+  - `config.example.yaml` ships a conservative **8** for unknown tiers.
+  - **Lower to 4-8 on tier 1-2**, where several large concurrent calls throttle.
+  - Do NOT raise `expansion.max_concurrent_llm_calls` to match. It drives
+    `class_proposal` on gpt-4.1 at `max_tokens: 32768` against a ~2M TPM tier
+    (5× tighter); 4-8 is correct there.
   - Each command prints its resolved value on startup
     (`[extract-entities] concurrency = 32`) — quote it back when reporting.
 
