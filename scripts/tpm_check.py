@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Report your provider rate limits and recommend a concurrency setting.
 
-    uv run python scripts/tpm_check.py
+    uv run python scripts/tpm_check.py [<documents-dir>]
+
+Pass a corpus directory to also size `streaming_batch_size`, which silently
+CAPS effective concurrency: only the current batch's windows exist, so a
+semaphore larger than that has nothing to schedule.
 
 Reads OpenAI's authoritative rate-limit headers (one ~10-token probe per
 model) and turns them into a concrete suggestion for `concurrency:` in
@@ -93,6 +97,64 @@ def suggest(tpm: int | None, rpm: int | None) -> int | None:
     return max(1, min(by_tokens, by_requests, 128))
 
 
+def analyse_corpus(docs_dir: str, batch_size: int, concurrency: int) -> None:
+    """Explain how batch size and concurrency interact for THIS corpus.
+
+    streaming_batch_size is a stop-the-world barrier: pipeline_llm awaits each
+    batch before loading the next, so windows from later documents do not exist
+    yet. Effective concurrency is therefore
+        min(concurrency, windows_in_the_current_batch)
+    and a semaphore bigger than the batch's window count is simply idle.
+    """
+    from pathlib import Path
+
+    from backend.app.services.document_io import load_documents
+    from backend.app.services.evaluated_summarizer import get_encoder
+
+    print(f"\n\nCorpus plan for {docs_dir}")
+    print("  (extracting + tokenising -- may take a minute on a large corpus)")
+    enc = get_encoder()
+    docs = list(load_documents(Path(docs_dir)))
+    if not docs:
+        print("  no documents found.")
+        return
+    toks = [len(enc.encode(d.text)) for d in docs]
+    wins = [max(1, -(-t // 11500)) for t in toks]   # 12k window - 500 overlap
+    n, total_w = len(docs), sum(wins)
+
+    print(f"\n  {n} document(s), {sum(toks):,} tokens -> ~{total_w} summarization windows")
+    print(f"  largest doc: {max(toks):,} tok ({max(wins)} windows)")
+
+    print(f"\n{'batch_size':>11} {'batches':>8} {'windows/batch':>14} {'effective conc.':>16}  note")
+    print("  " + "-" * 68)
+    best = batch_size
+    for b in sorted({4, 8, 16, 32, n}):
+        if b < 1:
+            continue
+        nb = -(-n // b)
+        per = total_w / nb
+        eff = min(concurrency, per)
+        note = "saturates" if per >= concurrency else f"CAPS concurrency at ~{per:.0f}"
+        star = " <- current" if b == batch_size else ""
+        print(f"{b:>11} {nb:>8} {per:>14.0f} {eff:>16.0f}  {note}{star}")
+        if per >= concurrency and b <= n and (best == batch_size or b < best):
+            best = b
+
+    print(f"\n  Current: streaming_batch_size={batch_size}, concurrency.summarization={concurrency}")
+    per_now = total_w / max(1, -(-n // batch_size))
+    if per_now < concurrency:
+        print(f"  -> Only ~{per_now:.0f} windows exist per batch, so {concurrency - per_now:.0f} "
+              f"of your {concurrency} concurrency slots sit IDLE.")
+        print(f"  -> RECOMMEND chunking.streaming_batch_size: {best} "
+              f"(memory cost is small: ~50 MB at 16 docs).")
+        print(f"     Raising concurrency alone will NOT help until you do.")
+    else:
+        print(f"  -> Batch size is not the constraint here; concurrency "
+              f"{concurrency} is fully usable.")
+    print("\n  Batches are SEQUENTIAL (a barrier), so each batch also runs at the")
+    print("  speed of its slowest document -- one 6-window doc holds up its whole batch.")
+
+
 async def main() -> int:
     s = get_settings()
     if not s.openai_api_key:
@@ -145,6 +207,18 @@ async def main() -> int:
         print("total cost is unchanged because the same tokens are sent either way.")
         print("A higher value does slightly lower the prompt-cache hit rate")
         print("(measured 69% -> 49% going 4 -> 32, about +2% spend).")
+
+    if len(sys.argv) > 1:
+        cfg2 = get_settings().app_config
+        analyse_corpus(
+            sys.argv[1],
+            int((cfg2.get("chunking") or {}).get("streaming_batch_size", 8)),
+            int((cfg2.get("concurrency") or {}).get("summarization", 4)),
+        )
+    else:
+        print("\nTip: pass a documents directory to also size "
+              "chunking.streaming_batch_size,\n     which caps effective concurrency: "
+              "uv run python scripts/tpm_check.py <docs-dir>")
     return 0
 
 

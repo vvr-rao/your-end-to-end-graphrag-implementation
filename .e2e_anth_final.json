@@ -1,0 +1,170 @@
+[
+  {
+    "name": "db-migrate",
+    "exit": 0,
+    "seconds": 9.3,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "db-status",
+    "exit": 0,
+    "seconds": 13.7,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "db-size",
+    "exit": 0,
+    "seconds": 4.7,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "summarize-descriptions",
+    "exit": 0,
+    "seconds": 8.0,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "prune-expand",
+    "exit": 0,
+    "seconds": 850.5,
+    "cost_seen": 4.97,
+    "err": ""
+  },
+  {
+    "name": "audit-classifications",
+    "exit": 0,
+    "seconds": 23.1,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "repair-output",
+    "exit": 0,
+    "seconds": 19.0,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "clear-corpus",
+    "exit": 0,
+    "seconds": 24.5,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "db-init(replace)",
+    "exit": 0,
+    "seconds": 109.2,
+    "cost_seen": 0.0003,
+    "err": ""
+  },
+  {
+    "name": "import-ontology",
+    "exit": 0,
+    "seconds": 22.4,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "register-documents",
+    "exit": 0,
+    "seconds": 88.9,
+    "cost_seen": 0.081,
+    "err": ""
+  },
+  {
+    "name": "list-documents",
+    "exit": 0,
+    "seconds": 10.1,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "extract-entities",
+    "exit": 0,
+    "seconds": 61.7,
+    "cost_seen": 0.2946,
+    "err": ""
+  },
+  {
+    "name": "enrich-time",
+    "exit": 0,
+    "seconds": 41.8,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "generate-artifacts",
+    "exit": 0,
+    "seconds": 95.9,
+    "cost_seen": 0.3365,
+    "err": ""
+  },
+  {
+    "name": "query(simple_qa)",
+    "exit": 0,
+    "seconds": 44.4,
+    "cost_seen": 0.0174,
+    "err": ""
+  },
+  {
+    "name": "query(deep_research)",
+    "exit": 0,
+    "seconds": 123.0,
+    "cost_seen": 0.1351,
+    "err": ""
+  },
+  {
+    "name": "query(artifact_only)",
+    "exit": 0,
+    "seconds": 105.6,
+    "cost_seen": 0.0646,
+    "err": ""
+  },
+  {
+    "name": "conversation start",
+    "exit": 0,
+    "seconds": 0.0,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "conversation turn",
+    "exit": 0,
+    "seconds": 63.7,
+    "cost_seen": 0.0164,
+    "err": ""
+  },
+  {
+    "name": "conversation show",
+    "exit": 0,
+    "seconds": 22.9,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "delete-document(soft)",
+    "exit": 0,
+    "seconds": 177.6,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "regenerate-stale-artifacts",
+    "exit": 0,
+    "seconds": 14.0,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "db-size(final)",
+    "exit": 0,
+    "seconds": 6.2,
+    "cost_seen": 0.0,
+    "err": ""
+  }
+]

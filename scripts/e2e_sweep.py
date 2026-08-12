@@ -88,8 +88,12 @@ def main() -> int:
     results.append(run("db-init(replace)",
                        ["db-init", "--input", pe_dir, "--mode", "replace", "--yes"],
                        timeout=2400))
+    # No --limit here. It used to be `--limit 5` as a cheap smoke test, but when
+    # the db-init above REFUSES (e.g. dependent tables still populated), this
+    # step imports 5 classes into the now-empty ontology and leaves the DB in a
+    # degenerate 5-class state that silently persists into later runs.
     results.append(run("import-ontology",
-                       ["import-ontology", "--input", pe_dir, "--limit", "5"]))
+                       ["import-ontology", "--input", pe_dir], timeout=2400))
     results.append(run("register-documents",
                        ["register-documents", "--input", docs, "--limit", "4",
                         "--tables"], timeout=3600))

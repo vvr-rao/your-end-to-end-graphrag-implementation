@@ -99,6 +99,11 @@ domain_concepts) is ALWAYS merged in as well.
   - Flags: most commands take `--concurrency N`; `prune-expand` and `build` take
     three (`--summarization-concurrency`, `--table-mining-concurrency`,
     `--expansion-concurrency`) since they drive three stages on different models.
+  - **Batch size caps concurrency.** `chunking.streaming_batch_size` (default 8)
+    is how many DOCUMENTS are summarized at once, and batches are a barrier, so
+    `effective concurrency = min(concurrency, ~2.5 x batch_size)`. At batch 8
+    that is ~20 -- a concurrency above that is idle. Pass the corpus to
+    `tpm_check.py <docs-dir>` and it will size both.
   - See the README's "Tuning throughput" section.
 
 ## How to help

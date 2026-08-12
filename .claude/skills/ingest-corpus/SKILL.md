@@ -41,11 +41,23 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
 - **Check rate-limit headroom and RECOMMEND raising concurrency. Do this before
   every long paid step.** Run:
   ```
-  uv run python scripts/tpm_check.py
+  uv run python scripts/tpm_check.py "<DOCS>"
   ```
   It reads OpenAI's own rate-limit headers and prints the tier's TPM/RPM per
-  model, the current config, and a suggested value per stage. Costs ~nothing
-  (one 10-token probe per model).
+  model, the current config, and a suggested value per stage. Passing the corpus
+  also sizes `chunking.streaming_batch_size`. Costs ~nothing (one 10-token probe
+  per model).
+
+  **Explain BOTH knobs, because batch size usually wins.** `streaming_batch_size`
+  (default 8) is how many DOCUMENTS are summarized at a time, and batches are a
+  hard barrier -- only the current batch's work exists. So
+  `effective concurrency = min(concurrency, windows in this batch)`, roughly
+  `batch_size x 2.5`. At batch 8 that caps you near 20 parallel calls, and a
+  concurrency above that is simply idle. Raising concurrency alone does nothing
+  until the batch size moves.
+
+  Keep 8 / 32 as the shipped defaults -- safe on small-RAM boxes and low tiers.
+  RECOMMEND changes, do not apply them unprompted.
 
   Then **tell the user what you found and propose a number**, e.g.
   > *"Your gpt-4.1-mini limit is 10M TPM and we're set to 32 — that's using well

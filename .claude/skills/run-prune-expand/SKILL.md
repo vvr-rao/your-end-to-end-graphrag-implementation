@@ -175,10 +175,45 @@ Summarization dominates wall time. It scales close to linearly: a 1.6M-token
 corpus took **~4 hours at concurrency 4** and is **~25 minutes at 32**, at
 identical cost.
 
-**Before launching, check the headroom and recommend a value:**
+**Before launching, run the planner and TALK THE USER THROUGH IT:**
 ```
-uv run python scripts/tpm_check.py
+uv run python scripts/tpm_check.py "<DOCS>"
 ```
+Passing the corpus makes it size `chunking.streaming_batch_size` as well as
+concurrency, because **the two interact and batch size usually wins.**
+
+### Explain both knobs before proposing numbers
+Users reasonably assume "concurrency" is the speed dial. It is only half of it:
+
+- **`chunking.streaming_batch_size` (default 8) = how many DOCUMENTS are loaded
+  and summarized at a time.** Batches are a hard barrier: `pipeline_llm` awaits
+  each one fully before loading the next.
+- **`concurrency.summarization` (default 32) = how many LLM calls may be in
+  flight.** But only the CURRENT batch's windows exist, so:
+
+      effective concurrency = min(concurrency, windows in this batch)
+      windows per batch     ≈ streaming_batch_size × ~2.5 windows/doc
+
+  At batch 8 that is ~19-20 windows, so **a concurrency above ~20 is idle** --
+  raising it alone changes nothing. Measured on a 30-doc corpus: 13 of 32 slots
+  sat unused.
+
+Say this in plain terms, e.g.
+> *"Two settings drive the time. `streaming_batch_size` is how many documents
+> are worked on at once (currently 8); `concurrency` is how many LLM calls run
+> in parallel (currently 32). Because only the current batch's work exists, the
+> batch size is capping you at ~19 parallel calls — 13 of the 32 are idle.
+> Raising batch size to 16 unlocks the concurrency you already have. It costs
+> ~50 MB of memory and **does not change the bill** — same tokens, less waiting."*
+
+**Keep 8 and 32 as the shipped defaults.** They are safe on a small-RAM box and
+on low provider tiers. RECOMMEND changes; do not apply them unprompted. Both are
+per-run overridable (`--summarization-concurrency`); `streaming_batch_size` is
+config-only, so an edit to `config/config.yaml` is needed for that one.
+
+Also flag the barrier effect when the corpus has outliers: a batch runs at the
+speed of its slowest document, so one 60k-token doc holds up its whole batch.
+
 It reads OpenAI's own rate-limit headers and suggests a concurrency per stage.
 Then say what you found and propose raising it, e.g.
 > *"Your gpt-4.1-mini limit is 10M TPM; summarization is set to 32, using well

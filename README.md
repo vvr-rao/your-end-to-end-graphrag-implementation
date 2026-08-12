@@ -393,9 +393,23 @@ Every command takes `--concurrency N` to override for one run (except
 
 Two related knobs worth knowing:
 
-- `chunking.streaming_batch_size` (default 8) — documents are summarized in
-  batches and batch N+1 cannot start until N fully drains. Raising it removes
-  stalls at the cost of memory; keep it low on small-RAM machines.
+- **`chunking.streaming_batch_size` (default 8) — this caps concurrency, and is
+  usually the real limit.** It is how many *documents* are summarized at a time,
+  and batches are a hard barrier: only the current batch's windows exist, so
+
+  ```
+  effective concurrency = min(concurrency.summarization, windows in this batch)
+  windows per batch    ≈ streaming_batch_size × ~2.5 windows/doc
+  ```
+
+  At batch 8 that is ~20 windows — so **`concurrency: 32` leaves 12 slots idle,
+  and raising concurrency further does nothing.** Measured on a 30-document
+  corpus: 13 of 32 slots unused. Memory cost is small (~50 MB at 16 documents),
+  so 16–32 is usually right above 2 GB free. Size it for your corpus with
+  `uv run python scripts/tpm_check.py <documents-dir>`, which prints the table.
+
+  Batches are sequential, so a batch also runs at the speed of its **slowest**
+  document — one 60k-token file holds up the other seven.
 - `summarization.eval_rounds` (default 3) — each round adds an evaluate +
   revise call per window (~9 calls total at 3). Dropping to 2 is ~22% fewer
   calls, but trades away summary fidelity, which is the point of the evaluated
