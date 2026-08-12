@@ -146,6 +146,35 @@ box actually has free, and how the corpus divides into batches. It prints a
 concrete suggestion for each knob. **Report what it says and propose values --
 do not silently apply them.**
 
+**This is a REQUIRED step, not optional.** Run it, read the output back to the
+user, and propose a full settings block before launching. The tool reads free
+memory, swap, the provider's own rate-limit headers, and the corpus shape.
+
+Knobs, grouped by what actually constrains them:
+
+| Group | Knobs | Constraint | Shipped |
+|---|---|---|---|
+| **Memory** | `concurrency.table_extraction` | ~152 MB per PDF subprocess | 1 |
+| **Memory (cheap) + caps concurrency** | `chunking.streaming_batch_size` | ~50 MB at 16 docs | 8 |
+| **Mini-model rate limit (~10M TPM)** | `summarization`, `chunk_classification`, `entity_extraction`, `artifact_generation`, `table_mining` | measured ~3% of tier at 32 | 32 |
+| **Big-model rate limit (~2M TPM, 32k requests)** | `class_proposal`, `dedup` | measured **6.2% of tier at 4** | 4 |
+
+Per-run flags on prune-expand/build (each falls back to its config key):
+```
+--summarization-concurrency N   --classification-concurrency N   (Stage 1)
+--proposal-concurrency N        (Stage 2)   --dedup-concurrency N
+--table-mining-concurrency N    --expansion-concurrency N        (legacy: both stages)
+```
+
+**Stage 1 and Stage 2 are separate on purpose.** They shared one semaphore,
+which pinned `chunk_classification` (gpt-4.1-mini, 10M tier) to
+`class_proposal`'s safe value (gpt-4.1 @ 32k, 2M tier). Measured cost: 197
+chunks took ~8 minutes where ~1 would do. Never propose raising them together.
+
+**Cost concentration, from a measured 30-doc run ($25.71 total):**
+`class_proposal` **65%**, `dedup` **22%** — so the big-model group is 87% of
+prune-expand spend. Raising it saves the most TIME but changes no cost.
+
 Three knobs, three different constraints:
 
 | Knob | Bound by | Default | Notes |

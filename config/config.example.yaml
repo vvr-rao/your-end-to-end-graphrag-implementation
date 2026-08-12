@@ -161,6 +161,20 @@ concurrency:
   entity_extraction: 8
   # generate-artifacts + regenerate-stale-artifacts
   artifact_generation: 8
+  # Expansion Stage 1 -- chunk_classification (gpt-4.1-mini, ~10M TPM tier).
+  # SEPARATE from class_proposal on purpose: they ran on one semaphore, which
+  # pinned this cheap stage to the expensive one's safe value. Measured at 197
+  # chunks / ~8 min at 4, where ~1 min would do.
+  chunk_classification: 8
+  # Expansion Stage 2 -- class_proposal (gpt-4.1 @ max_tokens=32768, ~2M TPM).
+  # Measured at only 6.2% of that tier at concurrency 4, so 12-16 is likely
+  # safe -- but models.yaml warns that concurrent large gpt-4.1 calls throttle,
+  # so raise INCREMENTALLY and watch for 429s. This is 65% of prune-expand cost.
+  class_proposal: 4
+  # Stage 3 dedup batches (match_dedup, gpt-4.1 @ 32768). Its own knob because
+  # batch count scales with proposals, not chunks: a 30-doc run produced 32
+  # batches taking ~15-18 min at 4.
+  dedup: 4
   # prune-expand --tables / register-documents --tables: how many PDFs are
   # extracted CONCURRENTLY. Each PDF runs in its own subprocess
   # (table_extract_worker) so the kernel reclaims its memory on exit -- the

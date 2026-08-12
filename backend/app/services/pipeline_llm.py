@@ -838,9 +838,55 @@ _DEDUP_KEYS = (
 # added common parent from rule 4).
 _DEDUP_INPUT_SHARE = 0.6
 
-# Modest: dedup batches are large, and the point is to finish reliably rather
-# than fast. Matches the fan-out used by the other batched stages.
+# Fallback only. dedup runs match_dedup on gpt-4.1 at max_tokens=32768 against
+# the ~2M TPM tier, so it wants the same careful value as Stage 2 -- but it is
+# a SEPARATE knob because a run can have many dedup batches and few Stage-2
+# chunks, or vice versa. Measured: 32 batches took ~15-18 min at 4.
 _DEDUP_CONCURRENCY = 4
+
+
+def resolve_expansion_concurrency(
+    app_cfg: dict[str, Any],
+    *,
+    classification: int | None = None,
+    proposal: int | None = None,
+    expansion: int | None = None,
+) -> tuple[int, int]:
+    """(stage1, stage2) concurrency. CLI flag > per-stage config > legacy > 8.
+
+    Stage 1 and Stage 2 must resolve INDEPENDENTLY: chunk_classification runs
+    gpt-4.1-mini on a ~10M TPM tier while class_proposal runs gpt-4.1 at
+    max_tokens=32768 on ~2M. One shared value pinned the cheap stage to the
+    expensive stage's safe limit.
+
+    `expansion` is the legacy single flag; it still applies to BOTH when no
+    per-stage value is given, so existing invocations are unchanged.
+    """
+    conc = app_cfg.get("concurrency", {}) or {}
+    legacy = int(
+        expansion
+        if expansion is not None
+        else (app_cfg.get("expansion", {}) or {}).get("max_concurrent_llm_calls", 8)
+    )
+    s1 = int(classification if classification is not None
+             else conc.get("chunk_classification", legacy))
+    s2 = int(proposal if proposal is not None
+             else conc.get("class_proposal", legacy))
+    return max(1, s1), max(1, s2)
+
+
+def _dedup_concurrency() -> int:
+    """concurrency.dedup, falling back to class_proposal then the legacy cap."""
+    from backend.app.core.config import get_settings
+
+    cfg = get_settings().app_config
+    c = cfg.get("concurrency", {}) or {}
+    return max(1, int(c.get(
+        "dedup",
+        c.get("class_proposal",
+              (cfg.get("expansion", {}) or {}).get("max_concurrent_llm_calls",
+                                                   _DEDUP_CONCURRENCY)),
+    )))
 
 
 class DedupFailedError(RuntimeError):
@@ -967,7 +1013,11 @@ async def _plan_dedup_batches(
     return batches
 
 
-async def _dedup(router: LLMRouter, merged_results: dict[str, Any]) -> dict[str, Any]:
+async def _dedup(
+    router: LLMRouter,
+    merged_results: dict[str, Any],
+    concurrency: int | None = None,
+) -> dict[str, Any]:
     """Stage 3: collapse duplicate MATCH NOT FOUND across chunks.
 
     Batched: the whole merged set in one request crossed gpt-4.1's context
@@ -988,7 +1038,10 @@ async def _dedup(router: LLMRouter, merged_results: dict[str, Any]) -> dict[str,
     cost_before = router.total_cost_usd
     results: list[dict[str, Any]] = [None] * n  # type: ignore[list-item]
     failures: list[str] = []
-    sem = asyncio.Semaphore(_DEDUP_CONCURRENCY)
+    _dc = int(concurrency) if concurrency is not None else _dedup_concurrency()
+    if n > 1:
+        print(f"[stage3] dedup concurrency = {_dc}")
+    sem = asyncio.Semaphore(_dc)
 
     async def _one(i: int, batch: dict[str, Any]) -> None:
         system, user = PROMPTS["match_dedup"](batch, existing_concepts)
@@ -2399,6 +2452,9 @@ async def _run_llm_stages(
     # --expansion-concurrency). None => fall back to config.
     summarization_concurrency: int | None = None,
     expansion_concurrency: int | None = None,
+    classification_concurrency: int | None = None,
+    proposal_concurrency: int | None = None,
+    dedup_concurrency: int | None = None,
 ) -> dict[str, Any]:
     """Stages 1-3. Returns the merged + deduplicated match-results dict.
 
@@ -2447,10 +2503,7 @@ async def _run_llm_stages(
             (app_cfg.get("summarization", {}) or {}).get("concurrency", _concurrency),
         )
     )
-    print(
-        f"[llm] concurrency: summarization={_summ_concurrency} "
-        f"expansion(stage1/2)={_concurrency}"
-    )
+    print(f"[llm] concurrency: summarization={_summ_concurrency}")
 
     # Method: evaluated (near-lossless, new default) vs single_pass (legacy).
     # `single_pass_summaries=True` (CLI --single-pass-summaries) forces legacy.
@@ -2501,8 +2554,17 @@ async def _run_llm_stages(
         return {"MATCHES FOUND": [], "MATCH NOT FOUND": [], "MATCH NOT FOUND RELATIONS": []}
 
     expansion_cfg = app_cfg.get("expansion", {}) or {}
-    concurrency = int(expansion_cfg.get("max_concurrent_llm_calls", 8))
-    sem = asyncio.Semaphore(concurrency)
+    stage1_conc, stage2_conc = resolve_expansion_concurrency(
+        app_cfg,
+        classification=classification_concurrency,
+        proposal=proposal_concurrency,
+        expansion=expansion_concurrency,
+    )
+    concurrency = stage2_conc  # other stage-4 passes inherit the careful value
+    sem = asyncio.Semaphore(stage1_conc)          # Stage 1
+    sem2 = asyncio.Semaphore(stage2_conc)         # Stage 2
+    print(f"[llm] concurrency: stage1(classify)={stage1_conc} "
+          f"stage2(propose)={stage2_conc}")
 
     # Entity-shaped-class filter inputs: dynamic place set sourced from the
     # loaded ontology + optional user extensions from config.yaml.
@@ -2545,7 +2607,7 @@ async def _run_llm_stages(
 
     async def _propose_one(idx: int, chunk: TextChunk, iris: list[str]) -> dict[str, Any] | None:
         nonlocal stage2_done, stage2_over_budget
-        async with sem:
+        async with sem2:
             # Cost short-circuit: once the cap is crossed, stop paying for
             # further Stage-2 calls (queued chunks return None). Bounds the
             # overshoot to ~concurrency in-flight calls instead of all of them.
@@ -2647,7 +2709,7 @@ async def _run_llm_stages(
         f"{len(merged.get('MATCH NOT FOUND', []))} new class proposals, "
         f"{len(merged.get('MATCH NOT FOUND RELATIONS', []))} new relation proposals"
     )
-    deduped = await _dedup(router, merged)
+    deduped = await _dedup(router, merged, dedup_concurrency)
     # Canonical-label coercion: replace free-text "Person" / "Organization"
     # / "Role" / "Post" PARENT_LABELs and TYPE_LABELs with the actual FOAF/
     # ORG class IRIs from the merge, and route predicate LABELs like
@@ -2730,6 +2792,9 @@ async def prune_and_expand_async(
     summarization_concurrency: int | None = None,
     table_mining_concurrency: int | None = None,
     expansion_concurrency: int | None = None,
+    classification_concurrency: int | None = None,
+    proposal_concurrency: int | None = None,
+    dedup_concurrency: int | None = None,
 ) -> Path:
     return await _run(
         "prune-expand",
@@ -2746,6 +2811,9 @@ async def prune_and_expand_async(
         summarization_concurrency=summarization_concurrency,
         table_mining_concurrency=table_mining_concurrency,
         expansion_concurrency=expansion_concurrency,
+        classification_concurrency=classification_concurrency,
+        proposal_concurrency=proposal_concurrency,
+        dedup_concurrency=dedup_concurrency,
     )
 
 
@@ -2764,6 +2832,9 @@ async def build_async(
     summarization_concurrency: int | None = None,
     table_mining_concurrency: int | None = None,
     expansion_concurrency: int | None = None,
+    classification_concurrency: int | None = None,
+    proposal_concurrency: int | None = None,
+    dedup_concurrency: int | None = None,
 ) -> Path:
     # build = merge + prune-expand chained. Merge first (sync), then drive the
     # async LLM pipeline against the just-written version folder.
@@ -2785,6 +2856,9 @@ async def build_async(
         summarization_concurrency=summarization_concurrency,
         table_mining_concurrency=table_mining_concurrency,
         expansion_concurrency=expansion_concurrency,
+        classification_concurrency=classification_concurrency,
+        proposal_concurrency=proposal_concurrency,
+        dedup_concurrency=dedup_concurrency,
     )
 
 
@@ -2804,6 +2878,9 @@ async def _run(
     summarization_concurrency: int | None = None,
     table_mining_concurrency: int | None = None,
     expansion_concurrency: int | None = None,
+    classification_concurrency: int | None = None,
+    proposal_concurrency: int | None = None,
+    dedup_concurrency: int | None = None,
 ) -> Path:
     settings = get_settings()
     app_cfg = settings.app_config
@@ -2936,6 +3013,9 @@ async def _run(
         single_pass_summaries=single_pass_summaries,
         summarization_concurrency=summarization_concurrency,
         expansion_concurrency=expansion_concurrency,
+        classification_concurrency=classification_concurrency,
+        proposal_concurrency=proposal_concurrency,
+        dedup_concurrency=dedup_concurrency,
     )
 
     # Inject user-suggested classes that the LLM didn't already propose. These

@@ -281,6 +281,35 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
 
+        _p.add_argument(
+            "--classification-concurrency", type=int, default=None, metavar="N",
+            help=(
+                "Concurrent Stage-1 calls (chunk_classification, gpt-4.1-mini "
+                "on a ~10M TPM tier). SEPARATE from Stage 2 on purpose: sharing "
+                "one value pinned this cheap stage to the expensive one's safe "
+                "limit. Unset => concurrency.chunk_classification."
+            ),
+        )
+        _p.add_argument(
+            "--proposal-concurrency", type=int, default=None, metavar="N",
+            help=(
+                "Concurrent Stage-2 calls (class_proposal, gpt-4.1 at "
+                "max_tokens=32768 on a ~2M TPM tier). Measured at only 6%% of "
+                "that tier at 4, so 12-16 is usually safe -- raise it "
+                "incrementally and watch for 429s. Unset => "
+                "concurrency.class_proposal."
+            ),
+        )
+        _p.add_argument(
+            "--dedup-concurrency", type=int, default=None, metavar="N",
+            help=(
+                "Concurrent stage-3 dedup batches (match_dedup, gpt-4.1 at "
+                "max_tokens=32768). A large corpus produces many batches -- 32 "
+                "on a 30-doc run -- so this is its own knob. Unset => "
+                "concurrency.dedup."
+            ),
+        )
+
     p_build.set_defaults(func=_cmd_build)
 
     p_sd = sub.add_parser(
@@ -1166,6 +1195,9 @@ def _cmd_prune_expand(args: argparse.Namespace) -> int:
             summarization_concurrency=getattr(args, "summarization_concurrency", None),
             table_mining_concurrency=getattr(args, "table_mining_concurrency", None),
             expansion_concurrency=getattr(args, "expansion_concurrency", None),
+            classification_concurrency=getattr(args, "classification_concurrency", None),
+            proposal_concurrency=getattr(args, "proposal_concurrency", None),
+            dedup_concurrency=getattr(args, "dedup_concurrency", None),
         )
     )
     print(f"\nPRUNED+EXPANDED ontology written to: {version_dir}")
@@ -1190,6 +1222,9 @@ def _cmd_build(args: argparse.Namespace) -> int:
             summarization_concurrency=getattr(args, "summarization_concurrency", None),
             table_mining_concurrency=getattr(args, "table_mining_concurrency", None),
             expansion_concurrency=getattr(args, "expansion_concurrency", None),
+            classification_concurrency=getattr(args, "classification_concurrency", None),
+            proposal_concurrency=getattr(args, "proposal_concurrency", None),
+            dedup_concurrency=getattr(args, "dedup_concurrency", None),
         )
     )
     print(f"\nBUILT ontology written to: {version_dir}")

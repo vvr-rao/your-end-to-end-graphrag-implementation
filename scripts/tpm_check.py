@@ -354,14 +354,26 @@ async def main() -> int:
           "   <- keep LOW (gpt-4.1 @ 32k max_tokens on the tighter tier)")
 
     if mini or big:
+        cur = (get_settings().app_config.get("concurrency") or {})
         if mini:
-            print(f"\nSuggested concurrency for the mini-model stages: {min(mini)}")
-            print("  concurrency.summarization / entity_extraction /")
-            print("  artifact_generation / table_mining")
+            m = min(mini)
+            print(f"\nMINI-MODEL stages (~10M TPM) -- suggested {m}:")
+            for k in ("summarization", "chunk_classification", "entity_extraction",
+                      "artifact_generation", "table_mining"):
+                now = cur.get(k, "(unset)")
+                flag = "  <- raise" if isinstance(now, int) and now < m // 2 else ""
+                print(f"    concurrency.{k:<22} now {now}{flag}")
+            print("    chunk_classification is Stage 1: it ran at 4 for a long time only")
+            print("    because it shared Stage 2's semaphore. It is independent now.")
         if big:
-            print(f"\nSuggested expansion.max_concurrent_llm_calls: {min(big)}")
-            print("  (Stage 1/2 class_proposal -- the tighter tier; the shipped 4-8")
-            print("   is deliberately below this, since it sends 32k-token requests)")
+            b = min(big)
+            print(f"\nBIG-MODEL stages (~2M TPM, 32k-token requests) -- ceiling ~{b}:")
+            for k in ("class_proposal", "dedup"):
+                print(f"    concurrency.{k:<22} now {cur.get(k, '(unset)')}")
+            print("    MEASURED: class_proposal used only 6.2% of the 2M tier at 4,")
+            print("    so 12-16 is likely safe. But models.yaml warns that concurrent")
+            print("    large gpt-4.1 calls throttle -- raise INCREMENTALLY, watch 429s.")
+            print("    class_proposal is ~65% of prune-expand cost; dedup ~22%.")
         print("\nThis buys SPEED, not savings. Wall time falls close to linearly;")
         print("total cost is unchanged because the same tokens are sent either way.")
         print("A higher value does slightly lower the prompt-cache hit rate")

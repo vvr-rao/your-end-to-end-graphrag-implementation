@@ -135,3 +135,83 @@ def test_prune_expand_has_no_single_ambiguous_concurrency_flag() -> None:
             continue
         opts = {o for a in pe._actions for o in a.option_strings}
         assert "--concurrency" not in opts
+
+
+# --------------------------------------------------------------------------- #
+# Expansion Stage 1 vs Stage 2 must resolve INDEPENDENTLY. They ran on one
+# semaphore, which pinned chunk_classification (gpt-4.1-mini, ~10M TPM) to
+# class_proposal's safe value (gpt-4.1 @ 32k, ~2M TPM) -- measured at 197
+# chunks / ~8 min where ~1 min would do.
+# --------------------------------------------------------------------------- #
+from backend.app.services.pipeline_llm import resolve_expansion_concurrency  # noqa: E402
+
+_CFG = {
+    "concurrency": {"chunk_classification": 32, "class_proposal": 4},
+    "expansion": {"max_concurrent_llm_calls": 8},
+}
+
+
+def test_stages_resolve_independently() -> None:
+    assert resolve_expansion_concurrency(_CFG) == (32, 4)
+
+
+def test_per_stage_cli_flags_win() -> None:
+    assert resolve_expansion_concurrency(
+        _CFG, classification=21, proposal=7
+    ) == (21, 7)
+
+
+def test_one_stage_can_be_overridden_alone() -> None:
+    """Raising Stage 1 must not drag Stage 2 up with it -- that coupling is
+    the whole bug."""
+    assert resolve_expansion_concurrency(_CFG, classification=64) == (64, 4)
+    assert resolve_expansion_concurrency(_CFG, proposal=16) == (32, 16)
+
+
+def test_legacy_flag_still_moves_both() -> None:
+    """--expansion-concurrency predates the split; keep it working."""
+    assert resolve_expansion_concurrency(
+        {"expansion": {"max_concurrent_llm_calls": 4}}, expansion=6
+    ) == (6, 6)
+
+
+def test_per_stage_config_beats_the_legacy_key() -> None:
+    assert resolve_expansion_concurrency(_CFG, expansion=None) == (32, 4)
+
+
+def test_falls_back_to_legacy_then_default() -> None:
+    assert resolve_expansion_concurrency(
+        {"expansion": {"max_concurrent_llm_calls": 5}}
+    ) == (5, 5)
+    assert resolve_expansion_concurrency({}) == (8, 8)
+
+
+def test_never_returns_zero() -> None:
+    assert resolve_expansion_concurrency({}, classification=0, proposal=-3) == (1, 1)
+
+
+@pytest.mark.parametrize("flag", [
+    "--classification-concurrency", "--proposal-concurrency", "--dedup-concurrency",
+])
+@pytest.mark.parametrize("command", ["prune-expand", "build"])
+def test_new_per_stage_flags_exist(command, flag) -> None:
+    from backend.app.cli.main import build_parser
+
+    parser = build_parser()
+    opts = {
+        o
+        for sub in parser._subparsers._group_actions          # type: ignore[attr-defined]
+        for name, sp in sub.choices.items() if name == command
+        for a in sp._actions for o in a.option_strings
+    }
+    assert flag in opts, f"{command} is missing {flag}"
+
+
+def test_dedup_concurrency_is_its_own_key() -> None:
+    """Batch count scales with proposals, not chunks: a 30-doc run produced 32
+    dedup batches but only 196 Stage-2 chunks."""
+    import yaml
+
+    block = yaml.safe_load(open("config/config.example.yaml")).get("concurrency") or {}
+    for key in ("chunk_classification", "class_proposal", "dedup"):
+        assert key in block, f"config.example.yaml missing concurrency.{key}"
