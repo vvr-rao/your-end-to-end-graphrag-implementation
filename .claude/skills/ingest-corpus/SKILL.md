@@ -59,6 +59,13 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
   Keep 8 / 32 as the shipped defaults -- safe on small-RAM boxes and low tiers.
   RECOMMEND changes, do not apply them unprompted.
 
+  **The tool also reads this machine's free memory** and suggests
+  `concurrency.table_extraction` (default 1, MEMORY-bound: one subprocess per
+  PDF, ~152 MB each). With `--tables` on a PDF-heavy corpus that serial
+  extraction is often the single biggest time cost -- 18 PDFs at 1 is ~100
+  minutes. Report free RAM, note if there is NO SWAP (an over-commit is then a
+  hard kill), and suggest closing other apps if under ~1.2 GB free.
+
   Then **tell the user what you found and propose a number**, e.g.
   > *"Your gpt-4.1-mini limit is 10M TPM and we're set to 32 — that's using well
   > under 1% of it. I can raise it to 64-125 and cut the wall time roughly

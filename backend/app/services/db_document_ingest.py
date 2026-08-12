@@ -733,7 +733,7 @@ async def _ingest_tables_for_docs(
         pdf_paths,
         run_cache_dir=None,
         use_vision=table_vision,
-        concurrency=1,
+        concurrency=table_extract.table_extraction_concurrency(),
     )
     for m in manifests.values():
         if m.get("source") not in ("cache", "skipped", "spawn-failed", "worker-failed"):

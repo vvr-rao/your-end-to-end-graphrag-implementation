@@ -348,6 +348,20 @@ Higher values do slightly reduce the prompt-cache hit rate (measured 69% → 49%
 going from 4 to 32, roughly +2% spend), which is negligible against the time
 saved.
 
+**Three knobs, three different constraints.** They are not interchangeable:
+
+| Knob | Bound by | Default | Why |
+|---|---|---|---|
+| `concurrency.table_extraction` | **memory** | 1 | One subprocess per PDF (~152 MB measured). Serial extraction is often the single biggest time cost: 18 PDFs at 1 ≈ 100 min. |
+| `chunking.streaming_batch_size` | memory (cheap) | 8 | Holds N documents' text (~50 MB at 16) — and **caps effective concurrency**. |
+| `concurrency.summarization` etc. | **provider rate limit** | 32 | Measured at ~0.5% of a 10M TPM tier; rarely the constraint on tier 3+. |
+
+The default of 1 for table extraction is deliberate, not an oversight: the
+in-process extractor accumulated heap fragmentation and reliably OOMed partway
+through a corpus, which is why each PDF now runs in its own subprocess. Raise it
+only against measured free memory — and note that on a **swapless** machine an
+over-commit is a hard kill mid-run, not a slowdown.
+
 **Check your actual limits** — don't guess:
 
 ```bash
@@ -355,8 +369,10 @@ uv run python scripts/tpm_check.py
 ```
 
 It reads OpenAI's own `x-ratelimit-*` response headers (one ~10-token probe per
-model), prints your tier's TPM/RPM alongside the current config, and suggests a
-value per stage. Measured on a tier-4 account running at concurrency 32:
+model), reads **this machine's free memory and whether it has swap**, and prints
+a concrete suggestion for every knob above — rate-limit-bound and memory-bound
+alike. Pass a documents directory and it also sizes `streaming_batch_size`
+against the corpus. Measured on a tier-4 account running at concurrency 32:
 **~0.5% sustained TPM utilisation and zero burst pressure** on the token bucket
 — on tier 3+ the provider limit is almost never what's slowing you down.
 

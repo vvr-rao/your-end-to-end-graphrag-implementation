@@ -2855,7 +2855,7 @@ async def _run(
             documents_dir,
             run_cache_dir=tables_dir,
             use_vision=table_vision,
-            concurrency=1,
+            concurrency=table_extract.table_extraction_concurrency(),
         )
         total = sum(int(m.get("n_tables", 0) or 0) for m in manifests.values())
         cost = sum(float(m.get("cost_usd", 0.0) or 0.0) for m in manifests.values())

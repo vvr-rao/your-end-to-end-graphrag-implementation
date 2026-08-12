@@ -136,6 +136,40 @@ Notes:
   user wants the original preserved, copy the folder first.
 - Skip only if the user explicitly wants the verbose descriptions in Stage 2.
 
+
+### Step 2c — Size the run against THIS machine (always, before launching)
+```
+uv run python scripts/tpm_check.py "<DOCS>"
+```
+One command answers three questions: provider rate limits, how much RAM this
+box actually has free, and how the corpus divides into batches. It prints a
+concrete suggestion for each knob. **Report what it says and propose values --
+do not silently apply them.**
+
+Three knobs, three different constraints:
+
+| Knob | Bound by | Default | Notes |
+|---|---|---|---|
+| `concurrency.table_extraction` | **MEMORY** | 1 | Each PDF = one subprocess, ~152 MB measured. Serial extraction is often the LONG POLE: 18 PDFs at 1 is ~100 min. |
+| `chunking.streaming_batch_size` | memory (cheap) | 8 | Holds N documents' text (~50 MB at 16). Also CAPS effective concurrency. |
+| `concurrency.summarization` | **RATE LIMIT** | 32 | Measured ~0.5% of a 10M TPM tier; rarely the constraint on tier 3+. |
+
+Say it plainly, e.g.
+> *"You have 2.0 GB free and no swap. Table extraction is set to 1 PDF at a
+> time — with 18 PDFs that's ~100 minutes, and it's the biggest single cost.
+> Your memory supports 7 in parallel, cutting it to ~15 minutes. Batch size 8
+> is also capping your concurrency at ~19 of 32, so I'd raise that to 16-32.
+> **None of this reduces the bill** — same tokens, less waiting."*
+
+**Memory rules:**
+- If free RAM is under ~1.2 GB, say so and suggest closing other applications
+  (an IDE easily holds 1.5+ GB) before a long paid run.
+- On a **swapless** box (the tool reports this) an over-commit is a HARD KILL
+  mid-run, not a slowdown. Prefer under-shooting.
+- `concurrency.table_extraction` exists precisely because the in-process
+  extractor OOMed partway through a corpus; 1 is a deliberate safe default, not
+  an oversight. Raise it only against measured free memory.
+
 ## Step 3 — Launch prune-expand DETACHED
 Choose a fresh, unique `RUN_ID` (e.g. `prune_expand_<date+time>`). Launch it detached
 via the harness as a **single-line command** (works in any shell). Append `--tables`

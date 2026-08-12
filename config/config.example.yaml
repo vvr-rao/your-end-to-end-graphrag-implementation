@@ -161,6 +161,23 @@ concurrency:
   entity_extraction: 8
   # generate-artifacts + regenerate-stale-artifacts
   artifact_generation: 8
+  # prune-expand --tables / register-documents --tables: how many PDFs are
+  # extracted CONCURRENTLY. Each PDF runs in its own subprocess
+  # (table_extract_worker) so the kernel reclaims its memory on exit -- the
+  # in-process extractor accumulated heap fragmentation and reliably OOMed
+  # partway through a corpus on a ~2.7 GB host.
+  #
+  # DEFAULT 1 IS DELIBERATE and should stay 1 on small-RAM machines.
+  #
+  # Sizing, from a measured run (125-page pharma label, vision ON):
+  #     one worker  ~152 MB RSS, ~340 s per PDF
+  #     18 PDFs at concurrency 1 = ~100 minutes, serial
+  # So: concurrency ~= (free_MB - 600 reserve) / 200
+  #     1855 MB free -> ~6; 2400 MB free -> ~9
+  # Check free memory FIRST (`free -m`), and prefer to under-shoot: a
+  # pathological PDF (large page rasters for the vision route) can cost several
+  # times the average, and an OOM kills the whole run with no swap on this box.
+  table_extraction: 1
   # prune-expand --tables: one LLM call per extracted table
   # (table_concept_grouping). Only runs during prune-expand, which has
   # no --concurrency flag, so this is the ONLY way to set it.

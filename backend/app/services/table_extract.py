@@ -1055,6 +1055,22 @@ async def extract_tables_async(
     return TableExtractionResult(tables=payloads, manifest=manifest)
 
 
+def table_extraction_concurrency() -> int:
+    """How many PDFs to extract in parallel (concurrency.table_extraction).
+
+    Defaults to 1: each PDF runs in its own subprocess because the in-process
+    extractor accumulated heap fragmentation and OOMed partway through a corpus
+    on a ~2.7 GB host. Measured at ~152 MB RSS and ~340 s per 125-page PDF, so
+    18 PDFs serially is ~100 minutes -- worth raising on a roomier machine, but
+    only after checking free memory, since one pathological PDF (large page
+    rasters for the vision route) can cost several times the average.
+    """
+    from backend.app.core.config import get_settings
+
+    cfg = get_settings().app_config
+    return max(1, int((cfg.get("concurrency", {}) or {}).get("table_extraction", 1)))
+
+
 def _find_pdfs(folder: Path) -> list[Path]:
     """Every PDF under `folder`, recursively and case-insensitively.
 

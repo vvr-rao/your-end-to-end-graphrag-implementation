@@ -97,6 +97,76 @@ def suggest(tpm: int | None, rpm: int | None) -> int | None:
     return max(1, min(by_tokens, by_requests, 128))
 
 
+def _mem_mb() -> tuple[int, int]:
+    """(MemAvailable, MemTotal) in MB. (-1, -1) if unreadable (non-Linux)."""
+    vals = {}
+    try:
+        for line in open("/proc/meminfo"):
+            k, _, rest = line.partition(":")
+            if k in ("MemAvailable", "MemTotal"):
+                vals[k] = int(rest.split()[0]) // 1024
+    except OSError:
+        return -1, -1
+    return vals.get("MemAvailable", -1), vals.get("MemTotal", -1)
+
+
+def _has_swap() -> bool:
+    try:
+        with open("/proc/swaps") as fh:
+            return len(fh.read().strip().splitlines()) > 1
+    except OSError:
+        return False
+
+
+# Measured on this project: one table_extract_worker subprocess (125-page
+# pharma label, vision ON) peaks around 152 MB RSS. 200 MB is that plus margin,
+# since a PDF with large page rasters costs several times the average.
+_TABLE_WORKER_MB = 200
+# Never plan to consume the last of RAM: the pipeline itself, Postgres client
+# buffers and the OS page cache all need room, and on a swapless box an OOM is
+# a hard kill rather than a slowdown.
+_RESERVE_MB = 600
+
+
+def advise_memory(batch_size: int, table_conc: int) -> None:
+    """Recommend memory-bound settings from what this machine actually has."""
+    avail, total = _mem_mb()
+    if avail < 0:
+        print("\n\nMemory: /proc/meminfo unavailable (non-Linux?) -- skipping "
+              "memory-based advice.")
+        return
+    swap = _has_swap()
+    print(f"\n\nMachine memory: {avail:,} MB available of {total:,} MB total"
+          f"  |  swap: {'yes' if swap else 'NONE'}")
+    if not swap:
+        print("  No swap: exceeding RAM is a HARD KILL mid-run, not a slowdown.")
+
+    budget = max(0, avail - _RESERVE_MB)
+    rec_table = max(1, min(8, budget // _TABLE_WORKER_MB))
+    print(f"\n  usable budget: {budget:,} MB "
+          f"(available minus a {_RESERVE_MB} MB reserve)")
+
+    print(f"\n  concurrency.table_extraction: {table_conc}  ->  suggest {rec_table}")
+    print(f"    Each PDF extracts in its own subprocess (~{_TABLE_WORKER_MB} MB "
+          f"budgeted, 152 MB measured).")
+    print(f"    Serial extraction is often the long pole: 18 PDFs at 1 = ~100 min.")
+    if rec_table > table_conc:
+        print(f"    -> raising to {rec_table} could cut that to ~{100 // rec_table} min.")
+    elif rec_table < table_conc:
+        print(f"    -> LOWER it: not enough free memory for {table_conc} workers.")
+
+    # streaming_batch_size holds N documents' extracted text, not their files.
+    # Even large labels are a few hundred KB of text, so this is cheap; the
+    # config's own note puts 16 docs at ~50 MB.
+    rec_batch = 32 if budget >= 1200 else (16 if budget >= 600 else 8)
+    print(f"\n  chunking.streaming_batch_size: {batch_size}  ->  suggest {rec_batch}")
+    print(f"    Holds N documents' extracted TEXT (~50 MB at 16 docs), so it is")
+    print(f"    cheap -- but it CAPS effective concurrency (see the corpus table).")
+    if avail < 1200:
+        print(f"\n  NOTE: under ~1.2 GB free. Close other applications (an IDE can")
+        print(f"    hold 1.5+ GB) before a long paid run.")
+
+
 def analyse_corpus(docs_dir: str, batch_size: int, concurrency: int) -> None:
     """Explain how batch size and concurrency interact for THIS corpus.
 
@@ -207,6 +277,12 @@ async def main() -> int:
         print("total cost is unchanged because the same tokens are sent either way.")
         print("A higher value does slightly lower the prompt-cache hit rate")
         print("(measured 69% -> 49% going 4 -> 32, about +2% spend).")
+
+    cfg1 = get_settings().app_config
+    advise_memory(
+        int((cfg1.get("chunking") or {}).get("streaming_batch_size", 8)),
+        int((cfg1.get("concurrency") or {}).get("table_extraction", 1)),
+    )
 
     if len(sys.argv) > 1:
         cfg2 = get_settings().app_config
