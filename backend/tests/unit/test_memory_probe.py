@@ -110,3 +110,48 @@ def test_recommendation_scales_with_available_memory(monkeypatch, capsys) -> Non
 
     assert rec(tight) == 1, "a 800 MB box must not be told to run several workers"
     assert rec(roomy) >= 6, "an 8 GB box should be told it can parallelise"
+
+
+# --------------------------------------------------------------------------- #
+# Windows swap detection. The first version returned `total > 0` -- always
+# True -- so a machine with the page file DISABLED would be told it has swap,
+# suppressing the "no swap = hard kill" warning exactly when it matters.
+# --------------------------------------------------------------------------- #
+def _win_swap_from(total_phys_mb: int, total_page_mb: int) -> bool:
+    """The rule under test: page file total exceeds physical by >5%."""
+    return total_page_mb > total_phys_mb * 1.05
+
+
+def test_windows_page_file_disabled_means_no_swap() -> None:
+    # GlobalMemoryStatusEx reports ullTotalPageFile == ullTotalPhys when the
+    # page file is off.
+    assert _win_swap_from(16384, 16384) is False
+
+
+def test_windows_normal_page_file_counts_as_swap() -> None:
+    assert _win_swap_from(16384, 32768) is True
+
+
+def test_windows_tiny_rounding_difference_is_not_swap() -> None:
+    """Values can differ slightly without a real page file; 5% margin."""
+    assert _win_swap_from(16384, 16500) is False
+
+
+def test_rate_limit_probe_is_platform_independent() -> None:
+    """The TPM/RPM half works everywhere -- it is just HTTP response headers,
+    no OS calls. Guards against someone adding a shell-out to it."""
+    import inspect
+
+    src = inspect.getsource(tpm.probe)
+    for bad in ("subprocess", "/proc/", "windll", "sysctl"):
+        assert bad not in src, f"probe() must stay OS-independent; found {bad!r}"
+
+
+def test_unknown_platform_message_names_all_three() -> None:
+    """The old text said 'non-Linux?', which is wrong now that macOS and
+    Windows are supported."""
+    import inspect
+
+    src = inspect.getsource(tpm.advise_memory)
+    assert "non-Linux" not in src
+    assert "Windows" in src and "macOS" in src

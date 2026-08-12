@@ -152,6 +152,26 @@ def _mem_windows() -> tuple[int, int]:
     return st.ullAvailPhys // mb, st.ullTotalPhys // mb
 
 
+def _win_mem_raw() -> tuple[int, int]:
+    """(total physical, total page file) in MB. Windows only."""
+    import ctypes
+
+    class _M(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+    st = _M()
+    st.dwLength = ctypes.sizeof(_M)
+    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))  # type: ignore[attr-defined]
+    mb = 1024 * 1024
+    return st.ullTotalPhys // mb, st.ullTotalPageFile // mb
+
+
 def _mem_mb() -> tuple[int, int]:
     """(available, total) MB on Linux, macOS or Windows. (-1,-1) if unknown.
 
@@ -196,12 +216,13 @@ def _has_swap() -> bool:
                                  capture_output=True, text=True).stdout
             return "total = 0.00M" not in out and bool(out.strip())
         if sys.platform.startswith("win"):
-            import ctypes
-
-            # Windows always has a page file unless explicitly disabled; treat
-            # a page-file total larger than physical RAM as "swap present".
-            avail, total = _mem_windows()
-            return total > 0
+            # ullTotalPageFile is physical RAM PLUS the page file, so swap
+            # exists only when it exceeds physical. Windows usually has a page
+            # file, but it can be disabled on perf-tuned machines -- and that
+            # is precisely when the "no swap = hard kill" warning matters, so
+            # this must actually be measured rather than assumed.
+            total_phys, total_page = _win_mem_raw()
+            return total_page > total_phys * 1.05
     except Exception:
         pass
     return False
@@ -221,8 +242,10 @@ def advise_memory(batch_size: int, table_conc: int) -> None:
     """Recommend memory-bound settings from what this machine actually has."""
     avail, total = _mem_mb()
     if avail < 0:
-        print("\n\nMemory: /proc/meminfo unavailable (non-Linux?) -- skipping "
-              "memory-based advice.")
+        print("\n\nMemory: could not be read on this platform "
+              f"({sys.platform}) -- skipping memory-based advice. "
+              "Linux, macOS and Windows are supported; check the OS command "
+              "manually (see the run-prune-expand skill).")
         return
     swap = _has_swap()
     print(f"\n\nMachine memory: {avail:,} MB available of {total:,} MB total"
