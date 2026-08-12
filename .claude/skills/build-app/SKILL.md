@@ -56,7 +56,10 @@ off to it). Suggest based on what they tell you, and confirm; never pick silentl
   (note the edit-and-resubmit gotcha the skill explains).
 
 After the merge, give them the output location and ask them to verify `merged.owl`
-in a third-party tool (Protégé) before the paid prune-expand. THEN ask for the
+in a third-party tool (Protégé) before the paid prune-expand. Between the merge
+and prune-expand, run `summarize-descriptions` on the merge folder — it costs
+cents, is idempotent, and cut prune-expand from $1.79 to $1.44 in testing by
+shrinking Stage 2's prompts by 78%. THEN ask for the
 corpus, mention the `--tables` option and ask their preference, and run
 prune-expand. Walk it one step at a time; never race ahead to a paid step.
 

@@ -38,12 +38,20 @@ def run(name: str, args: list[str], *, timeout: int = 3600) -> dict:
     except subprocess.TimeoutExpired:
         out, code = "TIMEOUT", 124
     dt = time.monotonic() - t0
-    tail = "\n".join(l for l in out.splitlines() if l.strip())[-1500:]
-    print(tail, flush=True)
+    # Keep HEAD as well as tail: config echoes ("concurrency = 32") print first
+    # and were being truncated away, while summary lines print last.
+    lines = [l for l in out.splitlines() if l.strip()]
+    if len(lines) > 40:
+        shown = lines[:12] + [f"    ... {len(lines) - 32} lines omitted ..."] + lines[-20:]
+    else:
+        shown = lines
+    print("\n".join(shown), flush=True)
     costs = [float(c) for c in COST_RE.findall(out)]
     return {"name": name, "exit": code, "seconds": round(dt, 1),
             "cost_seen": max(costs) if costs else 0.0,
-            "err": "" if code == 0 else tail[-300:]}
+            # Tail of the RAW output, not the elided view -- on a failure the
+            # traceback is the last thing printed and must survive intact.
+            "err": "" if code == 0 else "\n".join(lines)[-600:]}
 
 
 def capture(args: list[str]) -> str:
@@ -101,7 +109,7 @@ def main() -> int:
 
     # --- conversation ------------------------------------------------------
     conv = capture(["conversation", "start", "--title", f"e2e {label}", "--json"])
-    m = re.search(r"(https?://\S*#\S+)", conv)
+    m = re.search(r"(https?://[^\s\"',}\]]+#[^\s\"',}\]]+)", conv)
     iri = m.group(1) if m else ""
     print(f"\n[sweep] conversation iri = {iri or '(NOT FOUND)'}", flush=True)
     results.append({"name": "conversation start", "exit": 0 if iri else 1,
@@ -114,9 +122,22 @@ def main() -> int:
         results.append(run("conversation show", ["conversation", "show", "--conv", iri]))
 
     # --- lifecycle ---------------------------------------------------------
-    docs_out = capture(["list-documents", "--limit", "5"])
-    dm = re.search(r"(https?://\S*#Document_\S+)", docs_out)
-    doc_iri = dm.group(1) if dm else ""
+    # list-documents prints status/version/chunks/title -- NO iri column -- so
+    # the IRI has to come from the DB. Scraping stdout silently yielded "" and
+    # skipped the two lifecycle commands with no failure recorded.
+    doc_iri = subprocess.run(
+        ["uv", "run", "python", "-c",
+         "import asyncio;from sqlalchemy import text;"
+         "from backend.app.db.session import session_scope\n"
+         "async def m():\n"
+         "    async with session_scope() as s:\n"
+         "        r=await s.execute(text(\"SELECT document_identifier FROM graphrag.documents "
+         "WHERE status='ACTIVE' ORDER BY created_at LIMIT 1\"))\n"
+         "        row=r.first()\n"
+         "        print(row[0] if row else '')\n"
+         "asyncio.run(m())"],
+        cwd=ROOT, capture_output=True, text=True).stdout.strip().splitlines()
+    doc_iri = doc_iri[-1].strip() if doc_iri else ""
     print(f"\n[sweep] document iri = {doc_iri or '(NOT FOUND)'}", flush=True)
     if doc_iri:
         results.append(run("delete-document(soft)",

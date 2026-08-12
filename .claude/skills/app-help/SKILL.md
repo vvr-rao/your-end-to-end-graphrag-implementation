@@ -37,6 +37,10 @@ domain_concepts) is ALWAYS merged in as well.
    embeddings always OpenAI.
 2. **Database** — Supabase (prod) or local docker Postgres; `db-init` migrates.
 3. **Merge** ontologies (VIAO + 6 more core + a domain ontology) — deterministic, no LLM.
+3b. **summarize-descriptions** (optional but recommended, cents) — compacts each
+   class's verbose descriptions into one line, which Stage 2 of prune-expand then
+   ships instead. Measured: 78% fewer description tokens, prune-expand $1.79 →
+   $1.44. Idempotent; edits the merge folder in place.
 4. **prune-expand** — the paid, multi-hour ontology-building step (summarize →
    classify → propose → dedup → prune/extend). Caches summaries + tables on disk.
 5. **db-init --input** — load the resulting ontology into the DB.
@@ -78,27 +82,24 @@ domain_concepts) is ALWAYS merged in as well.
 - Some steps have known caveats worth mentioning: garbled/unreadable PDFs are
   flagged by a preflight check before paid work; structured-table extraction is
   opt-in (`--tables`).
-- **If the user asks why a run is slow, run `uv run python scripts/tpm_check.py`
-  and recommend raising concurrency.** It reads OpenAI's rate-limit headers and
-  suggests a value per stage. Measured on a tier-4 account at concurrency 32:
-  ~0.5% sustained TPM and zero burst pressure — so on tier 3+ the provider limit
-  is almost never the constraint, the config is. **Always say that concurrency
-  buys SPEED, not savings** — users assume a tuning knob lowers the bill, and
-  this one does not (~2% more, from a lower prompt-cache hit rate).
-- **If the user asks why a run is slow, ask about concurrency first.** Each
-  LLM-bound stage has its own setting under `concurrency:` in
-  `config/config.yaml` (`summarization`, `entity_extraction`,
-  `artifact_generation`, `evaluation`), overridable per run with
-  `--concurrency N`. Wall time scales close to linearly: a 1.6M-token corpus
-  took ~4 hours to summarize at 4 and ~25 minutes at 32, at the same cost
-  (identical token volume; the prompt-cache hit rate drops slightly, ~+2%).
-  Suggest 32-64 on OpenAI tier 3+, 4-8 on tier 1-2 where large concurrent calls
-  throttle. `expansion.max_concurrent_llm_calls` is deliberately separate and
-  should stay at 4-8 — it drives gpt-4.1 at 32k max_tokens against a ~2M TPM
-  tier. See the README's "Tuning throughput" section.
-  Flags: most commands take `--concurrency N`; `prune-expand` and `build` take
-  three (`--summarization-concurrency`, `--table-mining-concurrency`,
-  `--expansion-concurrency`) since they drive three stages on different models.
+- **If the user asks why a run is slow:** run `uv run python scripts/tpm_check.py`
+  first, then recommend raising concurrency. It reads OpenAI's rate-limit headers
+  and suggests a value per stage. Measured on a tier-4 account at concurrency 32:
+  ~0.5% sustained TPM and ZERO burst pressure, so on tier 3+ the provider limit
+  is almost never the constraint -- the config is.
+  - **Always say that concurrency buys SPEED, not savings.** Users assume a
+    tuning knob lowers the bill; this one does not (~2% more, from a lower
+    prompt-cache hit rate). Wall time scales close to linearly: a 1.6M-token
+    corpus took ~4h to summarize at 4 and ~25 min at 32.
+  - Settings live under `concurrency:` in `config/config.yaml`
+    (`summarization`, `entity_extraction`, `artifact_generation`,
+    `table_mining`, `evaluation`). Suggest 32-64 on tier 3+, 4-8 on tier 1-2.
+  - `expansion.max_concurrent_llm_calls` is deliberately SEPARATE and stays at
+    4-8 -- it drives gpt-4.1 at 32k max_tokens against a ~2M TPM tier.
+  - Flags: most commands take `--concurrency N`; `prune-expand` and `build` take
+    three (`--summarization-concurrency`, `--table-mining-concurrency`,
+    `--expansion-concurrency`) since they drive three stages on different models.
+  - See the README's "Tuning throughput" section.
 
 ## How to help
 - "What does X do / cost / support?" → answer here or from `--help`/README.

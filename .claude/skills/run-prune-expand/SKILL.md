@@ -110,6 +110,32 @@ ask their preference — don't silently pick. Lay out the trade-off:
 Only matters for PDF corpora (no effect on plain text). Set the flags in Step 3
 to match their answer.
 
+## Step 2b — Compact the class descriptions first (cheap; cuts the big step)
+**Always run this before prune-expand.** It is fast, costs cents, and lowers the
+most expensive stage that follows:
+
+```
+uv run python -m backend.app.cli summarize-descriptions --input "<MERGE_DIR>" --max-cost-usd 2.0
+```
+
+It compresses each class's verbose `descriptions`/`comments` into a one-line
+`compact_description`, written back into the merge folder in place. Stage 2's
+`class_proposal` prompt then ships the compact text instead of the verbose
+original (`pipeline_llm._slice_ontology`).
+
+Measured on the 757-class pharma merge: **647 classes compacted for $0.025**,
+a **78% reduction** in description tokens, and prune-expand cost fell
+**$1.79 → $1.44** with the prompt-cache hit rate rising to 37%. Stage 2 is
+63-70% of prune-expand's spend, so this is the highest-leverage cheap step in
+the build.
+
+Notes:
+- **Idempotent.** Classes that already have a `compact_description` are skipped,
+  so re-running is free. Safe to run even if you are unsure.
+- It **modifies the merge folder in place** (merged.json + merged.owl). If the
+  user wants the original preserved, copy the folder first.
+- Skip only if the user explicitly wants the verbose descriptions in Stage 2.
+
 ## Step 3 — Launch prune-expand DETACHED
 Choose a fresh, unique `RUN_ID` (e.g. `prune_expand_<date+time>`). Launch it detached
 via the harness as a **single-line command** (works in any shell). Append `--tables`
