@@ -122,6 +122,30 @@ The harness runs this command **unchanged**, so the two-tier table cache
 summary cache (`~/.cache/.../eval_summaries/`) work exactly as before. A re-run
 after a crash reuses everything already computed — it does not re-pay.
 
+### Concurrency — check it before a multi-hour run, and tell the user
+`prune-expand` has **no `--concurrency` flag**; it is config-only. Two separate
+knobs in `config/config.yaml`, because the stages use different models:
+
+| Knob | Drives | Model / limit | Sane value |
+|---|---|---|---|
+| `concurrency.summarization` | evaluated summarizer | mini-class, ~10M TPM | 32 (tier 3+), 8 (tier 1-2) |
+| `expansion.max_concurrent_llm_calls` | Stage 1/2 `class_proposal` | gpt-4.1 @ 32k max_tokens, ~2M TPM | **leave at 4-8** |
+
+Summarization dominates wall time. It scales close to linearly: a 1.6M-token
+corpus took **~4 hours at concurrency 4** and is **~25 minutes at 32**, at
+identical cost (same token volume; the prompt-cache hit rate drops slightly,
+measured 69% → 49%, about +2% spend).
+
+**Before launching**, read the value and say it plainly, e.g. *"summarization
+concurrency is 32 — suits OpenAI tier 3+; I'll lower it to 8 if you're on tier
+1-2."* Do **not** raise `expansion.max_concurrent_llm_calls` to match — several
+concurrent 32k-token gpt-4.1 calls throttle and time out.
+
+Also relevant to throughput: `chunking.streaming_batch_size` (default 8) is a
+hard barrier — documents process in batches and batch N+1 cannot start until N
+fully drains. Raising it trades memory for fewer stalls; keep it low on small-RAM
+boxes.
+
 ## Step 4 — Monitor (re-attach any time, even after a session death)
 ```bash
 uv run python scripts/job_status.py <RUN_ID> 40      # state + last 40 log lines

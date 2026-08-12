@@ -38,6 +38,24 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
   The choice is stored in the tracker as `fulltext=yes|no` on the
   `register-documents` step — check it (`build_state.py show`) and apply
   `--from-fulltext` consistently across all three downstream steps.
+- **Concurrency drives wall time — tell the user before a long run.** Steps 2, 3
+  and 5 read `concurrency.{summarization,entity_extraction,artifact_generation}`
+  from `config/config.yaml`; each also takes `--concurrency N` to override for one
+  run. Wall time scales close to linearly with it: a 1.6M-token corpus took ~4
+  hours at 4 and is ~25 minutes at 32. **Cost is unchanged** (same token volume),
+  though a higher value slightly lowers the prompt-cache hit rate (measured
+  69% → 49% going 4 → 32, about +2% spend).
+  - Before launching a long paid step, state the current value and the provider
+    tier it suits, e.g. *"running at concurrency 32 — right for OpenAI tier 3+;
+    say the word and I'll drop it to 8 if you're on tier 1-2."*
+  - The default shipped in `config.example.yaml` is a conservative **8**. Raise it
+    for tier 3+; **lower to 4-8 on tier 1-2**, where several large concurrent
+    calls throttle and time out.
+  - Do NOT raise `expansion.max_concurrent_llm_calls` to match. That one drives
+    `class_proposal` on gpt-4.1 at `max_tokens: 32768` against a ~2M TPM tier;
+    4-8 is correct there. The stages above run on mini-class models (~10M TPM).
+  - Each command prints its resolved value on startup
+    (`[extract-entities] concurrency = 32`) — quote it back when reporting.
 
 ## Step 1 — Load the ontology into the DB
 First get the prune-expand folder path (the helper prints it):

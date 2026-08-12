@@ -78,6 +78,17 @@ domain_concepts) is ALWAYS merged in as well.
 - Some steps have known caveats worth mentioning: garbled/unreadable PDFs are
   flagged by a preflight check before paid work; structured-table extraction is
   opt-in (`--tables`).
+- **If the user asks why a run is slow, ask about concurrency first.** Each
+  LLM-bound stage has its own setting under `concurrency:` in
+  `config/config.yaml` (`summarization`, `entity_extraction`,
+  `artifact_generation`, `evaluation`), overridable per run with
+  `--concurrency N`. Wall time scales close to linearly: a 1.6M-token corpus
+  took ~4 hours to summarize at 4 and ~25 minutes at 32, at the same cost
+  (identical token volume; the prompt-cache hit rate drops slightly, ~+2%).
+  Suggest 32-64 on OpenAI tier 3+, 4-8 on tier 1-2 where large concurrent calls
+  throttle. `expansion.max_concurrent_llm_calls` is deliberately separate and
+  should stay at 4-8 — it drives gpt-4.1 at 32k max_tokens against a ~2M TPM
+  tier. See the README's "Tuning throughput" section.
 
 ## How to help
 - "What does X do / cost / support?" → answer here or from `--help`/README.

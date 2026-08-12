@@ -115,6 +115,40 @@ summarization:
 # -----------------------------------------------------------------------------
 # Embeddings — provider/model lives in models.yaml; these are runtime params.
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# LLM call concurrency, per pipeline stage.
+#
+# WHY PER-STAGE: stages run on different models with very different rate
+# limits, so a single number cannot serve them all. Summarization, entity
+# extraction and artifact generation run on mini-class models (~10M TPM on
+# OpenAI tier 4) making modest calls; expansion Stage 1/2 runs class_proposal
+# on gpt-4.1 at max_tokens=32768 against a ~2M TPM tier. Tying them together
+# pins the cheap stages to the expensive stage's safe value.
+#
+# IMPACT: wall time scales close to linearly with these until you hit a
+# provider limit. A 1.6M-token corpus at concurrency 4 spent ~4 hours using
+# under 1% of a tier-4 allowance; the same work at 32 is ~25 minutes.
+#
+# SIZING: concurrency x tokens_per_call x (60 / seconds_per_call) must stay
+# under the model's TPM. At 32 concurrent, ~20k tokens per ~60s call is
+# ~640k TPM -- 6% of a 10M tier. Cost is unchanged by concurrency (same token
+# volume), though a higher value slightly lowers the prompt-cache hit rate
+# (measured 69% -> 49% at 4 -> 32, about +2% spend).
+#
+# LOWER THESE on OpenAI tier 1-2, where 8 concurrent large calls already
+# throttle and time out. Each CLI also takes --concurrency to override per run.
+# -----------------------------------------------------------------------------
+concurrency:
+  # register-documents / prune-expand summarization. Also settable as
+  # summarization.concurrency (kept for back-compat; this wins if both set).
+  summarization: 8
+  # extract-entities
+  entity_extraction: 8
+  # generate-artifacts + regenerate-stale-artifacts
+  artifact_generation: 8
+  # evaluate-queries (the QA eval harness)
+  evaluation: 4
+
 embeddings:
   # Number of texts to send per OpenAI batch call. 100 is a safe default.
   batch_size: 100
