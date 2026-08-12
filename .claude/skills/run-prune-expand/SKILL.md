@@ -150,6 +150,20 @@ do not silently apply them.**
 user, and propose a full settings block before launching. The tool reads free
 memory, swap, the provider's own rate-limit headers, and the corpus shape.
 
+**What it reads from the provider:** the account's real limits, not a guess --
+`x-ratelimit-limit-tokens` (**TPM**) and `x-ratelimit-limit-requests` (**RPM**),
+plus remaining headroom, per model in `config/models.yaml`. Both bound the
+suggestion: a stage is capped by whichever runs out first, which is why the
+mini-model stages land at 32 (TPM-rich) while `class_proposal` stays at 4. Cost
+is one 10-token probe per model.
+
+**Platform:** the rate-limit half is a plain HTTPS call, so it behaves
+identically on Linux, macOS and Windows. Only the *memory* half is
+OS-specific -- `/proc/meminfo`, `vm_stat`+`sysctl`, and `GlobalMemoryStatusEx`
+respectively, all built in. If a stage's advice is missing, it is memory
+detection that failed, never the limits; use the fallback table below and keep
+the rate-limit numbers as printed.
+
 Knobs, grouped by what actually constrains them:
 
 | Group | Knobs | Constraint | Shipped |

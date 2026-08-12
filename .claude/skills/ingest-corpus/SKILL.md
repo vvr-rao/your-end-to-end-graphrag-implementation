@@ -43,10 +43,20 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
   ```
   uv run python scripts/tpm_check.py "<DOCS>"
   ```
-  It reads OpenAI's own rate-limit headers and prints the tier's TPM/RPM per
-  model, the current config, and a suggested value per stage. Passing the corpus
-  also sizes `chunking.streaming_batch_size`. Costs ~nothing (one 10-token probe
-  per model).
+  It reads the account's own rate-limit headers -- `x-ratelimit-limit-tokens`
+  (**TPM**) and `x-ratelimit-limit-requests` (**RPM**), plus remaining headroom
+  -- per model in `config/models.yaml`, and prints the current config next to a
+  suggested value per stage. Both limits bound the suggestion; a stage is capped
+  by whichever runs out first. Passing the corpus also sizes
+  `chunking.streaming_batch_size`. Costs ~nothing (one 10-token probe per model).
+
+  **Platform:** the rate-limit probe is a plain HTTPS call and behaves the same
+  on Linux, macOS and Windows. Only the *memory* half is OS-specific
+  (`/proc/meminfo`, `vm_stat`+`sysctl`, `GlobalMemoryStatusEx` -- all built in).
+  If it prints "skipping memory-based advice", it is memory detection that
+  failed, not the limits: keep the printed TPM/RPM numbers and get RAM from the
+  OS's own command (see **run-prune-expand** Step 2c for the per-OS table and
+  the macOS "Pages free" trap).
 
   **Explain BOTH knobs, because batch size usually wins.** `streaming_batch_size`
   (default 8) is how many DOCUMENTS are summarized at a time, and batches are a
