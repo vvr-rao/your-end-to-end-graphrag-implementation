@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +52,7 @@ from backend.app.services.document_io import LoadedDocument
 from backend.app.services.llm_router import LLMRouter
 from backend.app.services.prompts import PROMPTS
 from backend.app.services.semantic_grouping import order_by_semantic_cluster
+from backend.app.services.stage_timing import StageTimer, format_duration
 from backend.app.services.token_budget import batch_by_token_budget, count_tokens
 from backend.app.services.suggestions import (
     load_suggested_classes,
@@ -2455,12 +2457,14 @@ async def _run_llm_stages(
     classification_concurrency: int | None = None,
     proposal_concurrency: int | None = None,
     dedup_concurrency: int | None = None,
+    timer: StageTimer | None = None,
 ) -> dict[str, Any]:
     """Stages 1-3. Returns the merged + deduplicated match-results dict.
 
     If the projected cost exceeds max_cost_usd, raises RuntimeError before
     any expensive calls.
     """
+    timer = timer if timer is not None else StageTimer()
     branches = _top_level_branches(loaded_ontology)
     print(f"[llm] top-level branches surfaced: {len(branches)}")
 
@@ -2511,37 +2515,39 @@ async def _run_llm_stages(
     method = "single_pass" if single_pass_summaries else sum_cfg.get("method", "evaluated")
 
     if method == "evaluated":
-        chunks = await stream_evaluated_summarize_and_chunk_async(
-            documents_dir=documents_dir,
-            router=router,
-            threshold_tokens=threshold_tokens,
-            eval_rounds=int(sum_cfg.get("eval_rounds", 3)),
-            questions_per_chunk=int(sum_cfg.get("questions_per_chunk", 12)),
-            max_chunk_tokens=int(sum_cfg.get("max_chunk_tokens", 12_000)),
-            overlap_tokens=int(sum_cfg.get("overlap_tokens", 500)),
-            summary_chunk_max_tokens=int(sum_cfg.get("summary_chunk_max_tokens", 1_200)),
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            encoding_name=encoding,
-            use_cache=use_cache,
-            concurrency=_summ_concurrency,
-            batch_size=streaming_batch_size,
-            max_cost_usd=max_cost_usd,
-        )
+        with timer.stage("summarize"):
+            chunks = await stream_evaluated_summarize_and_chunk_async(
+                documents_dir=documents_dir,
+                router=router,
+                threshold_tokens=threshold_tokens,
+                eval_rounds=int(sum_cfg.get("eval_rounds", 3)),
+                questions_per_chunk=int(sum_cfg.get("questions_per_chunk", 12)),
+                max_chunk_tokens=int(sum_cfg.get("max_chunk_tokens", 12_000)),
+                overlap_tokens=int(sum_cfg.get("overlap_tokens", 500)),
+                summary_chunk_max_tokens=int(sum_cfg.get("summary_chunk_max_tokens", 1_200)),
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                encoding_name=encoding,
+                use_cache=use_cache,
+                concurrency=_summ_concurrency,
+                batch_size=streaming_batch_size,
+                max_cost_usd=max_cost_usd,
+            )
     else:
-        chunks = await stream_summarize_and_chunk_async(
-            documents_dir=documents_dir,
-            router=router,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            encoding_name=encoding,
-            threshold_tokens=threshold_tokens,
-            max_doc_input_tokens=max_doc_input_tokens,
-            oversize_doc_sub_chunk_tokens=oversize_sub_chunk,
-            use_cache=use_cache,
-            concurrency=_summ_concurrency,
-            batch_size=streaming_batch_size,
-        )
+        with timer.stage("summarize"):
+            chunks = await stream_summarize_and_chunk_async(
+                documents_dir=documents_dir,
+                router=router,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                encoding_name=encoding,
+                threshold_tokens=threshold_tokens,
+                max_doc_input_tokens=max_doc_input_tokens,
+                oversize_doc_sub_chunk_tokens=oversize_sub_chunk,
+                use_cache=use_cache,
+                concurrency=_summ_concurrency,
+                batch_size=streaming_batch_size,
+            )
     print(f"[llm] produced {len(chunks)} chunk(s)")
     if not chunks:
         raise RuntimeError("No chunks produced from documents (empty after chunking)")
@@ -2593,9 +2599,10 @@ async def _run_llm_stages(
     print(
         f"[stage1] classifying {len(chunks)} chunk(s) "
         f"({_s1_spec.get('provider', '?')}:{_s1_spec.get('model', '?')}, "
-        f"concurrency={concurrency})"
+        f"concurrency={stage1_conc})"
     )
-    stage1_results = await asyncio.gather(*[_classify_one(c) for c in chunks])
+    with timer.stage("stage1-classify"):
+        stage1_results = await asyncio.gather(*[_classify_one(c) for c in chunks])
 
     # Stage-2 progress heartbeat: class_proposal fires one LLM call per chunk
     # with no per-chunk output, so under rate limiting the run can look frozen
@@ -2672,13 +2679,14 @@ async def _run_llm_stages(
         f"[stage2] proposing matches+new for {stage2_total} chunk(s) "
         f"({_s2_spec['provider']}:{_s2_spec['model']})"
     )
-    stage2_results: list[dict[str, Any] | None] = await asyncio.gather(
-        *[
-            _propose_one(i, c, iris)
-            for i, (c, iris) in enumerate(zip(chunks, stage1_results, strict=False))
-            if iris  # only fire Stage 2 if Stage 1 found relevant branches
-        ]
-    )
+    with timer.stage("stage2-propose"):
+        stage2_results: list[dict[str, Any] | None] = await asyncio.gather(
+            *[
+                _propose_one(i, c, iris)
+                for i, (c, iris) in enumerate(zip(chunks, stage1_results, strict=False))
+                if iris  # only fire Stage 2 if Stage 1 found relevant branches
+            ]
+        )
     valid = [r for r in stage2_results if r]
     print(
         f"[stage2] {len(valid)}/{len(chunks) - skipped_empty} chunks produced "
@@ -2709,7 +2717,8 @@ async def _run_llm_stages(
         f"{len(merged.get('MATCH NOT FOUND', []))} new class proposals, "
         f"{len(merged.get('MATCH NOT FOUND RELATIONS', []))} new relation proposals"
     )
-    deduped = await _dedup(router, merged, dedup_concurrency)
+    with timer.stage("stage3-dedup"):
+        deduped = await _dedup(router, merged, dedup_concurrency)
     # Canonical-label coercion: replace free-text "Person" / "Organization"
     # / "Role" / "Post" PARENT_LABELs and TYPE_LABELs with the actual FOAF/
     # ORG class IRIs from the merge, and route predicate LABELs like
@@ -2903,6 +2912,9 @@ async def _run(
         print(f"[{operation}] loaded {len(suggested)} user-suggested class(es) from {suggestions_path}")
 
     router = LLMRouter(settings)
+    # One timer spans the whole run so the final table can attribute wall time
+    # across table extraction, the four LLM stages and the deterministic pass.
+    timer = StageTimer()
 
     # Pre-flight: surface unreadable documents BEFORE the first paid stage.
     # Text extraction can yield confident gibberish (subsetted /Type0 fonts with
@@ -2928,12 +2940,13 @@ async def _run(
             f"PDFs (vision={'ON' if table_vision else 'OFF'}, "
             f"isolation=subprocess)"
         )
-        manifests = await table_extract.extract_tables_for_folder_subprocess(
-            documents_dir,
-            run_cache_dir=tables_dir,
-            use_vision=table_vision,
-            concurrency=table_extract.table_extraction_concurrency(),
-        )
+        with timer.stage("table-extract"):
+            manifests = await table_extract.extract_tables_for_folder_subprocess(
+                documents_dir,
+                run_cache_dir=tables_dir,
+                use_vision=table_vision,
+                concurrency=table_extract.table_extraction_concurrency(),
+            )
         total = sum(int(m.get("n_tables", 0) or 0) for m in manifests.values())
         cost = sum(float(m.get("cost_usd", 0.0) or 0.0) for m in manifests.values())
         n_cached = sum(1 for m in manifests.values() if m.get("source") == "cache")
@@ -2990,14 +3003,15 @@ async def _run(
             )
         )
         print(f"[table-mining] concurrency = {_table_conc}")
-        table_mining_stage2 = await table_ontology_mining.mine_table_concepts_async(
-            tables_dir=tables_dir,
-            loaded_ontology=loaded,
-            router=router,
-            cache_dir=tables_dir,
-            audit_callback=_audit_table_mining,
-            concurrency=_table_conc,
-        )
+        with timer.stage("table-mining"):
+            table_mining_stage2 = await table_ontology_mining.mine_table_concepts_async(
+                tables_dir=tables_dir,
+                loaded_ontology=loaded,
+                router=router,
+                cache_dir=tables_dir,
+                audit_callback=_audit_table_mining,
+                concurrency=_table_conc,
+            )
 
     deduped = await _run_llm_stages(
         loaded_ontology=loaded,
@@ -3016,6 +3030,7 @@ async def _run(
         classification_concurrency=classification_concurrency,
         proposal_concurrency=proposal_concurrency,
         dedup_concurrency=dedup_concurrency,
+        timer=timer,
     )
 
     # Inject user-suggested classes that the LLM didn't already propose. These
@@ -3028,6 +3043,10 @@ async def _run(
         print(f"[{operation}] injected {added} user-suggested class(es) into MATCH NOT FOUND")
 
     # Stage 4: deterministic prune / extend depending on subcommand.
+    # Timed with an explicit start/record rather than a `with` block -- it spans
+    # ~100 lines across several optional layers (E/G/H), and wrapping it would
+    # re-indent all of them for no gain.
+    _stage4_started = time.monotonic()
     detected = extract_detected_iris(deduped)
     print(f"[stage4] detected {len(detected)} IRIs from MATCHES FOUND")
 
@@ -3111,6 +3130,9 @@ async def _run(
             )
             _append_audit(audit_path, -1, "classification_audit", None, audit_summary)
 
+    timer.record("stage4-apply", time.monotonic() - _stage4_started)
+    print(f"[stage4-apply] wall={format_duration(time.monotonic() - _stage4_started)}")
+
     counts_after = folder_io.count_entities(out_ontology)
     print(f"[{operation}] entity counts: before={counts_before}, after={counts_after}")
 
@@ -3144,6 +3166,15 @@ async def _run(
     # tens of dollars a run, that is the question worth answering.
     versioning.write_cost_report(version_dir, router.cost_report())
     _print_cost_summary(router)
+    # Wall time next to spend, because they rank differently: dedup is 22% of
+    # the bill but a sequential barrier, while table extraction is nearly free
+    # and was the long pole. Only the two together say which knob to turn.
+    timer.print_report()
+    # Also persisted, so a finished run can be compared against a later one
+    # without having kept its console output.
+    (version_dir / "timings.json").write_text(
+        json.dumps(timer.as_dict(), indent=2), encoding="utf-8"
+    )
     return version_dir
 
 

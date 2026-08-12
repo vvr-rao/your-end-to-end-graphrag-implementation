@@ -62,6 +62,14 @@ class Provider(Protocol):
     ) -> ChatResult: ...
 
 
+# Assumed prefill (input-processing) throughput, tokens/second, used only to
+# split an observed latency into "reading the prompt" and "writing the reply".
+# Real prefill is far faster than decode and varies by model and load; a low
+# constant here credits MORE of the elapsed time to decode, which makes the
+# under-budget projection larger and the warning more eager. That is the safe
+# direction -- a missed warning is silent, a spurious one is merely noise.
+_PREFILL_TOKENS_PER_S = 3_000.0
+
 # Rough per-1K-token pricing as of 2026-05 — used only for the cost gate, not
 # billing. Update as needed; the router never refuses to call a model just
 # because its price isn't here (defaults to 0 cost in that case).
@@ -597,13 +605,11 @@ class LLMRouter:
                 # timeout-and-retry spiral. Without it, a healthy-but-slow run is
                 # indistinguishable from a deadlocked one from the outside --
                 # which is exactly how a working run got killed after an hour.
-                if timeout and elapsed > timeout * 0.5:
-                    log.warning(
-                        "slow call task=%s provider=%s model=%s took %.0fs "
-                        "(%.0f%% of its %ds timeout)",
-                        task, provider_name, model, elapsed,
-                        100.0 * elapsed / timeout, timeout,
-                    )
+                self._warn_if_near_deadline(
+                    task=task, provider_name=provider_name, model=model,
+                    elapsed=elapsed, timeout=timeout, max_tokens=max_tokens,
+                    result=result,
+                )
                 if result.cost_usd:
                     self._total_cost_usd += result.cost_usd
                     self._cost_by_task[task] = self._cost_by_task.get(task, 0.0) + result.cost_usd
@@ -619,6 +625,79 @@ class LLMRouter:
                 self._input_full_tokens += max(0, full)
                 return result
         raise RuntimeError(f"LLM call for task '{task}' exhausted retries")
+
+    def _warn_if_near_deadline(
+        self,
+        *,
+        task: str,
+        provider_name: str,
+        model: str,
+        elapsed: float,
+        timeout: int,
+        max_tokens: int,
+        result: ChatResult,
+    ) -> None:
+        """Warn when a call is at genuine risk of timing out on a later attempt.
+
+        The first version of this compared `elapsed > timeout * 0.5` and nothing
+        else. That is output-blind, and it produced BOTH kinds of error:
+
+        * False alarms on input-heavy tasks. `summary_evaluate` reached 59% of
+          its budget while emitting only a few hundred tokens -- the time went
+          into prefilling a large prompt, not into slow decoding. Nothing was
+          wrong, but it looked identical to the pathology that cost 45 minutes.
+        * Silence on the case that actually matters. A task that returns a SHORT
+          reply quickly can still be one long reply away from its deadline. At
+          25% of a 60s budget for 200 tokens, a full 8,192-token reply would
+          need ~20 minutes -- the flat rule says nothing.
+
+        So split elapsed into prefill and decode, measure the decode rate that
+        was actually achieved, and project what a MAXIMUM-length reply would
+        have cost at that rate. Warn when the projection exceeds the timeout --
+        i.e. when this task, on this model, right now, cannot reliably produce
+        the output it is configured to be allowed to produce.
+
+        Prefill is estimated rather than measured (no provider reports the
+        split). The constant is deliberately conservative: overestimating
+        prefill throughput attributes more time to decode, which makes the
+        projection larger and the warning more eager. Erring toward a spurious
+        warning is the right trade -- the failure this guards against is silent.
+        """
+        if not timeout:
+            return
+
+        prompt_tokens = result.prompt_tokens or 0
+        completion_tokens = result.completion_tokens or 0
+
+        # No usage reported (some providers/paths omit it) -- fall back to the
+        # old flat rule rather than skipping the check entirely.
+        if not completion_tokens:
+            if elapsed > timeout * 0.5:
+                log.warning(
+                    "slow call task=%s provider=%s model=%s took %.0fs "
+                    "(%.0f%% of its %ds timeout; no usage reported)",
+                    task, provider_name, model, elapsed,
+                    100.0 * elapsed / timeout, timeout,
+                )
+            return
+
+        prefill_s = min(prompt_tokens / _PREFILL_TOKENS_PER_S, elapsed * 0.9)
+        decode_s = max(elapsed - prefill_s, 1e-3)
+        decode_rate = completion_tokens / decode_s
+        projected = prefill_s + (max_tokens / decode_rate)
+
+        if projected <= timeout:
+            return
+
+        log.warning(
+            "task=%s provider=%s model=%s is under-budgeted: took %.0fs for "
+            "%d in / %d out (%.0f tok/s decode). A full %d-token reply would "
+            "need ~%.0fs, over the %ds timeout -- raise timeout to >=%d or "
+            "lower max_tokens.",
+            task, provider_name, model, elapsed,
+            prompt_tokens, completion_tokens, decode_rate,
+            max_tokens, projected, timeout, int(projected * 1.2) + 1,
+        )
 
     def _preflight_size(
         self,
