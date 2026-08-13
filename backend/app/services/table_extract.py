@@ -1181,7 +1181,7 @@ async def _drive_subprocess_workers(
     done = 0
     folder_started = time.monotonic()
     summary_stats = {"n_tables": 0, "cost_usd": 0.0, "n_cached": 0,
-                     "n_failed": 0}
+                     "n_failed": 0, "cost_saved_usd": 0.0}
     results: dict[str, dict[str, Any]] = {}
 
     cmd_base = [sys.executable, "-u", "-m",
@@ -1190,6 +1190,19 @@ async def _drive_subprocess_workers(
     async def _one(p: Path) -> tuple[str, dict[str, Any]]:
         nonlocal done
         async with sem:
+            # Sample cache presence BEFORE the worker runs. Afterwards the
+            # entry exists either way, so nothing downstream can tell whether
+            # this run paid for it.
+            was_cached = False
+            try:
+                from backend.app.services import table_cache  # local import
+                _, _pre_key = _hash_pdf_streaming(p)
+                was_cached = table_cache.two_tier_load(
+                    run_cache_dir, table_cache.user_cache_dir(), _pre_key,
+                ) is not None
+            except Exception:  # noqa: BLE001 -- accounting only, never fatal
+                was_cached = False
+
             cmd = list(cmd_base) + ["--pdf", str(p.resolve())]
             if run_cache_dir is not None:
                 cmd += ["--run-cache-dir", str(Path(run_cache_dir).resolve())]
@@ -1247,11 +1260,30 @@ async def _drive_subprocess_workers(
                     summary_stats["n_tables"] += int(
                         hit.manifest.get("n_tables", 0) or 0
                     )
-                    summary_stats["cost_usd"] += float(
-                        hit.manifest.get("cost_usd", 0.0) or 0.0
-                    )
-                    if hit.manifest.get("source") == "cache":
+                    cached_cost = float(hit.manifest.get("cost_usd", 0.0) or 0.0)
+                    # Cache-hit detection cannot read the manifest's own
+                    # "source": that field is written as "fresh" when the entry
+                    # is PERSISTED, and the "cache" value is only attached to
+                    # the in-memory return value (see the cold-path return
+                    # above). Reloading the file therefore always saw "fresh",
+                    # so n_cached was permanently 0 on this path -- an 18-PDF
+                    # re-run reported "0 cache-hits" while finishing in 66s
+                    # instead of 526s.
+                    #
+                    # `was_cached` is sampled BEFORE the worker is spawned,
+                    # which is the only observation that actually distinguishes
+                    # "the entry already existed" from "the worker just wrote
+                    # it".
+                    if was_cached:
                         summary_stats["n_cached"] += 1
+                        # Not spent THIS run. Adding it overstated the bill by
+                        # the full original extraction cost on every re-run --
+                        # two consecutive runs both reported $0.8145 when the
+                        # second paid nothing.
+                        summary_stats["cost_saved_usd"] += cached_cost
+                        manifest["source"] = "cache"
+                    else:
+                        summary_stats["cost_usd"] += cached_cost
             if rc != 0:
                 summary_stats["n_failed"] += 1
                 manifest.setdefault("source", "worker-failed")
