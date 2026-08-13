@@ -24,3 +24,8 @@
 {"ts": "2026-08-12T11:17:30-04:00", "step": "llm-mode", "details": {"mode": "openai"}}
 {"ts": "2026-08-12T11:36:58-04:00", "step": "llm-mode", "details": {"mode": "anthropic"}}
 {"ts": "2026-08-12T12:40:37-04:00", "step": "llm-mode", "details": {"mode": "openai"}}
+{"ts": "2026-08-13T07:52:40-04:00", "step": "db-init", "details": {"path": "output_ontologies/v20260813T111442Z-prune-expand"}}
+{"ts": "2026-08-13T08:01:22-04:00", "step": "register-documents", "details": {"docs": "30", "chunks": "212", "fulltext": "no", "tables": "528"}}
+{"ts": "2026-08-13T08:05:51-04:00", "step": "extract-entities", "details": {"entities": "846"}}
+{"ts": "2026-08-13T08:11:21-04:00", "step": "enrich-time", "details": {"instances": "633"}}
+{"ts": "2026-08-13T08:22:03-04:00", "step": "generate-artifacts", "details": {"artifacts": "2683"}}

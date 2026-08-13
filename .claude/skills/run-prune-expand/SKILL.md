@@ -137,7 +137,7 @@ Notes:
 - Skip only if the user explicitly wants the verbose descriptions in Stage 2.
 
 
-### Step 2c — Size the run against THIS machine (always, before launching)
+## Step 2c — MANDATORY GATE: size the run against THIS machine
 ```
 uv run python scripts/tpm_check.py "<DOCS>"
 ```
@@ -226,43 +226,85 @@ and note that these are NOT interchangeable:
   an oversight. Raise it only against measured free memory.
 
 ## Step 3 — Launch prune-expand DETACHED
+
+> **STOP if Step 2c has not run in this session.** Go back and run it. This step
+> spends real money for hours; launching at unexamined defaults is how a 1.6M-token
+> corpus took 4 hours instead of 25 minutes. The numbers below come FROM Step 2c —
+> do not invent them, and do not silently fall back to config defaults.
+
 Choose a fresh, unique `RUN_ID` (e.g. `prune_expand_<date+time>`). Launch it detached
 via the harness as a **single-line command** (works in any shell). Append `--tables`
-only if the user opted in, and `--no-table-vision` to skip vision:
+only if the user opted in, and `--no-table-vision` to skip vision.
+
+**Carry the Step 2c values through as flags.** All six exist; substitute the numbers
+the user agreed to and drop any you are leaving at config default:
 ```
-uv run python scripts/run_detached.py <RUN_ID> uv run python -m backend.app.cli prune-expand --input "<MERGE_DIR>" --documents "<DOCS>" --output-dir output_ontologies
+uv run python scripts/run_detached.py <RUN_ID> uv run python -m backend.app.cli prune-expand --input "<MERGE_DIR>" --documents "<DOCS>" --output-dir output_ontologies --summarization-concurrency <N> --classification-concurrency <N> --proposal-concurrency <N> --dedup-concurrency <N> --table-mining-concurrency <N>
 ```
+`--expansion-concurrency` is the legacy flag that sets Stage 1 AND Stage 2 together;
+prefer the separate `--classification-concurrency` / `--proposal-concurrency`, because
+tying them pins cheap gpt-4.1-mini work to gpt-4.1's safe value.
 The harness runs this command **unchanged**, so the two-tier table cache
 (`output_ontologies/.../tables/` + `~/.cache/.../tables/`) and the evaluated-
 summary cache (`~/.cache/.../eval_summaries/`) work exactly as before. A re-run
 after a crash reuses everything already computed — it does not re-pay.
 
 ### Concurrency — check it before a multi-hour run, and tell the user
-`prune-expand` takes **three separate flags**, one per stage, because the stages
-run on different models with different rate limits:
+`prune-expand` takes **six separate flags**, one per stage, because the stages run
+on different models with different rate limits:
 
 ```
---summarization-concurrency N   --table-mining-concurrency N   --expansion-concurrency N
+--summarization-concurrency N     # evaluated summarizer      (mini, ~10M TPM)
+--classification-concurrency N    # Stage 1 chunk_classification (mini, ~10M TPM)
+--proposal-concurrency N          # Stage 2 class_proposal     (gpt-4.1, ~2M TPM)
+--dedup-concurrency N             # Stage 3 match_dedup        (gpt-4.1, ~2M TPM)
+--table-mining-concurrency N      # --tables only              (mini, ~10M TPM)
+--expansion-concurrency N         # LEGACY: sets Stage 1 + 2 together
 ```
+
+**`--proposal-concurrency` and `--dedup-concurrency` matter most.** Measured on a
+30-doc run: `class_proposal` is 65% of spend and `match_dedup` 22%, and together
+they were 60% of wall time. They are also the two capped by the tighter gpt-4.1
+tier, so they are the numbers to get right. Measured at 12 and 8 respectively:
+zero 429s, Stage 2 fell from an estimated ~29 min to **9m 03s**.
 
 Each falls back to its config key when unset. Append them to the detached
 command above when the user wants a per-run value; otherwise edit
 `config/config.yaml`. The run prints what it resolved — quote it back:
 
 ```
-[llm] concurrency: summarization=32 expansion(stage1/2)=4
-[table-mining] concurrency = 32
+[llm] concurrency: stage1(classify)=64 stage2(propose)=12
+[table-mining] concurrency = 64
+[stage3] dedup concurrency = 8
 ```
 
 | Knob | Drives | Model / limit | Sane value |
 |---|---|---|---|
-| `concurrency.summarization` | evaluated summarizer | mini-class, ~10M TPM | 32 (tier 3+), 8 (tier 1-2) |
-| `concurrency.table_mining` | one call per table, `--tables` only | mini-class, ~10M TPM | 32 (tier 3+), 8 (tier 1-2) |
-| `expansion.max_concurrent_llm_calls` | Stage 1/2 `class_proposal` | gpt-4.1 @ 32k max_tokens, ~2M TPM | **leave at 4-8** |
+| `concurrency.summarization` | evaluated summarizer | mini, ~10M TPM | 32-64 (tier 3+), 8 (tier 1-2) |
+| `concurrency.chunk_classification` | Stage 1 | mini, ~10M TPM | 32-64 (tier 3+), 8 (tier 1-2) |
+| `concurrency.table_mining` | one call per table, `--tables` only | mini, ~10M TPM | 32-64 (tier 3+), 8 (tier 1-2) |
+| `concurrency.class_proposal` | Stage 2 | gpt-4.1 @ 32k, ~2M TPM | **12** measured safe; 16 is the ceiling |
+| `concurrency.dedup` | Stage 3 batches | gpt-4.1 @ 32k, ~2M TPM | **8** measured safe |
+| `concurrency.table_extraction` | PDF subprocesses | **MEMORY**, not rate | ~1 per 200 MB free |
 
-Summarization dominates wall time. It scales close to linearly: a 1.6M-token
-corpus took **~4 hours at concurrency 4** and is **~25 minutes at 32**, at
-identical cost.
+**Measured on the 30-doc pharma corpus (2026-08-13), 64 mini / 12 proposal /
+8 dedup, zero 429s:**
+
+| Stage | Wall | Share |
+|---|---|---|
+| stage2-propose | 9m 03s | 32.8% |
+| stage3-dedup | 7m 31s | 27.3% |
+| stage4-apply | 5m 10s | 18.7% |
+| summarize | 1m 55s | 7.0% |
+| stage1-classify | 1m 40s | 6.1% |
+| table-extract | 1m 05s | 4.0% |
+
+Two lessons from that table. **`stage4-apply` is the third-largest stage and has
+no concurrency flag at all** — concept-grouping plus the classification audit —
+so never promise a speedup proportional to the knobs you are turning. And
+raising the mini stages from 32 to 64 bought only ~15% on summarization, because
+a 30-doc corpus has just 77 windows: **concurrency above the number of work
+items does nothing.** Always check the corpus plan `tpm_check.py` prints.
 
 **Before launching, run the planner and TALK THE USER THROUGH IT:**
 ```
