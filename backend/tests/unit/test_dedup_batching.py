@@ -45,8 +45,11 @@ class _StubRouter:
 
 
 class _Result:
-    def __init__(self, text: str) -> None:
+    def __init__(self, text: str, finish_reason: str = "stop") -> None:
         self.text = text
+        # _dedup reads this to tell a reply truncated at max_tokens from a
+        # model that returned prose -- opposite causes, opposite remedies.
+        self.finish_reason = finish_reason
 
 
 def _proposals(n: int, prefix: str = "Concept") -> list[dict]:
@@ -129,7 +132,8 @@ async def test_unparseable_response_also_raises() -> None:
     'nothing to do' -- both silently returned the input unchanged."""
 
     def handler(idx, payload):
-        return _Result('{"MATCH NOT FOUND": [{"LABEL": "trunca')  # cut mid-JSON
+        # cut mid-JSON: this is what hitting max_tokens looks like
+        return _Result('{"MATCH NOT FOUND": [{"LABEL": "trunca', finish_reason="length")
 
     merged = {"MATCHES FOUND": [], "MATCH NOT FOUND": _proposals(5)}
     with pytest.raises(DedupFailedError):

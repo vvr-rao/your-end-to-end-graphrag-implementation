@@ -42,6 +42,12 @@ class ChatResult:
     # cache_write_tokens = input tokens written to cache (small premium).
     cache_read_tokens: int | None = None
     cache_write_tokens: int | None = None
+    # Why generation stopped: "stop" (complete), "length" (hit max_tokens), or
+    # a provider-specific value. Without this, a reply truncated at max_tokens
+    # is indistinguishable from a model that returned prose -- both surface as
+    # "not parseable JSON", and they have opposite remedies. Cost a 65-minute
+    # run to a dedup batch whose true cause could not be named.
+    finish_reason: str | None = None
 
 
 class Provider(Protocol):
@@ -174,24 +180,28 @@ def _openai_uses_completion_tokens(model: str) -> bool:
     return model.startswith(_OPENAI_COMPLETION_TOKEN_PREFIXES)
 
 
-async def _consume_openai_stream(stream: Any) -> tuple[str, Any]:
+async def _consume_openai_stream(stream: Any) -> tuple[str, Any, str | None]:
     """Drain an OpenAI chat stream into (text, usage).
 
     The usage-bearing chunk arrives last and carries no choices, so it must be
     read separately from the content deltas rather than assumed to be on the
-    final content chunk.
+    final content chunk. finish_reason arrives on its own earlier chunk, so it
+    is latched rather than read from the last one.
     """
     parts: list[str] = []
     usage = None
+    finish: str | None = None
     async for chunk in stream:
         if getattr(chunk, "usage", None):
             usage = chunk.usage
         for choice in getattr(chunk, "choices", None) or []:
+            if getattr(choice, "finish_reason", None):
+                finish = choice.finish_reason
             delta = getattr(choice, "delta", None)
             content = getattr(delta, "content", None) if delta else None
             if content:
                 parts.append(content)
-    return "".join(parts), usage
+    return "".join(parts), usage, finish
 
 
 class OpenAIProvider:
@@ -250,7 +260,7 @@ class OpenAIProvider:
             # both cost_report() and --max-cost-usd silently report $0.
             kwargs["stream"] = True
             kwargs["stream_options"] = {"include_usage": True}
-            text, usage = await _consume_openai_stream(
+            text, usage, finish = await _consume_openai_stream(
                 await self._client.chat.completions.create(**kwargs)
             )
         else:
@@ -258,6 +268,7 @@ class OpenAIProvider:
             choice = resp.choices[0]
             text = choice.message.content or ""
             usage = resp.usage
+            finish = getattr(choice, "finish_reason", None)
 
         prompt_tokens = getattr(usage, "prompt_tokens", None) if usage else None
         completion_tokens = getattr(usage, "completion_tokens", None) if usage else None
@@ -265,6 +276,7 @@ class OpenAIProvider:
         cached = (getattr(details, "cached_tokens", 0) or 0) if details is not None else 0
         uncached = (prompt_tokens or 0) - cached
         return ChatResult(
+            finish_reason=finish,
             text=text,
             model=model,
             provider="openai",
@@ -333,6 +345,7 @@ class GroqProvider:
         prompt_tokens = getattr(usage, "prompt_tokens", None) if usage else None
         completion_tokens = getattr(usage, "completion_tokens", None) if usage else None
         return ChatResult(
+            finish_reason=getattr(choice, "finish_reason", None),
             text=text,
             model=model,
             provider="groq",
@@ -447,6 +460,12 @@ class AnthropicProvider:
         cache_write = (getattr(usage, "cache_creation_input_tokens", 0) or 0) if usage else 0
         cache_read = (getattr(usage, "cache_read_input_tokens", 0) or 0) if usage else 0
         return ChatResult(
+            # Anthropic says "max_tokens" where OpenAI says "length"; normalise
+            # so callers test one value.
+            finish_reason=(
+                "length" if getattr(resp, "stop_reason", None) == "max_tokens"
+                else getattr(resp, "stop_reason", None)
+            ),
             text=text,
             model=model,
             provider="anthropic",

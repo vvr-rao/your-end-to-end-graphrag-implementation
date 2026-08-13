@@ -34,6 +34,7 @@ dependencies = [
     "pypdf>=5.1",
     "python-pptx>=1.0",
     "python-docx>=1.1",
+    "numpy>=1.26",   # vectorised cosine in semantic_grouping (also transitive via openai/pgvector)
     "tiktoken>=0.8",
     # HTTP / resilience
     "httpx>=0.28",

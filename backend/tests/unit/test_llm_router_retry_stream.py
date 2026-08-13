@@ -191,9 +191,51 @@ async def test_openai_stream_consumer_recovers_text_and_usage() -> None:
             yield _Chunk(content=part)
         yield _Chunk(usage=_Usage())  # final usage-only chunk
 
-    text, usage = await _consume_openai_stream(_gen())
+    text, usage, finish = await _consume_openai_stream(_gen())
     assert text == "Hello, world"
     assert usage is not None and usage.prompt_tokens == 1200
+    # finish_reason arrives on its own chunk, before the usage-only one, so the
+    # consumer must latch it rather than read it off the last chunk.
+    assert finish is None, "no chunk in this stream carried a finish_reason"
+
+
+@pytest.mark.asyncio
+async def test_stream_consumer_latches_finish_reason_from_its_own_chunk() -> None:
+    """OpenAI sends finish_reason on a chunk BEFORE the usage-only final one,
+    so reading it off the last chunk loses it. Losing it is not cosmetic: it is
+    what lets dedup distinguish a reply truncated at max_tokens from a model
+    that returned prose, and a run was lost to that ambiguity."""
+    class _Delta:
+        def __init__(self, content):
+            self.content = content
+
+    class _Choice:
+        def __init__(self, content=None, finish_reason=None):
+            self.delta = _Delta(content)
+            self.finish_reason = finish_reason
+
+    class _Chunk:
+        def __init__(self, content=None, usage=None, finish_reason=None):
+            self.choices = (
+                [_Choice(content, finish_reason)]
+                if content is not None or finish_reason is not None
+                else []
+            )
+            self.usage = usage
+
+    class _Usage:
+        prompt_tokens = 900
+        completion_tokens = 4096
+
+    async def _gen():
+        yield _Chunk(content="partial")
+        yield _Chunk(finish_reason="length")
+        yield _Chunk(usage=_Usage())
+
+    text, usage, finish = await _consume_openai_stream(_gen())
+    assert text == "partial"
+    assert finish == "length"
+    assert usage is not None, "usage must still be picked up from the last chunk"
 
 
 def test_clients_disable_sdk_level_retries() -> None:

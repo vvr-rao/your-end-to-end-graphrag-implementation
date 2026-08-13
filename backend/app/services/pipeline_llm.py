@@ -1015,6 +1015,37 @@ async def _plan_dedup_batches(
     return batches
 
 
+def _split_dedup_batch(batch: dict[str, Any]) -> list[dict[str, Any]]:
+    """Halve a dedup batch across all of its proposal lists.
+
+    `_plan_dedup_batches` emits one batch PER KEY, so in practice a batch holds
+    a single list and this just halves it. Every key is split at its midpoint
+    anyway, rather than moving whole lists between halves: if a multi-key batch
+    ever reaches here, sending one half nothing but relations would change what
+    the prompt is being asked to do, not just how much of it.
+
+    Returns [batch] unchanged when there is nothing left to split -- the caller
+    treats that as unrecoverable rather than looping.
+    """
+    total = sum(len(batch.get(k) or []) for k in _DEDUP_KEYS)
+    if total < 2:
+        return [batch]
+    left: dict[str, Any] = {}
+    right: dict[str, Any] = {}
+    for key in _DEDUP_KEYS:
+        items = list(batch.get(key) or [])
+        mid = len(items) // 2
+        left[key], right[key] = items[:mid], items[mid:]
+    for extra in batch:
+        if extra not in _DEDUP_KEYS:
+            left[extra] = right[extra] = batch[extra]
+    if not any(left.get(k) for k in _DEDUP_KEYS) or not any(
+        right.get(k) for k in _DEDUP_KEYS
+    ):
+        return [batch]
+    return [left, right]
+
+
 async def _dedup(
     router: LLMRouter,
     merged_results: dict[str, Any],
@@ -1045,22 +1076,73 @@ async def _dedup(
         print(f"[stage3] dedup concurrency = {_dc}")
     sem = asyncio.Semaphore(_dc)
 
-    async def _one(i: int, batch: dict[str, Any]) -> None:
+    async def _attempt(batch: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+        """One dedup request. Returns (parsed, reason) -- reason names WHY it
+        failed, so truncation and malformed output stay distinguishable."""
         system, user = PROMPTS["match_dedup"](batch, existing_concepts)
-        async with sem:
-            try:
-                out = await router.chat("match_dedup", system=system, user=user)
-            except Exception as exc:
-                failures.append(f"batch {i + 1}/{n}: {exc}")
-                return
+        try:
+            out = await router.chat("match_dedup", system=system, user=user)
+        except Exception as exc:
+            return None, f"{type(exc).__name__}: {exc}"
         cleaned = extract_json_from_output(out.text)
-        if not isinstance(cleaned, dict):
-            # Almost always a response truncated at max_tokens. Previously
-            # indistinguishable from "nothing to do" -- both returned the
-            # input unchanged.
-            failures.append(f"batch {i + 1}/{n}: response was not parseable JSON")
-            return
-        results[i] = cleaned
+        if isinstance(cleaned, dict):
+            return cleaned, ""
+        if out.finish_reason == "length":
+            return None, (
+                f"reply truncated at max_tokens ({len(out.text)} chars); "
+                "batch output exceeded the model's cap"
+            )
+        return None, "response was not parseable JSON (finish_reason=%s)" % (
+            out.finish_reason or "unknown"
+        )
+
+    async def _one(i: int, batch: dict[str, Any]) -> None:
+        """Run one batch, recovering from a failure rather than dooming the run.
+
+        A single unparseable batch used to abort everything -- correct in that
+        it refused to emit an un-deduplicated ontology, but it discarded 31
+        good batches and a 65-minute, ~$25 run over one bad response.
+
+        Two recovery steps, matched to the two causes:
+          1. Retry once as-is. A transient malformed reply is just a reroll.
+          2. Split the batch in half and run both. If the reply was truncated
+             at max_tokens, halving the input halves the echo, which is the
+             only thing that actually fixes it.
+        Still raises if a half fails on its own -- that is a real problem.
+        """
+        async with sem:
+            parsed, reason = await _attempt(batch)
+            if parsed is not None:
+                results[i] = parsed
+                return
+
+            print(f"[stage3] batch {i + 1}/{n} failed ({reason}); retrying")
+            parsed, reason2 = await _attempt(batch)
+            if parsed is not None:
+                results[i] = parsed
+                return
+
+            halves = _split_dedup_batch(batch)
+            if len(halves) < 2:
+                failures.append(f"batch {i + 1}/{n}: {reason2} (too small to split)")
+                return
+
+            print(
+                f"[stage3] batch {i + 1}/{n} failed again ({reason2}); "
+                f"splitting into {len(halves)} and retrying"
+            )
+            recovered: list[dict[str, Any]] = []
+            for half in halves:
+                sub, sub_reason = await _attempt(half)
+                if sub is None:
+                    failures.append(f"batch {i + 1}/{n} (split half): {sub_reason}")
+                    return
+                recovered.append(sub)
+            # Fold the halves back into one batch-shaped result.
+            results[i] = _merge_dedup_batches(
+                recovered, {c.lower() for c in existing_concepts}
+            )
+            print(f"[stage3] batch {i + 1}/{n} recovered after split")
 
     await asyncio.gather(*[_one(i, b) for i, b in enumerate(batches)])
 
@@ -3013,8 +3095,16 @@ async def _run(
                 concurrency=_table_conc,
             )
 
-    deduped = await _run_llm_stages(
-        loaded_ontology=loaded,
+    # Spend + timings must survive a failure. Everything below the LLM stages
+    # -- write_cost_report, _print_cost_summary, timer.print_report -- used to
+    # sit AFTER them with no guard, so an abort in stage 3 discarded the cost
+    # accounting for the entire run. A 65-minute, ~$25 run failed on one dedup
+    # batch and reported $0, leaving the spend to be reconstructed by hand from
+    # log fragments. The stage that fails is exactly the one whose cost you
+    # need.
+    try:
+        deduped = await _run_llm_stages(
+            loaded_ontology=loaded,
         documents_dir=documents_dir,
         router=router,
         max_hops=effective_hops,
@@ -3028,10 +3118,24 @@ async def _run(
         summarization_concurrency=summarization_concurrency,
         expansion_concurrency=expansion_concurrency,
         classification_concurrency=classification_concurrency,
-        proposal_concurrency=proposal_concurrency,
-        dedup_concurrency=dedup_concurrency,
-        timer=timer,
-    )
+            proposal_concurrency=proposal_concurrency,
+            dedup_concurrency=dedup_concurrency,
+            timer=timer,
+        )
+    except BaseException:
+        # Report what was spent and where the time went, then re-raise
+        # unchanged -- this is instrumentation, not error handling.
+        print(f"\n[{operation}] FAILED -- partial accounting for this run:")
+        try:
+            versioning.write_cost_report(version_dir, router.cost_report())
+            _print_cost_summary(router)
+            timer.print_report()
+            (version_dir / "timings.json").write_text(
+                json.dumps(timer.as_dict(), indent=2), encoding="utf-8"
+            )
+        except Exception as report_exc:  # noqa: BLE001
+            print(f"[{operation}] (could not write failure report: {report_exc})")
+        raise
 
     # Inject user-suggested classes that the LLM didn't already propose. These
     # are ADDITIONAL classes the user wants in the ontology regardless of
