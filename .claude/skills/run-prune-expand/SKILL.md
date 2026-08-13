@@ -197,6 +197,52 @@ Three knobs, three different constraints:
 | `chunking.streaming_batch_size` | memory (cheap) | 8 | Holds N documents' text (~50 MB at 16). Also CAPS effective concurrency. |
 | `concurrency.summarization` | **RATE LIMIT** | 32 | Measured ~0.5% of a 10M TPM tier; rarely the constraint on tier 3+. |
 
+### Present it as a CHOICE, with the downside stated
+
+Do not hand over a single number. Lay out the options, say what each buys AND
+costs, then **ask which they want** -- and make clear they can name their own.
+
+| | Conservative | Recommended | Aggressive |
+|---|---|---|---|
+| mini stages | 8 | 32-64 | up to 125 |
+| `class_proposal` | 4 | **12** | 16 |
+| `dedup` | 4 | **8** | 8 |
+| `table_extraction` | 1 | (free RAM ÷ 200 MB) | same, memory-capped |
+| Buys | safest on any tier | ~2-4x less wall time | marginal over recommended |
+| Costs | hours of waiting | ~2% more spend | 429 risk on tier 1-2 |
+
+**Every number above is a starting point from `tpm_check.py`, not a rule. If
+the user wants something different -- higher, lower, or "just use the defaults"
+-- do that.** Their machine, their bill, their deadline.
+
+State all four effects, because users reliably guess wrong about at least one:
+
+1. **Concurrency buys SPEED, not savings.** The same tokens are sent either
+   way. This is the most common misconception -- a tuning knob that does not
+   reduce the bill is counter-intuitive.
+2. **It costs slightly MORE** -- about 2% -- because a higher value lowers the
+   prompt-cache hit rate (measured 69% -> 49% going 4 -> 32).
+3. **Too high on the gpt-4.1 stages risks 429s**, which cost time in backoff
+   rather than failing outright. 12/8 measured clean; treat 16 as the ceiling
+   and raise incrementally.
+4. **Too high on `table_extraction` risks a HARD KILL**, not a slowdown, on a
+   swapless box. This is the only knob where being wrong loses the run.
+
+### When THEIR LIMITS are the binding constraint
+
+If `tpm_check.py` reports a low tier (roughly: gpt-4.1 under ~800k TPM, or RPM
+in the hundreds), say so explicitly rather than just proposing small numbers:
+
+> *"Your gpt-4.1 limit is 200k TPM, which caps `class_proposal` around 4 no
+> matter what else we change -- Stage 2 will take roughly N hours. That is an
+> account limit, not a setting. You can request a higher usage tier at
+> platform.openai.com → Settings → Limits; tiers rise with cumulative spend and
+> account age. Want to run at 4 now, or wait for an increase?"*
+
+Offer this whenever the rate limit -- not memory, and not the corpus size --
+is what is holding the number down. The user cannot act on a constraint nobody
+named.
+
 Say it plainly, e.g.
 > *"You have 2.0 GB free and no swap. Table extraction is set to 1 PDF at a
 > time — with 18 PDFs that's ~100 minutes, and it's the biggest single cost.

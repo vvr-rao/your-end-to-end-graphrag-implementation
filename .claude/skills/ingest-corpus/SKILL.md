@@ -82,6 +82,18 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
   > proportionally. **This won't reduce cost at all** — the same tokens get sent
   > either way; it only makes the run finish sooner. Want me to?"*
 
+  **Present it as a CHOICE, not a number.** Give conservative / recommended /
+  aggressive options with what each buys AND costs, then ask which they want,
+  and make clear they can name their own value or keep the defaults. See
+  **run-prune-expand** Step 2c for the option table and the four effects to
+  state (speed-not-savings, ~2% more spend from cache dilution, 429 risk on the
+  gpt-4.1 stages, HARD KILL risk on `table_extraction`).
+
+  **If their TIER is what caps the number** -- not memory, not corpus size --
+  say so explicitly and point them at platform.openai.com → Settings → Limits
+  to request an increase. A constraint nobody names is one the user cannot act
+  on.
+
   Be explicit every time that **concurrency buys SPEED, not savings.** Users
   reasonably assume a tuning knob saves money; this one does not. If anything it
   costs ~2% more, because a higher value slightly lowers the prompt-cache hit
