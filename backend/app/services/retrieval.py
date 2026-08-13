@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 import uuid
@@ -62,6 +63,7 @@ from backend.app.services import retrieval_sql
 from backend.app.services.retrieval_ranking import rrf_fuse
 from backend.app.services.retrieval_sql import _vec_str
 
+log = logging.getLogger(__name__)
 
 _DEFAULT_HOPS_FALLBACK = 3
 
@@ -749,10 +751,21 @@ async def _plan_rounds(router: LLMRouter, q: str) -> dict[str, Any]:
     a multi-part question whose 2nd part depends on the 1st) get two rounds; the
     common case returns needs_second_round=False. Fails safe to one round."""
     sys_p, user_p = PROMPTS["retrieval_rounds_plan"](q)
+    # The task must EXIST. This lookup used to sit inside the try below, so when
+    # `retrieval_rounds_plan` was missing from every preset the KeyError was
+    # swallowed by the fail-safe and two-round retrieval silently never ran --
+    # indistinguishable from the planner legitimately choosing one round.
+    # "Fail safe to one round" is right for a bad LLM response; it is wrong for
+    # a misconfiguration, which is permanent and invisible.
+    router.task_spec("retrieval_rounds_plan")
     try:
         out = await router.chat("retrieval_rounds_plan", system=sys_p, user=user_p)
         parsed = _extract_json(out.text) or {}
-    except Exception:
+    except Exception as exc:
+        log.warning(
+            "round planner call failed (%s: %s); falling back to a single "
+            "retrieval round", type(exc).__name__, exc,
+        )
         return {"needs_second_round": False, "round1_question": "", "round2_question": ""}
     r1 = (parsed.get("round1_question") or "").strip()
     r2 = (parsed.get("round2_question") or "").strip()

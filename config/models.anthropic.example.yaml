@@ -183,6 +183,22 @@ tasks:
     max_tokens: 1024
     response_format: json_object
 
+  # Iterative-retrieval planner: decides whether a question needs a second,
+  # DEPENDENT round (e.g. "compare X to its competitors" must discover the
+  # competitor list before it can retrieve their attributes). Sized like its
+  # sibling query_decompose -- a short JSON object of two sub-questions.
+  #
+  # This task was called by retrieval.py but defined in NO preset, so every
+  # lookup raised KeyError, was swallowed by the caller's fail-safe, and
+  # two-round retrieval silently never ran. Keep it present in ALL presets.
+  retrieval_rounds_plan:
+    provider: anthropic
+    model: claude-haiku-4-5
+    timeout: 90
+    temperature: 0.0
+    max_tokens: 1024
+    response_format: json_object
+
   # Per-entity probe fan-out (cheap templating -> haiku).
   entity_probes:
     provider: anthropic
