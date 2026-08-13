@@ -57,14 +57,17 @@ def router() -> LLMRouter:
 def test_prefill_dominated_call_is_not_flagged(router, caplog) -> None:
     """The false-alarm class the flat rule could not distinguish.
 
-    A 300k-token prompt is ~100s of prefill on its own. The reply then streams
-    out at ~170 tok/s in the remaining 6s -- fast. At 71% of a 150s budget the
+    A 150k-token prompt is ~50s of prefill on its own. The reply then streams
+    out at ~230 tok/s over the remaining 13s -- fast. At 72% of a 90s budget the
     old `elapsed > timeout * 0.5` rule warned; the projection correctly does
     not, because a full 4096-token reply still fits inside the deadline.
+
+    Sized so the decode span clears _MIN_DECODE_S -- otherwise this would be
+    SKIPPED as an unmeasurable sample and pass for the wrong reason.
     """
     text = _warn(
-        router, caplog, elapsed=106, timeout=150, max_tokens=4096,
-        result=_result(prompt=300_000, completion=1_000),
+        router, caplog, elapsed=65, timeout=90, max_tokens=4096,
+        result=_result(prompt=150_000, completion=3_000),
     )
     assert text == "", "prefill time must not be charged to the decode rate"
 
@@ -141,18 +144,90 @@ def test_missing_usage_and_fast_call_stays_silent(router, caplog) -> None:
     ) == ""
 
 
-def test_prefill_estimate_cannot_consume_the_whole_elapsed_time(router, caplog) -> None:
-    """A huge prompt with a fast reply must not drive decode_s to ~0 and
-    produce a nonsense rate (division-by-near-zero → no warning ever)."""
-    text = _warn(
+def test_huge_prompt_with_a_fast_reply_neither_crashes_nor_invents_a_rate(
+    router, caplog
+) -> None:
+    """A 900k-token prompt against a 1s elapsed time is degenerate: prefill
+    alone exceeds it. The clamps must keep decode_s positive (no division by
+    zero) AND the sample must be rejected -- 10 tokens in 1s supports no rate.
+
+    An earlier version of this test asserted a WARNING here, on the theory that
+    anything else meant the guard had silently divided the problem away. That
+    was wrong: emitting a confident 'needs 6000s' from a 10-token sample is the
+    false-positive this gate exists to stop.
+    """
+    assert _warn(
         router, caplog, elapsed=1, timeout=60, max_tokens=8192,
         result=_result(prompt=900_000, completion=10),
-    )
-    assert "under-budgeted" in text, "must still evaluate, not silently divide out"
+    ) == ""
 
 
 def test_zero_timeout_is_not_treated_as_a_deadline(router, caplog) -> None:
     assert _warn(
         router, caplog, elapsed=999, timeout=0, max_tokens=8192,
         result=_result(prompt=100, completion=100),
+    ) == ""
+
+
+# --------------------------------------------------------------------------- #
+# Short replies. Found live: the check fired on `table_concept_grouping`
+# returning 67 tokens in 7s, reporting "10 tok/s, needs 200s" for a task that
+# needs 13.7 tok/s and comfortably clears it. Almost all of those 7s were
+# time-to-first-token -- a FIXED per-request cost, not a per-token one.
+# --------------------------------------------------------------------------- #
+def test_tiny_reply_does_not_produce_a_rate(router, caplog) -> None:
+    """The exact live false positive: 815 in / 67 out in 7s."""
+    assert _warn(
+        router, caplog, elapsed=7, timeout=150, max_tokens=2048,
+        result=_result(prompt=815, completion=67),
+    ) == "", "TTFT divided across 67 tokens is not a throughput measurement"
+
+
+def test_short_reply_stays_silent_even_when_slow_in_wall_terms(router, caplog) -> None:
+    """A 30s call returning 50 tokens still says nothing about throughput."""
+    assert _warn(
+        router, caplog, elapsed=30, timeout=90, max_tokens=4096,
+        result=_result(prompt=2_000, completion=50),
+    ) == ""
+
+
+def test_the_check_activates_once_output_is_long_enough_to_measure(router, caplog) -> None:
+    """Skipping short replies must not disable the check. The first reply big
+    enough to time is also the first one where length can cause a timeout."""
+    text = _warn(
+        router, caplog, elapsed=60, timeout=90, max_tokens=8192,
+        result=_result(prompt=1_000, completion=600),
+    )
+    assert "under-budgeted" in text
+
+
+def test_boundary_reply_length_is_evaluated(router, caplog) -> None:
+    """At exactly the token threshold, with a decode span well past its own
+    threshold, the sample is usable and must be judged."""
+    from backend.app.services.llm_router import _MIN_TOKENS_TO_RATE
+
+    text = _warn(
+        router, caplog, elapsed=120, timeout=150, max_tokens=8192,
+        result=_result(prompt=500, completion=_MIN_TOKENS_TO_RATE),
+    )
+    assert "under-budgeted" in text
+
+
+def test_long_reply_over_a_short_decode_span_is_rejected(router, caplog) -> None:
+    """Many tokens is not sufficient on its own. 900 tokens delivered in ~1s of
+    decoding is a fine result, but the span is too short for the overhead
+    estimate to be a small share of it, so no rate should be claimed."""
+    assert _warn(
+        router, caplog, elapsed=3, timeout=180, max_tokens=8192,
+        result=_result(prompt=1_000, completion=900),
+    ) == ""
+
+
+def test_fixed_overhead_is_not_charged_to_decoding(router, caplog) -> None:
+    """A healthy call whose measured rate only looks marginal once ~2s of
+    request overhead is wrongly attributed to token generation."""
+    # 3000 tokens in 32s -> 94 tok/s raw; the overhead correction raises it.
+    assert _warn(
+        router, caplog, elapsed=32, timeout=150, max_tokens=8192,
+        result=_result(prompt=3_000, completion=3_000),
     ) == ""

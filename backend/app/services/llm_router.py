@@ -70,6 +70,20 @@ class Provider(Protocol):
 # direction -- a missed warning is silent, a spurious one is merely noise.
 _PREFILL_TOKENS_PER_S = 3_000.0
 
+# Minimum reply length before a decode rate is believable. Below this, elapsed
+# time is dominated by time-to-first-token (a fixed per-request cost), so the
+# implied "tokens per second" says more about latency than throughput.
+_MIN_TOKENS_TO_RATE = 128
+
+# Minimum decode span before the rate is stable. `_FIXED_OVERHEAD_S` is an
+# estimate; being wrong about it by a second or two barely moves a rate measured
+# over tens of seconds, but swings one measured over a few seconds several fold.
+_MIN_DECODE_S = 10.0
+
+# Fixed per-request overhead (connection, queueing, scheduling) subtracted
+# before the remainder is attributed to decoding.
+_FIXED_OVERHEAD_S = 2.0
+
 # Rough per-1K-token pricing as of 2026-05 — used only for the cost gate, not
 # billing. Update as needed; the router never refuses to call a model just
 # because its price isn't here (defaults to 0 cost in that case).
@@ -481,6 +495,12 @@ class LLMRouter:
         # everything else vanished with the terminal scrollback.
         self._cost_by_task: dict[str, float] = {}
         self._calls_by_task: dict[str, int] = {}
+        # Observed completion length per task. `max_tokens` and `timeout` are
+        # both sized against the LARGEST reply a task may produce, and until now
+        # that number was assumed rather than known -- which is how ~25 tasks
+        # per preset ended up on a timeout that assumed a decode rate nobody had
+        # measured. Recording it makes the next sizing pass evidence-based.
+        self._out_tokens_by_task: dict[str, list[int]] = {}
         self._validate_stream_support()
 
     def _validate_stream_support(self) -> None:
@@ -536,10 +556,35 @@ class LLMRouter:
                     "calls": self._calls_by_task.get(t, 0),
                     "model": self._tasks.get(t, {}).get("model"),
                     "provider": self._tasks.get(t, {}).get("provider"),
+                    **self._output_stats(t),
                 }
                 for t, c in by_task.items()
             },
         }
+
+    def _output_stats(self, task: str) -> dict[str, Any]:
+        """Observed vs configured output size for one task.
+
+        `headroom` is configured max_tokens divided by the largest reply seen.
+        A large value means the task is budgeted for output it never produces --
+        which inflates the decode rate its timeout implicitly demands, for no
+        benefit. A value near 1 means replies are brushing the cap and may be
+        getting truncated.
+        """
+        seen = self._out_tokens_by_task.get(task)
+        if not seen:
+            return {}
+        ordered = sorted(seen)
+        configured = int(self._tasks.get(task, {}).get("max_tokens") or 0)
+        stats: dict[str, Any] = {
+            "out_tokens_max": ordered[-1],
+            "out_tokens_p95": ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))],
+            "out_tokens_mean": round(sum(ordered) / len(ordered), 1),
+            "max_tokens_configured": configured or None,
+        }
+        if configured and ordered[-1]:
+            stats["headroom"] = round(configured / ordered[-1], 1)
+        return stats
 
     @property
     def cache_read_tokens(self) -> int:
@@ -614,6 +659,10 @@ class LLMRouter:
                     self._total_cost_usd += result.cost_usd
                     self._cost_by_task[task] = self._cost_by_task.get(task, 0.0) + result.cost_usd
                 self._calls_by_task[task] = self._calls_by_task.get(task, 0) + 1
+                if result.completion_tokens:
+                    self._out_tokens_by_task.setdefault(task, []).append(
+                        result.completion_tokens
+                    )
                 # Prompt-cache accounting. OpenAI reports prompt_tokens INCLUDING
                 # the cached portion; Anthropic reports input_tokens EXCLUDING it.
                 read = result.cache_read_tokens or 0
@@ -682,9 +731,31 @@ class LLMRouter:
             return
 
         prefill_s = min(prompt_tokens / _PREFILL_TOKENS_PER_S, elapsed * 0.9)
-        decode_s = max(elapsed - prefill_s, 1e-3)
+        overhead_s = min(_FIXED_OVERHEAD_S, max(elapsed - prefill_s - 1e-3, 0.0))
+        decode_s = max(elapsed - prefill_s - overhead_s, 1e-3)
+
+        # Is this sample big enough to extrapolate from? Two independent ways it
+        # can fail, and both were hit in practice:
+        #
+        #  * Too few tokens. A short reply is mostly TIME-TO-FIRST-TOKEN --
+        #    connection, queueing, scheduling -- a FIXED cost, not a per-token
+        #    one. Live: table_concept_grouping returned 67 tokens in 7s and was
+        #    reported as "10 tok/s, needs 200s" for a task needing 13.7 tok/s
+        #    that clears it several times over.
+        #  * Too little decode time. `_FIXED_OVERHEAD_S` is an estimate, not a
+        #    measurement. When decoding only spans a few seconds, being wrong
+        #    about it by a couple of seconds swings the computed rate several
+        #    fold; over tens of seconds the same error is a few percent.
+        #
+        # Skipping both costs nothing. A task whose replies stay short is not at
+        # risk of a LENGTH-driven timeout, and the first reply long enough to
+        # matter is also long enough to measure -- the check self-activates
+        # exactly when output size becomes the thing worth checking.
+        if completion_tokens < _MIN_TOKENS_TO_RATE or decode_s < _MIN_DECODE_S:
+            return
+
         decode_rate = completion_tokens / decode_s
-        projected = prefill_s + (max_tokens / decode_rate)
+        projected = prefill_s + overhead_s + (max_tokens / decode_rate)
 
         if projected <= timeout:
             return
