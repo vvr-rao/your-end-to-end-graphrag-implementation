@@ -70,3 +70,19 @@ def test_source_is_sampled_before_the_worker_runs() -> None:
     pre = src.index("was_cached = table_cache.two_tier_load(")
     spawn = src.index("create_subprocess_exec")
     assert pre < spawn, "cache presence must be sampled before spawning the worker"
+
+
+def test_saved_cost_is_actually_rendered_not_just_accumulated() -> None:
+    """`cost_saved_usd` was tracked but never displayed for one commit, because
+    the patch adding the suffix matched TWO byte-identical `folder DONE` print
+    blocks and refused to apply. The counter existing is not the feature; the
+    number reaching the user is.
+    """
+    import inspect
+    from backend.app.services import table_extract
+
+    src = inspect.getsource(table_extract._drive_subprocess_workers)
+    assert "saved by cache" in src, "saved cost is accumulated but never printed"
+    assert "cost_saved_usd" in src.split("folder DONE", 1)[1], (
+        "the suffix must be on the DONE line, where the spend figure is read"
+    )

@@ -1306,7 +1306,11 @@ async def _drive_subprocess_workers(
         f"({summary_stats['n_cached']} cache-hits, "
         f"{summary_stats['n_failed']} failed), "
         f"{time.monotonic() - folder_started:.0f}s, "
-        f"cost=${summary_stats['cost_usd']:.4f}",
+        f"cost=${summary_stats['cost_usd']:.4f}"
+        + (
+            f" (${summary_stats['cost_saved_usd']:.4f} saved by cache)"
+            if summary_stats.get("cost_saved_usd") else ""
+        ),
         flush=True,
     )
     return results
