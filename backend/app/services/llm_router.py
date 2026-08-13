@@ -484,6 +484,18 @@ class LLMRouter:
         mc = self._settings.models_config
         self._tasks = mc.get("tasks", {})
         self._retry = mc.get("defaults", {}).get("retries", {})
+        self.reset_counters()
+        self._validate_stream_support()
+
+    def reset_counters(self) -> None:
+        """Initialise every per-run accumulator.
+
+        Kept separate from __init__ because tests build bare routers via
+        `LLMRouter.__new__(LLMRouter)` to avoid needing real config, and then
+        hand-set the fields `chat()` touches. Every new counter used to break
+        those tests with an AttributeError from deep in the hot path; now they
+        call this instead and new counters cost nothing.
+        """
         self._total_cost_usd = 0.0
         # Prompt-cache accounting across all calls (see cache_hit_rate).
         self._cache_read_tokens = 0     # input served from cache
@@ -501,7 +513,6 @@ class LLMRouter:
         # per preset ended up on a timeout that assumed a decode rate nobody had
         # measured. Recording it makes the next sizing pass evidence-based.
         self._out_tokens_by_task: dict[str, list[int]] = {}
-        self._validate_stream_support()
 
     def _validate_stream_support(self) -> None:
         """Fail at config load, not mid-run, on an unsupportable `stream: true`.

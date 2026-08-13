@@ -10,6 +10,7 @@ from backend.app.services.llm_router import LLMRouter
 
 def _router(max_tokens=4096):
     r = LLMRouter.__new__(LLMRouter)
+    r.reset_counters()
     r._cost_by_task, r._calls_by_task, r._out_tokens_by_task = {}, {}, {}
     r._tasks = {"t": {"model": "m", "provider": "p", "max_tokens": max_tokens}}
     return r

@@ -26,16 +26,11 @@ from backend.app.services.llm_router import (
 
 def _router(tasks: dict, providers: dict) -> LLMRouter:
     r = LLMRouter.__new__(LLMRouter)
+    r.reset_counters()
     r._settings = None  # type: ignore[assignment]
     r._providers = providers
     r._tasks = tasks
     r._retry = {"max_attempts": 5, "initial_wait_seconds": 0, "max_wait_seconds": 0}
-    r._total_cost_usd = 0.0
-    r._cache_read_tokens = 0
-    r._cache_write_tokens = 0
-    r._input_full_tokens = 0
-    r._cost_by_task = {}
-    r._calls_by_task = {}
     return r
 
 
@@ -138,6 +133,7 @@ async def test_stream_defaults_off() -> None:
 
 def test_groq_stream_is_rejected_at_config_load_not_mid_run() -> None:
     r = LLMRouter.__new__(LLMRouter)
+    r.reset_counters()
     r._tasks = {"chunk_classification": {"provider": "groq", "stream": True}}
     with pytest.raises(ValueError) as ei:
         r._validate_stream_support()
@@ -148,6 +144,7 @@ def test_groq_stream_is_rejected_at_config_load_not_mid_run() -> None:
 
 def test_groq_without_stream_is_fine() -> None:
     r = LLMRouter.__new__(LLMRouter)
+    r.reset_counters()
     r._tasks = {"chunk_classification": {"provider": "groq"}}
     r._validate_stream_support()  # must not raise
 
