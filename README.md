@@ -286,6 +286,151 @@ Fill `.env` with:
 
 `pgvector` must be enabled in Supabase: Dashboard → Database → Extensions → toggle on **vector**.
 
+#### Tuning throughput (`concurrency`) — the single biggest lever on wall time
+
+Every LLM-bound stage has its own concurrency, because the stages run on
+different models with very different rate limits. In `config/config.yaml`:
+
+```yaml
+concurrency:
+  summarization: 32        # register-documents + prune-expand summarizer
+  entity_extraction: 32    # extract-entities
+  artifact_generation: 32  # generate-artifacts, regenerate-stale-artifacts
+  table_mining: 32         # prune-expand --tables (one LLM call per table)
+  evaluation: 8            # evaluate-queries
+
+expansion:
+  max_concurrent_llm_calls: 4   # Stage 1/2 of prune-expand — LEAVE LOW (see below)
+```
+
+**Overriding per run.** Most commands take a single `--concurrency N`:
+
+```bash
+uv run python -m backend.app.cli extract-entities --concurrency 48
+```
+
+`prune-expand` and `build` take **three separate flags**, because they drive
+three stages on models with different rate limits — one shared flag would
+re-create the conflation these knobs exist to remove:
+
+```bash
+uv run python -m backend.app.cli prune-expand --input <MERGE> --documents <DOCS> \
+  --summarization-concurrency 32 \
+  --table-mining-concurrency 32 \
+  --expansion-concurrency 4        # keep LOW: gpt-4.1 @ 32k against ~2M TPM
+```
+
+Both print what they resolved, so the value is never a mystery mid-run:
+
+```
+[llm] concurrency: summarization=32 expansion(stage1/2)=4
+[table-mining] concurrency = 32
+[extract-entities] concurrency = 32
+```
+
+| Command | Flags |
+|---|---|
+| `prune-expand`, `build` | `--summarization-concurrency`, `--table-mining-concurrency`, `--expansion-concurrency` |
+| `register-documents`, `extract-entities`, `generate-artifacts`, `regenerate-stale-artifacts`, `evaluate-queries` | `--concurrency` |
+| `merge`, `enrich-time`, `query` | none needed (no LLM fan-out) |
+
+Wall time scales close to linearly with these. A 1.6M-token corpus took **~4
+hours** to summarize at concurrency 4 and is **~25 minutes** at 32:
+
+```
+1,600,000 tokens / 11,500 per window  = ~139 windows x 9 sequential calls
+concurrency  4:  1251 calls /  4  = 313 rounds  ~ 3.2 h
+concurrency 32:  1251 calls / 32  =  39 rounds  ~ 24 min
+```
+
+**Cost is unchanged by concurrency** — the same tokens are sent either way.
+Higher values do slightly reduce the prompt-cache hit rate (measured 69% → 49%
+going from 4 to 32, roughly +2% spend), which is negligible against the time
+saved.
+
+**Three knobs, three different constraints.** They are not interchangeable:
+
+| Knob | Bound by | Default | Why |
+|---|---|---|---|
+| `concurrency.table_extraction` | **memory** | 1 | One subprocess per PDF (~152 MB measured). Serial extraction is often the single biggest time cost: 18 PDFs at 1 ≈ 100 min. |
+| `chunking.streaming_batch_size` | memory (cheap) | 8 | Holds N documents' text (~50 MB at 16) — and **caps effective concurrency**. |
+| `concurrency.summarization` etc. | **provider rate limit** | 32 | Measured at ~0.5% of a 10M TPM tier; rarely the constraint on tier 3+. |
+
+The default of 1 for table extraction is deliberate, not an oversight: the
+in-process extractor accumulated heap fragmentation and reliably OOMed partway
+through a corpus, which is why each PDF now runs in its own subprocess. Raise it
+only against measured free memory — and note that on a **swapless** machine an
+over-commit is a hard kill mid-run, not a slowdown.
+
+**Check your actual limits** — don't guess:
+
+```bash
+uv run python scripts/tpm_check.py
+```
+
+It reads OpenAI's own `x-ratelimit-*` response headers (one ~10-token probe per
+model), reads **this machine's free memory and whether it has swap**, and prints
+a concrete suggestion for every knob above — rate-limit-bound and memory-bound
+alike. Pass a documents directory and it also sizes `streaming_batch_size`
+against the corpus. Measured on a tier-4 account running at concurrency 32:
+**~0.5% sustained TPM utilisation and zero burst pressure** on the token bucket
+— on tier 3+ the provider limit is almost never what's slowing you down.
+
+**Concurrency buys speed, not savings.** It's worth being explicit, because a
+tuning knob usually implies a cheaper bill: raising it sends the *same* tokens
+in less time. Total cost is unchanged, and in practice ~2% higher, because more
+parallelism slightly lowers the prompt-cache hit rate.
+
+**Sizing it for your tier.** The constraint is tokens-per-minute:
+
+```
+concurrency x tokens_per_call x (60 / seconds_per_call)  <  your model's TPM
+```
+
+At 32 concurrent with ~20k tokens per ~60s call that is ~640k TPM — about 6% of
+a 10M TPM tier. Guidance:
+
+| OpenAI tier | Suggested | Why |
+|---|---|---|
+| Tier 3+ (≥2M TPM) | 32–64 | Plenty of headroom; this is where the 8× win is |
+| Tier 1–2 | 4–8 | Several large concurrent calls throttle and time out |
+
+**Do not raise `expansion.max_concurrent_llm_calls` to match.** It drives
+`class_proposal` on `gpt-4.1` at `max_tokens: 32768` against a ~2M TPM tier —
+at 32 concurrent that is ~1.3M TPM, close enough to the ceiling to throttle.
+4–8 is correct there. That coupling is exactly why the knobs are separate.
+
+Every command takes `--concurrency N` to override for one run (except
+`prune-expand`, which is config-only) and prints the resolved value on startup:
+
+```
+[extract-entities] concurrency = 32
+```
+
+Two related knobs worth knowing:
+
+- **`chunking.streaming_batch_size` (default 8) — this caps concurrency, and is
+  usually the real limit.** It is how many *documents* are summarized at a time,
+  and batches are a hard barrier: only the current batch's windows exist, so
+
+  ```
+  effective concurrency = min(concurrency.summarization, windows in this batch)
+  windows per batch    ≈ streaming_batch_size × ~2.5 windows/doc
+  ```
+
+  At batch 8 that is ~20 windows — so **`concurrency: 32` leaves 12 slots idle,
+  and raising concurrency further does nothing.** Measured on a 30-document
+  corpus: 13 of 32 slots unused. Memory cost is small (~50 MB at 16 documents),
+  so 16–32 is usually right above 2 GB free. Size it for your corpus with
+  `uv run python scripts/tpm_check.py <documents-dir>`, which prints the table.
+
+  Batches are sequential, so a batch also runs at the speed of its **slowest**
+  document — one 60k-token file holds up the other seven.
+- `summarization.eval_rounds` (default 3) — each round adds an evaluate +
+  revise call per window (~9 calls total at 3). Dropping to 2 is ~22% fewer
+  calls, but trades away summary fidelity, which is the point of the evaluated
+  summarizer. Tune concurrency first.
+
 ### 3. Build the ontology
 
 Drop your source ontologies in `source_ontologies/` (any combination of `.owl`, `.rdf`, `.ttl`, `.zip`). Two CLI paths:

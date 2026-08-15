@@ -1,0 +1,4 @@
+[prune-expand] loading prior version: output_ontologies/v20260727T140854Z-merge
+[prune-expand] table extraction: scanning source_documents/collection-of-pharma-docs-subset for PDFs (vision=ON, isolation=subprocess)
+[tables/worker] scanning 1 PDF(s) under source_documents/collection-of-pharma-docs-subset (concurrency=1, vision=ON, isolation=subprocess)
+[tables] 001_OZEMPIC__oral_semaglutide__tablet_RYBELSUS__oral_semaglutide__tablet_27f15fac-7d98-4114-a2ec-92494a91da98.pdf: starting (62 pages, cap 62, vision=ON)

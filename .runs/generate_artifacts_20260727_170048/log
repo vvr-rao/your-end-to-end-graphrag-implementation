@@ -1,0 +1,31 @@
+[generate-artifacts] 15 chunk(s) to process (types=Claim,Finding,Observation,Event, concurrency=4, entity-grounded=True; 15/15 chunks have >=1 entity)
+[generate-artifacts] progress: 1/15 chunk(s) (6.7%), ok=1 fail=0, cost=$0.0007, rate=0.1/s, ETA=2.5 min
+[generate-artifacts] progress: 2/15 chunk(s) (13.3%), ok=2 fail=0, cost=$0.0017, rate=0.1/s, ETA=1.8 min
+[generate-artifacts] progress: 3/15 chunk(s) (20.0%), ok=3 fail=0, cost=$0.0024, rate=0.2/s, ETA=1.3 min
+[generate-artifacts] progress: 4/15 chunk(s) (26.7%), ok=4 fail=0, cost=$0.0028, rate=0.2/s, ETA=1.1 min
+[generate-artifacts] progress: 5/15 chunk(s) (33.3%), ok=5 fail=0, cost=$0.0042, rate=0.2/s, ETA=0.8 min
+[generate-artifacts] progress: 6/15 chunk(s) (40.0%), ok=6 fail=0, cost=$0.0056, rate=0.2/s, ETA=0.7 min
+[generate-artifacts] progress: 7/15 chunk(s) (46.7%), ok=7 fail=0, cost=$0.0066, rate=0.2/s, ETA=0.6 min
+[generate-artifacts] progress: 8/15 chunk(s) (53.3%), ok=8 fail=0, cost=$0.0076, rate=0.2/s, ETA=0.6 min
+[generate-artifacts] progress: 9/15 chunk(s) (60.0%), ok=9 fail=0, cost=$0.0084, rate=0.2/s, ETA=0.5 min
+[generate-artifacts] progress: 10/15 chunk(s) (66.7%), ok=10 fail=0, cost=$0.0092, rate=0.2/s, ETA=0.4 min
+[generate-artifacts] progress: 11/15 chunk(s) (73.3%), ok=11 fail=0, cost=$0.0102, rate=0.2/s, ETA=0.3 min
+[generate-artifacts] progress: 12/15 chunk(s) (80.0%), ok=12 fail=0, cost=$0.0111, rate=0.2/s, ETA=0.2 min
+[generate-artifacts] progress: 13/15 chunk(s) (86.7%), ok=13 fail=0, cost=$0.0118, rate=0.2/s, ETA=0.1 min
+[generate-artifacts] progress: 14/15 chunk(s) (93.3%), ok=14 fail=0, cost=$0.0125, rate=0.2/s, ETA=0.1 min
+[generate-artifacts] progress: 15/15 chunk(s) (100.0%), ok=15 fail=0, cost=$0.0134, rate=0.2/s, ETA=0.0 min
+[generate-artifacts] LLM done: $0.0134, 15 success / 0 failed
+[generate-artifacts] embedded 207 artifact(s): $0.0001
+[generate-artifacts] DONE: artifacts=207 (Claim=64, Finding=47, Observation=60, Event=36), sources=207, edges=454, cost=$0.0136, wall=95.5s, graph_version -> 5
+[generate-artifacts] 4 doc(s) needing Summary
+[generate-artifacts] Summary progress: 1/4 doc(s) (25.0%), cost=$0.0000, ETA=0.0 min
+[generate-artifacts] Summary progress: 2/4 doc(s) (50.0%), cost=$0.0000, ETA=0.0 min
+[generate-artifacts] Summary progress: 3/4 doc(s) (75.0%), cost=$0.0000, ETA=0.0 min
+[generate-artifacts] Summary progress: 4/4 doc(s) (100.0%), cost=$0.0000, ETA=0.0 min
+[generate-artifacts] Summary DONE: docs=4 (verbatim, no re-summary), sources=97, summarizes+entity edges=98 (of which assertsAbout->entity=94), cost=$0.0003, wall=23.9s, graph_version -> 6
+[generate-artifacts] auto Summary rollup (2 layer(s), loss-loop eval_rounds=2) ...
+[rollup] no rollups produced
+[rollup] step 1: 3 cluster(s) to merge across 7 type(s) (concurrency=4)
+[rollup] step 1: inserted 3 rollup(s)
+[rollup] step 2: no clusters met min_cluster=2
+[rollup] DONE: rollups=3 (by_layer={1: 3}, by_type={'Claim': 2, 'Event': 1}), referencesArtifact_edges=6, inherited_entity/doc_edges=3, loss-loop(revised=0, still_incomplete=0), cost=$0.0075, wall=48.1s, graph_version -> 7

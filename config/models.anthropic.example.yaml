@@ -25,14 +25,14 @@ tasks:
   chunk_classification:
     provider: anthropic
     model: claude-haiku-4-5
-    timeout: 60
+    timeout: 600
     temperature: 0.0
     max_tokens: 8192
 
   class_proposal:
     provider: anthropic
     model: claude-sonnet-4-6
-    timeout: 180
+    timeout: 600
     temperature: 0.0
     max_tokens: 8192
     response_format: json_object
@@ -40,15 +40,19 @@ tasks:
   match_dedup:
     provider: anthropic
     model: claude-sonnet-4-6
-    timeout: 120
+    timeout: 2400
     temperature: 0.0
-    max_tokens: 4096
+    # Dedup echoes the whole deduplicated batch back, so output size tracks
+    # input size. At 4096 the JSON truncated mid-object, the parse returned
+    # nothing, and the stage silently passed its input through undeduplicated.
+    # pipeline_llm._dedup sizes its batches against this value.
+    max_tokens: 32768
     response_format: json_object
 
   concept_grouping:
     provider: anthropic
     model: claude-sonnet-4-6
-    timeout: 240
+    timeout: 600
     temperature: 0.0
     max_tokens: 8192
     response_format: json_object
@@ -56,7 +60,7 @@ tasks:
   compact_description:
     provider: anthropic
     model: claude-haiku-4-5
-    timeout: 60
+    timeout: 150
     temperature: 0.0
     max_tokens: 2048
     response_format: json_object
@@ -64,9 +68,10 @@ tasks:
   document_summarize:
     provider: anthropic
     model: claude-haiku-4-5
-    timeout: 120
+    timeout: 600
     temperature: 0.0
     max_tokens: 4096
+    stream: true
 
   # Evaluated (near-lossless) document summarizer -- new default ingestion path.
   # Uses the synthesis-tier sonnet (NOT haiku): the lossless-preservation + JSON
@@ -75,34 +80,36 @@ tasks:
   evaluated_summary_chunk:
     provider: anthropic
     model: claude-sonnet-4-6
-    timeout: 180
+    timeout: 600
     temperature: 0.0
     max_tokens: 8192
+    stream: true
   summary_question_gen:
     provider: anthropic
     model: claude-sonnet-4-6
-    timeout: 120
+    timeout: 300
     temperature: 0.0
     max_tokens: 4096
     response_format: json_object
   summary_evaluate:
     provider: anthropic
     model: claude-sonnet-4-6
-    timeout: 120
+    timeout: 300
     temperature: 0.0
     max_tokens: 4096
     response_format: json_object
   summary_revise:
     provider: anthropic
     model: claude-sonnet-4-6
-    timeout: 180
+    timeout: 600
     temperature: 0.0
     max_tokens: 8192
+    stream: true
 
   classification_audit:
     provider: anthropic
     model: claude-haiku-4-5
-    timeout: 90
+    timeout: 300
     temperature: 0.0
     max_tokens: 4096
     response_format: json_object
@@ -110,7 +117,7 @@ tasks:
   class_summarization:
     provider: anthropic
     model: claude-haiku-4-5
-    timeout: 60
+    timeout: 90
     temperature: 0.2
     max_tokens: 1024
 
@@ -118,7 +125,7 @@ tasks:
   qa_synthesis:
     provider: anthropic
     model: claude-opus-4-8
-    timeout: 180
+    timeout: 300
     max_tokens: 4096
 
   # Embeddings ALWAYS run on OpenAI (Anthropic has no embeddings API).
@@ -131,7 +138,7 @@ tasks:
   artifact_chunk_extract:
     provider: anthropic
     model: claude-haiku-4-5
-    timeout: 60
+    timeout: 600
     temperature: 0.0
     max_tokens: 8192          # entity-grounded artifact JSON on dense chunks exceeds 2048 -> truncation
     response_format: json_object
@@ -139,7 +146,7 @@ tasks:
   artifact_chunk_extract_with_entities:
     provider: anthropic
     model: claude-haiku-4-5
-    timeout: 60
+    timeout: 600
     temperature: 0.0
     max_tokens: 8192          # entity-grounded artifact JSON on dense chunks exceeds 2048 -> truncation
     response_format: json_object
@@ -147,7 +154,7 @@ tasks:
   entity_extract:
     provider: anthropic
     model: claude-haiku-4-5
-    timeout: 60
+    timeout: 600
     temperature: 0.0
     max_tokens: 8192          # dense chunks w/ many entities (50 candidate classes) exceed 2048 -> truncation
     response_format: json_object
@@ -155,7 +162,7 @@ tasks:
   question_parse:
     provider: anthropic
     model: claude-haiku-4-5
-    timeout: 30
+    timeout: 90
     temperature: 0.0
     max_tokens: 1024
     response_format: json_object
@@ -163,7 +170,7 @@ tasks:
   concept_expansion:
     provider: anthropic
     model: claude-haiku-4-5
-    timeout: 30
+    timeout: 90
     temperature: 0.0
     max_tokens: 1024
     response_format: json_object
@@ -171,7 +178,23 @@ tasks:
   query_decompose:
     provider: anthropic
     model: claude-haiku-4-5
-    timeout: 30
+    timeout: 90
+    temperature: 0.0
+    max_tokens: 1024
+    response_format: json_object
+
+  # Iterative-retrieval planner: decides whether a question needs a second,
+  # DEPENDENT round (e.g. "compare X to its competitors" must discover the
+  # competitor list before it can retrieve their attributes). Sized like its
+  # sibling query_decompose -- a short JSON object of two sub-questions.
+  #
+  # This task was called by retrieval.py but defined in NO preset, so every
+  # lookup raised KeyError, was swallowed by the caller's fail-safe, and
+  # two-round retrieval silently never ran. Keep it present in ALL presets.
+  retrieval_rounds_plan:
+    provider: anthropic
+    model: claude-haiku-4-5
+    timeout: 90
     temperature: 0.0
     max_tokens: 1024
     response_format: json_object
@@ -180,7 +203,7 @@ tasks:
   entity_probes:
     provider: anthropic
     model: claude-haiku-4-5
-    timeout: 30
+    timeout: 90
     temperature: 0.0
     max_tokens: 1024
     response_format: json_object
@@ -188,7 +211,7 @@ tasks:
   chunk_relevance_filter:
     provider: anthropic
     model: claude-haiku-4-5
-    timeout: 60
+    timeout: 300
     temperature: 0.0
     max_tokens: 4096
     response_format: json_object
@@ -196,35 +219,35 @@ tasks:
   answer_simple_qa:
     provider: anthropic
     model: claude-haiku-4-5
-    timeout: 60
+    timeout: 90
     temperature: 0.0
     max_tokens: 1024
 
   answer_deep_research:
     provider: anthropic
     model: claude-sonnet-4-6
-    timeout: 180
+    timeout: 600
     temperature: 0.1
     max_tokens: 8192          # 7-section deep_research answers over evidence-rich corpora exceed 4096
 
   follow_up_resolution:
     provider: anthropic
     model: claude-haiku-4-5
-    timeout: 30
+    timeout: 90
     temperature: 0.0
     max_tokens: 512
 
   answer_conversation_turn:
     provider: anthropic
     model: claude-haiku-4-5
-    timeout: 90
+    timeout: 150
     temperature: 0.1
     max_tokens: 2048
 
   insight_gen:
     provider: anthropic
     model: claude-sonnet-4-6
-    timeout: 120
+    timeout: 150
     temperature: 0.2
     max_tokens: 2048
     response_format: json_object
@@ -232,7 +255,7 @@ tasks:
   recommendation_gen:
     provider: anthropic
     model: claude-sonnet-4-6
-    timeout: 120
+    timeout: 150
     temperature: 0.2
     max_tokens: 2048
     response_format: json_object
@@ -242,21 +265,21 @@ tasks:
   artifact_merge:
     provider: anthropic
     model: claude-sonnet-4-6
-    timeout: 180
+    timeout: 600
     temperature: 0.2
     max_tokens: 8192
     response_format: json_object
   artifact_merge_evaluate:
     provider: anthropic
     model: claude-sonnet-4-6
-    timeout: 120
+    timeout: 300
     temperature: 0.0
     max_tokens: 4096
     response_format: json_object
   artifact_merge_revise:
     provider: anthropic
     model: claude-sonnet-4-6
-    timeout: 180
+    timeout: 600
     temperature: 0.2
     max_tokens: 8192
     response_format: json_object
@@ -268,28 +291,28 @@ tasks:
   summary_merge:
     provider: anthropic
     model: claude-sonnet-4-6
-    timeout: 180
+    timeout: 600
     temperature: 0.2
     max_tokens: 8192
     response_format: json_object
   summary_merge_evaluate:
     provider: anthropic
     model: claude-sonnet-4-6
-    timeout: 120
+    timeout: 300
     temperature: 0.0
     max_tokens: 4096
     response_format: json_object
   summary_merge_revise:
     provider: anthropic
     model: claude-sonnet-4-6
-    timeout: 180
+    timeout: 600
     temperature: 0.2
     max_tokens: 8192
     response_format: json_object
   judge_comprehensiveness:
     provider: anthropic
     model: claude-sonnet-4-6
-    timeout: 60
+    timeout: 90
     temperature: 0.0
     max_tokens: 1024
     response_format: json_object
@@ -297,7 +320,7 @@ tasks:
   judge_no_hallucination:
     provider: anthropic
     model: claude-sonnet-4-6
-    timeout: 60
+    timeout: 90
     temperature: 0.0
     max_tokens: 1024
     response_format: json_object
@@ -305,7 +328,7 @@ tasks:
   judge_gap_detection:
     provider: anthropic
     model: claude-sonnet-4-6
-    timeout: 60
+    timeout: 90
     temperature: 0.0
     max_tokens: 1024
     response_format: json_object
@@ -313,7 +336,7 @@ tasks:
   judge_consistency:
     provider: anthropic
     model: claude-sonnet-4-6
-    timeout: 60
+    timeout: 150
     temperature: 0.0
     max_tokens: 2048
     response_format: json_object
@@ -321,7 +344,7 @@ tasks:
   artifact_document_summary:
     provider: anthropic
     model: claude-sonnet-4-6      # parity: OpenAI preset uses gpt-4.1 (instruction-following tier)
-    timeout: 120
+    timeout: 300
     temperature: 0.2
     max_tokens: 4096
 
@@ -329,7 +352,7 @@ tasks:
   table_extract_vision:
     provider: anthropic          # Anthropic vision (base64 PNG) -- keeps --tables fully OpenAI-free
     model: claude-haiku-4-5
-    timeout: 120
+    timeout: 300
     temperature: 0.0
     max_tokens: 4096
     response_format: json_object
@@ -337,7 +360,7 @@ tasks:
   table_concept_grouping:
     provider: anthropic
     model: claude-haiku-4-5
-    timeout: 60
+    timeout: 150
     temperature: 0.0
     max_tokens: 2048
     response_format: json_object

@@ -1,0 +1,6 @@
+[insight-gen] 4 class cluster(s) to process (min_claims_per_class=10, concurrency=4)
+[insight-gen] LLM done: $0.0174, 4 cluster(s) succeeded
+[insight-gen] DONE: insights=12, insight_based_on_edges=216, derived_from_chunk_edges=57, artifact_sources=57, cost=$0.0174, wall=25.5s, graph_version -> 8
+[recommendation-gen] considering top 12 Insight(s); theme='Corpus-wide synthesis'
+[recommendation-gen] LLM done: $0.0042, 3 recommendation(s)
+[recommendation-gen] DONE: recommendations=3, based_on_edges=36, cost=$0.0042, wall=16.1s, graph_version -> 9

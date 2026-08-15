@@ -398,19 +398,34 @@ def class_identification_and_expansion(
     return system, user
 
 
-def match_dedup(merged_match_results: dict[str, Any]) -> tuple[str, str]:
+def match_dedup(
+    batch: dict[str, Any], existing_concepts: list[str] | None = None
+) -> tuple[str, str]:
     """Stage 3: after merging Stage-2 outputs from many chunks, collapse
     duplicate `MATCH NOT FOUND` proposals (same concept with slightly
     different labels), dedupe `MATCH NOT FOUND RELATIONS`, and drop
-    proposals that turn out to overlap with existing `MATCHES FOUND`."""
+    proposals that turn out to overlap with existing `MATCHES FOUND`.
+
+    Takes ONE BATCH of proposals, not the whole merged set: serializing
+    everything produced a 1,348,538-token prompt against gpt-4.1's
+    1,047,576-token limit at ~90-100 documents, and the resulting 400 left
+    the run emitting un-deduplicated results. `_dedup` in pipeline_llm
+    splits the set and merges the per-batch responses.
+
+    `MATCHES FOUND` is deliberately NOT sent. Rule 6 forbids modifying it, so
+    round-tripping it costs input and output tokens for no effect -- and its
+    TEXT_SNIPPET fields are the bulkiest part of the payload. Rule 1 only
+    needs to know WHICH concepts already exist, so the caller passes their
+    names in `existing_concepts` and re-attaches the untouched originals.
+    """
     system = (
         "You are deduplicating proposed ontology classes and relations. "
-        "You will receive a JSON object with three keys:\n"
-        "  - \"MATCHES FOUND\": matches against the existing ontology -- "
-        "DO NOT modify these.\n"
+        "You will receive a JSON object with these keys:\n"
+        "  - \"EXISTING_CONCEPTS\": names of classes that ALREADY exist in "
+        "the ontology. These are context only -- never output them.\n"
         "  - \"MATCH NOT FOUND\": proposed new classes (each carries LABEL, "
         "DESCRIPTION, and PARENT_LABEL) that may contain duplicates and "
-        "overlaps with MATCHES FOUND.\n"
+        "overlaps with EXISTING_CONCEPTS.\n"
         "  - \"MATCH NOT FOUND RELATIONS\": proposed new object-property "
         "relations (LABEL + DOMAIN + RANGE) that may contain duplicates.\n"
         "  - \"MATCH NOT FOUND INSTANCES\" (may be missing): proposed "
@@ -418,7 +433,8 @@ def match_dedup(merged_match_results: dict[str, Any]) -> tuple[str, str]:
         "DESCRIPTION).\n\n"
         "Your tasks:\n"
         "  1. From MATCH NOT FOUND, remove any entry whose concept already "
-        "exists in MATCHES FOUND (same idea, even if labeled differently).\n"
+        "exists in EXISTING_CONCEPTS (same idea, even if labeled "
+        "differently).\n"
         "  2. From MATCH NOT FOUND, collapse entries that propose the same "
         "concept under different labels into a single entry. Pick the "
         "clearest CANONICAL short label; merge DESCRIPTIONs concisely; "
@@ -441,7 +457,7 @@ def match_dedup(merged_match_results: dict[str, Any]) -> tuple[str, str]:
         "BMW + Honda + Hyundai are all car manufacturers; or "
         "Germany + France + Italy are all countries; or "
         "helium + neon + argon are all noble gases), AND that parent does "
-        "not already exist in MATCHES FOUND, you MAY:\n"
+        "not already exist in EXISTING_CONCEPTS, you MAY:\n"
         "       (a) add ONE new MATCH NOT FOUND entry for the parent "
         "(LABEL='CarManufacturer' or similar canonical name, DESCRIPTION "
         "explaining what kind of thing it is, PARENT_LABEL of its own); AND\n"
@@ -456,14 +472,21 @@ def match_dedup(merged_match_results: dict[str, Any]) -> tuple[str, str]:
         "specific TYPE_LABEL. Example collapses: 'Jan 2004' / 'Jan04' / "
         "'January 2004' all share CANONICAL_FORM='January 2004' -> one "
         "instance.\n"
-        "  6. Do NOT modify any MATCHES FOUND entries.\n"
+        "  6. NEVER output an EXISTING_CONCEPTS entry -- it is context only.\n"
         "  7. Do NOT add new entries for any reason other than rule 4.\n\n"
-        "Output strict JSON with all four keys present (use [] if empty), "
-        "no prose, no comments."
+        "Output strict JSON with exactly these three keys present (use [] if "
+        "empty): \"MATCH NOT FOUND\", \"MATCH NOT FOUND RELATIONS\", "
+        "\"MATCH NOT FOUND INSTANCES\". No prose, no comments."
     )
+    payload = {
+        "EXISTING_CONCEPTS": existing_concepts or [],
+        "MATCH NOT FOUND": batch.get("MATCH NOT FOUND", []),
+        "MATCH NOT FOUND RELATIONS": batch.get("MATCH NOT FOUND RELATIONS", []),
+        "MATCH NOT FOUND INSTANCES": batch.get("MATCH NOT FOUND INSTANCES", []),
+    }
     user = (
         "INPUT:\n"
-        + json.dumps(merged_match_results, ensure_ascii=False, default=str)
+        + json.dumps(payload, ensure_ascii=False, default=str)
         + "\n\nReturn the deduplicated JSON object."
     )
     return system, user

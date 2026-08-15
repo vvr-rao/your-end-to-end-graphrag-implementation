@@ -1055,6 +1055,44 @@ async def extract_tables_async(
     return TableExtractionResult(tables=payloads, manifest=manifest)
 
 
+def table_extraction_concurrency() -> int:
+    """How many PDFs to extract in parallel (concurrency.table_extraction).
+
+    Defaults to 1: each PDF runs in its own subprocess because the in-process
+    extractor accumulated heap fragmentation and OOMed partway through a corpus
+    on a ~2.7 GB host. Measured at ~152 MB RSS and ~340 s per 125-page PDF, so
+    18 PDFs serially is ~100 minutes -- worth raising on a roomier machine, but
+    only after checking free memory, since one pathological PDF (large page
+    rasters for the vision route) can cost several times the average.
+    """
+    from backend.app.core.config import get_settings
+
+    cfg = get_settings().app_config
+    return max(1, int((cfg.get("concurrency", {}) or {}).get("table_extraction", 1)))
+
+
+def _find_pdfs(folder: Path) -> list[Path]:
+    """Every PDF under `folder`, recursively and case-insensitively.
+
+    Must match how documents themselves are discovered -- ontology_io
+    .iter_documents walks with rglob and lowercases the suffix. These two
+    used `glob("*.pdf")`, so pointing --input at a corpus whose PDFs sit one
+    level down ingested every document while extracting tables from none of
+    them, and returned {} without a word. A paid, opt-in feature did nothing
+    and said nothing.
+    """
+    pdfs = sorted(
+        p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() == ".pdf"
+    )
+    if not pdfs:
+        print(
+            f"[tables] WARNING: no PDFs found under {folder} -- table "
+            f"extraction was requested but has nothing to do. Check the path.",
+            flush=True,
+        )
+    return pdfs
+
+
 async def extract_tables_for_paths_subprocess(
     pdf_paths: list[Path],
     *,
@@ -1111,7 +1149,7 @@ async def extract_tables_for_folder_subprocess(
 
     `concurrency=1` is the safe default; raise it on roomier hosts."""
     folder = Path(folder)
-    pdfs = sorted(folder.glob("*.pdf"))
+    pdfs = _find_pdfs(folder)
     if limit is not None:
         pdfs = pdfs[:limit]
     if not pdfs:
@@ -1143,7 +1181,7 @@ async def _drive_subprocess_workers(
     done = 0
     folder_started = time.monotonic()
     summary_stats = {"n_tables": 0, "cost_usd": 0.0, "n_cached": 0,
-                     "n_failed": 0}
+                     "n_failed": 0, "cost_saved_usd": 0.0}
     results: dict[str, dict[str, Any]] = {}
 
     cmd_base = [sys.executable, "-u", "-m",
@@ -1152,6 +1190,19 @@ async def _drive_subprocess_workers(
     async def _one(p: Path) -> tuple[str, dict[str, Any]]:
         nonlocal done
         async with sem:
+            # Sample cache presence BEFORE the worker runs. Afterwards the
+            # entry exists either way, so nothing downstream can tell whether
+            # this run paid for it.
+            was_cached = False
+            try:
+                from backend.app.services import table_cache  # local import
+                _, _pre_key = _hash_pdf_streaming(p)
+                was_cached = table_cache.two_tier_load(
+                    run_cache_dir, table_cache.user_cache_dir(), _pre_key,
+                ) is not None
+            except Exception:  # noqa: BLE001 -- accounting only, never fatal
+                was_cached = False
+
             cmd = list(cmd_base) + ["--pdf", str(p.resolve())]
             if run_cache_dir is not None:
                 cmd += ["--run-cache-dir", str(Path(run_cache_dir).resolve())]
@@ -1209,11 +1260,30 @@ async def _drive_subprocess_workers(
                     summary_stats["n_tables"] += int(
                         hit.manifest.get("n_tables", 0) or 0
                     )
-                    summary_stats["cost_usd"] += float(
-                        hit.manifest.get("cost_usd", 0.0) or 0.0
-                    )
-                    if hit.manifest.get("source") == "cache":
+                    cached_cost = float(hit.manifest.get("cost_usd", 0.0) or 0.0)
+                    # Cache-hit detection cannot read the manifest's own
+                    # "source": that field is written as "fresh" when the entry
+                    # is PERSISTED, and the "cache" value is only attached to
+                    # the in-memory return value (see the cold-path return
+                    # above). Reloading the file therefore always saw "fresh",
+                    # so n_cached was permanently 0 on this path -- an 18-PDF
+                    # re-run reported "0 cache-hits" while finishing in 66s
+                    # instead of 526s.
+                    #
+                    # `was_cached` is sampled BEFORE the worker is spawned,
+                    # which is the only observation that actually distinguishes
+                    # "the entry already existed" from "the worker just wrote
+                    # it".
+                    if was_cached:
                         summary_stats["n_cached"] += 1
+                        # Not spent THIS run. Adding it overstated the bill by
+                        # the full original extraction cost on every re-run --
+                        # two consecutive runs both reported $0.8145 when the
+                        # second paid nothing.
+                        summary_stats["cost_saved_usd"] += cached_cost
+                        manifest["source"] = "cache"
+                    else:
+                        summary_stats["cost_usd"] += cached_cost
             if rc != 0:
                 summary_stats["n_failed"] += 1
                 manifest.setdefault("source", "worker-failed")
@@ -1236,7 +1306,11 @@ async def _drive_subprocess_workers(
         f"({summary_stats['n_cached']} cache-hits, "
         f"{summary_stats['n_failed']} failed), "
         f"{time.monotonic() - folder_started:.0f}s, "
-        f"cost=${summary_stats['cost_usd']:.4f}",
+        f"cost=${summary_stats['cost_usd']:.4f}"
+        + (
+            f" (${summary_stats['cost_saved_usd']:.4f} saved by cache)"
+            if summary_stats.get("cost_saved_usd") else ""
+        ),
         flush=True,
     )
     return results
@@ -1256,7 +1330,7 @@ async def extract_tables_for_folder_async(
     Returns a mapping of doc-path-str -> TableExtractionResult. Used by
     the prune-expand integration to batch-process a corpus folder."""
     folder = Path(folder)
-    pdfs = sorted(folder.glob("*.pdf"))
+    pdfs = _find_pdfs(folder)
     if limit is not None:
         pdfs = pdfs[:limit]
     if not pdfs:

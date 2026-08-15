@@ -38,6 +38,81 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
   The choice is stored in the tracker as `fulltext=yes|no` on the
   `register-documents` step — check it (`build_state.py show`) and apply
   `--from-fulltext` consistently across all three downstream steps.
+- **Check rate-limit headroom and RECOMMEND raising concurrency. Do this before
+  every long paid step.** Run:
+  ```
+  uv run python scripts/tpm_check.py "<DOCS>"
+  ```
+  It reads the account's own rate-limit headers -- `x-ratelimit-limit-tokens`
+  (**TPM**) and `x-ratelimit-limit-requests` (**RPM**), plus remaining headroom
+  -- per model in `config/models.yaml`, and prints the current config next to a
+  suggested value per stage. Both limits bound the suggestion; a stage is capped
+  by whichever runs out first. Passing the corpus also sizes
+  `chunking.streaming_batch_size`. Costs ~nothing (one 10-token probe per model).
+
+  **Platform:** the rate-limit probe is a plain HTTPS call and behaves the same
+  on Linux, macOS and Windows. Only the *memory* half is OS-specific
+  (`/proc/meminfo`, `vm_stat`+`sysctl`, `GlobalMemoryStatusEx` -- all built in).
+  If it prints "skipping memory-based advice", it is memory detection that
+  failed, not the limits: keep the printed TPM/RPM numbers and get RAM from the
+  OS's own command (see **run-prune-expand** Step 2c for the per-OS table and
+  the macOS "Pages free" trap).
+
+  **Explain BOTH knobs, because batch size usually wins.** `streaming_batch_size`
+  (default 8) is how many DOCUMENTS are summarized at a time, and batches are a
+  hard barrier -- only the current batch's work exists. So
+  `effective concurrency = min(concurrency, windows in this batch)`, roughly
+  `batch_size x 2.5`. At batch 8 that caps you near 20 parallel calls, and a
+  concurrency above that is simply idle. Raising concurrency alone does nothing
+  until the batch size moves.
+
+  Keep 8 / 32 as the shipped defaults -- safe on small-RAM boxes and low tiers.
+  RECOMMEND changes, do not apply them unprompted.
+
+  **The tool also reads this machine's free memory** and suggests
+  `concurrency.table_extraction` (default 1, MEMORY-bound: one subprocess per
+  PDF, ~152 MB each). With `--tables` on a PDF-heavy corpus that serial
+  extraction is often the single biggest time cost -- 18 PDFs at 1 is ~100
+  minutes. Report free RAM, note if there is NO SWAP (an over-commit is then a
+  hard kill), and suggest closing other apps if under ~1.2 GB free.
+
+  Then **tell the user what you found and propose a number**, e.g.
+  > *"Your gpt-4.1-mini limit is 10M TPM and we're set to 32 — that's using well
+  > under 1% of it. I can raise it to 64-125 and cut the wall time roughly
+  > proportionally. **This won't reduce cost at all** — the same tokens get sent
+  > either way; it only makes the run finish sooner. Want me to?"*
+
+  **Present it as a CHOICE, not a number.** Give conservative / recommended /
+  aggressive options with what each buys AND costs, then ask which they want,
+  and make clear they can name their own value or keep the defaults. See
+  **run-prune-expand** Step 2c for the option table and the four effects to
+  state (speed-not-savings, ~2% more spend from cache dilution, 429 risk on the
+  gpt-4.1 stages, HARD KILL risk on `table_extraction`).
+
+  **If their TIER is what caps the number** -- not memory, not corpus size --
+  say so explicitly and point them at platform.openai.com → Settings → Limits
+  to request an increase. A constraint nobody names is one the user cannot act
+  on.
+
+  Be explicit every time that **concurrency buys SPEED, not savings.** Users
+  reasonably assume a tuning knob saves money; this one does not. If anything it
+  costs ~2% more, because a higher value slightly lowers the prompt-cache hit
+  rate (measured 69% → 49% going 4 → 32).
+
+- **The numbers.** Steps 2, 3 and 5 read
+  `concurrency.{summarization,entity_extraction,artifact_generation}` from
+  `config/config.yaml`; each also takes `--concurrency N` for a single run. Wall
+  time scales close to linearly: a 1.6M-token corpus took ~4 hours at 4 and is
+  ~25 minutes at 32. Measured utilisation at 32 was **~0.5% sustained** on a 10M
+  TPM tier, with **zero** burst pressure on the token bucket — so on tier 3+ the
+  limit is not the constraint, our setting is.
+  - `config.example.yaml` ships a conservative **8** for unknown tiers.
+  - **Lower to 4-8 on tier 1-2**, where several large concurrent calls throttle.
+  - Do NOT raise `expansion.max_concurrent_llm_calls` to match. It drives
+    `class_proposal` on gpt-4.1 at `max_tokens: 32768` against a ~2M TPM tier
+    (5× tighter); 4-8 is correct there.
+  - Each command prints its resolved value on startup
+    (`[extract-entities] concurrency = 32`) — quote it back when reporting.
 
 ## Step 1 — Load the ontology into the DB
 First get the prune-expand folder path (the helper prints it):

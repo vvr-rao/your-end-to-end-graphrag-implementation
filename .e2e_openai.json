@@ -1,0 +1,156 @@
+[
+  {
+    "name": "db-migrate",
+    "exit": 0,
+    "seconds": 8.5,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "db-status",
+    "exit": 0,
+    "seconds": 11.9,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "db-size",
+    "exit": 0,
+    "seconds": 4.6,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "summarize-descriptions",
+    "exit": 0,
+    "seconds": 53.9,
+    "cost_seen": 0.0249,
+    "err": ""
+  },
+  {
+    "name": "prune-expand",
+    "exit": 0,
+    "seconds": 1692.9,
+    "cost_seen": 1.44,
+    "err": ""
+  },
+  {
+    "name": "audit-classifications",
+    "exit": 0,
+    "seconds": 6.9,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "repair-output",
+    "exit": 0,
+    "seconds": 7.1,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "clear-corpus",
+    "exit": 0,
+    "seconds": 20.0,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "db-init(replace)",
+    "exit": 0,
+    "seconds": 96.6,
+    "cost_seen": 0.0002,
+    "err": ""
+  },
+  {
+    "name": "import-ontology",
+    "exit": 0,
+    "seconds": 19.3,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "register-documents",
+    "exit": 0,
+    "seconds": 45.7,
+    "cost_seen": 0.0672,
+    "err": ""
+  },
+  {
+    "name": "list-documents",
+    "exit": 0,
+    "seconds": 10.4,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "extract-entities",
+    "exit": 0,
+    "seconds": 55.1,
+    "cost_seen": 0.0113,
+    "err": ""
+  },
+  {
+    "name": "enrich-time",
+    "exit": 0,
+    "seconds": 44.5,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "generate-artifacts",
+    "exit": 0,
+    "seconds": 108.1,
+    "cost_seen": 0.0142,
+    "err": ""
+  },
+  {
+    "name": "query(simple_qa)",
+    "exit": 0,
+    "seconds": 42.3,
+    "cost_seen": 0.0016,
+    "err": ""
+  },
+  {
+    "name": "query(deep_research)",
+    "exit": 0,
+    "seconds": 77.6,
+    "cost_seen": 0.0458,
+    "err": ""
+  },
+  {
+    "name": "query(artifact_only)",
+    "exit": 0,
+    "seconds": 64.5,
+    "cost_seen": 0.0388,
+    "err": ""
+  },
+  {
+    "name": "conversation start",
+    "exit": 0,
+    "seconds": 0.0,
+    "cost_seen": 0.0,
+    "err": ""
+  },
+  {
+    "name": "conversation turn",
+    "exit": 1,
+    "seconds": 8.7,
+    "cost_seen": 0.0,
+    "err": "\n  File \"/home/veerlaramrao/your-personal-ontologist/backend/app/services/db_conversation.py\", line 156, in add_turn\n    raise ValueError(f\"conversation not found: {conversation_iri}\")\nValueError: conversation not found: https://veerla-ramrao.ai/ontology/conversations#Conversation_51e849638c354833\","
+  },
+  {
+    "name": "conversation show",
+    "exit": 1,
+    "seconds": 9.0,
+    "cost_seen": 0.0,
+    "err": "ome/veerlaramrao/your-personal-ontologist/backend/app/services/db_conversation.py\", line 357, in replay_conversation\n    raise ValueError(f\"conversation not found: {conversation_iri}\")\nValueError: conversation not found: https://veerla-ramrao.ai/ontology/conversations#Conversation_51e849638c354833\","
+  },
+  {
+    "name": "db-size(final)",
+    "exit": 0,
+    "seconds": 5.1,
+    "cost_seen": 0.0,
+    "err": ""
+  }
+]

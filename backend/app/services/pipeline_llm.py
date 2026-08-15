@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +51,9 @@ from backend.app.services.chunking import TextChunk, chunk_documents
 from backend.app.services.document_io import LoadedDocument
 from backend.app.services.llm_router import LLMRouter
 from backend.app.services.prompts import PROMPTS
+from backend.app.services.semantic_grouping import order_by_semantic_cluster
+from backend.app.services.stage_timing import StageTimer, format_duration
+from backend.app.services.token_budget import batch_by_token_budget, count_tokens
 from backend.app.services.suggestions import (
     load_suggested_classes,
     merge_suggestions_into_results,
@@ -823,21 +827,343 @@ def _filter_entity_shaped_classes(
 # ---------- Stage 3: dedup ----------
 
 
-async def _dedup(router: LLMRouter, merged_results: dict[str, Any]) -> dict[str, Any]:
-    """Stage 3: collapse duplicate MATCH NOT FOUND across chunks."""
-    if not merged_results.get("MATCH NOT FOUND"):
-        # Nothing to dedup; skip the LLM call.
-        return merged_results
-    system, user = PROMPTS["match_dedup"](merged_results)
-    try:
-        result = await router.chat("match_dedup", system=system, user=user)
-    except Exception as exc:
-        print(f"[stage3] dedup failed: {exc} — returning merged results unchanged")
-        return merged_results
-    cleaned = extract_json_from_output(result.text)
-    if not cleaned:
-        return merged_results
-    return cleaned
+_DEDUP_KEYS = (
+    "MATCH NOT FOUND",
+    "MATCH NOT FOUND RELATIONS",
+    "MATCH NOT FOUND INSTANCES",
+)
+
+# Share of the model's output budget one dedup batch may claim. Dedup echoes
+# its input back, so output size tracks input size and the OUTPUT cap -- not
+# the context window -- is the binding constraint. 0.6 leaves room for the
+# response being somewhat larger than the request (merged DESCRIPTIONs, an
+# added common parent from rule 4).
+_DEDUP_INPUT_SHARE = 0.6
+
+# Fallback only. dedup runs match_dedup on gpt-4.1 at max_tokens=32768 against
+# the ~2M TPM tier, so it wants the same careful value as Stage 2 -- but it is
+# a SEPARATE knob because a run can have many dedup batches and few Stage-2
+# chunks, or vice versa. Measured: 32 batches took ~15-18 min at 4.
+_DEDUP_CONCURRENCY = 4
+
+
+def resolve_expansion_concurrency(
+    app_cfg: dict[str, Any],
+    *,
+    classification: int | None = None,
+    proposal: int | None = None,
+    expansion: int | None = None,
+) -> tuple[int, int]:
+    """(stage1, stage2) concurrency. CLI flag > per-stage config > legacy > 8.
+
+    Stage 1 and Stage 2 must resolve INDEPENDENTLY: chunk_classification runs
+    gpt-4.1-mini on a ~10M TPM tier while class_proposal runs gpt-4.1 at
+    max_tokens=32768 on ~2M. One shared value pinned the cheap stage to the
+    expensive stage's safe limit.
+
+    `expansion` is the legacy single flag; it still applies to BOTH when no
+    per-stage value is given, so existing invocations are unchanged.
+    """
+    conc = app_cfg.get("concurrency", {}) or {}
+    legacy = int(
+        expansion
+        if expansion is not None
+        else (app_cfg.get("expansion", {}) or {}).get("max_concurrent_llm_calls", 8)
+    )
+    s1 = int(classification if classification is not None
+             else conc.get("chunk_classification", legacy))
+    s2 = int(proposal if proposal is not None
+             else conc.get("class_proposal", legacy))
+    return max(1, s1), max(1, s2)
+
+
+def _dedup_concurrency() -> int:
+    """concurrency.dedup, falling back to class_proposal then the legacy cap."""
+    from backend.app.core.config import get_settings
+
+    cfg = get_settings().app_config
+    c = cfg.get("concurrency", {}) or {}
+    return max(1, int(c.get(
+        "dedup",
+        c.get("class_proposal",
+              (cfg.get("expansion", {}) or {}).get("max_concurrent_llm_calls",
+                                                   _DEDUP_CONCURRENCY)),
+    )))
+
+
+class DedupFailedError(RuntimeError):
+    """Dedup could not complete, so the ontology must not be written.
+
+    This used to be a caught-and-printed warning that returned the input
+    unchanged. The run then "succeeded" while emitting proposals that had
+    never been deduplicated -- 757 classes became 4,942, 3,007 of them
+    orphans needing synthetic parents, and entity extraction downstream
+    reused only 48 of 4,422 minted entities because duplicate classes
+    crowded the fixed top-50 candidate list. A stopped run is far cheaper.
+    """
+
+
+def _existing_concept_names(matches_found: list[dict[str, Any]]) -> list[str]:
+    """Local names of already-matched classes, for dedup rule 1.
+
+    MATCHES FOUND entries carry {IRI, TEXT_SNIPPET}; the snippets are the
+    bulk of the payload and the model only needs to know which concepts
+    exist, so send local names alone.
+    """
+    names: list[str] = []
+    seen: set[str] = set()
+    for entry in matches_found or []:
+        iri = str(entry.get("IRI", "") or "")
+        local = iri.rsplit("#", 1)[-1].rsplit("/", 1)[-1].strip()
+        key = local.lower()
+        if local and key not in seen:
+            seen.add(key)
+            names.append(local)
+    return names
+
+
+def _dedup_merge_key(kind: str, entry: dict[str, Any]) -> str:
+    """Deterministic identity for cross-batch collapse.
+
+    Batching splits duplicate pairs across requests, so no single LLM call
+    sees both halves. This second, free pass catches the exact-match subset
+    of what the split hid.
+    """
+    def norm(v: Any) -> str:
+        return " ".join(str(v or "").split()).strip().lower()
+
+    if kind == "MATCH NOT FOUND RELATIONS":
+        # Same LABEL with different endpoints is a DIFFERENT relation.
+        return f"{norm(entry.get('LABEL'))}|{norm(entry.get('DOMAIN'))}|{norm(entry.get('RANGE'))}"
+    if kind == "MATCH NOT FOUND INSTANCES":
+        return norm(entry.get("CANONICAL_FORM") or entry.get("LABEL"))
+    return norm(entry.get("LABEL"))
+
+
+def _merge_dedup_batches(
+    per_batch: list[dict[str, Any]], existing: set[str]
+) -> dict[str, list[dict[str, Any]]]:
+    """Collapse per-batch results, first occurrence wins."""
+    out: dict[str, list[dict[str, Any]]] = {k: [] for k in _DEDUP_KEYS}
+    seen: dict[str, set[str]] = {k: set() for k in _DEDUP_KEYS}
+    for result in per_batch:
+        for key in _DEDUP_KEYS:
+            for entry in result.get(key) or []:
+                if not isinstance(entry, dict):
+                    continue
+                ident = _dedup_merge_key(key, entry)
+                if not ident or ident in seen[key]:
+                    continue
+                # Belt-and-braces on rule 6: never let an already-existing
+                # class re-enter as a "new" proposal.
+                if key == "MATCH NOT FOUND" and ident in existing:
+                    continue
+                seen[key].add(ident)
+                out[key].append(entry)
+    return out
+
+
+def _cluster_text(key: str, entry: dict[str, Any]) -> str:
+    """What to embed when deciding which items belong in the same batch.
+
+    Label carries most of the signal; the description disambiguates same-named
+    concepts from different domains. Relations are identified by their endpoints
+    as much as their verb, so those go in too.
+    """
+    label = str(entry.get("LABEL") or entry.get("CANONICAL_FORM") or "")
+    desc = " ".join(str(entry.get("DESCRIPTION") or "").split()[:25])
+    if key == "MATCH NOT FOUND RELATIONS":
+        return f"{label} ({entry.get('DOMAIN')} -> {entry.get('RANGE')}): {desc}"
+    return f"{label}: {desc}"
+
+
+async def _plan_dedup_batches(
+    merged_results: dict[str, Any], existing_concepts: list[str], max_tokens: int
+) -> list[dict[str, Any]]:
+    """Split the proposal set into batches that fit `max_tokens` of output.
+
+    The three proposal lists are batched independently: they are deduplicated
+    against each other only within their own kind, so a batch never needs to
+    mix them.
+
+    Within a kind, items are first ordered by semantic cluster so that
+    near-duplicates land in the SAME request. Without this, batching quietly
+    reintroduces duplicates: the LLM can only collapse what one call sees, and
+    the deterministic post-merge catches exact string matches only -- so
+    'USA' and 'United States' in different batches both survive.
+    """
+    budget = max(1, int(max_tokens * _DEDUP_INPUT_SHARE))
+    # Rule 1 needs the existing-concept list in EVERY batch, so it is fixed
+    # overhead that has to come out of the per-batch budget.
+    overhead = count_tokens(json.dumps(existing_concepts, ensure_ascii=False))
+    per_batch_budget = max(1, budget - overhead)
+
+    batches: list[dict[str, Any]] = []
+    for key in _DEDUP_KEYS:
+        items = [e for e in (merged_results.get(key) or []) if isinstance(e, dict)]
+        if not items:
+            continue
+        groups = batch_by_token_budget(
+            await order_by_semantic_cluster(
+                items, render=lambda e, k=key: _cluster_text(k, e)
+            ),
+            render=lambda e: json.dumps(e, ensure_ascii=False, default=str),
+            max_tokens=per_batch_budget,
+        )
+        for group in groups:
+            batches.append({key: group})
+    return batches
+
+
+def _split_dedup_batch(batch: dict[str, Any]) -> list[dict[str, Any]]:
+    """Halve a dedup batch across all of its proposal lists.
+
+    `_plan_dedup_batches` emits one batch PER KEY, so in practice a batch holds
+    a single list and this just halves it. Every key is split at its midpoint
+    anyway, rather than moving whole lists between halves: if a multi-key batch
+    ever reaches here, sending one half nothing but relations would change what
+    the prompt is being asked to do, not just how much of it.
+
+    Returns [batch] unchanged when there is nothing left to split -- the caller
+    treats that as unrecoverable rather than looping.
+    """
+    total = sum(len(batch.get(k) or []) for k in _DEDUP_KEYS)
+    if total < 2:
+        return [batch]
+    left: dict[str, Any] = {}
+    right: dict[str, Any] = {}
+    for key in _DEDUP_KEYS:
+        items = list(batch.get(key) or [])
+        mid = len(items) // 2
+        left[key], right[key] = items[:mid], items[mid:]
+    for extra in batch:
+        if extra not in _DEDUP_KEYS:
+            left[extra] = right[extra] = batch[extra]
+    if not any(left.get(k) for k in _DEDUP_KEYS) or not any(
+        right.get(k) for k in _DEDUP_KEYS
+    ):
+        return [batch]
+    return [left, right]
+
+
+async def _dedup(
+    router: LLMRouter,
+    merged_results: dict[str, Any],
+    concurrency: int | None = None,
+) -> dict[str, Any]:
+    """Stage 3: collapse duplicate MATCH NOT FOUND across chunks.
+
+    Batched: the whole merged set in one request crossed gpt-4.1's context
+    limit at ~90-100 documents. Raises DedupFailedError if any batch fails,
+    rather than silently returning un-deduplicated input.
+    """
+    if not any(merged_results.get(k) for k in _DEDUP_KEYS):
+        return merged_results  # nothing to dedup; skip the LLM call
+
+    matches_found = merged_results.get("MATCHES FOUND", [])
+    existing_concepts = _existing_concept_names(matches_found)
+    max_tokens = int(router.task_spec("match_dedup").get("max_tokens", 4096))
+    batches = await _plan_dedup_batches(merged_results, existing_concepts, max_tokens)
+    n = len(batches)
+    if n > 1:
+        print(f"[stage3] dedup: {n} batches (output budget {max_tokens} tok/batch)")
+
+    cost_before = router.total_cost_usd
+    results: list[dict[str, Any]] = [None] * n  # type: ignore[list-item]
+    failures: list[str] = []
+    _dc = int(concurrency) if concurrency is not None else _dedup_concurrency()
+    if n > 1:
+        print(f"[stage3] dedup concurrency = {_dc}")
+    sem = asyncio.Semaphore(_dc)
+
+    async def _attempt(batch: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+        """One dedup request. Returns (parsed, reason) -- reason names WHY it
+        failed, so truncation and malformed output stay distinguishable."""
+        system, user = PROMPTS["match_dedup"](batch, existing_concepts)
+        try:
+            out = await router.chat("match_dedup", system=system, user=user)
+        except Exception as exc:
+            return None, f"{type(exc).__name__}: {exc}"
+        cleaned = extract_json_from_output(out.text)
+        if isinstance(cleaned, dict):
+            return cleaned, ""
+        if out.finish_reason == "length":
+            return None, (
+                f"reply truncated at max_tokens ({len(out.text)} chars); "
+                "batch output exceeded the model's cap"
+            )
+        return None, "response was not parseable JSON (finish_reason=%s)" % (
+            out.finish_reason or "unknown"
+        )
+
+    async def _one(i: int, batch: dict[str, Any]) -> None:
+        """Run one batch, recovering from a failure rather than dooming the run.
+
+        A single unparseable batch used to abort everything -- correct in that
+        it refused to emit an un-deduplicated ontology, but it discarded 31
+        good batches and a 65-minute, ~$25 run over one bad response.
+
+        Two recovery steps, matched to the two causes:
+          1. Retry once as-is. A transient malformed reply is just a reroll.
+          2. Split the batch in half and run both. If the reply was truncated
+             at max_tokens, halving the input halves the echo, which is the
+             only thing that actually fixes it.
+        Still raises if a half fails on its own -- that is a real problem.
+        """
+        async with sem:
+            parsed, reason = await _attempt(batch)
+            if parsed is not None:
+                results[i] = parsed
+                return
+
+            print(f"[stage3] batch {i + 1}/{n} failed ({reason}); retrying")
+            parsed, reason2 = await _attempt(batch)
+            if parsed is not None:
+                results[i] = parsed
+                return
+
+            halves = _split_dedup_batch(batch)
+            if len(halves) < 2:
+                failures.append(f"batch {i + 1}/{n}: {reason2} (too small to split)")
+                return
+
+            print(
+                f"[stage3] batch {i + 1}/{n} failed again ({reason2}); "
+                f"splitting into {len(halves)} and retrying"
+            )
+            recovered: list[dict[str, Any]] = []
+            for half in halves:
+                sub, sub_reason = await _attempt(half)
+                if sub is None:
+                    failures.append(f"batch {i + 1}/{n} (split half): {sub_reason}")
+                    return
+                recovered.append(sub)
+            # Fold the halves back into one batch-shaped result.
+            results[i] = _merge_dedup_batches(
+                recovered, {c.lower() for c in existing_concepts}
+            )
+            print(f"[stage3] batch {i + 1}/{n} recovered after split")
+
+    await asyncio.gather(*[_one(i, b) for i, b in enumerate(batches)])
+
+    if failures:
+        raise DedupFailedError(
+            f"{len(failures)}/{n} dedup batch(es) failed; refusing to emit an "
+            f"un-deduplicated ontology. Failures: " + "; ".join(failures[:5])
+        )
+
+    merged = _merge_dedup_batches(
+        [r for r in results if r], {c.lower() for c in existing_concepts}
+    )
+    merged["MATCHES FOUND"] = matches_found  # never sent, never modified
+    spent = router.total_cost_usd - cost_before
+    before = sum(len(merged_results.get(k) or []) for k in _DEDUP_KEYS)
+    after = sum(len(merged[k]) for k in _DEDUP_KEYS)
+    print(
+        f"[stage3] dedup DONE: {before} -> {after} proposals "
+        f"({n} batch(es), ${spent:.4f})"
+    )
+    return merged
 
 
 # ---------- Layer G: top-level concept grouping (one LLM call) ----------
@@ -2206,12 +2532,21 @@ async def _run_llm_stages(
     suggested_new_classes: list[dict[str, Any]] | None = None,
     extra_stage2_results: list[dict[str, Any]] | None = None,
     single_pass_summaries: bool = False,
+    # CLI overrides (prune-expand/build --summarization-concurrency /
+    # --expansion-concurrency). None => fall back to config.
+    summarization_concurrency: int | None = None,
+    expansion_concurrency: int | None = None,
+    classification_concurrency: int | None = None,
+    proposal_concurrency: int | None = None,
+    dedup_concurrency: int | None = None,
+    timer: StageTimer | None = None,
 ) -> dict[str, Any]:
     """Stages 1-3. Returns the merged + deduplicated match-results dict.
 
     If the projected cost exceeds max_cost_usd, raises RuntimeError before
     any expensive calls.
     """
+    timer = timer if timer is not None else StageTimer()
     branches = _top_level_branches(loaded_ontology)
     print(f"[llm] top-level branches surfaced: {len(branches)}")
 
@@ -2230,7 +2565,31 @@ async def _run_llm_stages(
     max_doc_input_tokens = int(chunking_cfg.get("max_doc_input_tokens", 4_000))
     oversize_sub_chunk = int(chunking_cfg.get("oversize_doc_sub_chunk_tokens", 4_000))
     streaming_batch_size = int(chunking_cfg.get("streaming_batch_size", 16))
-    _concurrency = int(expansion_cfg_for_concur.get("max_concurrent_llm_calls", 4))
+    _concurrency = int(
+        expansion_concurrency
+        if expansion_concurrency is not None
+        else expansion_cfg_for_concur.get("max_concurrent_llm_calls", 4)
+    )
+    # Summarization gets its OWN concurrency, independent of Stage 1/2.
+    #
+    # They run on different models with very different rate limits, so one
+    # number cannot suit both: class_proposal is gpt-4.1 at max_tokens=32768
+    # (a ~2M TPM tier), while the summarizer is gpt-4.1-mini (~10M TPM) making
+    # far smaller calls. Tying them together forced the summarizer down to
+    # Stage 2's safe value, and a 139-window corpus then took ~4 hours at under
+    # 1% of the account's throughput allowance.
+    #
+    # Defaults to max_concurrent_llm_calls when unset, so existing configs
+    # behave exactly as before.
+    _summ_concurrency = int(
+        summarization_concurrency
+        if summarization_concurrency is not None
+        else (app_cfg.get("concurrency", {}) or {}).get(
+            "summarization",
+            (app_cfg.get("summarization", {}) or {}).get("concurrency", _concurrency),
+        )
+    )
+    print(f"[llm] concurrency: summarization={_summ_concurrency}")
 
     # Method: evaluated (near-lossless, new default) vs single_pass (legacy).
     # `single_pass_summaries=True` (CLI --single-pass-summaries) forces legacy.
@@ -2238,37 +2597,39 @@ async def _run_llm_stages(
     method = "single_pass" if single_pass_summaries else sum_cfg.get("method", "evaluated")
 
     if method == "evaluated":
-        chunks = await stream_evaluated_summarize_and_chunk_async(
-            documents_dir=documents_dir,
-            router=router,
-            threshold_tokens=threshold_tokens,
-            eval_rounds=int(sum_cfg.get("eval_rounds", 3)),
-            questions_per_chunk=int(sum_cfg.get("questions_per_chunk", 12)),
-            max_chunk_tokens=int(sum_cfg.get("max_chunk_tokens", 12_000)),
-            overlap_tokens=int(sum_cfg.get("overlap_tokens", 500)),
-            summary_chunk_max_tokens=int(sum_cfg.get("summary_chunk_max_tokens", 1_200)),
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            encoding_name=encoding,
-            use_cache=use_cache,
-            concurrency=_concurrency,
-            batch_size=streaming_batch_size,
-            max_cost_usd=max_cost_usd,
-        )
+        with timer.stage("summarize"):
+            chunks = await stream_evaluated_summarize_and_chunk_async(
+                documents_dir=documents_dir,
+                router=router,
+                threshold_tokens=threshold_tokens,
+                eval_rounds=int(sum_cfg.get("eval_rounds", 3)),
+                questions_per_chunk=int(sum_cfg.get("questions_per_chunk", 12)),
+                max_chunk_tokens=int(sum_cfg.get("max_chunk_tokens", 12_000)),
+                overlap_tokens=int(sum_cfg.get("overlap_tokens", 500)),
+                summary_chunk_max_tokens=int(sum_cfg.get("summary_chunk_max_tokens", 1_200)),
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                encoding_name=encoding,
+                use_cache=use_cache,
+                concurrency=_summ_concurrency,
+                batch_size=streaming_batch_size,
+                max_cost_usd=max_cost_usd,
+            )
     else:
-        chunks = await stream_summarize_and_chunk_async(
-            documents_dir=documents_dir,
-            router=router,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            encoding_name=encoding,
-            threshold_tokens=threshold_tokens,
-            max_doc_input_tokens=max_doc_input_tokens,
-            oversize_doc_sub_chunk_tokens=oversize_sub_chunk,
-            use_cache=use_cache,
-            concurrency=_concurrency,
-            batch_size=streaming_batch_size,
-        )
+        with timer.stage("summarize"):
+            chunks = await stream_summarize_and_chunk_async(
+                documents_dir=documents_dir,
+                router=router,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                encoding_name=encoding,
+                threshold_tokens=threshold_tokens,
+                max_doc_input_tokens=max_doc_input_tokens,
+                oversize_doc_sub_chunk_tokens=oversize_sub_chunk,
+                use_cache=use_cache,
+                concurrency=_summ_concurrency,
+                batch_size=streaming_batch_size,
+            )
     print(f"[llm] produced {len(chunks)} chunk(s)")
     if not chunks:
         raise RuntimeError("No chunks produced from documents (empty after chunking)")
@@ -2281,8 +2642,17 @@ async def _run_llm_stages(
         return {"MATCHES FOUND": [], "MATCH NOT FOUND": [], "MATCH NOT FOUND RELATIONS": []}
 
     expansion_cfg = app_cfg.get("expansion", {}) or {}
-    concurrency = int(expansion_cfg.get("max_concurrent_llm_calls", 8))
-    sem = asyncio.Semaphore(concurrency)
+    stage1_conc, stage2_conc = resolve_expansion_concurrency(
+        app_cfg,
+        classification=classification_concurrency,
+        proposal=proposal_concurrency,
+        expansion=expansion_concurrency,
+    )
+    concurrency = stage2_conc  # other stage-4 passes inherit the careful value
+    sem = asyncio.Semaphore(stage1_conc)          # Stage 1
+    sem2 = asyncio.Semaphore(stage2_conc)         # Stage 2
+    print(f"[llm] concurrency: stage1(classify)={stage1_conc} "
+          f"stage2(propose)={stage2_conc}")
 
     # Entity-shaped-class filter inputs: dynamic place set sourced from the
     # loaded ontology + optional user extensions from config.yaml.
@@ -2311,9 +2681,10 @@ async def _run_llm_stages(
     print(
         f"[stage1] classifying {len(chunks)} chunk(s) "
         f"({_s1_spec.get('provider', '?')}:{_s1_spec.get('model', '?')}, "
-        f"concurrency={concurrency})"
+        f"concurrency={stage1_conc})"
     )
-    stage1_results = await asyncio.gather(*[_classify_one(c) for c in chunks])
+    with timer.stage("stage1-classify"):
+        stage1_results = await asyncio.gather(*[_classify_one(c) for c in chunks])
 
     # Stage-2 progress heartbeat: class_proposal fires one LLM call per chunk
     # with no per-chunk output, so under rate limiting the run can look frozen
@@ -2325,7 +2696,7 @@ async def _run_llm_stages(
 
     async def _propose_one(idx: int, chunk: TextChunk, iris: list[str]) -> dict[str, Any] | None:
         nonlocal stage2_done, stage2_over_budget
-        async with sem:
+        async with sem2:
             # Cost short-circuit: once the cap is crossed, stop paying for
             # further Stage-2 calls (queued chunks return None). Bounds the
             # overshoot to ~concurrency in-flight calls instead of all of them.
@@ -2390,13 +2761,14 @@ async def _run_llm_stages(
         f"[stage2] proposing matches+new for {stage2_total} chunk(s) "
         f"({_s2_spec['provider']}:{_s2_spec['model']})"
     )
-    stage2_results: list[dict[str, Any] | None] = await asyncio.gather(
-        *[
-            _propose_one(i, c, iris)
-            for i, (c, iris) in enumerate(zip(chunks, stage1_results, strict=False))
-            if iris  # only fire Stage 2 if Stage 1 found relevant branches
-        ]
-    )
+    with timer.stage("stage2-propose"):
+        stage2_results: list[dict[str, Any] | None] = await asyncio.gather(
+            *[
+                _propose_one(i, c, iris)
+                for i, (c, iris) in enumerate(zip(chunks, stage1_results, strict=False))
+                if iris  # only fire Stage 2 if Stage 1 found relevant branches
+            ]
+        )
     valid = [r for r in stage2_results if r]
     print(
         f"[stage2] {len(valid)}/{len(chunks) - skipped_empty} chunks produced "
@@ -2427,7 +2799,8 @@ async def _run_llm_stages(
         f"{len(merged.get('MATCH NOT FOUND', []))} new class proposals, "
         f"{len(merged.get('MATCH NOT FOUND RELATIONS', []))} new relation proposals"
     )
-    deduped = await _dedup(router, merged)
+    with timer.stage("stage3-dedup"):
+        deduped = await _dedup(router, merged, dedup_concurrency)
     # Canonical-label coercion: replace free-text "Person" / "Organization"
     # / "Role" / "Post" PARENT_LABELs and TYPE_LABELs with the actual FOAF/
     # ORG class IRIs from the merge, and route predicate LABELs like
@@ -2507,6 +2880,12 @@ async def prune_and_expand_async(
     extract_tables: bool = False,
     table_vision: bool = True,
     single_pass_summaries: bool = False,
+    summarization_concurrency: int | None = None,
+    table_mining_concurrency: int | None = None,
+    expansion_concurrency: int | None = None,
+    classification_concurrency: int | None = None,
+    proposal_concurrency: int | None = None,
+    dedup_concurrency: int | None = None,
 ) -> Path:
     return await _run(
         "prune-expand",
@@ -2520,6 +2899,12 @@ async def prune_and_expand_async(
         extract_tables=extract_tables,
         table_vision=table_vision,
         single_pass_summaries=single_pass_summaries,
+        summarization_concurrency=summarization_concurrency,
+        table_mining_concurrency=table_mining_concurrency,
+        expansion_concurrency=expansion_concurrency,
+        classification_concurrency=classification_concurrency,
+        proposal_concurrency=proposal_concurrency,
+        dedup_concurrency=dedup_concurrency,
     )
 
 
@@ -2535,6 +2920,12 @@ async def build_async(
     extract_tables: bool = False,
     table_vision: bool = True,
     single_pass_summaries: bool = False,
+    summarization_concurrency: int | None = None,
+    table_mining_concurrency: int | None = None,
+    expansion_concurrency: int | None = None,
+    classification_concurrency: int | None = None,
+    proposal_concurrency: int | None = None,
+    dedup_concurrency: int | None = None,
 ) -> Path:
     # build = merge + prune-expand chained. Merge first (sync), then drive the
     # async LLM pipeline against the just-written version folder.
@@ -2553,6 +2944,12 @@ async def build_async(
         extract_tables=extract_tables,
         table_vision=table_vision,
         single_pass_summaries=single_pass_summaries,
+        summarization_concurrency=summarization_concurrency,
+        table_mining_concurrency=table_mining_concurrency,
+        expansion_concurrency=expansion_concurrency,
+        classification_concurrency=classification_concurrency,
+        proposal_concurrency=proposal_concurrency,
+        dedup_concurrency=dedup_concurrency,
     )
 
 
@@ -2569,6 +2966,12 @@ async def _run(
     extract_tables: bool = False,
     table_vision: bool = True,
     single_pass_summaries: bool = False,
+    summarization_concurrency: int | None = None,
+    table_mining_concurrency: int | None = None,
+    expansion_concurrency: int | None = None,
+    classification_concurrency: int | None = None,
+    proposal_concurrency: int | None = None,
+    dedup_concurrency: int | None = None,
 ) -> Path:
     settings = get_settings()
     app_cfg = settings.app_config
@@ -2591,6 +2994,9 @@ async def _run(
         print(f"[{operation}] loaded {len(suggested)} user-suggested class(es) from {suggestions_path}")
 
     router = LLMRouter(settings)
+    # One timer spans the whole run so the final table can attribute wall time
+    # across table extraction, the four LLM stages and the deterministic pass.
+    timer = StageTimer()
 
     # Pre-flight: surface unreadable documents BEFORE the first paid stage.
     # Text extraction can yield confident gibberish (subsetted /Type0 fonts with
@@ -2616,12 +3022,13 @@ async def _run(
             f"PDFs (vision={'ON' if table_vision else 'OFF'}, "
             f"isolation=subprocess)"
         )
-        manifests = await table_extract.extract_tables_for_folder_subprocess(
-            documents_dir,
-            run_cache_dir=tables_dir,
-            use_vision=table_vision,
-            concurrency=1,
-        )
+        with timer.stage("table-extract"):
+            manifests = await table_extract.extract_tables_for_folder_subprocess(
+                documents_dir,
+                run_cache_dir=tables_dir,
+                use_vision=table_vision,
+                concurrency=table_extract.table_extraction_concurrency(),
+            )
         total = sum(int(m.get("n_tables", 0) or 0) for m in manifests.values())
         cost = sum(float(m.get("cost_usd", 0.0) or 0.0) for m in manifests.values())
         n_cached = sum(1 for m in manifests.values() if m.get("source") == "cache")
@@ -2666,16 +3073,38 @@ async def _run(
         def _audit_table_mining(task: str, payload: dict[str, Any]) -> None:
             _append_audit(audit_path, -1, task, None, payload)
 
-        table_mining_stage2 = await table_ontology_mining.mine_table_concepts_async(
-            tables_dir=tables_dir,
-            loaded_ontology=loaded,
-            router=router,
-            cache_dir=tables_dir,
-            audit_callback=_audit_table_mining,
+        # Table mining runs only here (prune-expand --tables), and prune-expand
+        # has no --concurrency flag, so this is config-only.
+        _app_cfg = get_settings().app_config
+        _table_conc = int(
+            table_mining_concurrency
+            if table_mining_concurrency is not None
+            else (_app_cfg.get("concurrency", {}) or {}).get(
+                "table_mining",
+                (_app_cfg.get("expansion", {}) or {}).get("max_concurrent_llm_calls", 4),
+            )
         )
+        print(f"[table-mining] concurrency = {_table_conc}")
+        with timer.stage("table-mining"):
+            table_mining_stage2 = await table_ontology_mining.mine_table_concepts_async(
+                tables_dir=tables_dir,
+                loaded_ontology=loaded,
+                router=router,
+                cache_dir=tables_dir,
+                audit_callback=_audit_table_mining,
+                concurrency=_table_conc,
+            )
 
-    deduped = await _run_llm_stages(
-        loaded_ontology=loaded,
+    # Spend + timings must survive a failure. Everything below the LLM stages
+    # -- write_cost_report, _print_cost_summary, timer.print_report -- used to
+    # sit AFTER them with no guard, so an abort in stage 3 discarded the cost
+    # accounting for the entire run. A 65-minute, ~$25 run failed on one dedup
+    # batch and reported $0, leaving the spend to be reconstructed by hand from
+    # log fragments. The stage that fails is exactly the one whose cost you
+    # need.
+    try:
+        deduped = await _run_llm_stages(
+            loaded_ontology=loaded,
         documents_dir=documents_dir,
         router=router,
         max_hops=effective_hops,
@@ -2686,7 +3115,27 @@ async def _run(
         suggested_new_classes=suggested or None,
         extra_stage2_results=[table_mining_stage2] if table_mining_stage2 else None,
         single_pass_summaries=single_pass_summaries,
-    )
+        summarization_concurrency=summarization_concurrency,
+        expansion_concurrency=expansion_concurrency,
+        classification_concurrency=classification_concurrency,
+            proposal_concurrency=proposal_concurrency,
+            dedup_concurrency=dedup_concurrency,
+            timer=timer,
+        )
+    except BaseException:
+        # Report what was spent and where the time went, then re-raise
+        # unchanged -- this is instrumentation, not error handling.
+        print(f"\n[{operation}] FAILED -- partial accounting for this run:")
+        try:
+            versioning.write_cost_report(version_dir, router.cost_report())
+            _print_cost_summary(router)
+            timer.print_report()
+            (version_dir / "timings.json").write_text(
+                json.dumps(timer.as_dict(), indent=2), encoding="utf-8"
+            )
+        except Exception as report_exc:  # noqa: BLE001
+            print(f"[{operation}] (could not write failure report: {report_exc})")
+        raise
 
     # Inject user-suggested classes that the LLM didn't already propose. These
     # are ADDITIONAL classes the user wants in the ontology regardless of
@@ -2698,6 +3147,10 @@ async def _run(
         print(f"[{operation}] injected {added} user-suggested class(es) into MATCH NOT FOUND")
 
     # Stage 4: deterministic prune / extend depending on subcommand.
+    # Timed with an explicit start/record rather than a `with` block -- it spans
+    # ~100 lines across several optional layers (E/G/H), and wrapping it would
+    # re-indent all of them for no gain.
+    _stage4_started = time.monotonic()
     detected = extract_detected_iris(deduped)
     print(f"[stage4] detected {len(detected)} IRIs from MATCHES FOUND")
 
@@ -2781,6 +3234,9 @@ async def _run(
             )
             _append_audit(audit_path, -1, "classification_audit", None, audit_summary)
 
+    timer.record("stage4-apply", time.monotonic() - _stage4_started)
+    print(f"[stage4-apply] wall={format_duration(time.monotonic() - _stage4_started)}")
+
     counts_after = folder_io.count_entities(out_ontology)
     print(f"[{operation}] entity counts: before={counts_before}, after={counts_after}")
 
@@ -2814,6 +3270,15 @@ async def _run(
     # tens of dollars a run, that is the question worth answering.
     versioning.write_cost_report(version_dir, router.cost_report())
     _print_cost_summary(router)
+    # Wall time next to spend, because they rank differently: dedup is 22% of
+    # the bill but a sequential barrier, while table extraction is nearly free
+    # and was the long pole. Only the two together say which knob to turn.
+    timer.print_report()
+    # Also persisted, so a finished run can be compared against a later one
+    # without having kept its console output.
+    (version_dir / "timings.json").write_text(
+        json.dumps(timer.as_dict(), indent=2), encoding="utf-8"
+    )
     return version_dir
 
 

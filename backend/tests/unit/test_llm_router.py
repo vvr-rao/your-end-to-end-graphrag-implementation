@@ -29,6 +29,7 @@ class _StubProvider:
 @pytest.mark.asyncio
 async def test_router_dispatches_chunk_classification_to_groq() -> None:
     router = LLMRouter.__new__(LLMRouter)
+    router.reset_counters()
     router._settings = None  # type: ignore[assignment]
     router._providers = {"groq": _StubProvider(name="groq"), "openai": _StubProvider(name="openai")}
     router._tasks = {
@@ -41,13 +42,6 @@ async def test_router_dispatches_chunk_classification_to_groq() -> None:
         }
     }
     router._retry = {"max_attempts": 1, "initial_wait_seconds": 0, "max_wait_seconds": 0}
-    router._total_cost_usd = 0.0
-    router._cache_read_tokens = 0
-    router._cache_write_tokens = 0
-    router._input_full_tokens = 0
-    router._cost_by_task = {}
-    router._calls_by_task = {}
-
     result = await router.chat("chunk_classification", system="sys", user="usr")
     assert result.provider == "groq"
     assert result.model == "llama-3.3-70b-versatile"
@@ -59,6 +53,7 @@ async def test_router_dispatches_chunk_classification_to_groq() -> None:
 @pytest.mark.asyncio
 async def test_router_dispatches_class_proposal_to_openai() -> None:
     router = LLMRouter.__new__(LLMRouter)
+    router.reset_counters()
     router._settings = None  # type: ignore[assignment]
     router._providers = {"groq": _StubProvider(name="groq"), "openai": _StubProvider(name="openai")}
     router._tasks = {
@@ -72,13 +67,6 @@ async def test_router_dispatches_class_proposal_to_openai() -> None:
         }
     }
     router._retry = {"max_attempts": 1, "initial_wait_seconds": 0, "max_wait_seconds": 0}
-    router._total_cost_usd = 0.0
-    router._cache_read_tokens = 0
-    router._cache_write_tokens = 0
-    router._input_full_tokens = 0
-    router._cost_by_task = {}
-    router._calls_by_task = {}
-
     result = await router.chat("class_proposal", system="sys", user="usr")
     assert result.provider == "openai"
     assert router._providers["openai"].last_call["response_format"] == "json_object"
@@ -87,16 +75,11 @@ async def test_router_dispatches_class_proposal_to_openai() -> None:
 @pytest.mark.asyncio
 async def test_router_raises_on_unknown_task() -> None:
     router = LLMRouter.__new__(LLMRouter)
+    router.reset_counters()
     router._settings = None  # type: ignore[assignment]
     router._providers = {}
     router._tasks = {}
     router._retry = {}
-    router._total_cost_usd = 0.0
-    router._cache_read_tokens = 0
-    router._cache_write_tokens = 0
-    router._input_full_tokens = 0
-    router._cost_by_task = {}
-    router._calls_by_task = {}
     with pytest.raises(KeyError):
         await router.chat("nonexistent_task", system="", user="")
 
@@ -104,15 +87,10 @@ async def test_router_raises_on_unknown_task() -> None:
 @pytest.mark.asyncio
 async def test_router_raises_if_provider_not_configured() -> None:
     router = LLMRouter.__new__(LLMRouter)
+    router.reset_counters()
     router._settings = None  # type: ignore[assignment]
     router._providers = {"openai": _StubProvider(name="openai")}  # groq missing
     router._tasks = {"chunk_classification": {"provider": "groq", "model": "x", "max_tokens": 1, "timeout": 1, "temperature": 0}}
     router._retry = {"max_attempts": 1, "initial_wait_seconds": 0, "max_wait_seconds": 0}
-    router._total_cost_usd = 0.0
-    router._cache_read_tokens = 0
-    router._cache_write_tokens = 0
-    router._input_full_tokens = 0
-    router._cost_by_task = {}
-    router._calls_by_task = {}
     with pytest.raises(RuntimeError, match="not configured"):
         await router.chat("chunk_classification", system="", user="")

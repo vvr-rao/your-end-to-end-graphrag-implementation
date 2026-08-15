@@ -54,6 +54,20 @@ from backend.app.services.prompts import PROMPTS
 _ENTITIES_NS = "https://veerla-ramrao.ai/ontology/entities"
 
 
+# Warn (not raise) above this share of failed chunks: partial results are real
+# and worth keeping, but silent partial loss is how a corpus ends up with gaps
+# nobody notices until retrieval is thin.
+_FAILURE_WARN_PCT = 10.0
+
+
+class EntityExtractionFailedError(RuntimeError):
+    """Every chunk failed -- the step accomplished nothing.
+
+    Raised so a total provider outage cannot masquerade as "this corpus has no
+    entities". Extraction is idempotent, so the fix is to re-run.
+    """
+
+
 @dataclass
 class EntityExtractSummary:
     chunks_scanned: int = 0
@@ -450,6 +464,31 @@ async def extract_entities(
         f"[extract-entities] LLM done: ${summary.llm_cost_usd:.4f}, "
         f"{summary.chunks_scanned} success / {summary.chunks_failed} failed"
     )
+
+    # Fail loudly when nothing worked. Previously this returned normally after
+    # 0 successes, printing "DONE: entities (minted=0)" and exiting 0 -- making
+    # a total outage (expired key, exhausted credit, provider down)
+    # indistinguishable from "this corpus genuinely had no entities". Observed
+    # for real: 0 success / 31 failed, exit 0, empty entities table, no error.
+    # Only the NEXT stage's precondition guard revealed it.
+    attempted = summary.chunks_scanned + summary.chunks_failed
+    if attempted and summary.chunks_scanned == 0:
+        raise EntityExtractionFailedError(
+            f"all {summary.chunks_failed} chunk(s) failed entity extraction; "
+            f"refusing to report success with an empty entities table. "
+            f"Check provider credentials/credit and re-run -- the step is "
+            f"idempotent, so nothing is lost."
+        )
+    # A partial outage still writes real rows, so it must not abort -- but it
+    # must be impossible to miss in a long detached run's log.
+    if summary.chunks_failed and attempted:
+        pct = 100.0 * summary.chunks_failed / attempted
+        if pct >= _FAILURE_WARN_PCT:
+            print(
+                f"[extract-entities] WARNING: {summary.chunks_failed}/{attempted} "
+                f"chunk(s) failed ({pct:.0f}%) -- entities from those chunks are "
+                f"MISSING. Re-run after fixing the cause; extraction is idempotent."
+            )
 
     # Build the class_iri -> class_id map for everything we saw.
     all_class_iris: set[str] = set()

@@ -46,14 +46,29 @@ chunking:
   # the 128K context limit; raise if you want fewer sub-chunks per doc
   # (slightly more compression risk).
   oversize_doc_sub_chunk_tokens: 80000
-  # Number of documents loaded into memory per batch during the
-  # streaming summarize -> chunk pass. 8 keeps peak memory low on tight
-  # RAM budgets (~25 MB on a 2.7 GiB box); raise on machines with more
-  # RAM for slightly faster runs. The default was 16 historically but
-  # was lowered to 8 in Phase 2a after the financial-corpus run OOM'd
-  # mid-stream-loader (big PDF doc-texts in a 16-batch loaded ~150-300
-  # MB at once). Set to 0 to fall back to "load everything at once"
-  # (legacy behavior; will OOM on large corpora).
+  # Number of DOCUMENTS loaded + summarized per batch in the streaming
+  # summarize -> chunk pass.
+  #
+  # THIS SILENTLY CAPS CONCURRENCY. Batches are a hard barrier -- pipeline_llm
+  # awaits each one fully before loading the next -- so only the current
+  # batch's windows exist:
+  #
+  #     effective concurrency = min(concurrency.summarization,
+  #                                 windows in this batch)
+  #     windows per batch    ~= streaming_batch_size x ~2.5 windows/doc
+  #
+  # At 8 that is ~20 windows, so a concurrency.summarization above ~20 sits
+  # IDLE. Measured on a 30-doc corpus: 13 of 32 slots unused. Raising
+  # concurrency alone will not help until this moves.
+  #
+  # Memory cost is small (~50 MB at 16 docs), so 16-32 is usually right on a
+  # machine with >2 GB free. Kept at 8 by default: safe on a small-RAM box.
+  # Size it for YOUR corpus with:
+  #     uv run python scripts/tpm_check.py <documents-dir>
+  # Set to 0 to load everything at once (will OOM on a large corpus).
+  #
+  # Batches are sequential, so a batch also runs at the speed of its SLOWEST
+  # document -- one 60k-token doc holds up the other seven.
   streaming_batch_size: 8
   # tiktoken encoding name. o200k_base matches GPT-4o family + recent embedding models.
   encoding: o200k_base
@@ -72,6 +87,22 @@ summarization:
   # the summaries for free (keep chunking.summarization_threshold_tokens the same
   # for both -- it decides which docs get summarized; it is NOT in the cache key).
   method: evaluated
+  # Concurrent LLM calls for the summarizer, INDEPENDENT of
+  # expansion.max_concurrent_llm_calls (Stage 1/2 run on a different model with
+  # a different rate limit -- see pipeline_llm for why they must not share one
+  # number). Unset => falls back to max_concurrent_llm_calls.
+  #
+  # Sizing: a 1.6M-token corpus is ~139 windows (12k window - 500 overlap), each
+  # up to 9 sequential calls. Wall time ~= (139 / concurrency) * chain_time, so
+  # this value divides total runtime almost linearly until you hit a provider
+  # limit or local memory.
+  #
+  # Rate-limit check before raising: concurrency * (input+output tokens per call)
+  # * (60 / seconds_per_call) must stay under your model's TPM. At 32 concurrent
+  # with ~20k tokens per ~60s call that is ~640k TPM -- 6% of a 10M TPM tier.
+  # OpenAI tier 4 is 10M TPM for gpt-4.1-mini, so 32 is conservative there;
+  # LOWER it to 4-8 on tier 1-2, where 8 concurrent large calls already throttle.
+  concurrency: 8
   # Evaluator revise rounds per chunk (register-documents --eval-rounds overrides).
   # Higher = more fidelity + more cost (~6-9 LLM calls/chunk at 3).
   eval_rounds: 3
@@ -99,6 +130,75 @@ summarization:
 # -----------------------------------------------------------------------------
 # Embeddings — provider/model lives in models.yaml; these are runtime params.
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# LLM call concurrency, per pipeline stage.
+#
+# WHY PER-STAGE: stages run on different models with very different rate
+# limits, so a single number cannot serve them all. Summarization, entity
+# extraction and artifact generation run on mini-class models (~10M TPM on
+# OpenAI tier 4) making modest calls; expansion Stage 1/2 runs class_proposal
+# on gpt-4.1 at max_tokens=32768 against a ~2M TPM tier. Tying them together
+# pins the cheap stages to the expensive stage's safe value.
+#
+# IMPACT: wall time scales close to linearly with these until you hit a
+# provider limit. A 1.6M-token corpus at concurrency 4 spent ~4 hours using
+# under 1% of a tier-4 allowance; the same work at 32 is ~25 minutes.
+#
+# SIZING: concurrency x tokens_per_call x (60 / seconds_per_call) must stay
+# under the model's TPM. At 32 concurrent, ~20k tokens per ~60s call is
+# ~640k TPM -- 6% of a 10M tier. Cost is unchanged by concurrency (same token
+# volume), though a higher value slightly lowers the prompt-cache hit rate
+# (measured 69% -> 49% at 4 -> 32, about +2% spend).
+#
+# LOWER THESE on OpenAI tier 1-2, where 8 concurrent large calls already
+# throttle and time out. Each CLI also takes --concurrency to override per run.
+# -----------------------------------------------------------------------------
+concurrency:
+  # register-documents / prune-expand summarization. Also settable as
+  # summarization.concurrency (kept for back-compat; this wins if both set).
+  summarization: 8
+  # extract-entities
+  entity_extraction: 8
+  # generate-artifacts + regenerate-stale-artifacts
+  artifact_generation: 8
+  # Expansion Stage 1 -- chunk_classification (gpt-4.1-mini, ~10M TPM tier).
+  # SEPARATE from class_proposal on purpose: they ran on one semaphore, which
+  # pinned this cheap stage to the expensive one's safe value. Measured at 197
+  # chunks / ~8 min at 4, where ~1 min would do.
+  chunk_classification: 8
+  # Expansion Stage 2 -- class_proposal (gpt-4.1 @ max_tokens=32768, ~2M TPM).
+  # Measured at only 6.2% of that tier at concurrency 4, so 12-16 is likely
+  # safe -- but models.yaml warns that concurrent large gpt-4.1 calls throttle,
+  # so raise INCREMENTALLY and watch for 429s. This is 65% of prune-expand cost.
+  class_proposal: 4
+  # Stage 3 dedup batches (match_dedup, gpt-4.1 @ 32768). Its own knob because
+  # batch count scales with proposals, not chunks: a 30-doc run produced 32
+  # batches taking ~15-18 min at 4.
+  dedup: 4
+  # prune-expand --tables / register-documents --tables: how many PDFs are
+  # extracted CONCURRENTLY. Each PDF runs in its own subprocess
+  # (table_extract_worker) so the kernel reclaims its memory on exit -- the
+  # in-process extractor accumulated heap fragmentation and reliably OOMed
+  # partway through a corpus on a ~2.7 GB host.
+  #
+  # DEFAULT 1 IS DELIBERATE and should stay 1 on small-RAM machines.
+  #
+  # Sizing, from a measured run (125-page pharma label, vision ON):
+  #     one worker  ~152 MB RSS, ~340 s per PDF
+  #     18 PDFs at concurrency 1 = ~100 minutes, serial
+  # So: concurrency ~= (free_MB - 600 reserve) / 200
+  #     1855 MB free -> ~6; 2400 MB free -> ~9
+  # Check free memory FIRST (`free -m`), and prefer to under-shoot: a
+  # pathological PDF (large page rasters for the vision route) can cost several
+  # times the average, and an OOM kills the whole run with no swap on this box.
+  table_extraction: 1
+  # prune-expand --tables: one LLM call per extracted table
+  # (table_concept_grouping). Only runs during prune-expand, which has
+  # no --concurrency flag, so this is the ONLY way to set it.
+  table_mining: 8
+  # evaluate-queries (the QA eval harness)
+  evaluation: 4
+
 embeddings:
   # Number of texts to send per OpenAI batch call. 100 is a safe default.
   batch_size: 100

@@ -104,3 +104,9 @@ reference/
 
 # Per-user build-progress tracker (cross-session state; not repo content)
 .build/
+
+# Claude Code writes settings.local.json atomically; the temp files are not artifacts
+.claude/settings.local.json.tmp.*
+
+# ad-hoc scratch scripts at the repo root (real tools live in scripts/)
+/_*.py

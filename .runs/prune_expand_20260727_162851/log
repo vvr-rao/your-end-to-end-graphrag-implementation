@@ -1,0 +1,68 @@
+[prune-expand] loading prior version: output_ontologies/v20260727T140854Z-merge
+[prune-expand] table extraction: scanning source_documents/collection-of-pharma-docs-subset for PDFs (vision=ON, isolation=subprocess)
+[tables/worker] scanning 1 PDF(s) under source_documents/collection-of-pharma-docs-subset (concurrency=1, vision=ON, isolation=subprocess)
+[worker] result: n_tables=38 source=cache cost=$0.0000
+[tables/worker] folder progress: 1/1 done (3s, running totals: tables=38 cost=$0.0000 failures=0)
+[tables/worker] folder DONE: 38 tables across 1 PDF(s) (0 cache-hits, 0 failed), 3s, cost=$0.0000
+retry task=class_proposal provider=openai model=gpt-4.1 attempt=1/5 err=APITimeoutError: Request timed out. wait=1.0s
+[prune-expand] table extraction done: 38 tables across 1 PDF(s) (0 cache-hits, 0 failed), cost $0.0000
+[prune-expand] table extraction memory released; proceeding to LLM stages
+[table-mining] classifying 38 table(s) into 6 anchor bucket(s)
+[table-mining] done: 0 reused, 4 new proposed, 0 dropped (bad parent_iri), from 38 tables
+[llm] top-level branches surfaced: 124
+[stream-loader] evaluated summarization: streaming 4 doc(s) in batches of 8 (eval_rounds=3)
+[evaluated-summary] 001_OZEMPIC__oral_semaglutide__tablet_RYBELSUS__oral_semaglutide__tablet_27f15fac-7d98-4114-a2ec-92494a91da98.pdf: 30,424 tok -> 3 window(s), summarizing...
+[evaluated-summary] 004_Comparing_Injectable_Weight_Loss_Drugs.txt: 6,372 tok -> 1 window(s), summarizing...
+[evaluated-summary] 005_Prescription_Weight_Loss_Drugs__GLP-1s__Tirzepatide__and_More.txt: 10,354 tok -> 1 window(s), summarizing...
+[evaluated-summary] 009_Guide_to_FDA-Approved_Weight_Loss_Drugs_-_Verywell_Health.txt: 5,619 tok -> 1 window(s), summarizing...
+[evaluated-summary] 001_OZEMPIC__oral_semaglutide__tablet_RYBELSUS__oral_semaglutide__tablet_27f15fac-7d98-4114-a2ec-92494a91da98.pdf: window 1/3 done ($0.01 so far)
+[evaluated-summary] 001_OZEMPIC__oral_semaglutide__tablet_RYBELSUS__oral_semaglutide__tablet_27f15fac-7d98-4114-a2ec-92494a91da98.pdf: window 2/3 done ($0.08 so far)
+[evaluated-summary] 001_OZEMPIC__oral_semaglutide__tablet_RYBELSUS__oral_semaglutide__tablet_27f15fac-7d98-4114-a2ec-92494a91da98.pdf: window 3/3 done ($0.09 so far)
+[evaluated-summary] 004_Comparing_Injectable_Weight_Loss_Drugs.txt: window 1/1 done ($0.11 so far)
+[evaluated-summary] 005_Prescription_Weight_Loss_Drugs__GLP-1s__Tirzepatide__and_More.txt: window 1/1 done ($0.15 so far)
+[evaluated-summary] 009_Guide_to_FDA-Approved_Weight_Loss_Drugs_-_Verywell_Health.txt: window 1/1 done ($0.16 so far)
+[evaluated-summary] 4 doc(s): 4 summarized (eval_rounds=3), cost=$0.1625, prompt-cache-hit=54% (157,312/289,339 input tok), wall=337.9s
+[stream-loader] batch 1/1 done; chunks so far: 15
+[llm] produced 15 chunk(s)
+[stage2-filter] known_places=282 (from ontology + config), extra_suffixes=off, extra_tail_words=off
+[stage1] classifying 15 chunk(s) (openai:gpt-4.1-mini, concurrency=4)
+[stage2] proposing matches+new for 15 chunk(s) (openai:gpt-4.1)
+[stage2]   1/15 chunks proposed
+[stage2]   2/15 chunks proposed
+[stage2]   3/15 chunks proposed
+[stage2]   4/15 chunks proposed
+[stage2]   5/15 chunks proposed
+[stage2]   6/15 chunks proposed
+[stage2]   7/15 chunks proposed
+[stage2]   8/15 chunks proposed
+[stage2]   9/15 chunks proposed
+[stage2]   10/15 chunks proposed
+[stage2]   11/15 chunks proposed
+[stage2]   12/15 chunks proposed
+[stage2]   13/15 chunks proposed
+[stage2]   14/15 chunks proposed
+[stage2]   15/15 chunks proposed
+[stage2] 15/15 chunks produced a usable JSON response (Stage 1 surfaced no branches for 0 other chunks; those were skipped)
+[stage2] merged 1 extra Stage-2 result(s) from table mining
+[stage3] merging+dedup: 28 matches, 140 new class proposals, 170 new relation proposals
+[stage4] detected 28 IRIs from MATCHES FOUND
+[stage4] pruned to 502 kept classes (full IS-A hierarchy of detected + relationship partners) (342 forced by 3 protected prefix(es))
+[stage4] created 152 new classes from MATCH NOT FOUND, 292 new instances from MATCH NOT FOUND INSTANCES, 96 new relations from MATCH NOT FOUND RELATIONS, 0 relation(s) skipped (unresolved endpoints)
+[stage4-G] concept_grouping: 69 orphan class(es) to group
+[stage4-G] concept-grouping re-homed 66 class(es) under 5 new concept class(es)
+[stage4-H] classification_audit: 9 suspicious class(es) to review (out of 658 total)
+[stage4-H] processing 1 batch(es) of <= 50
+[stage4-H] DONE: 9 decisions applied (kept=1, rehomed=8, converted=0, noop=0), 1 LLM call(s), cost $0.0004
+[prune-expand] entity counts: before={'classes': 757, 'object_properties': 303, 'data_properties': 124, 'instances': 39}, after={'classes': 658, 'object_properties': 273, 'data_properties': 83, 'instances': 295}
+
+[cost] LLM total: $1.59 across 109 calls (prompt-cache hit 38%)
+[cost]   $   1.21    77%    15 call(s)  class_proposal (gpt-4.1)
+[cost]   $   0.14     9%     1 call(s)  match_dedup (gpt-4.1)
+[cost]   $   0.07     4%    10 call(s)  summary_revise (gpt-4.1-mini)
+[cost]   $   0.04     3%     6 call(s)  evaluated_summary_chunk (gpt-4.1-mini)
+[cost]   $   0.04     2%    16 call(s)  summary_evaluate (gpt-4.1-mini)
+[cost]   $   0.03     2%    15 call(s)  chunk_classification (gpt-4.1-mini)
+[cost]   $   0.03     2%     1 call(s)  concept_grouping (gpt-4.1)
+[cost]   $   0.02     1%     6 call(s)  summary_question_gen (gpt-4.1-mini)
+
+PRUNED+EXPANDED ontology written to: output_ontologies/v20260727T162855Z-prune-expand

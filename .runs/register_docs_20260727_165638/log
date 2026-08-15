@@ -1,0 +1,20 @@
+[ingest] 4 new doc(s); skipped 0 existing
+[ingest] evaluated summarization (eval_rounds=3, threshold=2000 tok, concurrency=4) ...
+[evaluated-summary] 4 doc(s): 4 summarized (eval_rounds=3), cost=$0.0000, prompt-cache-hit=0% (0/0 input tok), wall=0.1s
+[ingest] summarization done: $0.0000
+[ingest] 15 chunk(s) across 4 doc(s); embedding ...
+[ingest] embedding done: $0.0005
+[ingest] inserted 4 document row(s)
+[ingest] inserted 15 chunk row(s)
+[ingest] inserted 15 chunk-of edge(s)
+[ingest][fulltext] 82 full-text chunk(s) across 4 doc(s); embedding ...
+[ingest][fulltext] inserted 82 full-text chunk row(s)
+[ingest][fulltext] inserted 82 full-text chunk-of edge(s)
+[ingest][tables] 1 PDF(s) eligible (vision=ON, isolation=subprocess)
+[tables/worker] scanning 1 PDF(s) (concurrency=1, vision=ON, isolation=subprocess)
+[worker] result: n_tables=38 source=cache cost=$0.0000
+[tables/worker] folder progress: 1/1 done (3s, running totals: tables=38 cost=$0.0000 failures=0)
+[tables/worker] folder DONE: 38 tables across 1 PDF(s) (0 cache-hits, 0 failed), 3s, cost=$0.0000
+[ingest][tables] inserted 38 StructuredTable artifact(s) (extract cost $0.0000)
+[ingest][tables] inserted 76 table<->doc edge(s)
+[ingest] DONE: docs=4, chunks=97, edges=173, tables=38, cost=$0.0019, wall=50.2s, graph_version -> 2

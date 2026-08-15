@@ -17,7 +17,17 @@ router = APIRouter(tags=["browse"])
 
 # ----- documents -----
 
-@router.get("/documents/{iri:path}", operation_id="document_get")
+@router.get(
+    "/documents/{iri:path}",
+    operation_id="document_get",
+    summary="Get one document by IRI",
+    description=(
+        "Fetch a single ingested document: title, source path, status, version, "
+        "chunk count and ingestion metadata. `iri` is the FULL document IRI "
+        "including its '#' fragment, e.g. https://veerla-ramrao.ai/ontology/"
+        "intelligence-artifact#Document_ab12cd34. Use document_list to discover IRIs."
+    ),
+)
 async def get_document(iri: str) -> dict[str, Any]:
     async with session_scope() as session:
         r = await session.execute(
@@ -53,7 +63,16 @@ async def get_document(iri: str) -> dict[str, Any]:
     }
 
 
-@router.get("/documents", operation_id="document_list")
+@router.get(
+    "/documents",
+    operation_id="document_list",
+    summary="List ingested documents",
+    description=(
+        "List documents in the knowledge graph, newest first. Optionally filter "
+        "by status (ACTIVE, DELETED, SUPERSEDED). Start here to find document "
+        "IRIs to pass to document_get."
+    ),
+)
 async def list_documents(
     status_filter: str | None = Query(default=None, alias="status"),
     limit: int = Query(default=50, ge=1, le=500),
@@ -83,7 +102,17 @@ async def list_documents(
 
 # ----- entities -----
 
-@router.get("/entities/{iri:path}", operation_id="entity_get")
+@router.get(
+    "/entities/{iri:path}",
+    operation_id="entity_get",
+    summary="Get one entity by IRI",
+    description=(
+        "Fetch an extracted entity: its name, the ontology class it "
+        "instantiates, its graph relationships, and the chunks that mention "
+        "it. `iri` is the FULL entity IRI including its '#' fragment, e.g. "
+        "https://veerla-ramrao.ai/ontology/entities#glp-1-93a560ce34387e93."
+    ),
+)
 async def get_entity(iri: str) -> dict[str, Any]:
     async with session_scope() as session:
         r = await session.execute(
@@ -133,7 +162,16 @@ async def get_entity(iri: str) -> dict[str, Any]:
 
 # ----- classes -----
 
-@router.get("/classes/{iri:path}", operation_id="class_get")
+@router.get(
+    "/classes/{iri:path}",
+    operation_id="class_get",
+    summary="Get one ontology class by IRI",
+    description=(
+        "Fetch an ontology class: label, description, parent and child classes, "
+        "and the entities that instantiate it. `iri` is the FULL class IRI "
+        "including its '#' fragment."
+    ),
+)
 async def get_class(iri: str) -> dict[str, Any]:
     async with session_scope() as session:
         r = await session.execute(
@@ -185,7 +223,17 @@ async def get_class(iri: str) -> dict[str, Any]:
 
 # ----- artifacts -----
 
-@router.get("/artifacts/{iri:path}", operation_id="artifact_get")
+@router.get(
+    "/artifacts/{iri:path}",
+    operation_id="artifact_get",
+    summary="Get one intelligence artifact by IRI",
+    description=(
+        "Fetch a generated artifact -- Summary, Claim, Finding, Observation, "
+        "Insight, Recommendation or StructuredTable -- with its text and the "
+        "source chunks it was derived from, for traceability. `iri` is the FULL "
+        "artifact IRI including its '#' fragment."
+    ),
+)
 async def get_artifact(iri: str) -> dict[str, Any]:
     async with session_scope() as session:
         r = await session.execute(

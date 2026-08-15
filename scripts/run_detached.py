@@ -120,8 +120,19 @@ def _supervise(run_id: str, cmd: list[str]) -> int:
     code = 1
     try:
         with open(d / "log", "wb") as log:
+            # PYTHONUNBUFFERED: stdout here is a FILE, not a tty, so CPython
+            # block-buffers print() in ~4-8 KB chunks. In a detached run that
+            # means a stage can emit progress for many minutes and the log stays
+            # empty -- observed live: summarization ran for 11 minutes with zero
+            # [evaluated-summary] lines while logging-based warnings (stderr,
+            # unbuffered) streamed normally. "Silent" then looks identical to
+            # "hung", which is what makes people kill healthy runs.
+            #
+            # Set on the environment rather than adding `-u` to the argv so it
+            # applies to any python entrypoint, however the caller spelled it.
+            env = {**os.environ, "PYTHONUNBUFFERED": "1"}
             proc = subprocess.Popen(
-                cmd, cwd=str(ROOT),
+                cmd, cwd=str(ROOT), env=env,
                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
             )
             code = proc.wait()

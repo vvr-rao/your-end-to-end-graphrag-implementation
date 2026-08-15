@@ -37,6 +37,40 @@ class _BenignAsyncTeardownFilter(logging.Filter):
         return True
 
 
+def _resolve_concurrency(args: argparse.Namespace, stage: str) -> int:
+    """Concurrency for one pipeline stage: CLI flag > config > legacy > 4.
+
+    Stages run on different models with different rate limits, so each gets its
+    own key under `concurrency:` in config.yaml. Resolution order:
+
+      1. --concurrency on the command line (explicit wins, always)
+      2. concurrency.<stage> in config.yaml
+      3. the legacy per-section key, so pre-existing configs keep working
+         (summarization.concurrency, then expansion.max_concurrent_llm_calls)
+      4. 4 -- the old hardcoded default
+
+    Wall time scales close to linearly with this, and every stage but
+    summarization was previously pinned to 4 by argparse regardless of config.
+    """
+    from backend.app.core.config import get_settings
+
+    explicit = getattr(args, "concurrency", None)
+    if explicit is not None:
+        return int(explicit)
+
+    cfg = get_settings().app_config
+    stage_cfg = (cfg.get("concurrency", {}) or {})
+    if stage in stage_cfg:
+        return int(stage_cfg[stage])
+
+    # Legacy fallbacks: summarization had its own key before `concurrency:`.
+    if stage == "summarization":
+        legacy = (cfg.get("summarization", {}) or {}).get("concurrency")
+        if legacy is not None:
+            return int(legacy)
+    return int((cfg.get("expansion", {}) or {}).get("max_concurrent_llm_calls", 4))
+
+
 def _silence_benign_asyncio_teardown() -> None:
     """Install the filter on the asyncio logger (idempotent)."""
     lg = logging.getLogger("asyncio")
@@ -217,6 +251,65 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use the legacy one-shot document summarizer instead of the default "
              "evaluated summarizer (see prune-expand --single-pass-summaries).",
     )
+    for _p in (p_pe, p_build):
+        _p.add_argument(
+            "--summarization-concurrency", type=int, default=None, metavar="N",
+            help=(
+                "Concurrent LLM calls for the evaluated summarizer (mini-class "
+                "model, ~10M TPM on OpenAI tier 4). Dominates wall time: a "
+                "1.6M-token corpus is ~4h at 4 and ~25min at 32, at the same "
+                "cost. Unset => concurrency.summarization in config.yaml. "
+                "Use 32-64 on tier 3+, 4-8 on tier 1-2."
+            ),
+        )
+        _p.add_argument(
+            "--table-mining-concurrency", type=int, default=None, metavar="N",
+            help=(
+                "Concurrent LLM calls for table->ontology mining (one call per "
+                "extracted table; --tables only). Same model class as "
+                "summarization. Unset => concurrency.table_mining in config.yaml."
+            ),
+        )
+        _p.add_argument(
+            "--expansion-concurrency", type=int, default=None, metavar="N",
+            help=(
+                "Concurrent LLM calls for Stage 1/2 (chunk_classification, "
+                "class_proposal). SEPARATE ON PURPOSE: class_proposal runs on "
+                "gpt-4.1 at max_tokens=32768 against a ~2M TPM tier, where 32 "
+                "concurrent would be ~1.3M TPM. Keep this at 4-8 even when the "
+                "others are high. Unset => expansion.max_concurrent_llm_calls."
+            ),
+        )
+
+        _p.add_argument(
+            "--classification-concurrency", type=int, default=None, metavar="N",
+            help=(
+                "Concurrent Stage-1 calls (chunk_classification, gpt-4.1-mini "
+                "on a ~10M TPM tier). SEPARATE from Stage 2 on purpose: sharing "
+                "one value pinned this cheap stage to the expensive one's safe "
+                "limit. Unset => concurrency.chunk_classification."
+            ),
+        )
+        _p.add_argument(
+            "--proposal-concurrency", type=int, default=None, metavar="N",
+            help=(
+                "Concurrent Stage-2 calls (class_proposal, gpt-4.1 at "
+                "max_tokens=32768 on a ~2M TPM tier). Measured at only 6%% of "
+                "that tier at 4, so 12-16 is usually safe -- raise it "
+                "incrementally and watch for 429s. Unset => "
+                "concurrency.class_proposal."
+            ),
+        )
+        _p.add_argument(
+            "--dedup-concurrency", type=int, default=None, metavar="N",
+            help=(
+                "Concurrent stage-3 dedup batches (match_dedup, gpt-4.1 at "
+                "max_tokens=32768). A large corpus produces many batches -- 32 "
+                "on a 30-doc run -- so this is its own knob. Unset => "
+                "concurrency.dedup."
+            ),
+        )
+
     p_build.set_defaults(func=_cmd_build)
 
     p_sd = sub.add_parser(
@@ -450,8 +543,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Token overlap between adjacent chunks.",
     )
     p_reg.add_argument(
-        "--concurrency", type=int, default=4,
-        help="Concurrent LLM calls for summarization.",
+        "--concurrency", type=int, default=None,
+        help=(
+            "Concurrent LLM calls for summarization. Defaults to "
+            "summarization.concurrency in config.yaml (which itself falls back "
+            "to expansion.max_concurrent_llm_calls). Wall time scales close to "
+            "linearly with this until you hit the model's TPM limit."
+        ),
     )
     p_reg.add_argument(
         "--tables", action="store_true",
@@ -595,8 +693,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="How many candidate ontology classes to give the LLM per chunk.",
     )
     p_ext.add_argument(
-        "--concurrency", type=int, default=4,
-        help="Concurrent LLM calls.",
+        "--concurrency", type=int, default=None,
+        help="Concurrent LLM calls. Unset => concurrency.entity_extraction in config.yaml. Wall time scales ~linearly with this; raise it on OpenAI tier 3+ (cost is unchanged), lower it on tier 1-2 where large concurrent calls throttle.",
     )
     p_ext.add_argument(
         "--max-cost-usd", type=float, default=5.0,
@@ -656,7 +754,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Cap chunks/docs processed.",
     )
     p_art.add_argument(
-        "--concurrency", type=int, default=4,
+        "--concurrency", type=int, default=None,
         help="Concurrent LLM calls.",
     )
     p_art.add_argument(
@@ -745,7 +843,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-cost-usd", type=float, default=10.0,
         help="Cost cap passed to the scoped regeneration.",
     )
-    p_regen.add_argument("--concurrency", type=int, default=4)
+    p_regen.add_argument("--concurrency", type=int, default=None,
+                         help="Concurrent LLM calls. Unset => concurrency.artifact_generation in config.yaml. Wall time scales ~linearly with this; raise it on OpenAI tier 3+ (cost is unchanged), lower it on tier 1-2 where large concurrent calls throttle.")
     p_regen.add_argument(
         "--no-retire", dest="retire", action="store_false", default=True,
         help="Regenerate but keep the STALE rows instead of retiring them (status -> DELETED).",
@@ -850,7 +949,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Whole-run cost cap; aborts mid-run.")
     p_ev.add_argument("--query-max-cost-usd", type=float, default=0.20,
                       help="Per-query cost cap inside the eval loop.")
-    p_ev.add_argument("--concurrency", type=int, default=4)
+    p_ev.add_argument("--concurrency", type=int, default=None,
+                      help="Concurrent LLM calls. Unset => concurrency.evaluation in config.yaml. Wall time scales ~linearly with this; raise it on OpenAI tier 3+ (cost is unchanged), lower it on tier 1-2 where large concurrent calls throttle.")
     p_ev.add_argument("--verbose", action="store_true")
     p_ev.set_defaults(func=_cmd_evaluate_queries)
 
@@ -1092,6 +1192,12 @@ def _cmd_prune_expand(args: argparse.Namespace) -> int:
             extract_tables=getattr(args, "tables", False),
             table_vision=getattr(args, "table_vision", True),
             single_pass_summaries=getattr(args, "single_pass_summaries", False),
+            summarization_concurrency=getattr(args, "summarization_concurrency", None),
+            table_mining_concurrency=getattr(args, "table_mining_concurrency", None),
+            expansion_concurrency=getattr(args, "expansion_concurrency", None),
+            classification_concurrency=getattr(args, "classification_concurrency", None),
+            proposal_concurrency=getattr(args, "proposal_concurrency", None),
+            dedup_concurrency=getattr(args, "dedup_concurrency", None),
         )
     )
     print(f"\nPRUNED+EXPANDED ontology written to: {version_dir}")
@@ -1113,6 +1219,12 @@ def _cmd_build(args: argparse.Namespace) -> int:
             extract_tables=getattr(args, "tables", False),
             table_vision=getattr(args, "table_vision", True),
             single_pass_summaries=getattr(args, "single_pass_summaries", False),
+            summarization_concurrency=getattr(args, "summarization_concurrency", None),
+            table_mining_concurrency=getattr(args, "table_mining_concurrency", None),
+            expansion_concurrency=getattr(args, "expansion_concurrency", None),
+            classification_concurrency=getattr(args, "classification_concurrency", None),
+            proposal_concurrency=getattr(args, "proposal_concurrency", None),
+            dedup_concurrency=getattr(args, "dedup_concurrency", None),
         )
     )
     print(f"\nBUILT ontology written to: {version_dir}")
@@ -1255,11 +1367,15 @@ def _cmd_db_init(args: argparse.Namespace) -> int:
             reset_engine_cache()
         except RuntimeError as exc:
             print(f"\n[db-init] WIPE REFUSED: {exc}")
-            print("[db-init] Either delete the dependent rows first, "
-                  "or use --mode upsert.")
+            print("[db-init] Either clear the corpus first, or use --mode upsert.")
             return 1
         print()
     else:
+        # `--mode replace` without `--input` used to fall through here and do
+        # nothing at all -- no wipe, no import, no warning. Say so.
+        if args.input is None and args.mode == "replace" and not args.dry_run:
+            print("[db-init] --mode replace requires --input (the wipe only runs "
+                  "as part of an import); nothing was wiped.")
         if args.input is not None and not args.dry_run:
             print("=" * 64)
             print("DB-INIT: step 2/4 -- mode=upsert, no wipe needed")
@@ -1311,6 +1427,9 @@ def _cmd_clear_corpus(args: argparse.Namespace) -> int:
 def _cmd_register_documents(args: argparse.Namespace) -> int:
     from backend.app.services.db_document_ingest import ingest_documents_folder
 
+    concurrency = _resolve_concurrency(args, "summarization")
+    print(f"[register-documents] summarization concurrency = {concurrency}")
+
     asyncio.run(
         ingest_documents_folder(
             folder=args.input,
@@ -1319,7 +1438,7 @@ def _cmd_register_documents(args: argparse.Namespace) -> int:
             summarization_threshold=args.summarization_threshold,
             chunk_size=args.chunk_size,
             chunk_overlap=args.chunk_overlap,
-            concurrency=args.concurrency,
+            concurrency=concurrency,
             extract_tables=getattr(args, "tables", False),
             table_vision=getattr(args, "table_vision", True),
             full_text_chunks=getattr(args, "full_text_chunks", False),
@@ -1379,6 +1498,8 @@ def _cmd_enrich_time(args: argparse.Namespace) -> int:
 
 
 def _cmd_extract_entities(args: argparse.Namespace) -> int:
+    _conc = _resolve_concurrency(args, "entity_extraction")
+    print(f"[extract-entities] concurrency = {_conc}")
     from backend.app.services.db_entity_extract import extract_entities
 
     asyncio.run(
@@ -1386,7 +1507,7 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
             scope_document_iri=args.scope_iri,
             limit=args.limit,
             candidate_classes_per_chunk=args.candidate_classes,
-            concurrency=args.concurrency,
+            concurrency=_conc,
             max_cost_usd=args.max_cost_usd,
             chunk_kind="fulltext" if getattr(args, "from_fulltext", False) else "summary",
         )
@@ -1395,6 +1516,8 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
 
 
 def _cmd_generate_artifacts(args: argparse.Namespace) -> int:
+    _conc = _resolve_concurrency(args, "artifact_generation")
+    print(f"[generate-artifacts] concurrency = {_conc}")
     from backend.app.db.engine import reset_engine_cache
     from backend.app.services.db_artifact_gen import (
         generate_document_summaries,
@@ -1419,7 +1542,7 @@ def _cmd_generate_artifacts(args: argparse.Namespace) -> int:
                 scope_document_iri=args.scope_iri,
                 limit=args.limit,
                 types=per_chunk,
-                concurrency=args.concurrency,
+                concurrency=_conc,
                 max_cost_usd=args.max_cost_usd,
                 use_entities=use_entities,
                 chunk_kind="fulltext" if getattr(args, "from_fulltext", False) else "summary",
@@ -1434,7 +1557,7 @@ def _cmd_generate_artifacts(args: argparse.Namespace) -> int:
             generate_document_summaries(
                 scope_document_iri=args.scope_iri,
                 limit=args.limit,
-                concurrency=args.concurrency,
+                concurrency=_conc,
                 max_cost_usd=args.max_cost_usd,
             )
         )
@@ -1446,7 +1569,7 @@ def _cmd_generate_artifacts(args: argparse.Namespace) -> int:
             generate_insights(
                 min_claims_per_class=args.min_claims_per_class,
                 limit=args.limit,
-                concurrency=args.concurrency,
+                concurrency=_conc,
                 max_cost_usd=args.max_cost_usd,
             )
         )
@@ -1485,7 +1608,7 @@ def _cmd_generate_artifacts(args: argparse.Namespace) -> int:
                 threshold=args.rollup_threshold,
                 min_cluster=args.rollup_min_cluster,
                 max_neighbors=args.rollup_max_neighbors,
-                concurrency=args.concurrency,
+                concurrency=_conc,
                 max_cost_usd=args.max_cost_usd,
                 scope_document_iri=args.scope_iri,
                 eval_rounds=_eval_rounds,
@@ -1497,13 +1620,15 @@ def _cmd_generate_artifacts(args: argparse.Namespace) -> int:
 
 
 def _cmd_regenerate_stale_artifacts(args: argparse.Namespace) -> int:
+    _conc = _resolve_concurrency(args, "artifact_generation")
+    print(f"[regenerate-stale-artifacts] concurrency = {_conc}")
     from backend.app.services.db_artifact_gen import regenerate_stale_artifacts
 
     result = asyncio.run(
         regenerate_stale_artifacts(
             dry_run=args.dry_run,
             max_cost_usd=args.max_cost_usd,
-            concurrency=args.concurrency,
+            concurrency=_conc,
             retire=args.retire,
         )
     )
@@ -1576,6 +1701,8 @@ def _cmd_query(args: argparse.Namespace) -> int:
 
 
 def _cmd_evaluate_queries(args: argparse.Namespace) -> int:
+    _conc = _resolve_concurrency(args, "evaluation")
+    print(f"[evaluate-queries] concurrency = {_conc}")
     from backend.app.services.eval_judge import evaluate_questions
 
     # Accept the hyphenated spelling (artifact-only) as an alias for the
@@ -1592,7 +1719,7 @@ def _cmd_evaluate_queries(args: argparse.Namespace) -> int:
             output_md=args.output_md,
             max_cost_usd=args.max_cost_usd,
             query_max_cost_usd=args.query_max_cost_usd,
-            concurrency=args.concurrency,
+            concurrency=_conc,
             verbose=args.verbose,
         )
     )

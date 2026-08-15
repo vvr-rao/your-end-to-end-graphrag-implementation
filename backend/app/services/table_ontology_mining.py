@@ -374,6 +374,7 @@ async def mine_table_concepts_async(
     *,
     cache_dir: Path | None = None,
     audit_callback: Any = None,
+    concurrency: int = 4,
 ) -> dict[str, Any]:
     """Return a Stage-2-shaped dict ready to feed Stage 3 `match_dedup`.
 
@@ -403,8 +404,15 @@ async def mine_table_concepts_async(
     classes_dict = loaded_ontology.get("classes_dict") or {}
     classes_index = _all_class_labels(classes_dict)
 
-    # Run the LLM passes with bounded concurrency to keep memory + spend low.
-    sem = asyncio.Semaphore(4)
+    # One LLM call per table, bounded by `concurrency` (config:
+    # concurrency.table_mining). This was hardcoded to 4 "to keep memory +
+    # spend low", but neither holds: spend is identical at any concurrency
+    # (same calls, same tokens), and each payload is a caption plus label
+    # lists -- kilobytes. The real effect was wall time. 38 tables from one
+    # PDF is 5s either way; a table-heavy corpus (the financial-reports set is
+    # estimated at ~2,550 table rows) is hundreds of calls, where 4-wide on a
+    # 10M TPM model is the same bottleneck summarization had.
+    sem = asyncio.Semaphore(max(1, concurrency))
 
     async def _one(t: dict[str, Any]) -> dict[str, Any] | None:
         async with sem:

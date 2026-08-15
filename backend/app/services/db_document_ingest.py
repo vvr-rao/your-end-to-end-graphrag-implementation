@@ -258,19 +258,36 @@ async def ingest_documents_folder(
             "(same sha256) — keeping first occurrence only"
         )
 
-    # Dup check against active rows already in the DB.
+    # Dup check against rows already in the DB -- ANY status, not just ACTIVE.
+    #
+    # `documents_document_identifier_key` is unique on document_identifier with
+    # NO status component, so a soft-deleted row still owns the identifier.
+    # Filtering to ACTIVE here made a DELETED document look "new", and the
+    # insert then died with a raw UniqueViolationError. Deleting a document and
+    # re-adding it is ordinary use, and delete-document defaults to soft.
     candidate_iris = [iris[i] for i in keep_for_batch]
     async with session_scope() as session:
         result = await session.execute(
-            select(Document.document_identifier).where(
+            select(Document.document_identifier, Document.status).where(
                 Document.document_identifier.in_(candidate_iris),
-                Document.status == "ACTIVE",
             )
         )
-        existing = {row[0] for row in result.all()}
+        rows = result.all()
+    existing = {r[0] for r in rows}
+    revivable = sorted(r[0] for r in rows if r[1] != "ACTIVE")
 
     keep = [i for i in keep_for_batch if iris[i] not in existing]
     summary.docs_skipped_existing = len(existing)
+    if revivable:
+        # Not an error: the content is unchanged (same hash -> same IRI), so
+        # re-ingesting would be a no-op anyway. Say so, and say how to undo it,
+        # rather than crashing or silently leaving the document deleted.
+        print(
+            f"[ingest] {len(revivable)} document(s) already present but NOT "
+            f"ACTIVE (soft-deleted or superseded); skipping re-insert. "
+            f"To bring one back, use `update-document` to supersede it with a "
+            f"new version. First: {revivable[0]}"
+        )
 
     if not keep:
         print(
@@ -716,7 +733,7 @@ async def _ingest_tables_for_docs(
         pdf_paths,
         run_cache_dir=None,
         use_vision=table_vision,
-        concurrency=1,
+        concurrency=table_extract.table_extraction_concurrency(),
     )
     for m in manifests.values():
         if m.get("source") not in ("cache", "skipped", "spawn-failed", "worker-failed"):
