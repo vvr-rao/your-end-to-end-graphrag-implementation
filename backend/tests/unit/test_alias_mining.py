@@ -92,6 +92,74 @@ def test_acronym_expansion_requires_matching_initials() -> None:
     assert mine_text("The Federal Drug Agency (WHO) said") == []
 
 
+# --------------------------------------------------------------------------
+# Cross-domain generality
+#
+# The mining CONVENTIONS (parenthetical apposition, alias phrases,
+# skos:altLabel) are domain-neutral even though the guards were tuned on a
+# pharma dry run. These pin the non-pharma behavior so a later
+# pharma-motivated tweak cannot quietly break the finance corpus, which is
+# this project's other target.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        # Initials, the easy case.
+        (
+            "International Business Machines (IBM) announced",
+            ("ibm", "international business machines"),
+        ),
+        (
+            "Taiwan Semiconductor Manufacturing Company (TSMC) expanded",
+            ("taiwan semiconductor manufacturing company", "tsmc"),
+        ),
+        (
+            "the Large Hadron Collider (LHC) resumed operation",
+            ("large hadron collider", "lhc"),
+        ),
+        # Acronyms skip stopwords: SEC, not SAEC.
+        (
+            "The Securities and Exchange Commission (SEC) issued guidance",
+            ("sec", "securities and exchange commission"),
+        ),
+        # ...and the expansion runs past the ordinary 4-word cap.
+        (
+            "earnings before interest and taxes (EBIT) declined",
+            ("earnings before interest and taxes", "ebit"),
+        ),
+        # Company short forms are a PREFIX, not initials.
+        (
+            "BHP Group Limited (BHP) reported record shipments",
+            ("bhp", "bhp group limited"),
+        ),
+        # Rename phrasing.
+        (
+            "Meta Platforms, formerly known as Facebook, restated",
+            ("facebook", "meta platforms"),
+        ),
+    ],
+)
+def test_non_pharma_pairs(text: str, expected: tuple[str, str]) -> None:
+    pairs = mine_text(text)
+    assert [(p.term_a, p.term_b) for p in pairs] == [expected]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Revenue (in millions) for fiscal 2024",
+        "Net loss (unaudited) for the quarter",
+        "See Note 12 (Commitments and Contingencies)",
+        "Total assets (restated) increased",
+        "operating margin (excluding one-time charges) improved",
+    ],
+)
+def test_financial_statement_furniture_rejected(text: str) -> None:
+    assert mine_text(text) == []
+
+
 def test_surface_forms_are_preserved() -> None:
     """Probes embed the surface form, and "MOUNJARO" does not embed the
     same as "mounjaro"."""

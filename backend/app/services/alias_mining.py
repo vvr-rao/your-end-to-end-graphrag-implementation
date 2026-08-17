@@ -160,7 +160,21 @@ _GLUED_TOKEN_RE = re.compile(r"^[a-z]{4,}[A-Z]")
 
 _MIN_TERM_CHARS = 3
 _MAX_TERM_WORDS = 4
+# An acronym EXPANSION is legitimately longer than an ordinary name --
+# "earnings before interest and taxes", "Securities and Exchange
+# Commission" -- so the word cap is relaxed when the other side of the
+# pair is an acronym vouching for it.
+_MAX_ACRONYM_EXPANSION_WORDS = 6
 _MAX_TERM_CHARS = 60
+
+# Words an acronym conventionally skips. "Securities and Exchange
+# Commission" spells SEC, not SAEC; "earnings before interest and taxes"
+# spells EBIT, not EBIAT. Without this the initials rule rejects most
+# real-world acronyms outside the tidy three-capitalised-words case.
+_ACRONYM_SKIP_WORDS: frozenset[str] = frozenset({
+    "and", "of", "the", "for", "in", "on", "to", "a", "an", "at",
+    "by", "with", "from", "or", "de", "la", "le",
+})
 
 _WORD_RE = re.compile(r"[A-Za-z][\w\-']*")
 
@@ -174,11 +188,13 @@ def _has_upper(s: str) -> bool:
     return any(c.isupper() for c in s)
 
 
-def is_valid_term(s: str) -> bool:
+def is_valid_term(s: str, *, max_words: int = _MAX_TERM_WORDS) -> bool:
     """Term-shape guard, applied to BOTH sides of every candidate pair.
 
     Rejects clauses, cross-references, numbers, units and generic nouns.
     Deliberately strict: a false pair is worse than a missed one.
+
+    `max_words` is relaxed for acronym expansions by `is_valid_pair`.
     """
     s = _strip_marks(s)
     if not s:
@@ -198,7 +214,7 @@ def is_valid_term(s: str) -> bool:
     if any(_GLUED_TOKEN_RE.match(tok) for tok in re.split(r"[\s\-]+", s)):
         return False
     words = _WORD_RE.findall(s)
-    if not words or len(words) > _MAX_TERM_WORDS:
+    if not words or len(words) > max_words:
         return False
     # Must be mostly letters -- rejects "%", "+/-", stray symbols.
     if not re.fullmatch(r"[A-Za-z\s\-'&]+", s):
@@ -231,26 +247,52 @@ def is_valid_term(s: str) -> bool:
     return True
 
 
+def _acronym_matches(head: str, acronym: str) -> bool:
+    """Does `head` expand to `acronym`? Three accepted conventions.
+
+      initials          World Health Organization  -> WHO
+      skipping stopwords Securities and Exchange Commission -> SEC
+                         earnings before interest and taxes -> EBIT
+      prefix            BHP Group Limited -> BHP
+
+    The prefix form matters for company names, where the short form is
+    the leading token rather than a set of initials.
+    """
+    words = _WORD_RE.findall(head)
+    if not words:
+        return False
+    target = acronym.upper()
+    if "".join(w[0].upper() for w in words) == target:
+        return True
+    kept = [w for w in words if w.lower() not in _ACRONYM_SKIP_WORDS]
+    if kept and "".join(w[0].upper() for w in kept) == target:
+        return True
+    # Prefix form: only when the head is more than its first word, or the
+    # "pair" is just one name against itself.
+    if len(words) > 1 and words[0].upper() == target:
+        return True
+    return False
+
+
 def _acronym_applies(other: str, acronym: str) -> bool:
     """Whether the initials rule should be enforced for this pair at all.
 
-    Only when the other side has exactly as many words as the acronym has
-    letters -- that IS the convention. Without this gate, an all-caps
-    BRAND name of 2-6 letters looks like an acronym and gets rejected
-    against its own generic: `COZAAR (losartan potassium)` would demand
-    that "losartan potassium" spell C-O-Z-A-A-R.
+    Only when the other side is a multi-word phrase that could plausibly
+    expand to the acronym -- i.e. it has at least as many words as the
+    acronym has letters, once stopwords are dropped, OR it leads with the
+    acronym itself.
+
+    Without this gate an all-caps BRAND of 2-6 letters looks like an
+    acronym and gets rejected against its own generic: `COZAAR (losartan
+    potassium)` would demand that "losartan potassium" spell C-O-Z-A-A-R.
     """
-    return len(_WORD_RE.findall(other)) == len(acronym)
-
-
-def _acronym_matches(head: str, acronym: str) -> bool:
-    """Classic expansion rule: initials of the head spell the acronym.
-
-    `World Health Organization (WHO)` -> True.
-    `Federal Drug Agency (WHO)`       -> False.
-    """
-    initials = [w[0].upper() for w in _WORD_RE.findall(head)]
-    return "".join(initials) == acronym.upper()
+    words = _WORD_RE.findall(other)
+    if len(words) < 2:
+        return False
+    if words[0].upper() == acronym.upper():
+        return True
+    kept = [w for w in words if w.lower() not in _ACRONYM_SKIP_WORDS]
+    return len(kept) == len(acronym)
 
 
 def is_valid_pair(left: str, right: str) -> bool:
@@ -260,7 +302,15 @@ def is_valid_pair(left: str, right: str) -> bool:
     "administered in the morning (once daily)" -- two lowercase common
     phrases that happen to sit next to a parenthesis.
     """
-    if not (is_valid_term(left) and is_valid_term(right)):
+    # An acronym on one side vouches for a longer phrase on the other.
+    left_is_acr = _is_acronym(_strip_marks(left))
+    right_is_acr = _is_acronym(_strip_marks(right))
+    left_max = _MAX_ACRONYM_EXPANSION_WORDS if right_is_acr else _MAX_TERM_WORDS
+    right_max = _MAX_ACRONYM_EXPANSION_WORDS if left_is_acr else _MAX_TERM_WORDS
+    if not (
+        is_valid_term(left, max_words=left_max)
+        and is_valid_term(right, max_words=right_max)
+    ):
         return False
     ln, rn = normalize_term(left), normalize_term(right)
     if ln == rn or not ln or not rn:
@@ -369,12 +419,20 @@ def extract_parenthetical_pairs(text: str) -> list[tuple[str, str]]:
         inner = _strip_marks(m.group(1))
         if not inner:
             continue
-        # Acronym expansion is length-locked: an N-letter acronym is only
-        # an alias of the N words immediately before it. Reading a greedy
-        # capitalized run instead would make "The World Health
-        # Organization (WHO)" fail on the leading "The".
-        n_words = len(inner) if _is_acronym(inner) else None
-        head = _head_before(text, m.start(), n_words=n_words)
+        if _is_acronym(inner):
+            # An N-letter acronym expands from AT LEAST N words, and more
+            # when it skips stopwords ("Securities and Exchange Commission"
+            # -> SEC needs 4). Try increasing head lengths and take the
+            # first that actually spells the acronym; a greedy capitalized
+            # run instead would trip on the leading "The".
+            head = ""
+            for n in range(len(inner), _MAX_ACRONYM_EXPANSION_WORDS + 1):
+                cand = _head_before(text, m.start(), n_words=n)
+                if cand and _acronym_matches(cand, inner):
+                    head = cand
+                    break
+        else:
+            head = _head_before(text, m.start())
         if not head:
             continue
         if is_valid_pair(head, inner):
