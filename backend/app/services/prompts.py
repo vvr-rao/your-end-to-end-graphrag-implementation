@@ -1089,6 +1089,46 @@ def artifact_chunk_extract_with_entities(
     return system, user
 
 
+def embed_digest(text: str, target_tokens: int = 6000) -> tuple[str, str]:
+    """Last-resort compression tier for an oversize document summary,
+    used ONLY to compute `documents.embedding`.
+
+    Distinct from `document_summarize`, which writes readable prose and
+    therefore sometimes fails to shrink at all (its output is then longer
+    than its input and the embedder hard-truncates, silently dropping the
+    tail of the document from its vector). This prompt asks for a dense
+    retrieval index instead of prose: no sentences, no transitions, just
+    the terms a searcher would use.
+
+    Keeping BOTH the brand and generic name of every product is called
+    out explicitly. A document vector that carries only "MOUNJARO" cannot
+    be found by a query saying "tirzepatide", which is the document-level
+    form of the exact bug that motivated corpus-mined aliases.
+
+    Dispatched through the existing `document_summarize` task name, so no
+    models.yaml preset needs a new entry.
+    """
+    system = (
+        "You compress a document into a DENSE RETRIEVAL DIGEST -- the text "
+        "that will be embedded so this document can be found by search. It "
+        "is never shown to a reader, so write no prose.\n\n"
+        "INCLUDE, densely and without connectives:\n"
+        "  - Every proper noun: products, organizations, people, places.\n"
+        "  - EVERY name a thing goes by. If the document gives both a "
+        "brand and a generic name, a ticker and a company name, or an "
+        "acronym and its expansion, keep BOTH -- a searcher may use "
+        "either one.\n"
+        "  - Key figures with their units, dates and periods, and the "
+        "topics/sections the document covers.\n\n"
+        "OMIT: narrative, transitions, hedging, boilerplate, legal "
+        "disclaimers, repeated headers.\n\n"
+        f"HARD LIMIT: stay under {target_tokens} tokens (~{target_tokens * 3} "
+        "characters). Being well under is fine. Return ONLY the digest."
+    )
+    user = f"DOCUMENT:\n{text}\n\nWrite the retrieval digest now."
+    return system, user
+
+
 def question_parse(question: str) -> tuple[str, str]:
     """Phase 2 Milestone F step 3: parse a user question into structured
     constraints the retrieval pipeline can use as graph seeds.
@@ -1284,11 +1324,19 @@ def chunk_relevance_filter(
 
 def _format_evidence_block(evidence_items: list[dict], char_cap: int = 600) -> str:
     """Compact textual rendering of evidence items for stuffing into
-    answer-synthesis prompts. Each item: {iri, kind, text}.
+    answer-synthesis prompts. Each item: {iri, kind, text}, optionally
+    {document_title, entities}.
 
     `char_cap` bounds each item's text so the prompt stays manageable. The
     default 600 is the legacy value; callers pass `qa.evidence_char_cap` (1500)
-    so richer (e.g. evaluated-summary) chunks aren't clipped to ~150 tokens."""
+    so richer (e.g. evaluated-summary) chunks aren't clipped to ~150 tokens.
+
+    Each item is tagged with the document and entities it is ABOUT. Without
+    that, sibling passages are indistinguishable: asked to compare two
+    drugs and shown a mix of both labels' dosing text, the model reported
+    one drug's maximum dose under the other's name. The tag is what lets
+    `_ATTRIBUTION_RULE` below be enforceable.
+    """
     lines = []
     for it in evidence_items:
         kind = it.get("kind", "evidence")
@@ -1296,8 +1344,37 @@ def _format_evidence_block(evidence_items: list[dict], char_cap: int = 600) -> s
         text = (it.get("text") or "").strip().replace("\n", " ")
         if len(text) > char_cap:
             text = text[:char_cap] + "..."
-        lines.append(f"  [{kind} {iri}] {text}")
+        tags = []
+        title = (it.get("document_title") or "").strip()
+        if title:
+            tags.append(f"document: {title}")
+        ents = [e for e in (it.get("entities") or []) if e]
+        if ents:
+            tags.append("about: " + ", ".join(ents[:6]))
+        tag_str = f" ({' | '.join(tags)})" if tags else ""
+        lines.append(f"  [{kind} {iri}]{tag_str} {text}")
     return "\n".join(lines)
+
+
+_ATTRIBUTION_RULE = (
+    "ATTRIBUTION RULE (mandatory):\n"
+    "  - Each evidence item is tagged with the document it came from and "
+    "the entities it is about. A figure, date, or property stated in an "
+    "item belongs to THAT item's entities and to no others.\n"
+    "  - NEVER transfer a value from one entity to another. If the "
+    "question asks about entity X and the only dosing/revenue/date "
+    "figures you can see are tagged with entity Y, you have NOT found "
+    "X's value -- do not report Y's as if it were X's.\n"
+    "  - When the evidence contains nothing tagged with an entity the "
+    "question asks about, say so explicitly by name: \"the retrieved "
+    "evidence contains no <property> for <entity>\". An incomplete "
+    "answer that names its gap is correct; a complete-looking answer "
+    "built on a sibling entity's numbers is wrong.\n"
+    "  - Note that the same thing may appear under more than one name "
+    "(a brand name and a generic name, a ticker and a company name). "
+    "Treat them as the same entity ONLY when an evidence item shows "
+    "them together; never assume it."
+)
 
 
 _FACTS_FIRST_RULE = (
@@ -1332,6 +1409,8 @@ def answer_simple_qa(
         "You answer the user's question DIRECTLY, in 1-3 sentences, using "
         "ONLY the evidence below.\n\n"
         + _FACTS_FIRST_RULE
+        + "\n\n"
+        + _ATTRIBUTION_RULE
         + "\n\nSTRICT SCOPE:\n"
         "  - Answer ONLY the question asked. Do NOT add context, "
         "background, broader implications, or a 'this suggests...' "
@@ -1426,6 +1505,8 @@ def answer_deep_research(
         "the evidence below. The structure is FIXED and must be followed "
         "exactly.\n\n"
         + _FACTS_FIRST_RULE
+        + "\n\n"
+        + _ATTRIBUTION_RULE
         + "\n\n"
         + _DEEP_RESEARCH_SECTIONS
         + "\n\nLENGTH: 650-1,300 words across all seven sections. "
@@ -2440,6 +2521,11 @@ PROMPTS = {
     # Phase 2a follow-up — table → KG anchor-bucket grouping
     "table_concept_grouping": table_concept_grouping,
     # Milestone F
+    # NOTE: dispatched through the `document_summarize` TASK (see
+    # db_document_ingest._compress_summary_for_embed) -- PROMPTS keys and
+    # router task names are independent lookups, and reusing the task
+    # avoids adding an entry to every models.yaml preset on a live deploy.
+    "embed_digest": embed_digest,
     "question_parse": question_parse,
     "concept_expansion": concept_expansion,
     "query_decompose": query_decompose,

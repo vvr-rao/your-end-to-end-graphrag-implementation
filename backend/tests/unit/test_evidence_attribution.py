@@ -1,0 +1,85 @@
+"""Evidence attribution tagging in the answer-synthesis prompts.
+
+Pure-unit; no DB, no LLM, no cost.
+
+Motivation: asked to compare two drugs, the synthesis reported one drug's
+maximum dose under the other's name. Every claim traced to retrieved
+evidence -- the evidence was simply about the wrong drug, which is why
+the `no_hallucination` metric passed it. Tagging each evidence item with
+the document and entities it concerns is what makes the attribution rule
+in the system prompt checkable rather than aspirational.
+"""
+from __future__ import annotations
+
+from backend.app.services.prompts import (
+    _ATTRIBUTION_RULE,
+    _format_evidence_block,
+    answer_deep_research,
+    answer_simple_qa,
+)
+
+
+def _chunk(**over):
+    base = {
+        "kind": "chunk",
+        "iri": "viao:Chunk_abc",
+        "text": "The maximum dosage is 4.5 mg once weekly.",
+        "document_title": "TRULICITY dulaglutide injection",
+        "entities": ["dulaglutide", "TRULICITY"],
+    }
+    base.update(over)
+    return base
+
+
+def test_document_and_entities_are_tagged():
+    out = _format_evidence_block([_chunk()])
+    assert "document: TRULICITY dulaglutide injection" in out
+    assert "about: dulaglutide, TRULICITY" in out
+    assert "4.5 mg" in out
+
+
+def test_untagged_evidence_still_renders():
+    """Artifacts carry no document/entity tags; they must not break or
+    emit an empty '()' marker."""
+    out = _format_evidence_block(
+        [{"kind": "artifact", "iri": "viao:Claim_1", "text": "A claim."}]
+    )
+    assert out.strip() == "[artifact viao:Claim_1] A claim."
+
+
+def test_partial_tags():
+    doc_only = _format_evidence_block([_chunk(entities=[])])
+    assert "document:" in doc_only and "about:" not in doc_only
+
+    ents_only = _format_evidence_block([_chunk(document_title=None)])
+    assert "about:" in ents_only and "document:" not in ents_only
+
+
+def test_entity_list_is_bounded():
+    out = _format_evidence_block([_chunk(entities=[f"e{i}" for i in range(20)])])
+    assert "e5" in out and "e6" not in out
+
+
+def test_char_cap_still_applies_to_text_only():
+    """The cap bounds the passage, not the tag -- attribution must not be
+    the thing that gets truncated away."""
+    out = _format_evidence_block([_chunk(text="x" * 5000)], char_cap=100)
+    assert "document: TRULICITY dulaglutide injection" in out
+    assert "x" * 100 + "..." in out
+    assert "x" * 200 not in out
+
+
+def test_both_answer_modes_carry_the_attribution_rule():
+    for fn in (answer_simple_qa, answer_deep_research):
+        system, user = fn("Compare dosing of tirzepatide and dulaglutide", [_chunk()])
+        assert _ATTRIBUTION_RULE in system, f"{fn.__name__} missing attribution rule"
+        # And the evidence the rule refers to is actually tagged.
+        assert "about: dulaglutide" in user
+
+
+def test_attribution_rule_demands_naming_the_gap():
+    """The rule has to require an explicit statement of absence -- silence
+    is what let a sibling entity's number get substituted."""
+    lowered = _ATTRIBUTION_RULE.lower()
+    assert "never transfer" in lowered
+    assert "no <property> for <entity>" in lowered or "contains no" in lowered

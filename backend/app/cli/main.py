@@ -851,6 +851,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_regen.set_defaults(func=_cmd_regenerate_stale_artifacts)
 
+    # ---------- Phase 2: corpus-mined synonyms ----------
+    p_ma = sub.add_parser(
+        "mine-aliases",
+        help=(
+            "Extract synonym pairs from the corpus deterministically -- "
+            "parenthetical apposition ('MOUNJARO (tirzepatide) injection'), "
+            "explicit alias phrases, and the skos:altLabel annotations already "
+            "imported with the ontology. No LLM, no embeddings, $0. Populates "
+            "graphrag.term_aliases, which retrieval uses to expand query terms."
+        ),
+    )
+    p_ma.add_argument(
+        "--dry-run", action="store_true",
+        help="Print the pairs and write NOTHING. Run this first to eyeball "
+             "precision before anything lands in the database.",
+    )
+    p_ma.add_argument(
+        "--limit", type=int, default=None,
+        help="Scan at most N chunks (smoke test). Ontology annotations are "
+             "always scanned in full -- they are already in the DB and cheap.",
+    )
+    p_ma.add_argument(
+        "--min-occurrences", type=int, default=1,
+        help="Drop pairs seen fewer than this many times. 1 (default) keeps "
+             "everything; the parenthetical convention is high-precision, so a "
+             "single well-formed mention is usually real.",
+    )
+    p_ma.add_argument(
+        "--show", type=int, default=40,
+        help="How many pairs to print (default 40).",
+    )
+    p_ma.add_argument("--verbose", action="store_true", help="Per-page progress.")
+    p_ma.set_defaults(func=_cmd_mine_aliases)
+
     # ---------- Phase 2: Milestone F (retrieval + answer synthesis) ----------
     p_q = sub.add_parser(
         "query",
@@ -903,6 +937,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_q.add_argument(
         "--verbose", action="store_true",
         help="Print debug info from each pipeline step.",
+    )
+    p_q.add_argument(
+        "--no-persist", dest="persist", action="store_false", default=True,
+        help=(
+            "Do not write retrieval_runs / retrieval_evidence rows. Makes the "
+            "run read-only against the database, so a local build can be tested "
+            "against a deployed corpus without leaving test traffic in it."
+        ),
     )
     p_q.add_argument(
         "--single-round", dest="multi_round", action="store_false", default=True,
@@ -1636,6 +1678,57 @@ def _cmd_regenerate_stale_artifacts(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_mine_aliases(args: argparse.Namespace) -> int:
+    from backend.app.services.alias_mining import mine_aliases
+
+    summary = asyncio.run(
+        mine_aliases(
+            dry_run=args.dry_run,
+            limit=args.limit,
+            min_occurrences=args.min_occurrences,
+            verbose=args.verbose,
+        )
+    )
+
+    print("=" * 72)
+    print("MINE-ALIASES" + ("  (DRY RUN -- nothing written)" if args.dry_run else ""))
+    print("=" * 72)
+    print(f"chunks scanned:   {summary.chunks_scanned:,}")
+    print(f"classes scanned:  {summary.classes_scanned:,}")
+    print(f"pairs found:      {summary.pairs_found:,}")
+    if summary.by_kind:
+        for kind, n in sorted(summary.by_kind.items(), key=lambda kv: -kv[1]):
+            print(f"    {kind:<16} {n:,}")
+    if not args.dry_run:
+        print(f"pairs written:    {summary.pairs_written:,}")
+        if summary.pairs_pruned:
+            print(f"pairs pruned:     {summary.pairs_pruned:,} (no longer qualify)")
+    print(f"wall:             {summary.wall_seconds:.1f}s")
+
+    if summary.samples:
+        print()
+        print(f"top {min(args.show, len(summary.samples))} pair(s):")
+        for p in summary.samples[: args.show]:
+            print(
+                f"  {p.surface_a:<28} <-> {p.surface_b:<28} "
+                f"{p.evidence_kind:<14} x{p.occurrences}"
+            )
+    else:
+        # Silence here is a finding, not a success -- retrieval will behave
+        # exactly as before, so say so rather than letting it read as "done".
+        print()
+        print(
+            "No pairs found. Retrieval will behave exactly as it does today.\n"
+            "Check that the corpus actually appositions its synonyms, e.g.\n"
+            "  SELECT text FROM graphrag.chunks WHERE text ILIKE '%(tirzepatide)%' LIMIT 3;"
+        )
+
+    if args.dry_run and summary.pairs_found:
+        print()
+        print("Re-run without --dry-run to write these pairs.")
+    return 0
+
+
 def _cmd_query(args: argparse.Namespace) -> int:
     import json as _json
     from backend.app.services.retrieval import retrieve_and_answer
@@ -1655,6 +1748,7 @@ def _cmd_query(args: argparse.Namespace) -> int:
             max_probes=args.max_probes,
             verbose=args.verbose,
             multi_round=getattr(args, "multi_round", True),
+            persist=getattr(args, "persist", True),
         )
     )
 
@@ -1678,7 +1772,11 @@ def _cmd_query(args: argparse.Namespace) -> int:
     print(f"MODE:     {result.mode}")
     print(f"QUERY:    {result.resolved_query}")
     print(f"COST:     ${result.cost_usd:.4f}   wall: {result.wall_seconds:.1f}s")
-    print(f"RUN_ID:   {result.retrieval_run_id}")
+    print(
+        f"RUN_ID:   {result.retrieval_run_id}"
+        if result.retrieval_run_id
+        else "RUN_ID:   (not persisted -- --no-persist)"
+    )
     print("=" * 72)
 
     if result.answer:

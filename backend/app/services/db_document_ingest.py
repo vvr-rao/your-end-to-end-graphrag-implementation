@@ -19,6 +19,7 @@ Generic: no corpus-specific paths or assumptions; the only input is `folder`.
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -52,12 +53,26 @@ from backend.app.services.prompts import PROMPTS
 
 _VIAO_NS = "https://veerla-ramrao.ai/ontology/intelligence-artifact"
 
+log = logging.getLogger(__name__)
+
 # Embedding model input cap (OpenAI: 8192 hard; 8000 leaves headroom).
 _EMBED_INPUT_CAP_TOKENS = 8000
 # Per gpt-4o-mini call we never feed more than ~100K tokens (matches
 # Phase 1's `max_doc_input_tokens` in `summarize_long_documents_async`).
 # Above that we split + summarize each half + recurse.
 _LLM_INPUT_SPLIT_THRESHOLD = 100_000
+
+
+def _count_embed_tokens(text: str) -> int | None:
+    """Token count under the embedding model's encoder, or None if
+    tiktoken is unavailable (in which case truncation is unknowable here
+    and the embedder reports it instead)."""
+    try:
+        import tiktoken
+        enc = tiktoken.encoding_for_model("text-embedding-3-small")
+    except (ImportError, KeyError):
+        return None
+    return len(enc.encode(text, disallowed_special=()))
 
 
 async def _compress_summary_for_embed(
@@ -99,6 +114,31 @@ async def _compress_summary_for_embed(
             return s
         return result.text.strip() or s
 
+    async def _digest_once(s: str) -> str:
+        """Fallback tier: a dense retrieval digest rather than prose.
+
+        `document_summarize` writes readable prose and sometimes fails to
+        shrink at all -- at which point the embedder used to hard-truncate,
+        silently dropping the tail of the document out of its vector. This
+        asks for keywords and names instead, which compresses reliably and
+        keeps both the brand and generic name of everything (a vector
+        holding only "MOUNJARO" is unreachable by a query saying
+        "tirzepatide").
+
+        Runs on the SAME `document_summarize` router task -- PROMPTS keys
+        and task names are independent lookups -- so no models.yaml preset
+        needs a new entry on a live deployment.
+        """
+        system, user = PROMPTS["embed_digest"](s, target_tokens)
+        try:
+            result = await router.chat(
+                "document_summarize", system=system, user=user
+            )
+        except Exception as exc:
+            print(f"[ingest] embed-digest LLM call failed: {exc}")
+            return s
+        return result.text.strip() or s
+
     def _split_on_paragraph(s: str) -> tuple[str, str]:
         """Split near the middle on a blank-line boundary if one exists."""
         mid = len(s) // 2
@@ -131,12 +171,28 @@ async def _compress_summary_for_embed(
             compressed = await _compress_once(current)
             n2 = _tok_count(compressed)
             if n2 >= n:
-                # Model didn't actually compress; bail and let embedder truncate.
+                # Prose summarization didn't shrink it. Previously this
+                # returned immediately and let the embedder hard-truncate,
+                # dropping the tail of the document out of its vector with
+                # only an anonymous "[embed] N/M truncated" line to show
+                # for it. Try the dense-digest tier before giving up.
                 print(
                     f"[ingest] compression no-op (out={n2:,} >= in={n:,}); "
-                    "embedder will hard-truncate"
+                    "falling back to dense embed-digest"
                 )
-                return text
+                digest = await _digest_once(current)
+                n3 = _tok_count(digest)
+                if n3 < n:
+                    print(
+                        f"[ingest] embed-digest: {n:,} -> {n3:,} tokens"
+                    )
+                    current = digest
+                    continue
+                print(
+                    f"[ingest] embed-digest also failed to shrink "
+                    f"(out={n3:,} >= in={n:,})"
+                )
+                return current
             print(f"[ingest] compress iter {iteration + 1}: {n:,} -> {n2:,} tokens")
             current = compressed
             continue
@@ -151,10 +207,18 @@ async def _compress_summary_for_embed(
             f"{n:,} -> {_tok_count(current):,} tokens"
         )
 
+    # Last chance before the embedder's hard cut: one dense-digest pass.
     if _tok_count(current) > target_tokens:
-        print(
-            f"[ingest] reached compression iteration cap with "
-            f"{_tok_count(current):,} tokens; embedder will hard-truncate"
+        digest = await _digest_once(current)
+        if _tok_count(digest) < _tok_count(current):
+            current = digest
+
+    if _tok_count(current) > target_tokens:
+        log.warning(
+            "document embedding input still %s tokens after compression "
+            "(cap %s); the embedder will hard-truncate and the tail of this "
+            "document will not be searchable by its vector",
+            f"{_tok_count(current):,}", f"{target_tokens:,}",
         )
     return current
 
@@ -387,9 +451,31 @@ async def ingest_documents_folder(
     # summary still gets stored in documents.text_summary below.
     cost_before_compress = router.total_cost_usd
     doc_embed_inputs: list[str] = []
-    for sd in summarized:
-        doc_embed_inputs.append(
-            await _compress_summary_for_embed(sd.text, router)
+    # Per-document record of what actually got embedded, stamped into
+    # documents.extra_metadata below. Truncation used to be reported only as
+    # an anonymous "[embed] N/M inputs truncated" line with no way to tell
+    # WHICH document lost its tail; this makes it queryable after the fact.
+    embed_input_meta: list[dict[str, Any]] = []
+    for sd, _orig in zip(summarized, fresh, strict=True):
+        compressed = await _compress_summary_for_embed(sd.text, router)
+        doc_embed_inputs.append(compressed)
+        tok = _count_embed_tokens(compressed)
+        embed_input_meta.append({
+            "compressed": compressed is not sd.text and compressed != sd.text,
+            "tokens": tok,
+            "truncated": bool(tok and tok > _EMBED_INPUT_CAP_TOKENS),
+        })
+    _n_trunc = sum(1 for m in embed_input_meta if m["truncated"])
+    if _n_trunc:
+        log.warning(
+            "%d document(s) still exceed the %s-token embedding cap after "
+            "compression and will be hard-truncated: %s",
+            _n_trunc, f"{_EMBED_INPUT_CAP_TOKENS:,}",
+            ", ".join(
+                o.path.name
+                for o, m in zip(fresh, embed_input_meta, strict=True)
+                if m["truncated"]
+            ),
         )
     compress_cost = router.total_cost_usd - cost_before_compress
     if compress_cost > 0:
@@ -422,6 +508,12 @@ async def ingest_documents_folder(
             "extra_metadata": {
                 "original_text_bytes": len(orig.text.encode("utf-8")),
                 "summary_text_bytes": len(summ.text.encode("utf-8")),
+                # What was actually fed to the embedding call for this
+                # document: whether it had to be compressed, its final token
+                # count, and whether it was still truncated anyway.
+                "embed_input": (
+                    embed_input_meta[i] if i < len(embed_input_meta) else {}
+                ),
             },
         })
 

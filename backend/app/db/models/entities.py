@@ -1,4 +1,4 @@
-"""Corpus-extracted entities + temporal nodes.
+"""Corpus-extracted entities + temporal nodes + mined synonym pairs.
 
 `Entity` is an individual mentioned in a chunk (Honda, Vietnam,
 Donald Trump). Its `class_id` FK points at an `OntologyClass` --
@@ -7,6 +7,9 @@ ALWAYS instantiates an existing ontology class.
 
 `TimeInstance` is a normalized temporal node (YEAR_2024 / Q1_2024 /
 MONTH_2024_01) created by the temporal-enrichment pass in Milestone D.
+
+`TermAlias` is a synonym pair mined deterministically from the corpus
+by `mine-aliases` (see `services/alias_mining.py`).
 """
 from __future__ import annotations
 
@@ -15,7 +18,7 @@ from datetime import date, datetime
 from typing import Any
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import CheckConstraint, Date, ForeignKey, Text
+from sqlalchemy import CheckConstraint, Date, ForeignKey, Integer, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -80,6 +83,51 @@ class TimeInstance(Base):
     display_label: Mapped[str] = mapped_column(Text, nullable=False)
     parent_time_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("time_instances.id")
+    )
+    extra_metadata: Mapped[dict[str, Any]] = metadata_jsonb_column()
+    created_at: Mapped[datetime] = timestamp_column()
+
+
+class TermAlias(Base):
+    """One mined synonym pair, e.g. MOUNJARO <-> tirzepatide.
+
+    Deliberately NOT a column on `Entity`: entity extraction mines only
+    `chunks.kind='summary'`, so a name appearing solely in full-text
+    chunks may have no entity row to hang an alias off. Pairs are also
+    symmetric and many-to-many.
+
+    `term_a`/`term_b` are normalized (see `alias_mining.normalize_term`)
+    and stored in lexical order, so ONE row answers a lookup from either
+    side -- query time UNIONs `term_a = :norm` with `term_b = :norm`.
+    The `surface_*` columns keep the form as it appeared in the text,
+    because "MOUNJARO" and "mounjaro" do not embed identically and the
+    probe wants the real one.
+    """
+
+    __tablename__ = "term_aliases"
+    __table_args__ = (
+        CheckConstraint(
+            "evidence_kind IN ('parenthetical','phrase','ontology')",
+            name="term_aliases_kind_check",
+        ),
+        CheckConstraint("term_a < term_b", name="term_aliases_order_check"),
+        UniqueConstraint(
+            "term_a", "term_b", "evidence_kind", name="term_aliases_pair_uq"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = uuid_pk_column()
+    term_a: Mapped[str] = mapped_column(Text, nullable=False)
+    term_b: Mapped[str] = mapped_column(Text, nullable=False)
+    surface_a: Mapped[str] = mapped_column(Text, nullable=False)
+    surface_b: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_ref: Mapped[str | None] = mapped_column(Text)
+    occurrences: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    graph_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
     )
     extra_metadata: Mapped[dict[str, Any]] = metadata_jsonb_column()
     created_at: Mapped[datetime] = timestamp_column()

@@ -362,6 +362,173 @@ async def vector_search_all_artifacts(
     return [row[0] for row in result.all()]
 
 
+async def vector_search_documents(
+    session: AsyncSession,
+    probe_embedding: list[float],
+    *,
+    top_k: int = 10,
+) -> list[uuid.UUID]:
+    """Global HNSW nearest-neighbor over ALL active documents.
+
+    Mirrors `vector_search_all_artifacts` -- unfiltered, so the
+    `documents_embedding_idx` HNSW index is actually used.
+
+    `documents.embedding` has been written at ingest and indexed since
+    0001, but until now nothing read it. It gives retrieval a
+    document-level recall path: a document that is ABOUT a topic
+    surfaces even when no individual chunk matches the query's
+    vocabulary, which is the same failure mode brand/generic names
+    cause at chunk level.
+    """
+    if top_k <= 0:
+        return []
+    result = await session.execute(
+        sql_text("""
+        SELECT id FROM graphrag.documents
+         WHERE embedding IS NOT NULL AND status = 'ACTIVE'
+         ORDER BY embedding <-> CAST(:probe AS vector)
+         LIMIT :limit
+        """),
+        {"probe": _vec_str(probe_embedding), "limit": top_k},
+    )
+    return [row[0] for row in result.all()]
+
+
+async def fetch_chunks_for_documents(
+    session: AsyncSession,
+    document_ids: list[uuid.UUID],
+    *,
+    limit: int = 300,
+) -> list[tuple[uuid.UUID, float]]:
+    """Chunks belonging to `document_ids`, best-first by document rank.
+
+    Prefers `kind='fulltext'` chunks for documents that have them (the
+    same preference the step-8.5 bridge applies), so citations land on
+    verbatim text. Returns (chunk_id, score) where score decays with the
+    document's position in `document_ids` -- so a chunk from the
+    top-ranked document outranks one from the tenth.
+    """
+    if not document_ids:
+        return []
+    result = await session.execute(
+        sql_text("""
+        SELECT c.id, c.document_id
+          FROM graphrag.chunks c
+         WHERE c.document_id = ANY(CAST(:ids AS uuid[]))
+           AND c.status = 'ACTIVE'
+           AND c.embedding IS NOT NULL
+           AND (c.kind = 'fulltext' OR NOT EXISTS (
+                 SELECT 1 FROM graphrag.chunks f
+                  WHERE f.document_id = c.document_id
+                    AND f.kind = 'fulltext'
+                    AND f.status = 'ACTIVE'))
+         LIMIT :limit
+        """),
+        {"ids": [str(d) for d in document_ids], "limit": limit},
+    )
+    rank_of = {did: i for i, did in enumerate(document_ids)}
+    out: list[tuple[uuid.UUID, float]] = []
+    for cid, did in result.all():
+        out.append((cid, 1.0 / (1.0 + rank_of.get(did, len(document_ids)))))
+    out.sort(key=lambda t: -t[1])
+    return out
+
+
+async def fetch_chunk_entity_names(
+    session: AsyncSession,
+    chunk_ids: list[uuid.UUID],
+    *,
+    per_chunk_limit: int = 6,
+) -> dict[uuid.UUID, list[str]]:
+    """Entity names each chunk assertsAbout, for evidence attribution.
+
+    Run over the FINAL top-k only (~30 rows), not the candidate pool, so
+    it is one cheap query. Lets the synthesis prompt label each passage
+    with the entity it actually concerns -- the guard against reporting
+    one drug's dose under another drug's name.
+    """
+    if not chunk_ids:
+        return {}
+    result = await session.execute(
+        sql_text("""
+        SELECT gr.source_chunk_id, e.name
+          FROM graphrag.graph_relationships gr
+          JOIN graphrag.entities e ON e.id = gr.target_node_id
+         WHERE gr.predicate_label = 'viao:assertsAbout'
+           AND gr.target_node_type = 'entity'
+           AND gr.source_chunk_id = ANY(CAST(:ids AS uuid[]))
+        """),
+        {"ids": [str(cid) for cid in chunk_ids]},
+    )
+    out: dict[uuid.UUID, list[str]] = {}
+    for cid, name in result.all():
+        if not name:
+            continue
+        names = out.setdefault(cid, [])
+        if name not in names and len(names) < per_chunk_limit:
+            names.append(name)
+    return out
+
+
+async def fetch_aliases(
+    session: AsyncSession,
+    normalized_terms: list[str],
+    *,
+    per_term_limit: int = 6,
+) -> dict[str, list[str]]:
+    """Corpus-mined synonyms for each normalized query term.
+
+    Pure indexed lookup against `term_aliases` -- no scan, no LLM. Pairs
+    are stored with `term_a < term_b`, so one row answers a lookup from
+    either side; hence the UNION.
+
+    Returns {normalized_term: [surface form, ...]}, best-attested first.
+    A term with no mined alias is simply absent, and retrieval then
+    behaves exactly as it did before this feature existed.
+
+    Ties on `occurrences` break toward the SHORTER surface form: clinical
+    tables produce both "Mounjaro" and header runs like "Dose NDC
+    Mounjaro" at identical counts, and the bare name is the one worth
+    embedding.
+    """
+    if not normalized_terms:
+        return {}
+    out: dict[str, list[str]] = {}
+    for term in normalized_terms:
+        if not term:
+            continue
+        result = await session.execute(
+            sql_text("""
+            SELECT surface, occurrences FROM (
+                SELECT surface_b AS surface, occurrences
+                  FROM graphrag.term_aliases WHERE term_a = :t
+                UNION ALL
+                SELECT surface_a AS surface, occurrences
+                  FROM graphrag.term_aliases WHERE term_b = :t
+            ) s
+             -- A synonym USED AS A PROBE has to be a name, not a phrase.
+             -- Longer runs are label boilerplate that survived mining
+             -- ("Medication Guide TRULICITY TRU-li-si-tee"); injecting one
+             -- into probe text would poison the embedding it rides on.
+             WHERE array_length(string_to_array(btrim(surface), ' '), 1) <= 3
+             ORDER BY occurrences DESC, length(surface) ASC, surface
+             LIMIT :limit
+            """),
+            {"t": term, "limit": per_term_limit},
+        )
+        seen: set[str] = set()
+        surfaces: list[str] = []
+        for surface, _occ in result.all():
+            key = (surface or "").strip().lower()
+            if not key or key == term or key in seen:
+                continue
+            seen.add(key)
+            surfaces.append(surface.strip())
+        if surfaces:
+            out[term] = surfaces
+    return out
+
+
 async def same_type_neighbor_edges(
     session: AsyncSession,
     candidate_ids: list[uuid.UUID],

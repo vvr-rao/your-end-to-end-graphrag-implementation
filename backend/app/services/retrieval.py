@@ -55,6 +55,7 @@ from backend.app.db.models.documents import Chunk, Document
 from backend.app.db.models.entities import Entity, TimeInstance
 from backend.app.db.models.ontology import OntologyClass
 from backend.app.db.session import session_scope
+from backend.app.services.alias_mining import normalize_term
 from backend.app.services.db_artifact_gen import _extract_json
 from backend.app.services.embeddings import Embedder
 from backend.app.services.llm_router import LLMRouter
@@ -78,6 +79,19 @@ def default_hops() -> int:
         return int(value) if value is not None else _DEFAULT_HOPS_FALLBACK
     except Exception:
         return _DEFAULT_HOPS_FALLBACK
+
+
+def _qa_cfg(key: str, default: Any) -> Any:
+    """Read one `qa.*` config value, falling back on any config error.
+
+    Every knob added here must keep today's behavior when unset -- these
+    features are additive and a missing key must never change results.
+    """
+    try:
+        value = get_settings().app_config.get("qa", {}).get(key)
+        return default if value is None else value
+    except Exception:
+        return default
 
 
 _VALID_MODES = ("simple_qa", "deep_research", "artifact_only")
@@ -127,6 +141,7 @@ async def retrieve_and_answer(
     resolved_query: str | None = None,
     verbose: bool = False,
     multi_round: bool = True,
+    persist: bool = True,
     _round_depth: int = 0,
 ) -> RetrievalResult:
     """Driver. `resolved_query` skips the follow-up resolution step
@@ -134,6 +149,11 @@ async def retrieve_and_answer(
 
     `top_k` defaults to 30 for deep_research (more breadth for the
     seven-section output) and 20 for simple_qa.
+
+    `persist=False` skips the `retrieval_runs` / `retrieval_evidence`
+    writes, leaving `retrieval_run_id` None. Lets the CLI be pointed at a
+    deployed database for testing without leaving rows in it; the API
+    path always persists.
     """
     if mode not in _VALID_MODES:
         raise ValueError(
@@ -175,7 +195,7 @@ async def retrieve_and_answer(
                 plan["round1_question"], mode="simple_qa",
                 hops=hops, max_cost_usd=max_cost_usd, decompose=decompose,
                 max_probes=max_probes, verbose=verbose,
-                multi_round=False, _round_depth=1,
+                multi_round=False, persist=persist, _round_depth=1,
             )
             # Round 2 (final): enrich the question with round-1 findings so the
             # pipeline seeds on the discovered entities AND the synthesis uses them.
@@ -195,7 +215,8 @@ async def retrieve_and_answer(
                 enriched_final, mode=mode, top_k=top_k,
                 hops=hops, max_cost_usd=max_cost_usd, decompose=decompose,
                 max_probes=max_probes, conversation_turn_id=conversation_turn_id,
-                verbose=verbose, multi_round=False, _round_depth=1,
+                verbose=verbose, multi_round=False, persist=persist,
+                _round_depth=1,
             )
             # Merge: r2 is the final answer; fold in round-1 evidence + all cost.
             # artifact_only only ever surfaces artifact evidence, so skip folding
@@ -223,11 +244,26 @@ async def retrieve_and_answer(
     if verbose:
         print(f"[query] parsed: {parsed}")
 
+    # -------- step 3.5: corpus-mined alias expansion --------
+    # Pure SQL lookup against `term_aliases` (populated by `mine-aliases`).
+    # No LLM: the synonymy comes from the corpus stating it, e.g. the FDA
+    # label line "MOUNJARO (tirzepatide) injection". Without this, a query
+    # saying "tirzepatide" cannot reach chunks that only ever say
+    # "MOUNJARO" -- they are unrelated in embedding space. Empty table =>
+    # empty dict => every downstream step behaves exactly as before.
+    aliases = await _expand_aliases(parsed.get("entities") or [])
+    parsed["aliases"] = aliases
+    if verbose and aliases:
+        print(
+            "[query] mined aliases: "
+            + "; ".join(f"{t} -> {', '.join(a)}" for t, a in aliases.items())
+        )
+
     # -------- step 4: ontology match --------
     embedder = Embedder()
     qvec = (await embedder.embed([resolved_query]))[0]
     seeds, matched_classes, matched_entities, matched_times = await _ontology_match(
-        parsed, qvec
+        parsed, qvec, aliases=aliases
     )
     if verbose:
         print(
@@ -280,7 +316,32 @@ async def retrieve_and_answer(
             session, expanded_entity_ids, limit=200,
         )
 
-    candidate_chunk_ids = list({cid for cid, _ in ent_chunks + time_chunks})
+    # Document-level recall arm. `documents.embedding` has been written and
+    # HNSW-indexed since 0001 but nothing ever read it. A document that is
+    # ABOUT the query topic surfaces here even when no individual chunk
+    # matches the query's vocabulary -- an independent path to the same
+    # recall gap brand/generic names open at chunk level, and one that
+    # needs no mined alias pair. `qa.k_documents: 0` disables it.
+    _k_docs = int(_qa_cfg("k_documents", 10))
+    doc_chunks: list[tuple[uuid.UUID, float]] = []
+    if _k_docs > 0:
+        async with session_scope() as session:
+            _doc_ids = await retrieval_sql.vector_search_documents(
+                session, qvec, top_k=_k_docs,
+            )
+            if _doc_ids:
+                doc_chunks = await retrieval_sql.fetch_chunks_for_documents(
+                    session, _doc_ids, limit=300,
+                )
+        if verbose:
+            print(
+                f"[query] document arm: {len(_doc_ids)} document(s) -> "
+                f"{len(doc_chunks)} chunk(s)"
+            )
+
+    candidate_chunk_ids = list(
+        {cid for cid, _ in ent_chunks + time_chunks + doc_chunks}
+    )
     candidate_artifact_ids = [aid for aid, _ in artifact_candidates]
 
     # Document-mediated table inclusion: pull every StructuredTable
@@ -448,6 +509,13 @@ async def retrieve_and_answer(
                     break
                 if sq.strip() and sq.strip() != resolved_query.strip():
                     probes.append(sq)
+
+    # Alias injection, applied to whichever probe set was built above.
+    # The chunk that broke the reported query says "MOUNJARO" and never
+    # "tirzepatide"; without the brand name in a probe, no probe can
+    # reach it.
+    probes = _apply_aliases_to_probes(probes, aliases, verbose=verbose)
+
     if verbose:
         print(f"[query] probes ({len(probes)}): {probes}")
 
@@ -463,21 +531,33 @@ async def retrieve_and_answer(
     chunk_rankings: list[list[uuid.UUID]] = []
     artifact_rankings: list[list[uuid.UUID]] = []
     async with session_scope() as session:
-        for pvec in probe_vecs:
+        for probe_text, pvec in zip(probes, probe_vecs, strict=False):
             ranked = await retrieval_sql.vector_rerank_chunks(
                 session, candidate_chunk_ids, pvec, top_k=top_k * 3,
             )
-            chunk_rankings.append([cid for cid, _ in ranked])
+            chunk_rankings.append(
+                _trim_by_distance(ranked, label=probe_text, verbose=verbose)
+            )
             if candidate_artifact_ids:
                 ranked_a = await retrieval_sql.vector_rerank_artifacts(
                     session, candidate_artifact_ids, pvec, top_k=top_k,
                 )
-                artifact_rankings.append([aid for aid, _ in ranked_a])
+                artifact_rankings.append(_trim_by_distance(ranked_a))
 
     # Graph-distance ranking: BFS score per chunk (via its entities). Uses the
     # entity-coverage ranking from step 8, propagated to full-text chunks by the
     # step-8.5 bridge when present (else identical to `ent_chunks`).
     chunk_rankings.append(graph_chunk_ranking)
+    # Document-similarity ranking as its own RRF voter. Filtered to the
+    # surviving candidate set -- the step-8.5 bridge may have swapped a
+    # document's summary chunks out for its full-text ones, and voting for
+    # a chunk that is no longer a candidate would burn a top_k slot on a
+    # row that gets dropped again at context-packing time.
+    if doc_chunks:
+        _cand = set(candidate_chunk_ids)
+        _doc_ranking = [cid for cid, _ in doc_chunks if cid in _cand]
+        if _doc_ranking:
+            chunk_rankings.append(_doc_ranking)
     if artifact_candidates:
         artifact_rankings.append([aid for aid, _ in artifact_candidates])
 
@@ -488,12 +568,18 @@ async def retrieve_and_answer(
     fused_artifacts = rrf_fuse(artifact_rankings)[:_art_k]
 
     # -------- step 11: pack context --------
+    _fused_chunk_ids = [cid for cid, _ in fused_chunks]
     async with session_scope() as session:
-        chunk_rows = await retrieval_sql.fetch_chunk_text(
-            session, [cid for cid, _ in fused_chunks]
-        )
+        chunk_rows = await retrieval_sql.fetch_chunk_text(session, _fused_chunk_ids)
         artifact_rows = await retrieval_sql.fetch_artifact_rows(
             session, [aid for aid, _ in fused_artifacts]
+        )
+        # Attribution: which entities each surviving chunk is actually
+        # about. One query over the final top-k, so the synthesis can be
+        # told that a passage concerns dulaglutide and must not be quoted
+        # as tirzepatide's dose.
+        chunk_entities = await retrieval_sql.fetch_chunk_entity_names(
+            session, _fused_chunk_ids
         )
 
     evidence: list[dict[str, Any]] = []
@@ -513,6 +599,7 @@ async def retrieve_and_answer(
             "text": info["text"],
             "document_iri": info["document_iri"],
             "document_title": info["document_title"],
+            "entities": chunk_entities.get(cid, []),
         })
     for rank, (aid, score) in enumerate(fused_artifacts, start=1):
         info = artifact_rows.get(aid)
@@ -555,12 +642,16 @@ async def retrieve_and_answer(
         cost_usd=cost,
         wall_seconds=time.time() - t0,
     )
-    await _persist_run(
-        result, mode=mode, resolved_query=resolved_query,
-        matched_classes=matched_classes, matched_entities=matched_entities,
-        matched_times=matched_times, graph_hops=hops,
-        conversation_turn_id=conversation_turn_id,
-    )
+    if persist:
+        await _persist_run(
+            result, mode=mode, resolved_query=resolved_query,
+            matched_classes=matched_classes, matched_entities=matched_entities,
+            matched_times=matched_times, graph_hops=hops,
+            conversation_turn_id=conversation_turn_id,
+        )
+    else:
+        async with session_scope() as session:
+            result.graph_version = await current_version(session)
     return result
 
 
@@ -590,8 +681,55 @@ async def _question_parse(router: LLMRouter, q: str) -> dict[str, Any]:
     }
 
 
+async def _expand_aliases(entity_terms: list[str]) -> dict[str, list[str]]:
+    """Corpus-mined synonyms for the parsed entity terms.
+
+    Keyed by the ORIGINAL surface term as it appeared in the question, so
+    probe rewriting can substitute in place. Terms are normalized with
+    the same normalizer used at ingest before lookup -- note the existing
+    entity trigram match at `_ontology_match` only lowercases, so
+    punctuation is handled inconsistently there; this path uses the real
+    one.
+
+    Fails soft: any error (table missing because 0006 has not been
+    applied yet, DB hiccup) yields {} and retrieval proceeds unchanged.
+    """
+    if not entity_terms:
+        return {}
+    max_aliases = int(_qa_cfg("max_aliases", 6))
+    if max_aliases <= 0:
+        return {}
+    norm_to_original: dict[str, str] = {}
+    for term in entity_terms[:10]:
+        norm = normalize_term(term or "")
+        if norm and norm not in norm_to_original:
+            norm_to_original[norm] = term.strip()
+    if not norm_to_original:
+        return {}
+    try:
+        async with session_scope() as session:
+            by_norm = await retrieval_sql.fetch_aliases(
+                session, list(norm_to_original), per_term_limit=max_aliases
+            )
+    except Exception as exc:
+        log.warning(
+            "alias lookup failed (%s: %s); continuing without alias "
+            "expansion. Has `mine-aliases` been run?",
+            type(exc).__name__, exc,
+        )
+        return {}
+    return {
+        norm_to_original[norm]: surfaces
+        for norm, surfaces in by_norm.items()
+        if norm in norm_to_original and surfaces
+    }
+
+
 async def _ontology_match(
-    parsed: dict[str, Any], qvec: list[float]
+    parsed: dict[str, Any],
+    qvec: list[float],
+    *,
+    aliases: dict[str, list[str]] | None = None,
 ) -> tuple[
     list[tuple[uuid.UUID, str]],
     list[dict[str, Any]],
@@ -623,8 +761,15 @@ async def _ontology_match(
             )
             seeds.append((cid, "ontology_class"))
 
-        # Vector + trgm entity match per parsed entity term.
-        for term in parsed.get("entities", [])[:10]:
+        # Vector + trgm entity match per parsed entity term. Mined aliases
+        # are matched alongside the question's own wording, so a graph
+        # entity minted as "MOUNJARO" is seeded by a question that only
+        # ever says "tirzepatide". Costs no rerank pass -- this widens the
+        # candidate pool, it does not add probes.
+        _terms: list[str] = list(parsed.get("entities", [])[:10])
+        for _alias_list in (aliases or {}).values():
+            _terms.extend(_alias_list)
+        for term in _terms:
             if not term.strip():
                 continue
             r = await session.execute(
@@ -715,6 +860,154 @@ async def _query_decompose(router: LLMRouter, q: str) -> list[str]:
         return []
     sqs = parsed.get("sub_questions") or []
     return [s for s in sqs if isinstance(s, str) and s.strip()]
+
+
+def _trim_by_distance(
+    ranked: list[tuple[uuid.UUID, float]],
+    *,
+    label: str | None = None,
+    verbose: bool = False,
+) -> list[uuid.UUID]:
+    """Drop a probe's weak tail before RRF sees it.
+
+    RRF fuses rank ORDER and discards distance, so a probe that matched
+    nothing still casts full-strength rank-1..N votes -- indistinguishable
+    from a probe that found exactly the right passage. In the reported
+    failure the tirzepatide probe had no real match, yet its best-of-
+    nothing results were fused as confidently as the dulaglutide probes'
+    genuine hits, and dulaglutide passages swept the answer context.
+
+    Two guards, both from `qa.*` and both no-ops when unset:
+
+      probe_dist_floor -- if even the BEST hit is farther than this, the
+                          probe found nothing; contribute no votes at all.
+      probe_dist_band  -- keep only results within this distance of the
+                          probe's own best hit.
+
+    Distances are L2 over normalized OpenAI embeddings, so they are
+    comparable across probes.
+    """
+    if not ranked:
+        return []
+    floor = _qa_cfg("probe_dist_floor", None)
+    band = _qa_cfg("probe_dist_band", None)
+    if floor is None and band is None:
+        return [cid for cid, _ in ranked]
+
+    best = min(dist for _, dist in ranked)
+    if floor is not None and best > float(floor):
+        if verbose:
+            print(
+                f"[query] probe dropped (best dist {best:.4f} > floor "
+                f"{float(floor):.2f}): {label!r}"
+            )
+        return []
+    if band is None:
+        return [cid for cid, _ in ranked]
+    cutoff = best + float(band)
+    kept = [cid for cid, dist in ranked if dist <= cutoff]
+    if verbose and len(kept) < len(ranked):
+        print(
+            f"[query] probe trimmed {len(ranked)} -> {len(kept)} "
+            f"(best {best:.4f}, cutoff {cutoff:.4f}): {label!r}"
+        )
+    return kept
+
+
+def _apply_aliases_to_probes(
+    probes: list[str],
+    aliases: dict[str, list[str]],
+    *,
+    verbose: bool = False,
+) -> list[str]:
+    """Inject corpus-mined aliases into the probe list.
+
+    Mode comes from `qa.alias_probe_mode`:
+
+      blended  -- rewrite in place: "Dosing schedule of tirzepatide"
+                  becomes "Dosing schedule of tirzepatide (Mounjaro)".
+                  Costs NO extra rerank pass.
+      separate -- add a dedicated probe per alias:
+                  "Dosing schedule of Mounjaro". Strictly better recall
+                  (the measured evidence is that a dedicated brand-name
+                  probe moved the target chunk from rank #886 to #1),
+                  at one sequential id-filtered rerank each.
+      off      -- aliases used for graph seeding only.
+
+    Default is `blended`. If it proves too weak on a given corpus, flip
+    the knob rather than editing code.
+
+    No aliases (or an unrecognized mode) returns the input list
+    unchanged, so behavior is identical to before this feature existed.
+    """
+    if not aliases or not probes:
+        return probes
+    mode = str(_qa_cfg("alias_probe_mode", "blended")).strip().lower()
+    if mode not in ("blended", "separate"):
+        return probes
+
+    max_alias_probes = int(_qa_cfg("max_alias_probes", 4))
+    out: list[str] = []
+    added = 0
+    seen = {p.strip().lower() for p in probes}
+
+    for probe in probes:
+        rewritten = probe
+        lowered = probe.lower()
+        for term, surfaces in aliases.items():
+            if not term or term.lower() not in lowered:
+                continue
+            # Don't repeat an alias the probe already names.
+            fresh = [s for s in surfaces if s.lower() not in lowered]
+            if not fresh:
+                continue
+            if mode == "blended":
+                # Substitute via a callable so the matched text is kept
+                # verbatim -- a case-insensitive match on "TIRZEPATIDE"
+                # must not rewrite it to the lowercased parse output.
+                _suffix = f" ({', '.join(fresh[:2])})"
+                rewritten = re.sub(
+                    re.escape(term),
+                    lambda m, s=_suffix: m.group(0) + s,
+                    rewritten,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+                lowered = rewritten.lower()
+        out.append(rewritten)
+
+    if mode == "separate":
+        for probe in probes:
+            lowered = probe.lower()
+            for term, surfaces in aliases.items():
+                if not term or term.lower() not in lowered:
+                    continue
+                for surface in surfaces:
+                    if added >= max_alias_probes:
+                        break
+                    if surface.lower() in lowered:
+                        continue
+                    variant = re.sub(
+                        re.escape(term), surface, probe, count=1, flags=re.IGNORECASE
+                    )
+                    key = variant.strip().lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(variant)
+                    added += 1
+
+    if verbose and out != probes:
+        # blended rewrites in place (0 added) while separate appends, so
+        # report both numbers rather than just the length delta.
+        rewritten = sum(
+            1 for a, b in zip(probes, out[: len(probes)]) if a != b
+        )
+        print(
+            f"[query] alias probe mode={mode}: "
+            f"{rewritten} probe(s) rewritten, {len(out) - len(probes)} added"
+        )
+    return out
 
 
 def _use_entity_probes(intent: str, n_entities: int, max_entity_probes: int) -> bool:
@@ -827,7 +1120,13 @@ async def _persist_run(
                     {"label": t["display_label"]} for t in matched_times[:10]
                 ]),
                 "hops": graph_hops,
-                "plan": json.dumps({"intent": result.parsed.get("intent", "")}),
+                # Aliases are recorded so a bad expansion is diagnosable
+                # after the fact -- otherwise a wrong mined pair would be
+                # invisible in the run history.
+                "plan": json.dumps({
+                    "intent": result.parsed.get("intent", ""),
+                    "aliases": result.parsed.get("aliases", {}),
+                }),
                 "gv": gv,
             },
         )

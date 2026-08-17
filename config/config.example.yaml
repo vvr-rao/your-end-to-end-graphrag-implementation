@@ -316,6 +316,59 @@ qa:
   # (sequential on the pooler). 0 disables the fan-out (generic decompose only).
   max_entity_probes: 8
 
+  # --- corpus-mined synonyms (populate with `mine-aliases`) --------------------
+  # FDA labels, filings and technical prose state their own synonyms
+  # ("MOUNJARO (tirzepatide) injection"). `mine-aliases` extracts those pairs
+  # deterministically -- no LLM -- into graphrag.term_aliases; retrieval then
+  # expands query terms with them. Without this, a question saying
+  # "tirzepatide" cannot reach chunks that only ever say "MOUNJARO": the two
+  # words are unrelated in embedding space.
+  #
+  # How mined aliases enter the vector probes:
+  #   blended  -- append to existing probe text ("... of tirzepatide (Mounjaro)").
+  #               No extra rerank pass, so no added latency.
+  #   separate -- add a dedicated probe per alias ("Dosing schedule of Mounjaro").
+  #               Better recall -- a dedicated brand-name probe measurably
+  #               outperforms a blended one -- at one extra sequential rerank each.
+  #   off      -- aliases still widen graph seeding, but do not touch probes.
+  alias_probe_mode: blended
+  # Max mined aliases carried per query term (seeding + probes).
+  max_aliases: 6
+  # Only used when alias_probe_mode: separate. Caps total added probes.
+  max_alias_probes: 4
+
+  # --- distance-aware probe fusion --------------------------------------------
+  # RRF fuses rank ORDER and throws distance away, so a probe that matched
+  # nothing still casts full-strength rank-1..N votes, indistinguishable from a
+  # probe that found the right passage. These guards restore that signal.
+  # Comment both out to get the previous (rank-only) behavior exactly.
+  #
+  # UNITS: pgvector `<->` is L2 distance over 1024-dim embeddings, range [0,2].
+  # NOT cosine distance -- the two are easy to confuse and differ by roughly a
+  # factor of two in this range. Measured on the pharma corpus:
+  #     on-topic probes    best hit 0.77 - 0.86
+  #     off-topic probes   best hit 1.24 - 1.25
+  #     nonsense probes    best hit 1.13
+  # 1.05 sits clear of both bands. Re-measure before changing it: embed a few
+  # relevant and a few deliberately off-topic probes and take min(distance)
+  # over graphrag.chunks.
+  #
+  # If even the BEST hit is farther than this, the probe found nothing relevant
+  # and contributes no votes at all.
+  probe_dist_floor: 1.05
+  # Keep only results within this L2 distance of the probe's own best hit.
+  # OFF by default: measured top-30 spread for a relevant probe is only
+  # 0.085-0.107, so any band loose enough to be safe is also loose enough to be
+  # a no-op, and a tighter one would discard real evidence. Enable only with
+  # measurements from your own corpus.
+  # probe_dist_band: 0.10
+
+  # --- document-level recall arm ----------------------------------------------
+  # Top-k documents by whole-document embedding similarity, whose chunks join
+  # the candidate pool. Surfaces documents that are ABOUT the topic even when no
+  # individual chunk matches the query's wording. 0 disables the arm.
+  k_documents: 10
+
 # -----------------------------------------------------------------------------
 # Background jobs (arq).
 # -----------------------------------------------------------------------------
