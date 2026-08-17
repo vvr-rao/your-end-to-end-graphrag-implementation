@@ -138,8 +138,9 @@ otherwise ask — never scan+pick). Discuss the options with the user:
   with `--from-fulltext`** (see the full-text-consistency rule above) — decide this
   once, here.
 
-**Smoke-test** with `--limit 5`, review, then scale. Launch detached (single-line
-command; choose a fresh `RUN_ID`, e.g. `register_docs_<date+time>`):
+**Smoke-test** with `--limit 5`, review, then scale. Add `--no-mine-aliases` to the
+smoke test only (see the alias note below). Launch detached (single-line command;
+choose a fresh `RUN_ID`, e.g. `register_docs_<date+time>`):
 ```
 uv run python scripts/run_detached.py <RUN_ID> uv run python -m backend.app.cli register-documents --input "<DOCS>" [--tables] [--full-text-chunks]
 uv run python scripts/job_status.py <RUN_ID> 40
@@ -150,6 +151,22 @@ steps and future sessions know to apply `--from-fulltext`:
 ```
 uv run python scripts/build_state.py record register-documents docs=<n> chunks=<n> fulltext=<yes|no> tables=<n>
 ```
+
+**Corpus synonyms refresh automatically here.** A successful (non-dry-run) ingest
+ends by re-running `mine-aliases`, which extracts brand/generic pairs, acronym
+expansions and alias phrases straight out of the text — "MOUNJARO (tirzepatide)
+injection", "Securities and Exchange Commission (SEC)". Retrieval uses these so a
+question asking "tirzepatide" still reaches chunks that only ever say "MOUNJARO".
+It is free ($0, no LLM), takes ~1 min per 2,500 chunks, and always rescans the
+whole corpus, so:
+- **Pass `--no-mine-aliases` on `--limit` smoke tests** — a full rescan there is
+  wasted work.
+- **Never pass it on the real run.** Skipping it leaves the alias table stale for
+  exactly the documents you just added, and nothing at query time says so.
+- If the step reports a WARNING (e.g. migration `0006_term_aliases` not applied),
+  the ingest still succeeded — apply migrations and run `mine-aliases` by hand.
+- Look at the pair count it prints. Zero pairs on a real corpus means the guards
+  are rejecting everything; run `mine-aliases --dry-run --show 40` to inspect.
 
 ## Step 3 — extract-entities (entities + relationships; long, paid)
 Mints entities/relationships per chunk — **no new ontology classes**. **If Step 2
@@ -187,6 +204,15 @@ uv run python scripts/build_state.py record generate-artifacts artifacts=<n>
 Report what's now queryable (documents, entities, artifacts), the final `db-size`,
 and total cost. The corpus is now a knowledge graph — the user can `query` /
 `conversation`, or proceed to the **deploy** skill (which needs a **cloud** DB).
+
+Before handing back, confirm synonyms are populated — Step 2 does this
+automatically, but a skipped or failed refresh is invisible until a query
+silently under-retrieves:
+```
+uv run python -m backend.app.cli mine-aliases --dry-run --show 15
+```
+If the printed pair count is 0, or far below what the corpus should yield, say so
+rather than reporting a clean finish.
 
 ## Notes
 - **Scale ceiling:** at very large corpora both `extract-entities` and

@@ -28,6 +28,7 @@ from backend.app.db.models.documents import Chunk, Document
 from backend.app.db.session import session_scope
 from backend.app.services.db_document_ingest import (
     _document_iri,
+    _refresh_aliases,
     ingest_documents_folder,
 )
 from backend.app.services.document_io import load_document
@@ -123,6 +124,16 @@ async def delete_document(iri: str, *, hard: bool = False) -> dict[str, Any]:
         f"  artifacts -> STALE: {len(stale_ids)}\n"
         f"  graph_version ->    {new_version}"
     )
+
+    # Same invariant as ingest: the corpus changed, so re-derive synonyms.
+    # A soft delete flags the chunks DELETED and mining reads only ACTIVE
+    # ones, so either mode can strand a pair whose supporting text is gone.
+    # Milder than the ingest case -- a probe for a term with no remaining
+    # evidence now falls under `qa.probe_dist_floor` and casts no votes --
+    # but the refresh is free, so keep the rule simple.
+    if chunk_count:
+        await _refresh_aliases("delete-document")
+
     return {
         "mode": mode,
         "title": title,

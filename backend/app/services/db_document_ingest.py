@@ -277,6 +277,7 @@ async def ingest_documents_folder(
     full_text_chunks: bool = False,
     summarization_method: str | None = None,
     eval_rounds: int | None = None,
+    mine_aliases: bool = True,
 ) -> IngestSummary:
     """Ingest every supported file in `folder`. See module docstring.
 
@@ -650,7 +651,49 @@ async def ingest_documents_folder(
         f"graph_version -> {summary.new_graph_version}"
     )
 
+    # Refresh corpus-mined synonyms. New documents bring new brand/generic
+    # pairs and acronym expansions; without this the alias table silently
+    # goes stale and retrieval turns vocabulary-blind for exactly the
+    # documents just added -- a question asking "tirzepatide" stops reaching
+    # a chunk that only says "MOUNJARO", with no signal at query time.
+    #
+    # Lives here rather than in the CLI handler because `update_document`
+    # reaches this function directly; the invariant is "corpus changed =>
+    # aliases refreshed", and it has to hold on every path.
+    #
+    # Free ($0, no LLM) and idempotent -- a full scan replaces the table --
+    # but it always rescans the whole corpus, hence the opt-out for
+    # `--limit` smoke tests.
+    if mine_aliases:
+        await _refresh_aliases("ingest")
+
     return summary
+
+
+async def _refresh_aliases(tag: str) -> None:
+    """Re-mine corpus synonyms, reporting rather than raising.
+
+    Never let this fail an operation that already succeeded: the documents
+    are committed and (for ingest) paid for by this point, and a missing
+    `term_aliases` table or a dropped connection is recoverable by hand.
+    """
+    from backend.app.services.alias_mining import mine_aliases as _mine
+
+    try:
+        s = await _mine()
+    except Exception as exc:
+        log.warning(
+            "[%s] alias refresh failed (%s: %s). The operation itself "
+            "succeeded; run `mine-aliases` to refresh synonym expansion. "
+            "Has migration 0006_term_aliases been applied?",
+            tag, type(exc).__name__, exc,
+        )
+        return
+    print(
+        f"[{tag}] aliases refreshed: {s.pairs_written:,} pair(s) across "
+        f"{s.chunks_scanned:,} chunk(s)"
+        + (f", {s.pairs_pruned:,} pruned" if s.pairs_pruned else "")
+    )
 
 
 # ---------- Optional: ingest verbatim full-text chunks (kind='fulltext') ----------

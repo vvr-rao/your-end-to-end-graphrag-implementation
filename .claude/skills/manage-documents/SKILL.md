@@ -46,6 +46,13 @@ ingest. Record it:
 uv run python scripts/build_state.py record add-documents docs=<n> fulltext=<yes|no>
 ```
 
+**Synonyms refresh automatically.** `register-documents` ends by re-running
+`mine-aliases`, so brand/generic pairs and acronym expansions in the new documents
+become searchable straight away. Only pass `--no-mine-aliases` on a `--limit`
+smoke test — on the real add, skipping it leaves the new documents
+vocabulary-blind (a question asking "tirzepatide" won't reach a chunk that only
+says "MOUNJARO") with no signal at query time.
+
 ## Update (replace) a document
 Replaces a document's content. **No-op if the new file's sha256 matches the old.**
 ```bash
@@ -56,6 +63,7 @@ old, the old document → `DELETED`, and artifacts whose **ALL** sources were in
 document → **STALE** (mixed-source artifacts stay `ACTIVE`). Follow up with
 `extract-entities` (covers the new chunks) and **`regenerate-stale-artifacts`**
 (regenerates artifacts for the new version + retires the stale rows) — see below.
+Corpus synonyms refresh automatically (this routes through the same ingest path).
 
 ## Delete a document
 ```bash
@@ -73,6 +81,26 @@ uv run python -m backend.app.cli delete-document --iri "<doc-iri>" --hard
   is left pointing at deleted evidence. **Get explicit user confirmation first.**
 
 Record the action, e.g. `uv run python scripts/build_state.py record delete-document iri=<iri> mode=<soft|hard>`.
+
+## Corpus synonyms (`term_aliases`) — automatic on every path
+`mine-aliases` extracts brand/generic pairs, acronym expansions and alias phrases
+straight out of the corpus text ("MOUNJARO (tirzepatide) injection", "Securities
+and Exchange Commission (SEC)"). Retrieval expands query terms with them, so a
+question asking "tirzepatide" still reaches chunks that only ever say "MOUNJARO".
+
+**Every command on this page refreshes it automatically** — `register-documents`,
+`update-document` (it routes through the same ingest path) and `delete-document`
+(when it affected chunks). It's free ($0, no LLM) and idempotent: a full scan
+replaces the table, so pairs whose supporting text is gone are pruned.
+
+You only need to think about it in three cases:
+- **`--limit` smoke tests:** pass `--no-mine-aliases` to skip the full rescan.
+  Remember to drop the flag for the real run.
+- **A WARNING in the output** (e.g. migration `0006_term_aliases` not applied):
+  the document operation still succeeded — fix the cause, then run
+  `mine-aliases` by hand.
+- **You skipped it earlier:** the staleness is invisible at query time, so check
+  with `mine-aliases --dry-run --show 20` if you're unsure.
 
 ## Stale artifacts (the follow-on)
 After an update or soft-delete, artifacts that depended **entirely** on the

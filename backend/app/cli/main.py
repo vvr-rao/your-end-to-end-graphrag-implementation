@@ -595,6 +595,16 @@ def build_parser() -> argparse.ArgumentParser:
             "fidelity + more cost. Ignored with --single-pass-summaries."
         ),
     )
+    p_reg.add_argument(
+        "--no-mine-aliases", dest="mine_aliases", action="store_false", default=True,
+        help=(
+            "Skip the automatic corpus-synonym refresh that normally follows a "
+            "successful ingest. The refresh is free ($0, no LLM) but always scans "
+            "the WHOLE corpus (~1 min per 2,500 chunks), which is wasted work "
+            "during a --limit smoke test. Run `mine-aliases` yourself before "
+            "querying if you skip it here."
+        ),
+    )
     p_reg.set_defaults(func=_cmd_register_documents)
 
     p_del = sub.add_parser(
@@ -1488,6 +1498,7 @@ def _cmd_register_documents(args: argparse.Namespace) -> int:
                 "single_pass" if getattr(args, "single_pass_summaries", False) else None
             ),
             eval_rounds=getattr(args, "eval_rounds", None),
+            mine_aliases=getattr(args, "mine_aliases", True),
         )
     )
     return 0
