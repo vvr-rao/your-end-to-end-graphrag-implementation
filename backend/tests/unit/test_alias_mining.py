@@ -133,6 +133,20 @@ def test_rejects_non_synonym_parentheticals(text: str) -> None:
     assert mine_text(text) == []
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        # A dosage FORM is a presentation, not a synonym of the product.
+        # "pill" reached probe text as an alias of Wegovy before this guard.
+        "Wegovy (pill) for chronic weight management",
+        "Rybelsus (oral) semaglutide",
+        "Ozempic (solution) for injection",
+    ],
+)
+def test_dosage_forms_are_not_synonyms(text: str) -> None:
+    assert mine_text(text) == []
+
+
 def test_both_sides_lowercase_common_words_rejected() -> None:
     """At least one side must look like a proper name, or ordinary prose
     apposition mints garbage pairs."""

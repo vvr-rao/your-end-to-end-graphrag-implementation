@@ -138,6 +138,11 @@ _GENERIC_TERMS: frozenset[str] = frozenset({
     "tablets", "tablet", "injection", "injections", "capsule", "capsules",
     "vial", "vials", "carton", "storage", "store", "keep", "read",
     "medication", "guide", "usage", "supplied", "dispense", "pharmacist",
+    # Dosage FORMS are not synonyms of the drug: "Wegovy (pill)" describes
+    # a presentation, and admitting it lets "pill" ride into probe text as
+    # though it named the product.
+    "pill", "pills", "shot", "shots", "syringe", "needle", "prefilled",
+    "solution", "suspension", "powder", "oral", "subcutaneous",
 })
 
 # Terms whose SHAPE marks them as not-a-name, checked before the word lists.

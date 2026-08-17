@@ -470,6 +470,52 @@ async def fetch_chunk_entity_names(
     return out
 
 
+# Trigram floor for the misspelling fallback below. Measured against this
+# corpus's drug vocabulary:
+#     typos           similarity 0.50 - 0.77  (ozempick/ozempic = 0.700)
+#     different drugs similarity 0.00 - 0.14  (losartan/lisinopril = 0.053)
+# 0.45 sits clear of both, so a typo resolves while two genuinely different
+# drugs never collapse into one another -- which would reintroduce the exact
+# wrong-entity failure this whole feature exists to prevent.
+_ALIAS_FUZZY_THRESHOLD = 0.45
+
+_ALIAS_EXACT_SQL = """
+SELECT surface, occurrences FROM (
+    SELECT surface_b AS surface, occurrences
+      FROM graphrag.term_aliases WHERE term_a = :t
+    UNION ALL
+    SELECT surface_a AS surface, occurrences
+      FROM graphrag.term_aliases WHERE term_b = :t
+) s
+ -- A synonym USED AS A PROBE has to be a name, not a phrase. Longer runs
+ -- are label boilerplate that survived mining ("Medication Guide TRULICITY
+ -- TRU-li-si-tee"); injecting one into probe text would poison the
+ -- embedding it rides on.
+ WHERE array_length(string_to_array(btrim(surface), ' '), 1) <= 3
+ ORDER BY occurrences DESC, length(surface) ASC, surface
+ LIMIT :limit
+"""
+
+# Fallback for misspelled query terms. Every other stage of the pipeline
+# tolerates typos -- question_parse and query_decompose are LLM calls,
+# entity seeding is already trigram-matched, and embeddings degrade
+# gracefully -- so an exact-match alias lookup was the single brittle link
+# in the chain: one wrong character silently disabled synonym expansion
+# with no signal that it had happened.
+_ALIAS_FUZZY_SQL = """
+SELECT surface, occurrences, sim FROM (
+    SELECT surface_b AS surface, occurrences, similarity(term_a, :t) AS sim
+      FROM graphrag.term_aliases WHERE similarity(term_a, :t) >= :thr
+    UNION ALL
+    SELECT surface_a AS surface, occurrences, similarity(term_b, :t) AS sim
+      FROM graphrag.term_aliases WHERE similarity(term_b, :t) >= :thr
+) s
+ WHERE array_length(string_to_array(btrim(surface), ' '), 1) <= 3
+ ORDER BY sim DESC, occurrences DESC, length(surface) ASC, surface
+ LIMIT :limit
+"""
+
+
 async def fetch_aliases(
     session: AsyncSession,
     normalized_terms: list[str],
@@ -498,27 +544,25 @@ async def fetch_aliases(
         if not term:
             continue
         result = await session.execute(
-            sql_text("""
-            SELECT surface, occurrences FROM (
-                SELECT surface_b AS surface, occurrences
-                  FROM graphrag.term_aliases WHERE term_a = :t
-                UNION ALL
-                SELECT surface_a AS surface, occurrences
-                  FROM graphrag.term_aliases WHERE term_b = :t
-            ) s
-             -- A synonym USED AS A PROBE has to be a name, not a phrase.
-             -- Longer runs are label boilerplate that survived mining
-             -- ("Medication Guide TRULICITY TRU-li-si-tee"); injecting one
-             -- into probe text would poison the embedding it rides on.
-             WHERE array_length(string_to_array(btrim(surface), ' '), 1) <= 3
-             ORDER BY occurrences DESC, length(surface) ASC, surface
-             LIMIT :limit
-            """),
-            {"t": term, "limit": per_term_limit},
+            sql_text(_ALIAS_EXACT_SQL), {"t": term, "limit": per_term_limit}
         )
+        rows = result.all()
+        if not rows:
+            # Exact miss: the term may simply be misspelled. The table is
+            # small (corpus vocabulary, not corpus size), so the seq scan
+            # this costs is negligible and only runs on the miss path.
+            result = await session.execute(
+                sql_text(_ALIAS_FUZZY_SQL),
+                {
+                    "t": term,
+                    "limit": per_term_limit,
+                    "thr": _ALIAS_FUZZY_THRESHOLD,
+                },
+            )
+            rows = [(r[0], r[1]) for r in result.all()]
         seen: set[str] = set()
         surfaces: list[str] = []
-        for surface, _occ in result.all():
+        for surface, _occ in rows:
             key = (surface or "").strip().lower()
             if not key or key == term or key in seen:
                 continue
