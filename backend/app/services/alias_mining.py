@@ -143,6 +143,11 @@ _GENERIC_TERMS: frozenset[str] = frozenset({
     # though it named the product.
     "pill", "pills", "shot", "shots", "syringe", "needle", "prefilled",
     "solution", "suspension", "powder", "oral", "subcutaneous",
+    # Delivery DEVICES are not the drug either. "MOUNJARO KwikPen" is a
+    # presentation of tirzepatide, not another name for it, and admitting
+    # it burns an alias slot that a real brand name should hold.
+    "kwikpen", "flexpen", "flextouch", "autoinjector", "auto-injector",
+    "singledose", "multidose", "cartridge", "ampoule", "ampule",
 })
 
 # Terms whose SHAPE marks them as not-a-name, checked before the word lists.
@@ -352,6 +357,33 @@ _CONNECTIVES: frozenset[str] = frozenset({
 })
 
 
+# A separator that means two adjacent capitalised words belong to DIFFERENT
+# items, even though the word tokenizer cannot see it:
+#   digits      list/section markers -- "Ozempic 3.1 Mounjaro (tirzepatide)"
+#               merged into the head "Ozempic Mounjaro"
+#   . + space   sentence or list end -- "in Wegovy 8. Zepbound (Tirzepatide)"
+#   newline/pipe/bullet  table cells and list items
+# A bare period is NOT a boundary, or "Alphabet Inc." and "U.S." would split.
+_ITEM_BOUNDARY_RE = re.compile(r"\d|\.\s|[\n|•;]")
+
+
+def _clean_tail_tokens(prefix: str) -> list[str]:
+    """Trailing word tokens of `prefix`, cut at the last item boundary.
+
+    Without this the capitalised-run rule reads straight through a
+    numbered list and invents a name from two neighbouring entries.
+    """
+    matches = list(_WORD_RE.finditer(prefix))
+    if not matches:
+        return []
+    start_idx = 0
+    for i in range(1, len(matches)):
+        gap = prefix[matches[i - 1].end() : matches[i].start()]
+        if _ITEM_BOUNDARY_RE.search(gap):
+            start_idx = i
+    return [m.group(0) for m in matches[start_idx:]]
+
+
 def _head_before(text: str, end: int, *, n_words: int | None = None) -> str:
     """The name immediately preceding position `end`.
 
@@ -368,8 +400,11 @@ def _head_before(text: str, end: int, *, n_words: int | None = None) -> str:
     `n_words` forces an exact-length head, used by the acronym rule where
     an N-letter acronym must be matched against exactly N words.
     """
-    prefix = _strip_marks(text[:end])
-    tokens = _WORD_RE.findall(prefix)
+    # NOTE: read boundaries from the RAW slice, not `_strip_marks` output --
+    # that collapses whitespace and would turn ". " into "." , hiding a
+    # sentence boundary.
+    prefix = text[:end]
+    tokens = _clean_tail_tokens(prefix)
     while tokens and tokens[-1].lower() in _CONNECTIVES:
         tokens.pop()
     if not tokens:

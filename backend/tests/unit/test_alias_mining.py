@@ -160,6 +160,39 @@ def test_financial_statement_furniture_rejected(text: str) -> None:
     assert mine_text(text) == []
 
 
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        # Verbatim from the corpus. The list marker "3.1" is invisible to
+        # the word tokenizer, so the capitalised-run head ran straight
+        # through it and invented the name "Ozempic Mounjaro".
+        (
+            "Best Alternatives to Ozempic 3.1 Mounjaro (tirzepatide) tablets",
+            [("mounjaro", "tirzepatide")],
+        ),
+        # Same defect via a sentence/list boundary: "... in Wegovy 8.
+        # Zepbound (Tirzepatide)" produced "Wegovy Zepbound".
+        (
+            "ingredients in Wegovy 8. Zepbound (Tirzepatide) is dual-acting",
+            [("tirzepatide", "zepbound")],
+        ),
+    ],
+)
+def test_item_boundaries_do_not_merge_neighbouring_names(
+    text: str, expected: list[tuple[str, str]]
+) -> None:
+    assert [(p.term_a, p.term_b) for p in mine_text(text)] == expected
+
+
+def test_abbreviation_periods_are_not_item_boundaries() -> None:
+    """A bare period inside an abbreviation must not split the head, or
+    "U.S. Securities and Exchange Commission" stops resolving."""
+    (pair,) = mine_text(
+        "The U.S. Securities and Exchange Commission (SEC) issued guidance"
+    )
+    assert (pair.term_a, pair.term_b) == ("sec", "securities and exchange commission")
+
+
 def test_surface_forms_are_preserved() -> None:
     """Probes embed the surface form, and "MOUNJARO" does not embed the
     same as "mounjaro"."""
