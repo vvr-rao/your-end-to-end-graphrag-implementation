@@ -83,3 +83,41 @@ def test_attribution_rule_demands_naming_the_gap():
     lowered = _ATTRIBUTION_RULE.lower()
     assert "never transfer" in lowered
     assert "no <property> for <entity>" in lowered or "contains no" in lowered
+
+
+# --------------------------------------------------------------------------
+# Alias block: retrieval knows the synonyms, so the synthesis must too
+# --------------------------------------------------------------------------
+
+
+def test_alias_block_lists_corpus_verified_pairs():
+    for fn in (answer_simple_qa, answer_deep_research):
+        _, user = fn(
+            "Compare dosing of tirzepatide and dulaglutide",
+            [_chunk()],
+            1500,
+            {"tirzepatide": ["Mounjaro", "Zepbound"], "dulaglutide": ["Trulicity"]},
+        )
+        assert "ALTERNATE NAMES" in user, fn.__name__
+        assert "tirzepatide = Mounjaro, Zepbound" in user
+        assert "dulaglutide = Trulicity" in user
+
+
+def test_alias_block_absent_when_nothing_was_mined():
+    """REGRESSION GUARD: on a database where `mine-aliases` never ran, the
+    prompt must be byte-identical to the pre-alias version."""
+    for fn in (answer_simple_qa, answer_deep_research):
+        base = fn("q", [_chunk()], 1500)
+        for empty in (None, {}, {"tirzepatide": []}):
+            assert fn("q", [_chunk()], 1500, empty) == base, fn.__name__
+        assert "ALTERNATE NAMES" not in base[1]
+
+
+def test_attribution_rule_points_at_the_alias_block():
+    """The rule must tell the model the listed pairs ARE the same entity.
+    Without that it stays conservative and refuses to merge them, which
+    is the behavior the alias block exists to override."""
+    lowered = _ATTRIBUTION_RULE.lower()
+    assert "alternate names" in lowered
+    # ...while still forbidding unlisted merges.
+    assert "unless an evidence item shows" in lowered

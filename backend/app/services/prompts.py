@@ -1370,11 +1370,42 @@ _ATTRIBUTION_RULE = (
     "evidence contains no <property> for <entity>\". An incomplete "
     "answer that names its gap is correct; a complete-looking answer "
     "built on a sibling entity's numbers is wrong.\n"
-    "  - Note that the same thing may appear under more than one name "
-    "(a brand name and a generic name, a ticker and a company name). "
-    "Treat them as the same entity ONLY when an evidence item shows "
+    "  - The same thing often appears under more than one name (brand vs "
+    "generic, ticker vs company, acronym vs expansion, nickname vs full "
+    "name). Any ALTERNATE NAMES block below lists pairs that THIS CORPUS "
+    "states are the same thing -- treat those as one entity, and prefer "
+    "the name the question used when you write the answer. Two names NOT "
+    "listed there are different entities unless an evidence item shows "
     "them together; never assume it."
 )
+
+
+def _format_alias_block(aliases: dict[str, list[str]] | None) -> str:
+    """Render corpus-verified alternate names for the synthesis prompt.
+
+    Retrieval already uses these to widen graph seeding and probe text,
+    but the model answering the question could not see them: it was told
+    that alternate names exist without being told WHICH, so it had to
+    re-derive from the evidence that MOUNJARO is tirzepatide -- and would
+    conservatively decline to merge them when no single passage happened
+    to show both. Handing over the pairs we mined removes that guesswork.
+
+    Empty/absent -> empty string, and the prompt is byte-identical to
+    what it was before aliases existed.
+    """
+    if not aliases:
+        return ""
+    lines = [
+        f"  - {term} = {', '.join(alts)}"
+        for term, alts in aliases.items()
+        if alts
+    ]
+    if not lines:
+        return ""
+    return (
+        "\n\nALTERNATE NAMES (stated by this corpus; treat each line as "
+        "one entity):\n" + "\n".join(lines)
+    )
 
 
 _FACTS_FIRST_RULE = (
@@ -1398,7 +1429,10 @@ _FACTS_FIRST_RULE = (
 
 
 def answer_simple_qa(
-    question: str, evidence: list[dict], evidence_char_cap: int = 600
+    question: str,
+    evidence: list[dict],
+    evidence_char_cap: int = 600,
+    aliases: dict[str, list[str]] | None = None,
 ) -> tuple[str, str]:
     """Tight one-shot answer. Only the question, nothing more.
 
@@ -1420,7 +1454,9 @@ def answer_simple_qa(
         "  - Return ONLY the answer text."
     )
     user = (
-        f"QUESTION: {question}\n\nEVIDENCE:\n"
+        f"QUESTION: {question}"
+        + _format_alias_block(aliases)
+        + "\n\nEVIDENCE:\n"
         + _format_evidence_block(evidence, evidence_char_cap)
         + "\n\nAnswer now."
     )
@@ -1492,7 +1528,10 @@ _DEEP_RESEARCH_SECTIONS = (
 
 
 def answer_deep_research(
-    question: str, evidence: list[dict], evidence_char_cap: int = 600
+    question: str,
+    evidence: list[dict],
+    evidence_char_cap: int = 600,
+    aliases: dict[str, list[str]] | None = None,
 ) -> tuple[str, str]:
     """deep_research mode: structured 7-section output.
 
@@ -1513,7 +1552,9 @@ def answer_deep_research(
         "Return plain text only -- no markdown."
     )
     user = (
-        f"QUESTION: {question}\n\nEVIDENCE:\n"
+        f"QUESTION: {question}"
+        + _format_alias_block(aliases)
+        + "\n\nEVIDENCE:\n"
         + _format_evidence_block(evidence, evidence_char_cap)
         + "\n\nWrite the seven-section answer now."
     )

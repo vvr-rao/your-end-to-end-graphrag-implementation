@@ -625,7 +625,14 @@ async def retrieve_and_answer(
     _evidence_cap = int(
         get_settings().app_config.get("qa", {}).get("evidence_char_cap", 600)
     )
-    sys_p, user_p = answer_prompt_fn(resolved_query, evidence, _evidence_cap)
+    # Hand the mined aliases to the synthesis too, not just to retrieval.
+    # Finding the evidence and understanding it are separate problems: the
+    # model was being told alternate names exist without being told WHICH,
+    # so it had to re-derive "MOUNJARO is tirzepatide" from whatever
+    # happened to be in the context window.
+    sys_p, user_p = answer_prompt_fn(
+        resolved_query, evidence, _evidence_cap, parsed.get("aliases") or {}
+    )
     try:
         out = await router.chat(answer_task_name, system=sys_p, user=user_p)
         answer = out.text.strip()
