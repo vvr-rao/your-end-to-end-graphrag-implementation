@@ -102,12 +102,17 @@ class TermAlias(Base):
     The `surface_*` columns keep the form as it appeared in the text,
     because "MOUNJARO" and "mounjaro" do not embed identically and the
     probe wants the real one.
+
+    `evidence_kind` is the pair's provenance: 'parenthetical', 'phrase'
+    and 'ontology' are mined and get replaced on every `mine-aliases`
+    run, while 'manual' is hand-curated and deliberately exempt from
+    that prune -- see README "Identity Layer" for the INSERT recipe.
     """
 
     __tablename__ = "term_aliases"
     __table_args__ = (
         CheckConstraint(
-            "evidence_kind IN ('parenthetical','phrase','ontology')",
+            "evidence_kind IN ('parenthetical','phrase','ontology','manual')",
             name="term_aliases_kind_check",
         ),
         CheckConstraint("term_a < term_b", name="term_aliases_order_check"),

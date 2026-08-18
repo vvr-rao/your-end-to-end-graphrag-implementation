@@ -339,6 +339,36 @@ def test_pairs_are_stored_in_lexical_order() -> None:
     assert b.surface_a == "MOUNJARO" and b.surface_b == "tirzepatide"
 
 
+def test_manual_pairs_are_exempt_from_the_prune() -> None:
+    """`mine-aliases` replaces the mined rows wholesale and deletes any it
+    did not just produce. That refresh now runs automatically after every
+    ingest, so a hand-curated pair MUST be exempt or an operator's work
+    disappears with no warning. The README documents this guarantee;
+    pin the SQL that provides it."""
+    import inspect
+
+    from backend.app.services import alias_mining
+
+    src = inspect.getsource(alias_mining.mine_aliases)
+    assert "DELETE FROM graphrag.term_aliases" in src, "prune removed?"
+    # The exemption must sit inside the DELETE's own WHERE clause.
+    delete_stmt = src[src.index("DELETE FROM graphrag.term_aliases") :]
+    where_clause = delete_stmt.split('"""')[0]
+    assert "evidence_kind <> 'manual'" in where_clause
+
+
+def test_manual_is_an_accepted_evidence_kind() -> None:
+    """The CHECK constraint on the table must admit it (migration 0007)."""
+    from backend.app.db.models.entities import TermAlias
+
+    checks = [
+        str(c.sqltext)
+        for c in TermAlias.__table__.constraints
+        if hasattr(c, "sqltext")
+    ]
+    assert any("manual" in c for c in checks), checks
+
+
 def test_occurrences_accumulate_across_mentions() -> None:
     from backend.app.services.alias_mining import _merge
 

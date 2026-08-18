@@ -793,11 +793,17 @@ async def mine_aliases(
         # precision guards, or text removed from the corpus) must not
         # linger and keep steering probes. Skipped under --limit, where
         # the scan is a sample and pruning would delete almost everything.
+        #
+        # `evidence_kind='manual'` is exempt. Those rows are hand-curated
+        # for pairs the corpus never states outright, and since this
+        # refresh runs automatically after every ingest, pruning them
+        # would delete an operator's work with no warning.
         if limit is None:
             pruned = await session.execute(
                 sql_text("""
                 DELETE FROM graphrag.term_aliases
-                 WHERE (term_a, term_b, evidence_kind) NOT IN (
+                 WHERE evidence_kind <> 'manual'
+                   AND (term_a, term_b, evidence_kind) NOT IN (
                      SELECT * FROM unnest(
                        CAST(:a AS text[]), CAST(:b AS text[]), CAST(:k AS text[])
                      )

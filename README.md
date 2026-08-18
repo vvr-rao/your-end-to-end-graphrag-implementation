@@ -114,7 +114,9 @@ Conversation view: a prior *simple_qa* turn with its cited answer, plus a *deep_
 
 5. **Time + geography expansion, curated upper ontologies.** Temporal mentions in the corpus auto-expand into a year/quarter/month/day hierarchy with parent creation + gap-fill. Geography rides on existing OWL classes from the merged geography ontology. This allows automatic discovery during RAG (e.g. documents talking about "Jan 2024" are retrievable in queries on "2024" and vice-versa, documents talking about "India" are retrievable in queries on "Asia" and vice-versa) 
 
-6. **Output formatting.** 2 modes of information retrieval - *simple_qa* and *deep_research*. *deep_research* does a deep search, identifies facts, provides the analysis and insights on the facts, identifies claims made and **calls out whether or not the claim is backed with evidence** (I feel this is important), identifies **imbalances in data within the corpus** (e.g. more information on one company/country/product etc. than another - a key issue I see in real world RAG applications). 
+6. **Identity layer — corpus-mined synonyms and acronyms.** The same thing is rarely called the same thing twice (brand vs generic drug name, ticker vs company, acronym vs expansion, nickname vs full name), and embeddings do NOT know these are equivalent — `tirzepatide` and `MOUNJARO` are as far apart in vector space as two unrelated words. The system mines these equivalences out of the corpus itself, deterministically and with no LLM, by reading the conventions authors already use (`MOUNJARO (tirzepatide)`, `Securities and Exchange Commission (SEC)`, `also known as`) plus any `skos:altLabel` annotations in your ontology. The pairs then widen graph seeding, ride into the vector probes, survive misspelled queries, and are handed to the answer LLM so it treats the names as one entity. See **[Identity Layer](#identity-layer)**.
+
+7. **Output formatting.** 2 modes of information retrieval - *simple_qa* and *deep_research*. *deep_research* does a deep search, identifies facts, provides the analysis and insights on the facts, identifies claims made and **calls out whether or not the claim is backed with evidence** (I feel this is important), identifies **imbalances in data within the corpus** (e.g. more information on one company/country/product etc. than another - a key issue I see in real world RAG applications). 
 
 ## Notes
 
@@ -190,6 +192,199 @@ Every artifact lives in `graphrag.intelligence_artifacts` with a `vector(1024)` 
 ```
 Answer → retrieval_evidence → intelligence_artifacts → artifact_sources → chunks → documents → file_path
 ```
+
+### Identity Layer
+
+The same thing is rarely called the same thing twice. FDA labels use brand and generic names interchangeably; filings mix ticker, legal name and short name; every technical corpus is dense with acronyms. **The embedding model does not know these are the same thing** — `tirzepatide` and `MOUNJARO` are as far apart in vector space as two unrelated words, so a question phrased with one vocabulary silently fails to retrieve chunks written in the other.
+
+This is a quiet failure, not a loud one. In the case that motivated this layer, *"Compare the dosing schedules of tirzepatide and dulaglutide"* returned tirzepatide's maximum dose as **4.5 mg**. The correct figure is 15 mg — 4.5 mg belongs to *dulaglutide*. The right chunk existed but said `MOUNJARO` and never `tirzepatide`, so it ranked **#886 of 2,498**. Every claim in that answer traced correctly to retrieved evidence; the evidence was simply about the wrong drug. A `no_hallucination` grounding metric passes it.
+
+The **Identity Layer** fixes this by mining name equivalences *out of the corpus itself* — no LLM, no external knowledge base, $0.
+
+#### How pairs are identified
+
+When a writer puts a name in parentheses immediately after another name, they are **declaring the two are the same thing**. That convention is near-universal in technical prose, and it is machine-readable:
+
+```
+The maximum dosage of MOUNJARO® (tirzepatide) injection is 15 mg.
+                      └───┬───┘  └─────┬─────┘
+                          │            └── inner: the parenthetical
+                          └── head: walk left over words, keep the
+                              trailing CAPITALISED run
+                              [The][maximum][dosage][of][MOUNJARO]
+                                                     ↑ lowercase → stop
+```
+
+The lowercase `of` acts as a natural fence, so the head is `MOUNJARO`, not `dosage of MOUNJARO`. Guards then reject anything that isn't a name — digits, units, clauses, cross-references, generic nouns — and the pair is normalised and stored.
+
+Three sources feed the same table:
+
+| Source | Convention | Example |
+|---|---|---|
+| `parenthetical` | apposition, either direction | `MOUNJARO (tirzepatide)` · `tirzepatide (Mounjaro)` |
+| | acronym — initials | `World Health Organization (WHO)` |
+| | acronym — skipping stopwords | `Securities and Exchange Commission (SEC)` |
+| | acronym — leading-token prefix | `BHP Group Limited (BHP)` |
+| | nicknames and short names | `Robert (Bob) Smith` · `William Henry Gates III (Bill Gates)` |
+| `phrase` | explicit statement | `tirzepatide, also known as Mounjaro` · `marketed as` · `sold under the brand name` · `formerly known as` |
+| `ontology` | annotations already imported with your OWL | `skos:altLabel`, `oboInOwl:hasExactSynonym`, `IAO_0000118` |
+
+**This is structural adjacency, not co-occurrence.** Frequency contributes nothing to whether a pair exists:
+
+| Text | Result |
+|---|---|
+| "Mounjaro **and** tirzepatide were both studied" | nothing |
+| Both names, hundreds of times, same document, no convention | **nothing** |
+| "MOUNJARO **(**tirzepatide**)**" | **pair** |
+| "tirzepatide, **also known as** Mounjaro" | **pair** |
+
+The author has to actually assert the equivalence. That is what makes it safe to run without a model: the corpus supplies the claim, the miner only reads it. `occurrences` is used solely to *rank* aliases when a term has several — never to decide whether a pair exists.
+
+Because the guards are tuned by inspection, **`--dry-run` is the gate**. It prints every pair sorted by frequency and writes nothing:
+
+```bash
+uv run python -m backend.app.cli mine-aliases --dry-run --show 40
+```
+
+Run it on a new corpus, read the top of the list, add any domain-specific junk to `_GENERIC_TERMS` in `backend/app/services/alias_mining.py`, and re-run. A full scan **replaces** the table, so tightening a guard removes the pairs that no longer qualify — nothing stale accumulates.
+
+#### Where pairs are stored: `graphrag.term_aliases`
+
+Every pair — mined or hand-curated — lives in a single table, **`graphrag.term_aliases`** (created by migration `0006_term_aliases`, widened by `0007_manual_aliases`). It is additive: one new table, no `ALTER` on anything that existed before.
+
+| Column | Example | Notes |
+|---|---|---|
+| `term_a` | `mounjaro` | **normalised** lookup key — lowercase, punctuation stripped |
+| `term_b` | `tirzepatide` | stored in **lexical order** (`term_a < term_b`, a CHECK constraint) so ONE row answers a lookup from either side |
+| `surface_a` | `MOUNJARO` | original casing, used verbatim in probe text |
+| `surface_b` | `tirzepatide` | `MOUNJARO` and `mounjaro` do not embed identically |
+| `evidence_kind` | `parenthetical` | `parenthetical` \| `phrase` \| `ontology` \| `manual` |
+| `evidence_ref` | `…#Chunk_8d51…` | chunk or class IRI — every pair auditable back to its source |
+| `occurrences` | `44` | ranking only; never decides whether a pair exists |
+| `graph_version` | `13` | ingestion-run stamp |
+
+Inspect it directly:
+
+```sql
+-- What do we know about a term? (either direction)
+SELECT surface_a, surface_b, evidence_kind, occurrences, evidence_ref
+  FROM graphrag.term_aliases
+ WHERE term_a = 'tirzepatide' OR term_b = 'tirzepatide'
+ ORDER BY occurrences DESC;
+
+-- Where did a pair come from?
+SELECT c.text FROM graphrag.chunks c
+  JOIN graphrag.term_aliases t ON t.evidence_ref = c.chunk_identifier
+ WHERE t.term_a = 'mounjaro' AND t.term_b = 'tirzepatide';
+
+-- Inventory by provenance
+SELECT evidence_kind, count(*) FROM graphrag.term_aliases GROUP BY 1;
+```
+
+#### Adding pairs by hand
+
+Mining only finds equivalences the corpus states outright. When you know a pair the text never appositions — an internal codename, a product rename that predates your documents, a domain convention — insert it with `evidence_kind = 'manual'`.
+
+**`manual` is the only kind exempt from pruning.** `mine-aliases` treats this table as a derived view: a full scan replaces the mined rows and deletes any it did not just produce. Since that refresh now runs automatically after every ingest, a pair inserted under any other kind would be **silently deleted**. Use `'manual'` and it survives every refresh.
+
+Four rules the CHECK constraints enforce — get them wrong and the INSERT is rejected rather than quietly misbehaving:
+
+1. `term_a` and `term_b` must be **normalised**: lowercase, punctuation stripped, internal whitespace collapsed. `GLP-1 agonist` → `glp1 agonist`.
+2. `term_a` must sort **before** `term_b` lexically.
+3. `evidence_kind` must be `'manual'` for hand-curated rows.
+4. `(term_a, term_b, evidence_kind)` is UNIQUE.
+
+```sql
+-- Add "Ozempic Face" <-> "facial volume loss" (a colloquialism the
+-- labels never define). Note: keys lowercased + punctuation stripped,
+-- and 'facial…' sorts before 'ozempic…', so it goes in term_a.
+INSERT INTO graphrag.term_aliases
+  (term_a, term_b, surface_a, surface_b, evidence_kind, evidence_ref, occurrences, graph_version)
+VALUES
+  ('facial volume loss', 'ozempic face',
+   'facial volume loss', 'Ozempic Face',
+   'manual', 'curated: clinician glossary 2026-08', 1, 0)
+ON CONFLICT (term_a, term_b, evidence_kind) DO NOTHING;
+```
+
+If you are unsure of the normalised form, let the code tell you rather than guessing:
+
+```bash
+uv run python -c "from backend.app.services.alias_mining import normalize_term as n; \
+print(sorted([n('Ozempic Face'), n('facial volume loss')]))"
+# ['facial volume loss', 'ozempic face']   <- term_a, term_b in that order
+```
+
+Then confirm it resolves through the normal query path:
+
+```bash
+uv run python -c "import asyncio; from backend.app.services.retrieval import _expand_aliases; \
+print(asyncio.run(_expand_aliases(['Ozempic Face'])))"
+# {'Ozempic Face': ['facial volume loss']}
+```
+
+To remove or edit a curated pair, just `DELETE`/`UPDATE` it — no re-mining needed:
+
+```sql
+DELETE FROM graphrag.term_aliases
+ WHERE evidence_kind = 'manual' AND term_b = 'ozempic face';
+```
+
+A curated pair behaves exactly like a mined one everywhere downstream — graph seeding, probe text, typo fallback, and the `ALTERNATE NAMES` block in the answer prompt. Use `evidence_ref` to record *why* you added it; nothing parses that field, and future-you will want the note.
+
+Mining prefers verbatim `kind='fulltext'` chunks over summary chunks. Not because summaries drop the convention — they largely keep it — but because summarisation *synthesises adjacency*: it juxtaposes facts that were never adjacent in the source, producing confident-looking mis-attributions like `Altimmune CEO Albert Bourla ↔ Pfizer CEO`. Verbatim text has trustworthy adjacency.
+
+Case is handled uniformly: keys are lowercased on write and on read, so `Mounjaro`, `MOUNJARO`, `mounjaro` and `MoUnJaRo` all resolve to the same row.
+
+#### How pairs are used in retrieval
+
+Aliases enter the pipeline at **three independent points**, which is what makes the layer robust — if one path misses, the others still fire:
+
+1. **Graph seeding.** Aliases are trigram-matched against `entities` alongside your own wording, so an entity minted as `MOUNJARO` is seeded by a question that only says "tirzepatide". This widens the candidate pool *before* any vector work and costs no rerank pass.
+2. **Vector probe text.** Probes are rewritten in place — `"Dosing schedule of tirzepatide"` → `"Dosing schedule of tirzepatide (Mounjaro, Zepbound)"`. Controlled by `qa.alias_probe_mode`: `blended` (default, no extra rerank), `separate` (one dedicated probe per alias — better recall, one extra sequential rerank each), or `off` (seeding only).
+3. **Spelling tolerance.** The lookup is exact-match first, then falls back to trigram similarity ≥ 0.45. Thresholds measured, not guessed: typos score 0.50–0.77 (`ozempick`/`ozempic` = 0.700) while genuinely different drugs score 0.00–0.14 (`losartan`/`lisinopril` = 0.053). The wide margin matters — collapsing two different drugs would recreate the original bug from the opposite direction.
+
+#### How pairs are used in answer synthesis
+
+Retrieving the right evidence and *understanding* it are separate problems, and both need the synonyms. The synthesis prompt receives an `ALTERNATE NAMES` block listing the corpus-verified pairs for this query:
+
+```
+ALTERNATE NAMES (stated by this corpus; treat each line as one entity):
+  - tirzepatide = Mounjaro, Zepbound
+  - dulaglutide = Trulicity
+```
+
+This pairs with an **attribution rule** that closes the other half of the original failure. Every evidence item is tagged with the document and entities it is about:
+
+```
+[chunk viao:Chunk_2c9e...] (document: TRULICITY dulaglutide injection | about: dulaglutide) The maximum dosage is 4.5 mg...
+```
+
+and the model is required to (a) treat listed pairs as one entity, (b) treat *unlisted* names as different entities unless a passage shows them together, and (c) **never transfer a figure between entities** — stating "the retrieved evidence contains no dosing for X" instead of quietly reporting a sibling's number. An incomplete answer that names its gap is correct; a complete-looking answer built on the wrong drug's numbers is not.
+
+#### Operating it
+
+The table refreshes **automatically** whenever the corpus changes — `register-documents`, `update-document`, and `delete-document` all re-mine on completion. It's free and idempotent, so re-running always converges.
+
+```bash
+# Inspect before writing (free, writes nothing)
+uv run python -m backend.app.cli mine-aliases --dry-run --show 40
+
+# Populate / refresh manually
+uv run python -m backend.app.cli mine-aliases
+
+# Skip the automatic refresh during a --limit smoke test (it always
+# rescans the whole corpus, which is wasted work there)
+uv run python -m backend.app.cli register-documents --input <docs> --limit 5 --no-mine-aliases
+```
+
+Skipping it on a real run leaves the new documents vocabulary-blind, and **nothing at query time says so** — `mine-aliases --dry-run` is the way to check.
+
+#### Limitations worth knowing
+
+- **Recall is bounded by the corpus.** A pair the text never appositions is never found, and those queries behave as they did before. This is deliberate — no world knowledge is used — and the mining report makes the gap visible rather than hiding it. Fill known gaps with a `'manual'` row (above).
+- **The guards are domain-tuned.** The extraction *conventions* are domain-neutral (verified against finance, tech and pharma text), but the junk blacklist was built by reading dry-run output from a pharma corpus. A legal or manufacturing corpus will surface junk that needs adding.
+- **Not every pair is a true synonym.** `Ozempic` and `Wegovy` are both semaglutide but differ in indication and dosing. The attribution tagging above is the backstop: evidence stays labelled with the document it came from, so the model can distinguish them even when the identity layer links them.
 
 ### The document-summarization prompt
 
@@ -528,9 +723,10 @@ uv run python -m backend.app.cli db-size
 ### 5. Ingest documents
 
 ```bash
-# Smoke-test with 5 docs first
+# Smoke-test with 5 docs first. --no-mine-aliases skips the automatic
+# synonym refresh, which always rescans the whole corpus (see below).
 uv run python -m backend.app.cli register-documents \
-  --input source_documents/<your-corpus> --limit 5
+  --input source_documents/<your-corpus> --limit 5 --no-mine-aliases
 
 # Full corpus
 uv run python -m backend.app.cli register-documents \
@@ -547,6 +743,17 @@ uv run python -m backend.app.cli register-documents \
 # See "Full-text vs summary chunks" below. Smoke-test + check db-size first.
 uv run python -m backend.app.cli register-documents \
   --input source_documents/<your-corpus> --full-text-chunks
+```
+
+A successful ingest ends by re-mining corpus synonyms into `graphrag.term_aliases`
+(free, no LLM, ~1 min per 2,500 chunks) so brand/generic pairs and acronym
+expansions in the new documents are immediately searchable — see
+**[Identity Layer](#identity-layer)**. `update-document` and `delete-document`
+refresh it too. Inspect what was found, or refresh by hand, with:
+
+```bash
+uv run python -m backend.app.cli mine-aliases --dry-run --show 40   # writes nothing
+uv run python -m backend.app.cli mine-aliases                       # populate/refresh
 ```
 
 ### 6. Enrich time
