@@ -44,17 +44,51 @@ def _head_revision() -> str | None:
 async def report_db_status() -> int:
     """Pretty-print Phase 2 DB status. Returns 0 on success."""
     async with session_scope() as session:
-        # Alembic revision
-        rev = await session.execute(
-            text("SELECT version_num FROM graphrag.alembic_version LIMIT 1")
+        # Does the schema exist at all? On a brand-new database -- or one
+        # wiped with DROP SCHEMA -- it does not, and a status command must
+        # say so plainly instead of raising UndefinedTableError. This is
+        # the FIRST thing a build runs, so the empty case is the common
+        # case, not an edge case.
+        r = await session.execute(
+            text(
+                "SELECT 1 FROM information_schema.schemata "
+                "WHERE schema_name = 'graphrag'"
+            )
         )
-        revision = rev.scalar_one_or_none() or "(none)"
+        if r.scalar() is None:
+            print("=" * 64)
+            print("GRAPHRAG DB STATUS")
+            print("=" * 64)
+            print("  Connected, but the 'graphrag' schema does not exist yet.")
+            print()
+            print("  Create it with:")
+            print("    uv run python -m backend.app.cli db-init")
+            print("=" * 64)
+            return 0
+
+        # Alembic revision. Guarded independently: the schema can exist
+        # without alembic_version if it was created by hand.
+        try:
+            rev = await session.execute(
+                text("SELECT version_num FROM graphrag.alembic_version LIMIT 1")
+            )
+            revision = rev.scalar_one_or_none() or "(none)"
+        except Exception:
+            await session.rollback()
+            revision = "(none)"
 
         # graph_version
-        gv = await session.execute(
-            text("SELECT current_value FROM graphrag.graph_version_state WHERE id = 1")
-        )
-        graph_version = gv.scalar_one_or_none()
+        try:
+            gv = await session.execute(
+                text(
+                    "SELECT current_value FROM graphrag.graph_version_state "
+                    "WHERE id = 1"
+                )
+            )
+            graph_version = gv.scalar_one_or_none()
+        except Exception:
+            await session.rollback()
+            graph_version = None
 
         # Per-table row counts. A table missing entirely (the DB predates
         # the migration that adds it) reports as "-" rather than blowing up
