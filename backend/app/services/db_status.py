@@ -21,7 +21,24 @@ _REPORT_ORDER = [
     "conversation_turns",
     "retrieval_runs",
     "retrieval_evidence",
+    "term_aliases",
 ]
+
+
+def _head_revision() -> str | None:
+    """The newest migration on disk, for comparison against the DB's.
+
+    Returns None if alembic's script directory can't be read (e.g. the
+    CLI is being run from outside the repo), in which case the caller
+    just skips the comparison.
+    """
+    try:
+        from alembic.config import Config
+        from alembic.script import ScriptDirectory
+
+        return ScriptDirectory.from_config(Config("alembic.ini")).get_current_head()
+    except Exception:
+        return None
 
 
 async def report_db_status() -> int:
@@ -39,11 +56,22 @@ async def report_db_status() -> int:
         )
         graph_version = gv.scalar_one_or_none()
 
-        # Per-table row counts
-        counts: dict[str, int] = {}
+        # Per-table row counts. A table missing entirely (the DB predates
+        # the migration that adds it) reports as "-" rather than blowing up
+        # the whole status report.
+        counts: dict[str, int | None] = {}
         for tbl in _REPORT_ORDER:
-            r = await session.execute(text(f"SELECT count(*) FROM graphrag.{tbl}"))
-            counts[tbl] = int(r.scalar_one())
+            try:
+                r = await session.execute(
+                    text(f"SELECT count(*) FROM graphrag.{tbl}")
+                )
+                counts[tbl] = int(r.scalar_one())
+            except Exception:
+                await session.rollback()
+                counts[tbl] = None
+
+    head = _head_revision()
+    behind = head is not None and revision != head
 
     print("=" * 64)
     print("GRAPHRAG DB STATUS")
@@ -54,6 +82,14 @@ async def report_db_status() -> int:
     print("  Row counts:")
     for tbl in _REPORT_ORDER:
         n = counts[tbl]
-        print(f"    {tbl:32s} {n:>10,}")
+        print(f"    {tbl:32s} {'-' if n is None else format(n, '>10,')}")
+    # Pending migrations degrade features silently rather than loudly --
+    # a missing `term_aliases`, for instance, just turns synonym expansion
+    # off and logs a warning nobody reads. Say so where it will be seen.
+    if behind:
+        print()
+        print(f"  !! MIGRATIONS PENDING: db is at {revision}, code ships {head}.")
+        print("     Features added by the newer revisions are inactive until you run:")
+        print("       uv run python -m backend.app.cli db-migrate")
     print("=" * 64)
     return 0
