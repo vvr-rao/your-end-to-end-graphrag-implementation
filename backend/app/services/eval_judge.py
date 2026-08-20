@@ -22,7 +22,30 @@ from typing import Any
 from backend.app.services.db_artifact_gen import _extract_json
 from backend.app.services.llm_router import LLMRouter
 from backend.app.services.prompts import PROMPTS
-from backend.app.services.retrieval import retrieve_and_answer
+from backend.app.services.retrieval import (
+    RetrievalResult,
+    _CITATION_TOKEN_RE,
+    _citation_key,
+    retrieve_and_answer,
+)
+
+
+def _citation_validity(res: RetrievalResult) -> float | None:
+    """Fraction of emitted citations that resolve to retrieved evidence.
+
+    1.0 = every citation resolves; None = the answer cited nothing, which
+    is not a failure and must not be averaged in as a zero.
+
+    `retrieve_and_answer` already strips unresolvable citations, so the
+    numerator counts what survived and `res.invalid_citations` supplies
+    what was removed. Purely arithmetic -- no judge call, no cost.
+    """
+    kept = len(_CITATION_TOKEN_RE.findall(res.answer or ""))
+    removed = len(res.invalid_citations)
+    total = kept + removed
+    if total == 0:
+        return None
+    return kept / total
 
 
 @dataclass
@@ -152,6 +175,13 @@ async def evaluate_questions(
                                             if res.retrieval_run_id else None,
                         "wall_seconds": res.wall_seconds,
                         "cost_usd": res.cost_usd,
+                        # Deterministic, no LLM call. `no_hallucination` asks
+                        # whether each CLAIM is grounded and never looks at
+                        # IRIs, so an answer carrying citations that resolve
+                        # to nothing scores a clean 1.0 on it -- exactly how
+                        # four dead ids passed the 2026-08-19 audit. This
+                        # counts them instead.
+                        "citation_validity": _citation_validity(res),
                     })
                 except Exception as exc:
                     qres.runs.append({
@@ -160,6 +190,7 @@ async def evaluate_questions(
                         "retrieval_run_id": None,
                         "wall_seconds": time.time() - rt0,
                         "cost_usd": 0.0,
+                        "citation_validity": None,
                     })
 
             # Judge calls -- parallel, one per metric per run + 1

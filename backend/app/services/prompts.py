@@ -1340,7 +1340,6 @@ def _format_evidence_block(evidence_items: list[dict], char_cap: int = 600) -> s
     lines = []
     for it in evidence_items:
         kind = it.get("kind", "evidence")
-        iri = it.get("iri", "")
         text = (it.get("text") or "").strip().replace("\n", " ")
         if len(text) > char_cap:
             text = text[:char_cap] + "..."
@@ -1351,9 +1350,43 @@ def _format_evidence_block(evidence_items: list[dict], char_cap: int = 600) -> s
         ents = [e for e in (it.get("entities") or []) if e]
         if ents:
             tags.append("about: " + ", ".join(ents[:6]))
+        # Time the passage is about, so a question with a date constraint
+        # can be answered against it. Without this tag the model cannot
+        # honour "by 2025" even when told to -- the per-item date simply
+        # is not in the prompt.
+        times = [t for t in (it.get("times") or []) if t]
+        if times:
+            tags.append("time: " + ", ".join(times[:4]))
         tag_str = f" ({' | '.join(tags)})" if tags else ""
-        lines.append(f"  [{kind} {iri}]{tag_str} {text}")
+        lines.append(f"  [{citation_token(it)}]{tag_str} {text}")
     return "\n".join(lines)
+
+
+def citation_token(evidence_item: dict) -> str:
+    """The exact citation string the model should write for this item.
+
+    Single source of truth, shared by the evidence block and by the
+    validator in `retrieval.py`, so the two can never drift.
+
+    `iri` is stored as a full absolute URL
+    (`https://veerla-ramrao.ai/ontology/intelligence-artifact#Chunk_8d51..._ft_0005`)
+    but `_FACTS_FIRST_RULE` asks for `[viao:Chunk_...]`. Rendering the
+    URL and demanding the short form made every citation a hand
+    transcription of a 16-hex hash out of a 90-character string -- which
+    is how a real id came back as `Chunk_f8d5b501138d570e` with its
+    `_ft_NNNN` suffix dropped. Show what we want written, and citing
+    becomes copying.
+    """
+    iri = (evidence_item.get("iri") or "").strip()
+    if not iri:
+        return "viao:unknown"
+    fragment = iri.rsplit("#", 1)[-1] if "#" in iri else iri
+    # Don't double-prefix an id that already arrives in short form. Real
+    # rows always store the full URL, but tests and any future caller may
+    # not, and "viao:viao:Claim_1" would fail its own validator.
+    if fragment.lower().startswith("viao:"):
+        fragment = fragment[5:]
+    return f"viao:{fragment}"
 
 
 _ATTRIBUTION_RULE = (
@@ -1378,6 +1411,32 @@ _ATTRIBUTION_RULE = (
     "listed there are different entities unless an evidence item shows "
     "them together; never assume it."
 )
+
+
+def _format_time_scope_block(time_terms: list[str] | None) -> str:
+    """State the question's date constraint and how to honour it.
+
+    The parser already extracts these ("by 2025" -> ['2025']) and, until
+    now, nothing downstream read them: time-linked chunks got an RRF rank
+    BOOST but were never excluded, and the synthesis was never told a
+    window existed. A question asking "by 2025" was answered with a drug
+    approved in 2026.
+
+    Deliberately a flag, not a filter. A 2026 review legitimately
+    discusses 2025 events, so the model is asked to identify out-of-window
+    evidence rather than to discard it.
+    """
+    terms = [t.strip() for t in (time_terms or []) if t and t.strip()]
+    if not terms:
+        return ""
+    return (
+        "\n\nTIME SCOPE: the question constrains to " + ", ".join(terms) + ".\n"
+        "  - Evidence items are tagged with the period they concern.\n"
+        "  - Anything outside that window must be explicitly identified as "
+        "outside it -- never presented as if it satisfied the constraint.\n"
+        "  - If the in-window evidence is thin, say so rather than filling "
+        "the gap with out-of-window material."
+    )
 
 
 def _format_alias_block(aliases: dict[str, list[str]] | None) -> str:
@@ -1433,6 +1492,7 @@ def answer_simple_qa(
     evidence: list[dict],
     evidence_char_cap: int = 600,
     aliases: dict[str, list[str]] | None = None,
+    time_terms: list[str] | None = None,
 ) -> tuple[str, str]:
     """Tight one-shot answer. Only the question, nothing more.
 
@@ -1456,6 +1516,7 @@ def answer_simple_qa(
     user = (
         f"QUESTION: {question}"
         + _format_alias_block(aliases)
+        + _format_time_scope_block(time_terms)
         + "\n\nEVIDENCE:\n"
         + _format_evidence_block(evidence, evidence_char_cap)
         + "\n\nAnswer now."
@@ -1532,6 +1593,7 @@ def answer_deep_research(
     evidence: list[dict],
     evidence_char_cap: int = 600,
     aliases: dict[str, list[str]] | None = None,
+    time_terms: list[str] | None = None,
 ) -> tuple[str, str]:
     """deep_research mode: structured 7-section output.
 
@@ -1554,6 +1616,7 @@ def answer_deep_research(
     user = (
         f"QUESTION: {question}"
         + _format_alias_block(aliases)
+        + _format_time_scope_block(time_terms)
         + "\n\nEVIDENCE:\n"
         + _format_evidence_block(evidence, evidence_char_cap)
         + "\n\nWrite the seven-section answer now."

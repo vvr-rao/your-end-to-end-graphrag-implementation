@@ -248,6 +248,77 @@ def test_dosage_forms_are_not_synonyms(text: str) -> None:
     assert mine_text(text) == []
 
 
+# --------------------------------------------------------------------------
+# Audit 2026-08-19 regressions
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        # D4: the corpus says "Rybelsus (oral semaglutide)". The route word
+        # is stripped so the generic underneath is judged on its own. Missing
+        # this pair made Q18 answer "Wegovy and Ozempic, no others".
+        ("Rybelsus (oral semaglutide).", ("rybelsus", "semaglutide")),
+        (
+            "Wegovy (injectable semaglutide) once weekly",
+            ("semaglutide", "wegovy"),
+        ),
+    ],
+)
+def test_route_modifiers_are_stripped_from_the_generic(
+    text: str, expected: tuple[str, str]
+) -> None:
+    pairs = mine_text(text)
+    assert [(p.term_a, p.term_b) for p in pairs] == [expected]
+
+
+def test_stripping_is_limited_to_route_words() -> None:
+    """Peeling ANY leading generic word would resurrect table-header junk;
+    only route/formulation modifiers qualify."""
+    assert mine_text("Product Characteristics Color WHITE (White to off white)") == []
+
+
+@pytest.mark.parametrize("text", ["the MRHD (monkey) margin", "at the MRHD (rabbit) dose"])
+def test_acronym_paired_with_a_single_word_is_rejected(text: str) -> None:
+    """A 4-letter acronym cannot expand to one word. These were minting
+    species qualifiers as expansions."""
+    assert mine_text(text) == []
+
+
+def test_two_word_expansion_of_an_acronym_still_kept() -> None:
+    """ACE really is also called kininase II -- the single-word rule must
+    not take this with it."""
+    (pair,) = mine_text("ACE (kininase II) inhibits the conversion")
+    assert (pair.term_a, pair.term_b) == ("ace", "kininase ii")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "TRULICITY (TRU-li-si-tee) injection",
+        "OZEMPIC (oh-ZEM-pick) is indicated",
+        "MOUNJARO (mown-JAHR-OH) once weekly",
+        "ZEPBOUND (ZEHP-bownd) is a dual agonist",
+        "WEGOVY (wee-GOH-vee) weekly",
+        "amlodipine (am loe' di peen) tablets",
+    ],
+)
+def test_pronunciation_respellings_rejected(text: str) -> None:
+    """FDA label respellings are notation, not synonyms, and they were
+    riding into live probe expansions."""
+    assert mine_text(text) == []
+
+
+@pytest.mark.parametrize(
+    "term", ["PEG-loxenatide", "non-HDL cholesterol", "Modified Intent-to-Treat"]
+)
+def test_real_hyphenated_names_survive_the_respelling_guard(term: str) -> None:
+    """The <=5-char-syllable rule is what protects these; a shape-only
+    test on mixed case would reject all three."""
+    assert is_valid_term(term)
+
+
 def test_both_sides_lowercase_common_words_rejected() -> None:
     """At least one side must look like a proper name, or ordinary prose
     apposition mints garbage pairs."""

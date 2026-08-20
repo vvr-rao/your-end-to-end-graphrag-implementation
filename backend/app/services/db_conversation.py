@@ -19,6 +19,7 @@ Reuses `retrieve_and_answer` from retrieval.py -- no new pipeline.
 """
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Any
 
@@ -30,7 +31,13 @@ from backend.app.db.session import session_scope
 from backend.app.services.db_artifact_gen import _extract_json
 from backend.app.services.llm_router import LLMRouter
 from backend.app.services.prompts import PROMPTS
-from backend.app.services.retrieval import retrieve_and_answer, RetrievalResult
+from backend.app.services.retrieval import (
+    _validate_citations,
+    retrieve_and_answer,
+    RetrievalResult,
+)
+
+log = logging.getLogger(__name__)
 
 
 _CONVERSATIONS_NS = "https://veerla-ramrao.ai/ontology/conversations"
@@ -263,6 +270,20 @@ async def add_turn(
             )
             convo_answer = (out.text or "").strip()
             if convo_answer:
+                # This synthesis REPLACES the validated F-pipeline answer, so
+                # it needs the same citation check -- otherwise every
+                # multi-turn query bypasses it and can emit ids that resolve
+                # to nothing. The evidence set is already in hand.
+                convo_answer, bad_cites = _validate_citations(
+                    convo_answer, result.evidence
+                )
+                if bad_cites:
+                    result.invalid_citations = list(bad_cites)
+                    log.warning(
+                        "conversation synthesis emitted %d unresolvable "
+                        "citation(s), stripped: %s",
+                        len(bad_cites), ", ".join(bad_cites[:8]),
+                    )
                 if verbose:
                     print(
                         "[conversation] re-synthesized answer with "

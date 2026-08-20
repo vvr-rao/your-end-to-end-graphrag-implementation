@@ -156,6 +156,93 @@ _GENERIC_TERMS: frozenset[str] = frozenset({
 #     scraped into the text ("drugsatfdaCOZAAR", "drugsatfdaPRINIVIL").
 #     The 6-char minimum on the lowercase side keeps real mixed-case
 #     terms ("mTOR", "mITT", "pH") safe.
+# Route / formulation modifiers that legitimately PRECEDE a generic name:
+# "Rybelsus (oral semaglutide)". These are stripped from the front of a
+# candidate term before validation, so the real name underneath is judged
+# on its own merits.
+#
+# Deliberately much narrower than "strip any leading generic word" -- that
+# broader rule would resurrect junk like "Product Characteristics Color
+# WHITE" by peeling "Product" off the front. Only route/form words qualify.
+_FORM_MODIFIERS: frozenset[str] = frozenset({
+    "oral", "orally", "injectable", "injected", "subcutaneous",
+    "intravenous", "intramuscular", "topical", "inhaled", "nasal",
+    "sublingual", "transdermal", "chewable", "effervescent",
+    "extended-release", "immediate-release", "delayed-release",
+    "sustained-release", "controlled-release", "long-acting",
+    "short-acting", "rapid-acting", "micronized", "generic", "recombinant",
+})
+
+
+def _strip_form_modifiers(s: str) -> str:
+    """Peel leading route/formulation words off a candidate term.
+
+    "oral semaglutide" -> "semaglutide". Returns the input unchanged when
+    nothing strips, or when stripping would leave nothing behind.
+    """
+    parts = s.split()
+    i = 0
+    while i < len(parts) - 1 and parts[i].lower().strip(",") in _FORM_MODIFIERS:
+        i += 1
+    return " ".join(parts[i:]) if i else s
+
+
+# An FDA label pronunciation respelling: "TRULICITY (TRU-li-si-tee)",
+# "OZEMPIC (oh-ZEM-pick)", "amlodipine (am loe' di peen)". These are
+# notation, not synonyms, and they were riding into live probe expansions.
+#
+# The discriminator is that respelling syllables are ALL SHORT. Trigram
+# similarity does not work here -- a respelling is often paired with the
+# GENERIC name, so "oh-ZEM-pick"/"semaglutide" scores 0.000. The <=5 rule
+# is what protects real hyphenated names: "PEG-loxenatide" (10) and
+# "non-HDL cholesterol" (11) both survive, where a shape-only test kills them.
+_MAX_RESPELLING_SYLLABLE = 5
+
+
+def _is_pronunciation_respelling(s: str) -> bool:
+    """True for FDA-style phonetic respellings."""
+    parts = [p for p in re.split(r"[\s\-]+", s.strip()) if p]
+    if len(parts) < 2:
+        return False
+    if max(len(p) for p in parts) > _MAX_RESPELLING_SYLLABLE:
+        return False
+    # An apostrophe stress mark ("loe'") is conclusive on its own.
+    if any(p.endswith("'") for p in parts):
+        return True
+    # Otherwise: the tell-tale ALL-CAPS / all-lowercase syllable alternation.
+    has_upper = any(p.isupper() and len(p) >= 2 for p in parts)
+    has_lower = any(p.islower() and len(p) >= 2 for p in parts)
+    return has_upper and has_lower
+
+
+def _strip_inline_respelling(s: str) -> str:
+    """Drop a respelling that trails the name it respells.
+
+    Label headers run the two together -- "TRULICITY TRU-li-si-tee
+    (dulaglutide)" -- so the head comes back as both words and the pair
+    stores a surface no query will ever match. Removing the respelling
+    recovers the CORRECT pair (`TRULICITY <-> dulaglutide`) rather than
+    discarding the mention.
+
+    Only strips when another token in the term shares the respelling's
+    first two letters, which is what makes it a respelling *of that name*.
+    That guard is why "non-HDL cholesterol" survives intact: "non-HDL" is
+    respelling-shaped, but "cholesterol" does not start with "no".
+    """
+    parts = s.split()
+    if len(parts) < 2:
+        return s
+    keep: list[str] = []
+    for i, tok in enumerate(parts):
+        if _is_pronunciation_respelling(tok):
+            head2 = normalize_term(tok)[:2]
+            others = [p for j, p in enumerate(parts) if j != i]
+            if head2 and any(normalize_term(o).startswith(head2) for o in others):
+                continue
+        keep.append(tok)
+    return " ".join(keep) if keep else s
+
+
 _UNIT_SLASH_RE = re.compile(r"/")
 # Applied per whitespace/hyphen-separated token, not across the whole
 # string: "lossMounjaro" and "drugsatfdaCOZAAR" are single glued tokens,
@@ -184,7 +271,7 @@ _ACRONYM_SKIP_WORDS: frozenset[str] = frozenset({
 _WORD_RE = re.compile(r"[A-Za-z][\w\-']*")
 
 
-def _is_acronym(s: str) -> bool:
+def is_acronym(s: str) -> bool:
     """All-caps token of 2-6 letters, e.g. WHO, FDA, GLP."""
     return bool(re.fullmatch(r"[A-Z]{2,6}", s))
 
@@ -205,6 +292,9 @@ def is_valid_term(s: str, *, max_words: int = _MAX_TERM_WORDS) -> bool:
     if not s:
         return False
     if len(s) > _MAX_TERM_CHARS:
+        return False
+    # A phonetic respelling is notation, not a synonym.
+    if _is_pronunciation_respelling(s):
         return False
     # Numbers anywhere: "(2024)", "(n=234)", "(95% CI)", "(NCT01234)".
     if any(c.isdigit() for c in s):
@@ -231,7 +321,7 @@ def is_valid_term(s: str, *, max_words: int = _MAX_TERM_WORDS) -> bool:
     # "see Table 3"). A bare acronym is exempt, or "WHO" would be thrown
     # out for colliding with the relative pronoun.
     if words[0].lower() in _LEAD_STOPWORDS and not (
-        len(words) == 1 and _is_acronym(_strip_marks(s))
+        len(words) == 1 and is_acronym(_strip_marks(s))
     ):
         return False
     if norm in _UNIT_TOKENS or norm in _GENERIC_TERMS:
@@ -308,8 +398,8 @@ def is_valid_pair(left: str, right: str) -> bool:
     phrases that happen to sit next to a parenthesis.
     """
     # An acronym on one side vouches for a longer phrase on the other.
-    left_is_acr = _is_acronym(_strip_marks(left))
-    right_is_acr = _is_acronym(_strip_marks(right))
+    left_is_acr = is_acronym(_strip_marks(left))
+    right_is_acr = is_acronym(_strip_marks(right))
     left_max = _MAX_ACRONYM_EXPANSION_WORDS if right_is_acr else _MAX_TERM_WORDS
     right_max = _MAX_ACRONYM_EXPANSION_WORDS if left_is_acr else _MAX_TERM_WORDS
     if not (
@@ -326,14 +416,39 @@ def is_valid_pair(left: str, right: str) -> bool:
         return False
     right_bare = _strip_marks(right)
     left_bare = _strip_marks(left)
+    # A 3+ letter acronym cannot expand to a SINGLE word. "MRHD (monkey)"
+    # and "MRHD (rabbit)" are species qualifiers on a dose, and they were
+    # being minted as expansions because `_acronym_applies` returns False
+    # for a one-word other and so skipped the initials check entirely.
+    # "ACE (kininase II)" is two words and unaffected.
+    for acr, other in ((left_bare, right_bare), (right_bare, left_bare)):
+        if not is_acronym(acr):
+            continue
+        # A 3+ letter acronym cannot expand to a SINGLE word. "MRHD
+        # (monkey)" and "MRHD (rabbit)" are species qualifiers on a dose,
+        # and they were being minted as expansions because
+        # `_acronym_applies` returns False for a one-word other and so
+        # skipped the initials check entirely. "ACE (kininase II)" is two
+        # words and unaffected.
+        if len(acr) >= 3 and len(_WORD_RE.findall(other)) < 2:
+            return False
+        # An expansion may LEAD with its short form -- "BHP Group Limited
+        # (BHP)" -- but repeating it later means the "expansion" is really
+        # a description of the word itself: "WHITE (White to off white)",
+        # "BLUE (Light blue to blue)". Those slip past the initials rule
+        # because their word counts happen not to match the acronym length.
+        other_words = normalize_term(other).split()
+        acr_norm = normalize_term(acr)
+        if any(w == acr_norm for w in other_words[1:]):
+            return False
     if (
-        _is_acronym(right_bare)
+        is_acronym(right_bare)
         and _acronym_applies(left_bare, right_bare)
         and not _acronym_matches(left_bare, right_bare)
     ):
         return False
     if (
-        _is_acronym(left_bare)
+        is_acronym(left_bare)
         and _acronym_applies(right_bare, left_bare)
         and not _acronym_matches(right_bare, left_bare)
     ):
@@ -452,9 +567,14 @@ def extract_parenthetical_pairs(text: str) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
     for m in _PAREN_RE.finditer(text):
         inner = _strip_marks(m.group(1))
+        # "Rybelsus (oral semaglutide)" -- the parenthetical is a descriptor
+        # plus the generic name. Peel the route/form word so the real name
+        # underneath is judged (and stored) on its own.
+        inner = _strip_form_modifiers(inner)
+        inner = _strip_inline_respelling(inner)
         if not inner:
             continue
-        if _is_acronym(inner):
+        if is_acronym(inner):
             # An N-letter acronym expands from AT LEAST N words, and more
             # when it skips stopwords ("Securities and Exchange Commission"
             # -> SEC needs 4). Try increasing head lengths and take the
@@ -468,6 +588,9 @@ def extract_parenthetical_pairs(text: str) -> list[tuple[str, str]]:
                     break
         else:
             head = _head_before(text, m.start())
+        if not head:
+            continue
+        head = _strip_inline_respelling(head)
         if not head:
             continue
         if is_valid_pair(head, inner):

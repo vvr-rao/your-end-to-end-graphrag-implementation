@@ -55,7 +55,7 @@ from backend.app.db.models.documents import Chunk, Document
 from backend.app.db.models.entities import Entity, TimeInstance
 from backend.app.db.models.ontology import OntologyClass
 from backend.app.db.session import session_scope
-from backend.app.services.alias_mining import normalize_term
+from backend.app.services.alias_mining import is_acronym, normalize_term
 from backend.app.services.db_artifact_gen import _extract_json
 from backend.app.services.embeddings import Embedder
 from backend.app.services.llm_router import LLMRouter
@@ -111,21 +111,87 @@ class RetrievalResult:
     evidence: list[dict[str, Any]] = field(default_factory=list)
     retrieval_run_id: uuid.UUID | None = None
     parsed: dict[str, Any] = field(default_factory=dict)
+    # Citations the synthesis emitted that resolve to nothing in `evidence`.
+    # Stripped from `answer`; surfaced here (and in retrieval_plan) so a
+    # regression is measurable instead of silent.
+    invalid_citations: list[str] = field(default_factory=list)
     cost_usd: float = 0.0
     wall_seconds: float = 0.0
     graph_version: int = 0
 
 
 # Matches inline evidence citation tokens the synthesis emits, e.g.
-# "[viao:Chunk_180a994f...]", "[viao:Claim_c91c...]", or a bracketed URL.
-# Used to scrub chunk citations out of the artifact_only bridge's prior-research
-# text so round 2 can't echo citations to evidence it never retrieved.
-_CITATION_TOKEN_RE = re.compile(r"\s*\[(?:viao:[^\]]+|https?://[^\]]+)\]")
+# "[viao:Chunk_180a994f...]", "[viao:Claim_c91c...]", a bracketed URL, or the
+# kind-prefixed form the evidence block used to render ("[chunk https://...]").
+# The body is captured so `_validate_citations` can check what was cited;
+# leading whitespace is consumed so removal doesn't leave a double space.
+_CITATION_TOKEN_RE = re.compile(
+    r"\s*\[(?:(?:chunk|artifact|evidence)\s+)?(viao:[^\]]+|https?://[^\]]+)\]"
+)
 
 
 def _strip_citation_tokens(text: str) -> str:
     """Remove inline [viao:...] / [http...] citation tokens from prose."""
     return _CITATION_TOKEN_RE.sub("", text)
+
+
+def _citation_key(raw: str) -> str:
+    """Reduce a cited identifier to the fragment both forms share.
+
+    The model may write the `viao:`-prefixed short form it is asked for,
+    or echo a full URL from the evidence block. Both reduce to the part
+    after the last '#' (or after 'viao:'), which is what actually
+    identifies the row.
+    """
+    s = raw.strip()
+    if "#" in s:
+        s = s.rsplit("#", 1)[-1]
+    elif s.lower().startswith("viao:"):
+        s = s[5:]
+    return s.strip()
+
+
+def _validate_citations(
+    answer: str, evidence: list[dict[str, Any]]
+) -> tuple[str, list[str]]:
+    """Drop inline citations that resolve to nothing in `evidence`.
+
+    The synthesis occasionally cites an id that does not exist, or copies
+    a real one incorrectly -- an audit of 21 questions found 4 such
+    citations out of 264, all in one answer. The claims themselves were
+    true and separately cited, so no reader was misled on fact, but a
+    citation resolving to nothing breaks the traceability chain the whole
+    artifact layer exists to provide.
+
+    Returns `(cleaned_answer, invalid_ids)`. The evidence set is already
+    in hand at synthesis time, so this costs one pass over the text and
+    no I/O.
+    """
+    if not answer or not evidence:
+        return answer, []
+    allowed = {
+        _citation_key(ev["iri"]) for ev in evidence if ev.get("iri")
+    }
+    if not allowed:
+        return answer, []
+
+    invalid: list[str] = []
+
+    def _keep(m: re.Match[str]) -> str:
+        key = _citation_key(m.group(1))
+        if key in allowed:
+            return m.group(0)
+        invalid.append(key)
+        return ""
+
+    cleaned = _CITATION_TOKEN_RE.sub(_keep, answer)
+    if invalid:
+        # Removing a token mid-sentence leaves seams -- a doubled space, or
+        # a space stranded before the full stop. Tidy those; don't attempt
+        # to repair the prose itself.
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r"[ \t]+([.,;:!?)])", r"\1", cleaned)
+    return cleaned, invalid
 
 
 async def retrieve_and_answer(
@@ -252,6 +318,18 @@ async def retrieve_and_answer(
     # "MOUNJARO" -- they are unrelated in embedding space. Empty table =>
     # empty dict => every downstream step behaves exactly as before.
     aliases = await _expand_aliases(parsed.get("entities") or [])
+    # The parser decides entity-vs-class, and it routinely files acronyms as
+    # CLASSES -- so `mrhd` and `ace`, both present in term_aliases, never
+    # fired in a 21-question audit. That gated a fully deterministic lookup
+    # behind an LLM's judgement call. Expand class terms too, but only accept
+    # ACRONYM pairs from them: class terms are common nouns, and an ungated
+    # lookup would let a class of "hormone" pull in "angiotensin II".
+    class_aliases = await _expand_aliases(
+        parsed.get("classes") or [], acronyms_only=True
+    )
+    for term, alts in class_aliases.items():
+        if term not in aliases:
+            aliases[term] = alts
     parsed["aliases"] = aliases
     if verbose and aliases:
         print(
@@ -581,6 +659,11 @@ async def retrieve_and_answer(
         chunk_entities = await retrieval_sql.fetch_chunk_entity_names(
             session, _fused_chunk_ids
         )
+        # Same idea for time: a date-scoped question ("by 2025") can only be
+        # honoured if each passage carries the period it concerns.
+        chunk_times = await retrieval_sql.fetch_chunk_time_labels(
+            session, _fused_chunk_ids
+        )
 
     evidence: list[dict[str, Any]] = []
     for rank, (cid, score) in enumerate(fused_chunks, start=1):
@@ -600,6 +683,7 @@ async def retrieve_and_answer(
             "document_iri": info["document_iri"],
             "document_title": info["document_title"],
             "entities": chunk_entities.get(cid, []),
+            "times": chunk_times.get(cid, []),
         })
     for rank, (aid, score) in enumerate(fused_artifacts, start=1):
         info = artifact_rows.get(aid)
@@ -630,14 +714,29 @@ async def retrieve_and_answer(
     # model was being told alternate names exist without being told WHICH,
     # so it had to re-derive "MOUNJARO is tirzepatide" from whatever
     # happened to be in the context window.
+    # `time_terms` likewise: the parser extracts a date constraint and, until
+    # now, only used it to seed graph nodes. The synthesis never saw it, so
+    # "by 2025" was answered with a 2026 approval.
     sys_p, user_p = answer_prompt_fn(
-        resolved_query, evidence, _evidence_cap, parsed.get("aliases") or {}
+        resolved_query,
+        evidence,
+        _evidence_cap,
+        parsed.get("aliases") or {},
+        parsed.get("time_terms") or [],
     )
     try:
         out = await router.chat(answer_task_name, system=sys_p, user=user_p)
         answer = out.text.strip()
     except Exception as exc:
         answer = f"(answer generation failed: {exc})"
+
+    # Every cited id must resolve to something we actually retrieved.
+    answer, invalid_citations = _validate_citations(answer, evidence)
+    if invalid_citations:
+        log.warning(
+            "stripped %d unresolvable citation(s) from the answer: %s",
+            len(invalid_citations), ", ".join(invalid_citations[:8]),
+        )
 
     cost = router.total_cost_usd - cost_before
     result = RetrievalResult(
@@ -646,6 +745,7 @@ async def retrieve_and_answer(
         resolved_query=resolved_query,
         evidence=evidence,
         parsed=parsed,
+        invalid_citations=invalid_citations,
         cost_usd=cost,
         wall_seconds=time.time() - t0,
     )
@@ -688,8 +788,10 @@ async def _question_parse(router: LLMRouter, q: str) -> dict[str, Any]:
     }
 
 
-async def _expand_aliases(entity_terms: list[str]) -> dict[str, list[str]]:
-    """Corpus-mined synonyms for the parsed entity terms.
+async def _expand_aliases(
+    entity_terms: list[str], *, acronyms_only: bool = False
+) -> dict[str, list[str]]:
+    """Corpus-mined synonyms for the parsed query terms.
 
     Keyed by the ORIGINAL surface term as it appeared in the question, so
     probe rewriting can substitute in place. Terms are normalized with
@@ -697,6 +799,12 @@ async def _expand_aliases(entity_terms: list[str]) -> dict[str, list[str]]:
     entity trigram match at `_ontology_match` only lowercases, so
     punctuation is handled inconsistently there; this path uses the real
     one.
+
+    `acronyms_only` keeps just those aliases where the query term or its
+    alias is an acronym. Used for parsed CLASS terms, which are common
+    nouns: it recovers the acronym expansions the parser misfiled as
+    classes (MRHD, ACE) without letting a class of "hormone" drag in
+    "angiotensin II".
 
     Fails soft: any error (table missing because 0006 has not been
     applied yet, DB hiccup) yields {} and retrieval proceeds unchanged.
@@ -725,11 +833,30 @@ async def _expand_aliases(entity_terms: list[str]) -> dict[str, list[str]]:
             type(exc).__name__, exc,
         )
         return {}
-    return {
-        norm_to_original[norm]: surfaces
-        for norm, surfaces in by_norm.items()
-        if norm in norm_to_original and surfaces
-    }
+    out: dict[str, list[str]] = {}
+    for norm, surfaces in by_norm.items():
+        if norm not in norm_to_original or not surfaces:
+            continue
+        original = norm_to_original[norm]
+        term_is_acronym = is_acronym(original.strip())
+        # The SQL allows up to 6 words so acronym expansions survive; tighten
+        # back to 3 for everything else, where a long surface is boilerplate
+        # rather than a name and would poison the probe it rides in.
+        surfaces = [
+            s for s in surfaces
+            if term_is_acronym or is_acronym(s) or len(s.split()) <= 3
+        ]
+        if acronyms_only:
+            # Class terms are common nouns. Keep the pair only if this is
+            # genuinely an acronym relationship, or a class of "hormone"
+            # would drag in "angiotensin II".
+            surfaces = [
+                s for s in surfaces if term_is_acronym or is_acronym(s)
+            ]
+        if not surfaces:
+            continue
+        out[original] = surfaces
+    return out
 
 
 async def _ontology_match(
@@ -1133,6 +1260,10 @@ async def _persist_run(
                 "plan": json.dumps({
                     "intent": result.parsed.get("intent", ""),
                     "aliases": result.parsed.get("aliases", {}),
+                    "time_terms": result.parsed.get("time_terms", []),
+                    # Persisted so citation quality is trendable across runs
+                    # rather than only visible in a log line.
+                    "invalid_citations": result.invalid_citations,
                 }),
                 "gv": gv,
             },

@@ -40,11 +40,15 @@ def test_document_and_entities_are_tagged():
 
 def test_untagged_evidence_still_renders():
     """Artifacts carry no document/entity tags; they must not break or
-    emit an empty '()' marker."""
+    emit an empty '()' marker.
+
+    The bracket now holds the citable short form rather than `kind + iri`,
+    so the model copies what it is asked to write instead of transcribing
+    a URL into it."""
     out = _format_evidence_block(
         [{"kind": "artifact", "iri": "viao:Claim_1", "text": "A claim."}]
     )
-    assert out.strip() == "[artifact viao:Claim_1] A claim."
+    assert out.strip() == "[viao:Claim_1] A claim."
 
 
 def test_partial_tags():
@@ -111,6 +115,37 @@ def test_alias_block_absent_when_nothing_was_mined():
         for empty in (None, {}, {"tirzepatide": []}):
             assert fn("q", [_chunk()], 1500, empty) == base, fn.__name__
         assert "ALTERNATE NAMES" not in base[1]
+
+
+# --------------------------------------------------------------------------
+# Time scope (audit D3): "by 2025" was extracted, then ignored
+# --------------------------------------------------------------------------
+
+
+def test_evidence_carries_its_time_tag():
+    """Without a per-item date the model cannot honour a date constraint
+    even when instructed -- the information simply is not in the prompt."""
+    out = _format_evidence_block([_chunk(times=["2026"])])
+    assert "time: 2026" in out
+
+
+def test_time_scope_block_states_the_constraint():
+    for fn in (answer_simple_qa, answer_deep_research):
+        _, user = fn("competitors by 2025", [_chunk(times=["2026"])], 1500, {}, ["2025"])
+        assert "TIME SCOPE" in user, fn.__name__
+        assert "2025" in user
+        # ...and it must demand flagging, not silent inclusion.
+        assert "outside" in user.lower()
+
+
+def test_time_scope_absent_when_the_question_has_no_date():
+    """REGRESSION GUARD: an undated question must produce a prompt
+    byte-identical to before this feature."""
+    for fn in (answer_simple_qa, answer_deep_research):
+        base = fn("what is the dose", [_chunk()], 1500, {})
+        for empty in (None, [], [""]):
+            assert fn("what is the dose", [_chunk()], 1500, {}, empty) == base
+        assert "TIME SCOPE" not in base[1]
 
 
 def test_attribution_rule_points_at_the_alias_block():

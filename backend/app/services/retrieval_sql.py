@@ -491,7 +491,14 @@ SELECT surface, occurrences FROM (
  -- are label boilerplate that survived mining ("Medication Guide TRULICITY
  -- TRU-li-si-tee"); injecting one into probe text would poison the
  -- embedding it rides on.
- WHERE array_length(string_to_array(btrim(surface), ' '), 1) <= 3
+ --
+ -- The ceiling is 6, not 3, because acronym EXPANSIONS are legitimately
+ -- longer ("maximum recommended human dose", "Non-Steroidal Anti
+ -- Inflammatory Drugs") and a 3-word cap silently dropped them -- which is
+ -- half of why MRHD never fired in the 2026-08-19 audit. `_expand_aliases`
+ -- tightens back to 3 for non-acronym pairs, where it has the per-term
+ -- context to tell the difference.
+ WHERE array_length(string_to_array(btrim(surface), ' '), 1) <= 6
  ORDER BY occurrences DESC, length(surface) ASC, surface
  LIMIT :limit
 """
@@ -514,6 +521,51 @@ SELECT surface, occurrences, sim FROM (
  ORDER BY sim DESC, occurrences DESC, length(surface) ASC, surface
  LIMIT :limit
 """
+
+
+async def fetch_chunk_time_labels(
+    session: AsyncSession,
+    chunk_ids: list[uuid.UUID],
+    *,
+    per_chunk_limit: int = 4,
+) -> dict[uuid.UUID, list[str]]:
+    """Time periods each chunk is linked to, for date-scoped questions.
+
+    Mirrors `fetch_chunk_entity_names`: one query over the FINAL top-k
+    only, walking `time:hasTime` edges to `time_instances`.
+
+    Without this the synthesis cannot honour a date constraint even when
+    told to -- the evidence block carries no per-item date, so "by 2025"
+    was answered with a 2026 approval. Ordered coarsest-first (year
+    before month before day) so the most useful label leads.
+    """
+    if not chunk_ids:
+        return {}
+    result = await session.execute(
+        sql_text("""
+        SELECT gr.source_chunk_id, t.display_label, t.time_level, t.start_date
+          FROM graphrag.graph_relationships gr
+          JOIN graphrag.time_instances t ON t.id = gr.target_node_id
+         WHERE gr.predicate_label = 'time:hasTime'
+           AND gr.target_node_type = 'time_instance'
+           AND gr.source_chunk_id = ANY(CAST(:ids AS uuid[]))
+         ORDER BY
+           CASE t.time_level
+             WHEN 'year' THEN 0 WHEN 'quarter' THEN 1
+             WHEN 'month' THEN 2 WHEN 'day' THEN 3 ELSE 4
+           END,
+           t.start_date
+        """),
+        {"ids": [str(cid) for cid in chunk_ids]},
+    )
+    out: dict[uuid.UUID, list[str]] = {}
+    for cid, label, _level, _start in result.all():
+        if not label:
+            continue
+        labels = out.setdefault(cid, [])
+        if label not in labels and len(labels) < per_chunk_limit:
+            labels.append(label)
+    return out
 
 
 async def fetch_aliases(
