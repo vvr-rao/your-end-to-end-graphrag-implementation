@@ -1774,6 +1774,10 @@ def _cmd_query(args: argparse.Namespace) -> int:
             "cost_usd": result.cost_usd,
             "wall_seconds": result.wall_seconds,
             "graph_version": result.graph_version,
+            # Citations the synthesis emitted that resolved to nothing and
+            # were stripped. Empty is the expected state; anything here is
+            # a traceability regression worth investigating.
+            "invalid_citations": result.invalid_citations,
         }
         print(_json.dumps(envelope, indent=2, default=str))
         return 0

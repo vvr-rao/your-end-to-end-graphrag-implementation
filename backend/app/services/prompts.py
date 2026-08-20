@@ -1482,6 +1482,12 @@ _FACTS_FIRST_RULE = (
     "etc.).\n"
     "  - Cite every fact by its IRI in brackets, e.g. [viao:Chunk_abc...] "
     "or [viao:Claim_...]. Multiple citations on one fact are fine.\n"
+    "  - COPY each citation character-for-character from the EVIDENCE "
+    "block. Never construct, complete, guess or adjust an identifier. The "
+    "ids look sequential -- they are not: neighbouring numbers are "
+    "different documents or do not exist. If a fact is worth stating but "
+    "you cannot find its exact id in the block, state it without a "
+    "citation rather than inventing one.\n"
     "  - If a specific name or figure is NOT in the evidence, do not "
     "invent one; say what's known and what's missing."
 )

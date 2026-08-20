@@ -1099,7 +1099,13 @@ def _apply_aliases_to_probes(
                 # Substitute via a callable so the matched text is kept
                 # verbatim -- a case-insensitive match on "TIRZEPATIDE"
                 # must not rewrite it to the lowercased parse output.
-                _suffix = f" ({', '.join(fresh[:2])})"
+                #
+                # 3, not 2: semaglutide legitimately has three brands
+                # (Ozempic, Wegovy, Rybelsus) and a 2-cap left Rybelsus out
+                # of every probe, so "which drugs contain semaglutide?"
+                # answered with two of the three.
+                _n_blend = int(_qa_cfg("alias_blend_count", 3))
+                _suffix = f" ({', '.join(fresh[:_n_blend])})"
                 rewritten = re.sub(
                     re.escape(term),
                     lambda m, s=_suffix: m.group(0) + s,

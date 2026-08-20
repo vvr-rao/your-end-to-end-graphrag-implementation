@@ -336,6 +336,10 @@ qa:
   max_aliases: 6
   # Only used when alias_probe_mode: separate. Caps total added probes.
   max_alias_probes: 4
+  # How many aliases ride into ONE blended probe. 3 covers a typical brand
+  # family (semaglutide -> Ozempic, Wegovy, Rybelsus); 2 silently dropped the
+  # third and answered enumeration questions incompletely.
+  alias_blend_count: 3
 
   # --- distance-aware probe fusion --------------------------------------------
   # RRF fuses rank ORDER and throws distance away, so a probe that matched
