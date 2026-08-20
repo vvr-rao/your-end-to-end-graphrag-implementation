@@ -523,6 +523,32 @@ SELECT surface, occurrences, sim FROM (
 """
 
 
+async def fetch_all_alias_terms(
+    session: AsyncSession, *, limit: int = 5000
+) -> list[tuple[str, str, str, str]]:
+    """Every mined pair as (term_a, term_b, surface_a, surface_b).
+
+    Small by construction -- it is corpus VOCABULARY, not corpus size
+    (a few hundred rows), so pulling the lot and matching in Python is
+    cheaper than a query per candidate phrase.
+
+    Supports the literal-question scan in `_expand_aliases_from_question`,
+    which exists because the question parser reduces multi-word technical
+    phrases to a head noun: "maximum recommended human dose" comes back as
+    just "dose", so a pair that IS in the table never gets looked up.
+    """
+    result = await session.execute(
+        sql_text("""
+        SELECT term_a, term_b, surface_a, surface_b
+          FROM graphrag.term_aliases
+         ORDER BY occurrences DESC
+         LIMIT :limit
+        """),
+        {"limit": limit},
+    )
+    return [(a, b, sa, sb) for a, b, sa, sb in result.all()]
+
+
 async def fetch_chunk_time_labels(
     session: AsyncSession,
     chunk_ids: list[uuid.UUID],

@@ -115,6 +115,52 @@ def test_artifact_citations_validate_too():
     assert "[viao:Claim_9212ccabafc04929]" in cleaned
 
 
+def test_multiple_ids_in_one_bracket_are_validated_individually():
+    """The synthesis groups citations -- "[viao:A; viao:B; viao:C]" --
+    because the rules say multiple citations on one fact are fine.
+    Treating the body as a single id discarded the VALID ones along with
+    the bad, destroying traceability rather than protecting it."""
+    answer = (
+        "Dosing rises to 15 mg "
+        f"[viao:Chunk_8d5104fae90b5632_ft_0005; viao:Claim_9212ccabafc04929; "
+        "viao:Claim_deadbeefdeadbeef]."
+    )
+    cleaned, invalid = _validate_citations(
+        answer, [_ev(), _ev(_REAL_ART, kind="artifact")]
+    )
+    assert invalid == ["Claim_deadbeefdeadbeef"]
+    assert "viao:Chunk_8d5104fae90b5632_ft_0005" in cleaned
+    assert "viao:Claim_9212ccabafc04929" in cleaned
+    assert "deadbeef" not in cleaned
+
+
+def test_grouped_bracket_all_valid_is_untouched():
+    answer = (
+        "Both agree [viao:Chunk_8d5104fae90b5632_ft_0005; "
+        "viao:Claim_9212ccabafc04929]."
+    )
+    cleaned, invalid = _validate_citations(
+        answer, [_ev(), _ev(_REAL_ART, kind="artifact")]
+    )
+    assert cleaned == answer and invalid == []
+
+
+def test_grouped_bracket_all_invalid_is_removed():
+    answer = "Claimed [viao:Claim_aaaaaaaaaaaaaaaa; viao:Claim_bbbbbbbbbbbbbbbb]."
+    cleaned, invalid = _validate_citations(answer, [_ev()])
+    assert len(invalid) == 2
+    assert "[" not in cleaned
+
+
+def test_document_stem_without_chunk_suffix_is_invalid():
+    """A real document hash cited without its `_ft_NNNN` chunk suffix
+    resolves to nothing -- the audit's truncation case, still seen live."""
+    answer = "As stated [viao:Chunk_8d5104fae90b5632]."
+    cleaned, invalid = _validate_citations(answer, [_ev()])
+    assert invalid == ["Chunk_8d5104fae90b5632"]
+    assert "[" not in cleaned
+
+
 def test_removal_tidies_the_seam():
     """Stripping mid-sentence must not leave a doubled space or a space
     stranded before the full stop."""

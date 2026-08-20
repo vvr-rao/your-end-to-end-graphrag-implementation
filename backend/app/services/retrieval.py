@@ -178,11 +178,22 @@ def _validate_citations(
     invalid: list[str] = []
 
     def _keep(m: re.Match[str]) -> str:
-        key = _citation_key(m.group(1))
-        if key in allowed:
-            return m.group(0)
-        invalid.append(key)
-        return ""
+        # One bracket may carry SEVERAL ids -- the synthesis writes
+        # "[viao:Chunk_x; viao:Claim_y; viao:Claim_z]" because the rules
+        # tell it multiple citations on one fact are fine. Validate each
+        # part and rebuild from the survivors; treating the whole body as
+        # a single id would discard valid citations along with the bad
+        # one, which is worse than the defect this guards against.
+        parts = [p.strip() for p in re.split(r"[;,]", m.group(1)) if p.strip()]
+        good = [p for p in parts if _citation_key(p) in allowed]
+        bad = [p for p in parts if _citation_key(p) not in allowed]
+        invalid.extend(_citation_key(p) for p in bad)
+        if not good:
+            return ""
+        if not bad:
+            return m.group(0)          # untouched, preserves original spacing
+        lead = m.group(0)[: m.group(0).index("[")]
+        return f"{lead}[{'; '.join(good)}]"
 
     cleaned = _CITATION_TOKEN_RE.sub(_keep, answer)
     if invalid:
@@ -328,6 +339,14 @@ async def retrieve_and_answer(
         parsed.get("classes") or [], acronyms_only=True
     )
     for term, alts in class_aliases.items():
+        if term not in aliases:
+            aliases[term] = alts
+    # Last resort, and the only parser-independent one: match the alias
+    # vocabulary against the raw question text. Catches multi-word phrases
+    # the parser reduced to a head noun ("maximum recommended human dose"
+    # -> "dose"), which is why that question and its acronym form retrieved
+    # different evidence.
+    for term, alts in (await _expand_aliases_from_question(resolved_query)).items():
         if term not in aliases:
             aliases[term] = alts
     parsed["aliases"] = aliases
@@ -856,6 +875,79 @@ async def _expand_aliases(
         if not surfaces:
             continue
         out[original] = surfaces
+    return out
+
+
+_MIN_LITERAL_ALIAS_CHARS = 4
+
+
+async def _expand_aliases_from_question(question: str) -> dict[str, list[str]]:
+    """Mined aliases for terms that appear VERBATIM in the question.
+
+    The parser is the weak link in alias expansion: it reduces multi-word
+    technical phrases to a head noun, so "What is the maximum recommended
+    human dose...?" parses to classes ['dose', 'animal studies'] and the
+    `maximum recommended human dose <-> MRHD` pair -- which is sitting
+    right there in the table -- is never looked up. Asking the same
+    question by its acronym DID expand, so the two phrasings diverged for
+    no reason other than how an LLM chose to chop the sentence.
+
+    This scan does not consult the parser at all. It matches the alias
+    vocabulary against the raw question on whole-word boundaries, longest
+    first so "maximum recommended human dose" wins over any substring of
+    itself.
+
+    Fails soft, like every other alias path.
+    """
+    q_norm = normalize_term(question or "")
+    if not q_norm:
+        return {}
+    max_aliases = int(_qa_cfg("max_aliases", 6))
+    if max_aliases <= 0:
+        return {}
+    try:
+        async with session_scope() as session:
+            pairs = await retrieval_sql.fetch_all_alias_terms(session)
+    except Exception as exc:
+        log.warning(
+            "literal alias scan failed (%s: %s); continuing without it",
+            type(exc).__name__, exc,
+        )
+        return {}
+
+    # `normalize_term` DELETES hyphens rather than replacing them with a
+    # space, so "angiotensin-converting enzyme" normalizes to
+    # "angiotensinconverting enzyme" and never matches the stored
+    # "angiotensin converting enzyme". Changing the normalizer would shift
+    # entity matching everywhere (and it is pinned to the ingest-time one
+    # by test), so widen the haystack here instead: scan both forms.
+    haystacks = {f" {q_norm} "}
+    hyphen_split = normalize_term(re.sub(r"[-‐-―]", " ", question or ""))
+    if hyphen_split and hyphen_split != q_norm:
+        haystacks.add(f" {hyphen_split} ")
+
+    hits: list[tuple[int, str, str]] = []   # (length, surface_found, alias)
+    for term_a, term_b, surface_a, surface_b in pairs:
+        for term, surface, alias in (
+            (term_a, surface_a, surface_b),
+            (term_b, surface_b, surface_a),
+        ):
+            # Short terms are too collision-prone for a substring scan;
+            # acronyms are exempt because that is the whole point.
+            if len(term.replace(" ", "")) < _MIN_LITERAL_ALIAS_CHARS and not is_acronym(
+                surface.strip()
+            ):
+                continue
+            if any(f" {term} " in h for h in haystacks):
+                hits.append((len(term), surface, alias))
+
+    out: dict[str, list[str]] = {}
+    for _len, surface, alias in sorted(hits, key=lambda h: -h[0]):
+        if len(out) >= max_aliases:
+            break
+        bucket = out.setdefault(surface, [])
+        if alias not in bucket and len(bucket) < max_aliases:
+            bucket.append(alias)
     return out
 
 

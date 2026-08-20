@@ -64,6 +64,16 @@ QUESTIONS: list[tuple[int, str, str]] = [
      "TREND: 'after' relation"),
     (25, "Which cardiovascular outcome trials were reported before 2020?",
      "TREND: 'before' relation - inverse window"),
+    # Sub-year granularity. `_ontology_match` regexes only the YEAR out of a
+    # time term, so "June 2026" and "Q2 2026" both seed YEAR_2026 -- broad,
+    # never wrong. The month can only be honoured downstream, via the
+    # per-chunk time tags (82 chunks carry month labels) plus the verbatim
+    # term in the prompt. NOTE no chunk links to a quarter node at all, so
+    # Q27 requires the model to infer the quarter from month labels.
+    (26, "What happened in June 2026 in the GLP-1 market?",
+     "MONTH: 13 chunks carry a 'June 2026' tag; seeding is year-level"),
+    (27, "What developments occurred in Q2 2026?",
+     "QUARTER: zero chunks link to a quarter node - must infer from months"),
 ]
 
 
