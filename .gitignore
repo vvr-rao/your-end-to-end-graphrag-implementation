@@ -110,3 +110,6 @@ reference/
 
 # ad-hoc scratch scripts at the repo root (real tools live in scripts/)
 /_*.py
+
+# Audit reports + query-run outputs: local working notes, not repo content
+docs/
