@@ -177,10 +177,28 @@ def test_removal_tidies_the_seam():
         (f"{_NS}#Chunk_abc", "Chunk_abc"),
         ("viao:Chunk_abc", "Chunk_abc"),
         ("Chunk_abc", "Chunk_abc"),
+        # The deep_research CLAIMS section is specified as
+        # "<Claim>. [Stated by <source> in <doc>]", so prose legitimately
+        # trails the id inside the bracket.
+        ("viao:Claim_abc in the corpus", "Claim_abc"),
+        (f"{_NS}#Claim_abc in the corpus", "Claim_abc"),
+        ("", ""),
     ],
 )
 def test_citation_key_normalizes_both_forms(raw: str, expected: str):
     assert _citation_key(raw) == expected
+
+
+def test_citation_with_trailing_prose_is_kept():
+    """REGRESSION: this stripped citations whose rows HAD been retrieved.
+    Destroying real traceability is worse than the fabricated citations
+    the validator exists to catch."""
+    answer = "Tirzepatide is dual-acting [viao:Claim_9212ccabafc04929 in the corpus]."
+    cleaned, invalid = _validate_citations(
+        answer, [_ev(_REAL_ART, kind="artifact")]
+    )
+    assert invalid == []
+    assert cleaned == answer
 
 
 # --------------------------------------------------------------------------

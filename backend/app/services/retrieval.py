@@ -142,13 +142,22 @@ def _citation_key(raw: str) -> str:
     or echo a full URL from the evidence block. Both reduce to the part
     after the last '#' (or after 'viao:'), which is what actually
     identifies the row.
+
+    Prose inside the bracket is discarded. The deep_research CLAIMS
+    section is specified as `"<Claim>. [Stated by <source> in <doc>]"`,
+    so citations legitimately arrive as
+    `[viao:Claim_cd262250c7af4c13 in the corpus]` -- and keeping that tail
+    made the key miss, stripping a citation whose row had genuinely been
+    retrieved. Losing real traceability is worse than the fabricated
+    citations this guard exists to catch, so the identifier is taken as
+    the first whitespace-delimited token.
     """
     s = raw.strip()
     if "#" in s:
         s = s.rsplit("#", 1)[-1]
     elif s.lower().startswith("viao:"):
         s = s[5:]
-    return s.strip()
+    return s.strip().split()[0] if s.strip() else ""
 
 
 def _validate_citations(
