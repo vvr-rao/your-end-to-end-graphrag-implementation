@@ -103,6 +103,44 @@ def test_strong_chunk_is_not_displaced_by_a_weak_one():
     )
 
 
+# --------------------------------------------------------------------------
+# Cap resolution: fraction vs absolute
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value,top_k,expected",
+    [
+        (0.75, 30, 22),      # deep_research default
+        (0.75, 20, 15),      # simple_qa scales automatically
+        (0.5, 30, 15),
+        (8, 30, 8),          # absolute count still honoured
+        (1, 30, 1),
+        (0, 30, 0),          # disabled
+        (0.0, 30, 0),
+        (-1, 30, 0),
+        ("nonsense", 30, 0),  # bad config must disable, not crash
+        (None, 30, 0),
+    ],
+)
+def test_resolve_doc_cap(value, top_k: int, expected: int):
+    """One knob accepts a FRACTION of top_k or an absolute count, so a
+    single setting works across corpora of very different document sizes.
+    No integer suits both: 8 breaks a 30-of-30 monopoly on small labels
+    but scatters a single-filing question across seven documents."""
+    from backend.app.services.retrieval import _resolve_doc_cap
+
+    assert _resolve_doc_cap(value, top_k) == expected
+
+
+def test_fraction_never_resolves_below_one():
+    """A tiny fraction must still leave a usable cap rather than 0, which
+    would silently mean 'disabled'."""
+    from backend.app.services.retrieval import _resolve_doc_cap
+
+    assert _resolve_doc_cap(0.01, 30) == 1
+
+
 def test_ratio_of_zero_makes_the_cap_absolute():
     """Nothing counts as competition, so the cap never yields."""
     a, b = uuid.uuid4(), uuid.uuid4()

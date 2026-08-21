@@ -94,6 +94,35 @@ def _qa_cfg(key: str, default: Any) -> Any:
         return default
 
 
+def _resolve_doc_cap(value: Any, top_k: int) -> int:
+    """How many evidence chunks one document may supply.
+
+    Accepts either form, so a single setting works across corpora:
+
+      0.75  -> a FRACTION of top_k. 75% of 30 = 22, guaranteeing at least
+               a quarter of the evidence comes from elsewhere.
+      8     -> an absolute count (any value >= 1).
+      0     -> disabled.
+
+    The fraction is the better default because it scales with `top_k` and
+    is corpus-independent. A fixed count cannot be: 8 breaks the 30-of-30
+    monopoly on a corpus of small labels, but dilutes a question about one
+    200-page filing across seven documents, and there is no single integer
+    that is right for both. A fraction bounds the WORST case concentration
+    without dictating how concentrated a legitimately single-source answer
+    may be.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if v <= 0:
+        return 0
+    if v < 1:                       # fraction of the evidence budget
+        return max(1, int(top_k * v))
+    return int(v)                   # absolute count
+
+
 _VALID_MODES = ("simple_qa", "deep_research", "artifact_only")
 # deep_research is the default workhorse mode; simple_qa is the tight
 # direct-answer mode. artifact_only runs the graph pipeline over ALL
@@ -685,7 +714,7 @@ async def retrieve_and_answer(
         # took all 30 evidence slots while 20 documents held the relevant
         # section. Capping after fusion keeps relevance in charge of the
         # ordering and only trims the monopoly.
-        _cap = int(_qa_cfg("max_chunks_per_document", 8))
+        _cap = _resolve_doc_cap(_qa_cfg("max_chunks_per_document", 0.75), top_k)
         if _cap > 0:
             async with session_scope() as session:
                 _doc_of = await retrieval_sql.fetch_chunk_document_ids(

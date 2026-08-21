@@ -377,10 +377,28 @@ qa:
   # Max evidence chunks any ONE document may contribute after rank fusion. RRF's
   # usual defence is agreement between independent ranked lists, but all three
   # chunk voters run over the same candidate pool -- when that pool is already
-  # concentrated they agree rather than cross-check. Measured: one document
-  # supplied all 30 evidence items while 20 documents carried the relevant
-  # section. 0 disables the cap.
-  max_chunks_per_document: 8
+  # concentrated they agree rather than cross-check. Measured with this OFF: one
+  # document supplied all 30 evidence items for "how do GLP-1 medications work?"
+  # while 20 documents carried a MECHANISM OF ACTION section.
+  #
+  # A FRACTION of top_k (0 < x < 1) is the right shape and the default; an
+  # absolute count (>= 1) is also accepted; 0 disables the cap.
+  #
+  # Why a fraction: no single integer suits every corpus. Measured on 30 docs
+  # at top_k=30 --
+  #     cap        monopoly question        single-document question
+  #     0.75 (22)  7 docs,  73% top          2 docs   <- matches uncapped
+  #     0.50 (15)  11 docs, 50%              3 docs
+  #     8 (fixed)  12 docs, 27%              7 docs   <- diluted
+  #     0 (off)    1 doc,  100%              2 docs
+  # A fraction bounds the WORST-case concentration without dictating how
+  # concentrated a legitimately single-source answer may be -- so a question
+  # about one 200-page filing keeps its filing, while a spurious monopoly is
+  # still broken. It also scales with top_k automatically (simple_qa uses 20).
+  # Lower it toward 0.5 for more diversity: that measured 11 docs on the
+  # monopoly question and the best recall on the trials question, at the cost
+  # of one extra document on single-source answers.
+  max_chunks_per_document: 0.75
   # ...but the cap YIELDS when there is no real alternative. Past the limit a
   # document's next chunk is still kept if it scores at least this fraction of
   # the best UNSELECTED chunk from any other document. Without this, the cap
