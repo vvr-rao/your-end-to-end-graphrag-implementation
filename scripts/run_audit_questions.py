@@ -74,6 +74,30 @@ QUESTIONS: list[tuple[int, str, str]] = [
      "MONTH: 13 chunks carry a 'June 2026' tag; seeding is year-level"),
     (27, "What developments occurred in Q2 2026?",
      "QUARTER: zero chunks link to a quarter node - must infer from months"),
+    # --- Batch 5: the temporal bug report's own questions ---------------------
+    # docs/temporal-retrieval-issue-2026-08-21.md, verbatim. Numbered 100+ so
+    # they stay visually distinct from the audit set. t10/t11/t12 and c3 were
+    # the failures; the rest were passing and are regression guards.
+    (100, "What clinical studies of diabetes and hypertension medications have been done since 2020?",
+     "t10 FORWARD - was a false 'no evidence' denial"),
+    (101, "How has GLP-1 dosing guidance evolved between 2020 and 2025?",
+     "t11 FORWARD - was a false 'no evidence' denial"),
+    (102, "What safety warnings were added to GLP-1 labels after 2023?",
+     "t12 FORWARD - was a false 'no evidence' denial"),
+    (103, "Which cardiovascular outcome trials were reported before 2020?",
+     "t13 BACKWARD - was PASS, 9 trials"),
+    (104, "What happened in June 2026 in the GLP-1 market?",
+     "t14 EXACT LABEL - was PASS"),
+    (105, "What developments occurred in Q2 2026?",
+     "t15 EXACT LABEL - was PASS"),
+    (106, "What safety warnings were added to GLP-1 labels?",
+     "c1 NO DATE - was PASS (control)"),
+    (107, "What safety warnings were in GLP-1 labels before 2026?",
+     "c2 BACKWARD - was PASS (control)"),
+    (108, "Which cardiovascular outcome trials were reported after 2020?",
+     "c3 FORWARD - was PARTIAL, 1 trial only"),
+    (109, "What recent changes were made to the ZEPBOUND prescribing information?",
+     "c4 'recent' - was PASS, change-log at rank 3"),
 ]
 
 
@@ -111,6 +135,14 @@ async def main() -> int:
 
         aliases = res.parsed.get("aliases") or {}
         times = res.parsed.get("time_terms") or []
+        # Document spread: the concentration defect showed up as every
+        # evidence item coming from one document, so track it per query.
+        titles = {
+            e.get("document_title")
+            for e in res.evidence
+            if e.get("kind") == "chunk" and e.get("document_title")
+        }
+        dated = sum(1 for e in res.evidence if e.get("times"))
         total_cost += res.cost_usd
         total_invalid += len(res.invalid_citations)
         rows.append((
@@ -119,7 +151,8 @@ async def main() -> int:
         ))
 
         print(f"  cost ${res.cost_usd:.4f}  wall {res.wall_seconds:.0f}s  "
-              f"evidence {len(res.evidence)}", flush=True)
+              f"evidence {len(res.evidence)}  docs {len(titles)}  "
+              f"dated {dated}", flush=True)
         if aliases:
             print("  aliases: " + "; ".join(
                 f"{k} -> {', '.join(v[:3])}" for k, v in aliases.items()), flush=True)
@@ -136,6 +169,8 @@ async def main() -> int:
             "invalid_citations": res.invalid_citations,
             "cost_usd": res.cost_usd, "wall_seconds": res.wall_seconds,
             "evidence_iris": [e.get("iri") for e in res.evidence],
+            "distinct_documents": len(titles),
+            "dated_evidence": dated,
         }, default=str) + "\n")
         fh.flush()
 

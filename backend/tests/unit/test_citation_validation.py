@@ -115,6 +115,31 @@ def test_artifact_citations_validate_too():
     assert "[viao:Claim_9212ccabafc04929]" in cleaned
 
 
+def test_facts_rule_forbids_building_an_id_from_the_document_name():
+    """Shortening the citation token put an opaque hash next to a readable
+    document title, and the model began splicing the two -- emitting
+    `Chunk_005_Some_Paper_Title_ft_0002`, which resolves to nothing. Eight
+    in a single answer. The rule has to name that trap explicitly."""
+    from backend.app.services.prompts import _FACTS_FIRST_RULE
+
+    low = _FACTS_FIRST_RULE.lower()
+    assert "document: ...)' tag is not part of it" in low or "not part of it" in low
+    assert "opaque" in low
+    assert "never appear inside a citation" in low
+
+
+def test_document_name_spliced_id_is_stripped():
+    """End of the same defect: even if the prompt fails, the validator
+    must reject an id built out of the document title."""
+    answer = (
+        "GLP-1 agonists act via cAMP "
+        "[viao:Chunk_005_Glucagon-like_peptide-1_receptor__mechanisms_ft_0002]."
+    )
+    cleaned, invalid = _validate_citations(answer, [_ev()])
+    assert len(invalid) == 1
+    assert "Glucagon-like" not in cleaned
+
+
 def test_multiple_ids_in_one_bracket_are_validated_individually():
     """The synthesis groups citations -- "[viao:A; viao:B; viao:C]" --
     because the rules say multiple citations on one fact are fine.
