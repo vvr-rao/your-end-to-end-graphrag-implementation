@@ -1353,10 +1353,14 @@ def _format_evidence_block(evidence_items: list[dict], char_cap: int = 600) -> s
         # Time the passage is about, so a question with a date constraint
         # can be answered against it. Without this tag the model cannot
         # honour "by 2025" even when told to -- the per-item date simply
-        # is not in the prompt.
-        times = [t for t in (it.get("times") or []) if t]
+        # is not in the prompt. Already rendered as a bounded span by
+        # `retrieval_sql._render_time_span`; a list is still accepted so a
+        # caller passing raw labels does not silently lose them.
+        times = it.get("times")
+        if isinstance(times, (list, tuple)):
+            times = ", ".join(str(t) for t in times if t)
         if times:
-            tags.append("time: " + ", ".join(times[:4]))
+            tags.append(f"time: {times}")
         tag_str = f" ({' | '.join(tags)})" if tags else ""
         lines.append(f"  [{citation_token(it)}]{tag_str} {text}")
     return "\n".join(lines)
@@ -1431,11 +1435,23 @@ def _format_time_scope_block(time_terms: list[str] | None) -> str:
         return ""
     return (
         "\n\nTIME SCOPE: the question constrains to " + ", ".join(terms) + ".\n"
-        "  - Evidence items are tagged with the period they concern.\n"
-        "  - Anything outside that window must be explicitly identified as "
-        "outside it -- never presented as if it satisfied the constraint.\n"
-        "  - If the in-window evidence is thin, say so rather than filling "
-        "the gap with out-of-window material."
+        "  - Some evidence items carry a `time:` tag; a range like "
+        "'2011 ... 2024 (8 periods)' means the item touches BOTH ends and "
+        "everything between, so it satisfies any window overlapping that "
+        "range.\n"
+        "  - An item with NO `time:` tag is of UNKNOWN date, not outside "
+        "the window. Only about a quarter of the corpus is date-tagged. Do "
+        "NOT exclude untagged evidence; use it, and note that its date is "
+        "not recorded where that matters.\n"
+        "  - An item whose tag is genuinely outside the window must be "
+        "identified as outside it -- never presented as if it satisfied "
+        "the constraint.\n"
+        "  - NEVER report that the corpus contains no such material when "
+        "you did retrieve relevant items but could not date them. Say what "
+        "is true: that you found N relevant items and could not confirm "
+        "their dates. A confident denial of data that exists is the worst "
+        "possible answer here -- far worse than an answer that names its "
+        "own uncertainty."
     )
 
 

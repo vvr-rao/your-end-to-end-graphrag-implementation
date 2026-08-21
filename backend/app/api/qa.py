@@ -11,6 +11,7 @@ Two modes (2026-06-13 redesign):
 """
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, status
@@ -48,6 +49,17 @@ class QARequest(BaseModel):
 
 
 class QAEvidenceItem(BaseModel):
+    """One retrieved evidence item.
+
+    Pydantic v2 defaults to `extra='ignore'`, so any key produced by
+    `retrieval.py` but NOT declared here is dropped from the response
+    silently -- no error, no warning. `node_id`, `entities` and `times`
+    were all being discarded that way, which is how a temporal-retrieval
+    investigation concluded the pipeline had no date information at all
+    when in fact the synthesis prompt had it and only the API response
+    lacked it. Declare every field the pipeline emits.
+    """
+
     kind: str
     iri: str
     rank: int
@@ -57,6 +69,15 @@ class QAEvidenceItem(BaseModel):
     document_title: str | None = None
     artifact_type: str | None = None
     confidence: float | None = None
+    # Primary key of the underlying chunk/artifact row, for joining back
+    # without parsing the IRI.
+    node_id: uuid.UUID | None = None
+    # Entities the passage asserts about -- the attribution signal that
+    # stops one entity's figures being reported under another's name.
+    entities: list[str] = Field(default_factory=list)
+    # Rendered period span, e.g. "2011 ... 2024 (8 periods)". Empty when
+    # the chunk carries no `time:hasTime` edge.
+    times: str = ""
 
 
 class QAResponse(BaseModel):

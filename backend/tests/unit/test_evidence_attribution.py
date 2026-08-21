@@ -125,8 +125,37 @@ def test_alias_block_absent_when_nothing_was_mined():
 def test_evidence_carries_its_time_tag():
     """Without a per-item date the model cannot honour a date constraint
     even when instructed -- the information simply is not in the prompt."""
-    out = _format_evidence_block([_chunk(times=["2026"])])
+    out = _format_evidence_block([_chunk(times="2026")])
     assert "time: 2026" in out
+
+
+def test_evidence_renders_a_time_span():
+    out = _format_evidence_block([_chunk(times="2011 ... 2024 (8 periods)")])
+    assert "time: 2011 ... 2024 (8 periods)" in out
+
+
+def test_evidence_still_accepts_a_list_of_labels():
+    """The span is pre-rendered upstream, but a caller passing raw labels
+    must not silently lose them."""
+    out = _format_evidence_block([_chunk(times=["2023", "2024"])])
+    assert "time: 2023, 2024" in out
+
+
+def test_untimed_evidence_has_no_time_tag():
+    for empty in ("", None, []):
+        assert "time:" not in _format_evidence_block([_chunk(times=empty)])
+
+
+def test_time_scope_tells_the_model_undated_is_not_out_of_window():
+    """The denial this guards against: undated evidence being treated as
+    outside the window, so a forward-bounded question reported a gap that
+    does not exist."""
+    for fn in (answer_simple_qa, answer_deep_research):
+        _, user = fn("warnings after 2023", [_chunk()], 1500, {}, ["after 2023"])
+        low = user.lower()
+        assert "unknown date" in low or "unknown" in low, fn.__name__
+        assert "do not exclude" in low
+        assert "never report that the corpus contains no such material" in low
 
 
 def test_time_scope_block_states_the_constraint():

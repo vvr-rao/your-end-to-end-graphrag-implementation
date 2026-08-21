@@ -61,7 +61,7 @@ from backend.app.services.embeddings import Embedder
 from backend.app.services.llm_router import LLMRouter
 from backend.app.services.prompts import PROMPTS
 from backend.app.services import retrieval_sql
-from backend.app.services.retrieval_ranking import rrf_fuse
+from backend.app.services.retrieval_ranking import cap_per_source, rrf_fuse
 from backend.app.services.retrieval_sql import _vec_str
 
 log = logging.getLogger(__name__)
@@ -438,6 +438,9 @@ async def retrieve_and_answer(
             if _doc_ids:
                 doc_chunks = await retrieval_sql.fetch_chunks_for_documents(
                     session, _doc_ids, limit=300,
+                    per_document_limit=int(
+                        _qa_cfg("max_fulltext_chunks_per_document", 50)
+                    ),
                 )
         if verbose:
             print(
@@ -523,6 +526,9 @@ async def retrieve_and_answer(
         async with session_scope() as session:
             ft_rows = await retrieval_sql.fetch_fulltext_chunks_for_chunks(
                 session, candidate_chunk_ids, limit=500,
+                per_document_limit=int(
+                    _qa_cfg("max_fulltext_chunks_per_document", 50)
+                ),
             )
             if ft_rows:
                 chunk_doc_map = await retrieval_sql.fetch_chunk_document_ids(
@@ -668,7 +674,25 @@ async def retrieve_and_answer(
         artifact_rankings.append([aid for aid, _ in artifact_candidates])
 
     # -------- step 10: RRF fusion --------
-    fused_chunks = [] if mode == "artifact_only" else rrf_fuse(chunk_rankings)[:top_k]
+    if mode == "artifact_only":
+        fused_chunks: list[tuple[uuid.UUID, float]] = []
+    else:
+        _fused_all = rrf_fuse(chunk_rankings)
+        # Cap one document's share BEFORE truncating to top_k. RRF's usual
+        # defence is agreement between independent lists, but all three
+        # voters here run over the same candidate pool -- when that pool is
+        # concentrated they agree rather than cross-check, and one document
+        # took all 30 evidence slots while 20 documents held the relevant
+        # section. Capping after fusion keeps relevance in charge of the
+        # ordering and only trims the monopoly.
+        _cap = int(_qa_cfg("max_chunks_per_document", 8))
+        if _cap > 0:
+            async with session_scope() as session:
+                _doc_of = await retrieval_sql.fetch_chunk_document_ids(
+                    session, [cid for cid, _ in _fused_all[: top_k * 4]]
+                )
+            _fused_all = cap_per_source(_fused_all, _doc_of, _cap)
+        fused_chunks = _fused_all[:top_k]
     # artifact_only packs a full artifact context (not top_k//2).
     _art_k = top_k if mode == "artifact_only" else top_k // 2
     fused_artifacts = rrf_fuse(artifact_rankings)[:_art_k]
@@ -711,7 +735,10 @@ async def retrieve_and_answer(
             "document_iri": info["document_iri"],
             "document_title": info["document_title"],
             "entities": chunk_entities.get(cid, []),
-            "times": chunk_times.get(cid, []),
+            # Pre-rendered span string, not a list: placing both endpoints
+            # requires seeing all of a chunk's periods (see
+            # retrieval_sql._render_time_span).
+            "times": chunk_times.get(cid, ""),
         })
     for rank, (aid, score) in enumerate(fused_artifacts, start=1):
         info = artifact_rows.get(aid)

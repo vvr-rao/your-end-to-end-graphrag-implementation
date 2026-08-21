@@ -255,6 +255,7 @@ async def fetch_fulltext_chunks_for_chunks(
     chunk_ids: list[uuid.UUID],
     *,
     limit: int = 500,
+    per_document_limit: int = 50,
 ) -> list[tuple[uuid.UUID, float, uuid.UUID]]:
     """Full-text chunks (kind='fulltext') belonging to the documents that own
     any of the given (summary) chunks.
@@ -268,7 +269,15 @@ async def fetch_fulltext_chunks_for_chunks(
     Returns (fulltext_chunk_id, hits, document_id) where hits = the number of
     candidate summary chunks owned by that document — i.e. the document's graph
     score, propagated to each of its full-text chunks. Empty when no full-text
-    chunks exist (→ caller keeps today's summary-chunk behavior)."""
+    chunks exist (→ caller keeps today's summary-chunk behavior).
+
+    `per_document_limit` is what stops ONE document eating the whole budget.
+    `hits` is a per-DOCUMENT constant, so a plain `ORDER BY hits DESC LIMIT
+    500` emitted every chunk of the top-scoring document first: a 600-chunk
+    label claimed all 500 slots and no other document appeared at all. That
+    is half of how a single document came to supply 30 of 30 evidence items.
+    The window keeps each document's best `chunk_index` prefix and leaves
+    room for the rest; the global `limit` stays as a backstop."""
     if not chunk_ids:
         return []
     result = await session.execute(
@@ -279,17 +288,30 @@ async def fetch_fulltext_chunks_for_chunks(
              WHERE c.id = ANY(CAST(:chunk_ids AS uuid[]))
                AND c.document_id IS NOT NULL
              GROUP BY c.document_id
+        ),
+        ranked AS (
+            SELECT ft.id, cd.n_chunks::float AS hits, ft.document_id,
+                   ft.chunk_index,
+                   row_number() OVER (
+                       PARTITION BY ft.document_id ORDER BY ft.chunk_index
+                   ) AS rn
+              FROM graphrag.chunks ft
+              JOIN candidate_docs cd ON cd.document_id = ft.document_id
+             WHERE ft.kind = 'fulltext'
+               AND ft.status = 'ACTIVE'
+               AND ft.embedding IS NOT NULL
         )
-        SELECT ft.id, cd.n_chunks::float AS hits, ft.document_id
-          FROM graphrag.chunks ft
-          JOIN candidate_docs cd ON cd.document_id = ft.document_id
-         WHERE ft.kind = 'fulltext'
-           AND ft.status = 'ACTIVE'
-           AND ft.embedding IS NOT NULL
-         ORDER BY hits DESC, ft.chunk_index
+        SELECT id, hits, document_id
+          FROM ranked
+         WHERE rn <= :per_doc
+         ORDER BY hits DESC, chunk_index
          LIMIT :limit
         """),
-        {"chunk_ids": [str(cid) for cid in chunk_ids], "limit": limit},
+        {
+            "chunk_ids": [str(cid) for cid in chunk_ids],
+            "limit": limit,
+            "per_doc": per_document_limit,
+        },
     )
     return [(cid, float(hits), did) for cid, hits, did in result.all()]
 
@@ -399,6 +421,7 @@ async def fetch_chunks_for_documents(
     document_ids: list[uuid.UUID],
     *,
     limit: int = 300,
+    per_document_limit: int = 50,
 ) -> list[tuple[uuid.UUID, float]]:
     """Chunks belonging to `document_ids`, best-first by document rank.
 
@@ -407,26 +430,54 @@ async def fetch_chunks_for_documents(
     verbatim text. Returns (chunk_id, score) where score decays with the
     document's position in `document_ids` -- so a chunk from the
     top-ranked document outranks one from the tenth.
+
+    Two things here are load-bearing and were previously wrong:
+
+    * The `LIMIT` had NO `ORDER BY`, so which rows survived truncation was
+      whatever order the scan produced -- in practice clustered by
+      document. A single document with >= `limit` chunks consumed the
+      entire budget and the other nine contributed nothing.
+    * The document-rank decay is applied in Python AFTER the query, so it
+      could never rescue a document the SQL had already truncated away.
+
+    `per_document_limit` bounds each document's share inside the query,
+    where it can actually take effect.
     """
     if not document_ids:
         return []
+    rank_of = {did: i for i, did in enumerate(document_ids)}
     result = await session.execute(
         sql_text("""
-        SELECT c.id, c.document_id
-          FROM graphrag.chunks c
-         WHERE c.document_id = ANY(CAST(:ids AS uuid[]))
-           AND c.status = 'ACTIVE'
-           AND c.embedding IS NOT NULL
-           AND (c.kind = 'fulltext' OR NOT EXISTS (
-                 SELECT 1 FROM graphrag.chunks f
-                  WHERE f.document_id = c.document_id
-                    AND f.kind = 'fulltext'
-                    AND f.status = 'ACTIVE'))
+        WITH eligible AS (
+            SELECT c.id, c.document_id, c.chunk_index,
+                   row_number() OVER (
+                       PARTITION BY c.document_id ORDER BY c.chunk_index
+                   ) AS rn
+              FROM graphrag.chunks c
+             WHERE c.document_id = ANY(CAST(:ids AS uuid[]))
+               AND c.status = 'ACTIVE'
+               AND c.embedding IS NOT NULL
+               AND (c.kind = 'fulltext' OR NOT EXISTS (
+                     SELECT 1 FROM graphrag.chunks f
+                      WHERE f.document_id = c.document_id
+                        AND f.kind = 'fulltext'
+                        AND f.status = 'ACTIVE'))
+        )
+        SELECT id, document_id
+          FROM eligible
+         WHERE rn <= :per_doc
+         -- Order by the caller's document ranking BEFORE truncating, so
+         -- the limit trims the least-relevant documents rather than an
+         -- arbitrary slice.
+         ORDER BY array_position(CAST(:ids AS uuid[]), document_id), chunk_index
          LIMIT :limit
         """),
-        {"ids": [str(d) for d in document_ids], "limit": limit},
+        {
+            "ids": [str(d) for d in document_ids],
+            "limit": limit,
+            "per_doc": per_document_limit,
+        },
     )
-    rank_of = {did: i for i, did in enumerate(document_ids)}
     out: list[tuple[uuid.UUID, float]] = []
     for cid, did in result.all():
         out.append((cid, 1.0 / (1.0 + rank_of.get(did, len(document_ids)))))
@@ -549,12 +600,37 @@ async def fetch_all_alias_terms(
     return [(a, b, sa, sb) for a, b, sa, sb in result.all()]
 
 
+def _render_time_span(
+    labels_by_date: list[tuple[str, Any]], per_chunk_limit: int
+) -> str:
+    """Render a chunk's periods as a bounded, DIRECTIONALLY NEUTRAL string.
+
+    Listing the first N periods in date order is a trap. A chunk tagged
+    2011,2013,2014,2019,2020,2022,2023,2024 rendered as
+    "2011, 2013, 2014, 2019" -- the recent end truncated away -- which
+    made every chunk look in-window for a backward bound ("before 2020")
+    and out-of-window for a forward one ("after 2023"). That is exactly
+    the asymmetry reported on 2026-08-21: forward-bounded questions
+    returned confident false denials while their backward twins passed.
+
+    So when there are more periods than fit, show BOTH endpoints and the
+    count. Neither direction is starved, and nothing is silently dropped.
+    """
+    if not labels_by_date:
+        return ""
+    if len(labels_by_date) <= per_chunk_limit:
+        return ", ".join(label for label, _ in labels_by_date)
+    earliest = labels_by_date[0][0]
+    latest = labels_by_date[-1][0]
+    return f"{earliest} ... {latest} ({len(labels_by_date)} periods)"
+
+
 async def fetch_chunk_time_labels(
     session: AsyncSession,
     chunk_ids: list[uuid.UUID],
     *,
     per_chunk_limit: int = 4,
-) -> dict[uuid.UUID, list[str]]:
+) -> dict[uuid.UUID, str]:
     """Time periods each chunk is linked to, for date-scoped questions.
 
     Mirrors `fetch_chunk_entity_names`: one query over the FINAL top-k
@@ -562,36 +638,39 @@ async def fetch_chunk_time_labels(
 
     Without this the synthesis cannot honour a date constraint even when
     told to -- the evidence block carries no per-item date, so "by 2025"
-    was answered with a 2026 approval. Ordered coarsest-first (year
-    before month before day) so the most useful label leads.
+    was answered with a 2026 approval.
+
+    Returns a rendered string per chunk rather than a list, because the
+    rendering has to see ALL of a chunk's periods to place both endpoints
+    (see `_render_time_span`). Ordered by date, oldest first, so the span
+    reads naturally.
     """
     if not chunk_ids:
         return {}
     result = await session.execute(
         sql_text("""
-        SELECT gr.source_chunk_id, t.display_label, t.time_level, t.start_date
+        SELECT gr.source_chunk_id, t.display_label, t.start_date
           FROM graphrag.graph_relationships gr
           JOIN graphrag.time_instances t ON t.id = gr.target_node_id
          WHERE gr.predicate_label = 'time:hasTime'
            AND gr.target_node_type = 'time_instance'
            AND gr.source_chunk_id = ANY(CAST(:ids AS uuid[]))
-         ORDER BY
-           CASE t.time_level
-             WHEN 'year' THEN 0 WHEN 'quarter' THEN 1
-             WHEN 'month' THEN 2 WHEN 'day' THEN 3 ELSE 4
-           END,
-           t.start_date
+         ORDER BY gr.source_chunk_id, t.start_date
         """),
         {"ids": [str(cid) for cid in chunk_ids]},
     )
-    out: dict[uuid.UUID, list[str]] = {}
-    for cid, label, _level, _start in result.all():
+    collected: dict[uuid.UUID, list[tuple[str, Any]]] = {}
+    for cid, label, start in result.all():
         if not label:
             continue
-        labels = out.setdefault(cid, [])
-        if label not in labels and len(labels) < per_chunk_limit:
-            labels.append(label)
-    return out
+        bucket = collected.setdefault(cid, [])
+        if all(label != seen for seen, _ in bucket):
+            bucket.append((label, start))
+    return {
+        cid: rendered
+        for cid, rows in collected.items()
+        if (rendered := _render_time_span(rows, per_chunk_limit))
+    }
 
 
 async def fetch_aliases(

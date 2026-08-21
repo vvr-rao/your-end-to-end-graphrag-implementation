@@ -373,6 +373,18 @@ qa:
   # individual chunk matches the query's wording. 0 disables the arm.
   k_documents: 10
 
+  # --- evidence diversification -------------------------------------------------
+  # Max evidence chunks any ONE document may contribute after rank fusion. RRF's
+  # usual defence is agreement between independent ranked lists, but all three
+  # chunk voters run over the same candidate pool -- when that pool is already
+  # concentrated they agree rather than cross-check. Measured: one document
+  # supplied all 30 evidence items while 20 documents carried the relevant
+  # section. 0 disables the cap.
+  max_chunks_per_document: 8
+  # Per-document window inside the document-mediated fetches, so a single large
+  # label cannot claim the whole global budget before other documents are seen.
+  max_fulltext_chunks_per_document: 50
+
 # -----------------------------------------------------------------------------
 # Background jobs (arq).
 # -----------------------------------------------------------------------------

@@ -113,3 +113,6 @@ reference/
 
 # Audit reports + query-run outputs: local working notes, not repo content
 docs/
+
+# Session scratch dir if one is created at the repo root
+.scratchpad/
