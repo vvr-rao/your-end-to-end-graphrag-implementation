@@ -381,6 +381,28 @@ qa:
   # supplied all 30 evidence items while 20 documents carried the relevant
   # section. 0 disables the cap.
   max_chunks_per_document: 8
+  # ...but the cap YIELDS when there is no real alternative. Past the limit a
+  # document's next chunk is still kept if it scores at least this fraction of
+  # the best UNSELECTED chunk from any other document. Without this, the cap
+  # diversifies unconditionally and will displace an excellent chunk with a
+  # much weaker one just to hit a quota -- wrong for corpora of large
+  # documents, where "the dosage instructions for ZEPBOUND" or a question
+  # about one 10-K legitimately answers from a single source.
+  # Reads as "how good must a RIVAL be to count as a real alternative":
+  #   0.9    a competing document counts only if within 90% of our score
+  #   HIGHER stricter about what counts as competition => one document
+  #          keeps MORE slots (better for corpora of large documents)
+  #   LOWER  diversifies more eagerly
+  #   0.0    nothing counts as competition => the cap is absolute
+  #
+  # DEFAULT 0.0 (absolute cap) because the escape hatch does NOT yet work:
+  # it compares fused RRF scores, and those are circular -- a document that
+  # monopolised the candidate pool scores high BECAUSE it monopolised it, so
+  # it always looks like "no better alternative exists". Measured: at 0.9 the
+  # 30-of-30 single-document monopoly returned. Making this usable needs a
+  # pool-independent signal (raw vector distance), which is not wired through
+  # fusion yet. Raise it only if you have measured your corpus.
+  diversity_relevance_ratio: 0.0
   # Per-document window inside the document-mediated fetches, so a single large
   # label cannot claim the whole global budget before other documents are seen.
   max_fulltext_chunks_per_document: 50

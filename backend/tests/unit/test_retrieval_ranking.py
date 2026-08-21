@@ -62,17 +62,75 @@ def test_rrf_empty_input():
 # --------------------------------------------------------------------------
 
 
-def test_one_source_cannot_monopolise():
-    """The reported failure: 30 of 30 evidence items from one document."""
-    hog = uuid.uuid4()
+def test_one_source_keeps_everything_when_it_is_the_only_source():
+    """A single-document question must NOT be truncated. Measured: with a
+    hard cap, "dosage instructions for ZEPBOUND" was spread over 7
+    documents when 2 would do -- the failure mode on a corpus of large
+    documents such as 10-K filings."""
+    only = uuid.uuid4()
     chunks = _ids(30)
     fused = [(c, 1.0 / (i + 1)) for i, c in enumerate(chunks)]
-    capped = cap_per_source(fused, {c: hog for c in chunks}, 8)
-    assert len(capped) == 8
+    capped = cap_per_source(fused, {c: only for c in chunks}, 8)
+    assert len(capped) == 30, "no alternative exists; the cap must yield"
 
 
-def test_cap_preserves_relevance_order():
-    """Capping must trim the monopoly, not reorder what survives."""
+def test_monopoly_is_broken_when_alternatives_are_competitive():
+    """The reported failure: 30 of 30 from one document while 20 other
+    documents carried the relevant section."""
+    hog, other = uuid.uuid4(), uuid.uuid4()
+    hog_chunks, other_chunks = _ids(20), _ids(20)
+    # Interleaved and near-equal in score: real competition.
+    fused = [(c, 1.0 - i * 0.001) for i, c in enumerate(hog_chunks)]
+    fused += [(c, 0.99 - i * 0.001) for i, c in enumerate(other_chunks)]
+    fused.sort(key=lambda t: -t[1])
+    src = {**{c: hog for c in hog_chunks}, **{c: other for c in other_chunks}}
+    kept = cap_per_source(fused, src, 8)
+    from collections import Counter
+    counts = Counter(src[c] for c, _ in kept)
+    assert counts[hog] <= 8, "a competitive alternative must break the monopoly"
+
+
+def test_strong_chunk_is_not_displaced_by_a_weak_one():
+    """The whole point of the escape hatch: never trade an excellent chunk
+    for a much worse one purely to hit a quota."""
+    strong, weak = uuid.uuid4(), uuid.uuid4()
+    strong_chunks, weak_chunks = _ids(12), _ids(12)
+    fused = [(c, 1.0) for c in strong_chunks] + [(c, 0.05) for c in weak_chunks]
+    src = {**{c: strong for c in strong_chunks}, **{c: weak for c in weak_chunks}}
+    kept = [c for c, _ in cap_per_source(fused, src, 4)]
+    assert all(c in kept for c in strong_chunks), (
+        "the weak source is not a real alternative; the strong one keeps its chunks"
+    )
+
+
+def test_ratio_of_zero_makes_the_cap_absolute():
+    """Nothing counts as competition, so the cap never yields."""
+    a, b = uuid.uuid4(), uuid.uuid4()
+    ac, bc = _ids(10), _ids(10)
+    fused = [(c, 1.0) for c in ac] + [(c, 0.01) for c in bc]
+    src = {**{c: a for c in ac}, **{c: b for c in bc}}
+    kept = cap_per_source(fused, src, 3, relevance_ratio=0.0)
+    from collections import Counter
+    assert Counter(src[c] for c, _ in kept)[a] == 3
+
+
+def test_higher_ratio_keeps_one_source_longer():
+    """The knob reads as 'how good must a rival be to count'. Stricter
+    (higher) means fewer things qualify as alternatives, so the dominant
+    source retains more slots."""
+    a, b = uuid.uuid4(), uuid.uuid4()
+    ac, bc = _ids(10), _ids(10)
+    fused = [(c, 1.0) for c in ac] + [(c, 0.8) for c in bc]
+    src = {**{c: a for c in ac}, **{c: b for c in bc}}
+    from collections import Counter
+    lenient = Counter(src[c] for c, _ in cap_per_source(fused, src, 2, relevance_ratio=0.5))
+    strict = Counter(src[c] for c, _ in cap_per_source(fused, src, 2, relevance_ratio=0.9))
+    assert strict[a] > lenient[a]
+
+
+def test_cap_never_reorders_what_survives():
+    """Capping may drop items but must not reorder the survivors --
+    relevance still decides the sequence."""
     d1, d2 = uuid.uuid4(), uuid.uuid4()
     chunks = _ids(6)
     source_of = {
@@ -81,8 +139,21 @@ def test_cap_preserves_relevance_order():
     }
     fused = [(c, 1.0 / (i + 1)) for i, c in enumerate(chunks)]
     capped = [c for c, _ in cap_per_source(fused, source_of, 2)]
-    # d1 keeps its two best (0, 1) and loses 3 and 5; d2 keeps both.
-    assert capped == [chunks[0], chunks[1], chunks[2], chunks[4]]
+    assert capped == [c for c in chunks if c in capped]
+
+
+def test_cap_binds_when_the_rival_is_close():
+    """d1 is over its cap and d2's next chunk is comparable, so d1's
+    surplus is dropped."""
+    d1, d2 = uuid.uuid4(), uuid.uuid4()
+    d1c, d2c = _ids(5), _ids(5)
+    fused = [(c, 1.00 - i * 0.001) for i, c in enumerate(d1c)]
+    fused += [(c, 0.999 - i * 0.001) for i, c in enumerate(d2c)]
+    fused.sort(key=lambda t: -t[1])
+    src = {**{c: d1 for c in d1c}, **{c: d2 for c in d2c}}
+    kept = cap_per_source(fused, src, 2)
+    from collections import Counter
+    assert Counter(src[c] for c, _ in kept)[d1] == 2
 
 
 def test_items_with_unknown_source_are_never_capped():

@@ -691,7 +691,10 @@ async def retrieve_and_answer(
                 _doc_of = await retrieval_sql.fetch_chunk_document_ids(
                     session, [cid for cid, _ in _fused_all[: top_k * 4]]
                 )
-            _fused_all = cap_per_source(_fused_all, _doc_of, _cap)
+            _fused_all = cap_per_source(
+                _fused_all, _doc_of, _cap,
+                relevance_ratio=float(_qa_cfg("diversity_relevance_ratio", 0.0)),
+            )
         fused_chunks = _fused_all[:top_k]
     # artifact_only packs a full artifact context (not top_k//2).
     _art_k = top_k if mode == "artifact_only" else top_k // 2
