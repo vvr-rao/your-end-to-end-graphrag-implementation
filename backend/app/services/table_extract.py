@@ -1132,6 +1132,7 @@ async def extract_tables_for_folder_subprocess(
     use_vision: bool = True,
     limit: int | None = None,
     concurrency: int = 1,
+    paths: list[Path] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Phase 2a v2: extract tables from every PDF in `folder` by spawning
     `python -m backend.app.services.table_extract_worker` per PDF.
@@ -1147,9 +1148,16 @@ async def extract_tables_for_folder_subprocess(
     returned dict only carries lightweight manifests -- the full
     JSON-LD payloads stay on disk in the run-cache + user-cache.
 
-    `concurrency=1` is the safe default; raise it on roomier hosts."""
+    `concurrency=1` is the safe default; raise it on roomier hosts.
+
+    `paths`, when given, restricts extraction to those files instead of
+    scanning `folder` -- corpus selection passes its chosen subset so a run
+    does not pay vision costs for documents the ontology will never see."""
     folder = Path(folder)
-    pdfs = _find_pdfs(folder)
+    if paths is not None:
+        pdfs = sorted(p for p in paths if p.suffix.lower() == ".pdf")
+    else:
+        pdfs = _find_pdfs(folder)
     if limit is not None:
         pdfs = pdfs[:limit]
     if not pdfs:

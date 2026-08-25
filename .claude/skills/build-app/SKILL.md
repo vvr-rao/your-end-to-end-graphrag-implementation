@@ -79,8 +79,12 @@ concurrently with step 3 (prune-expand doesn't need the DB).
 Pick the ontology source (supported domain / other→core-only / their own .owl-.rdf
 / modify an existing folder), merge with the 7 core ontologies, then **report the
 output and have them verify `merged.owl` in Protégé**. Next **ask** for the corpus
-path, **mention the `--tables` flag and ask their preference**, then launch
-prune-expand **detached**, monitoring to completion. First multi-hour paid step;
+path, **ask whether to build the ontology from the FULL corpus or from a
+representative subset** (`--select-subset` — clusters the corpus and keeps one
+document per cluster, one per document type, and every outlier; several-fold
+cheaper, and ingestion still uses every document), **mention the `--tables` flag
+and ask their preference**, then launch prune-expand **detached**, monitoring to
+completion. First multi-hour paid step;
 capture the resulting `v*-prune-expand/` folder. Note the edit-and-resubmit gotcha
 (hand-edited `merged.owl` needs `--use-owl` or a re-merge, or edits are ignored).
 

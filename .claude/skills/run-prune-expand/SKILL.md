@@ -96,6 +96,38 @@ never scan their folders and pick one.** Confirm the folder exists and list its
 contents back to them (use your own file-listing tools) so they confirm it's the
 right corpus. Hold the confirmed path as `DOCS` for Step 3.
 
+## Step 1e — Full corpus, or a representative subset?
+Ask which of the two the user wants. **Never auto-pick**, and never decide it
+for them based on corpus size alone — the trade-off is about fidelity, and only
+they know how much they care.
+
+Lay out both, with the downside of each stated:
+
+| | What it does | Buys | Costs |
+|---|---|---|---|
+| **Full corpus** (default) | Every document shapes the ontology. | Highest fidelity — nothing can be missed. | Full price. Stage 2+3 scale with document count. |
+| **Representative subset** (`--select-subset`) | Profiles + clusters the corpus, then builds from a chosen sample. | Several-fold cheaper and faster; guarantees one document per type plus every outlier. | A concept appearing in exactly ONE ordinary (non-outlier) document can be missed. |
+
+Say plainly how the subset is chosen, because it determines what can be lost:
+1. Every document is summarized, compressed, type-labelled, and embedded.
+2. k-means clusters the embeddings; **k** is picked by the inertia elbow with
+   a silhouette tiebreak. The document closest to each centroid is kept.
+3. **Every distinct document type contributes at least one document.** US and
+   EU filings, drug labels by country, papers by area — each is its own type,
+   because each carries vocabulary the others do not.
+4. **Every outlier is kept**, measured by distance to the nearest already-
+   selected document. Outliers are the documents least represented by anything
+   else, so they are the last thing to drop.
+
+Two points worth stating explicitly, because users assume otherwise:
+- **Ingestion is unaffected.** `register-documents` still loads the WHOLE
+  corpus. Only the ontology is built from the subset.
+- **The summarization is not wasted.** It writes to the same
+  `~/.cache/.../eval_summaries/` cache the later full ingest reads, so those
+  documents are summarized once for both steps.
+
+If they choose the subset, run Step 2e before Step 2d (the order matters).
+
 ## Step 2 — Mention the `--tables` option and ask what they prefer
 Proactively tell the user that prune-expand has an optional `--tables` flag, and
 ask their preference — don't silently pick. Lay out the trade-off:
@@ -137,9 +169,52 @@ Notes:
 - Skip only if the user explicitly wants the verbose descriptions in Stage 2.
 
 
-## Step 2c — MANDATORY GATE: size the run against THIS machine
+## Step 2e — Selection preview (ONLY if they chose the subset in Step 1e)
+Run this BEFORE Step 2d, so the machine-sizing gate measures the documents
+that will actually be processed, not the whole corpus.
+
+```
+uv run python -m backend.app.cli prune-expand --input "<MERGE_DIR>" --documents "<DOCS>" --output-dir output_ontologies --select-subset
+```
+
+Without `--yes` this **stops after selecting** — it writes `selection.json`
+into a fresh version folder, prints a summary, and spends only cents (document
+labelling + embeddings). Note the folder path it prints; call it `SEL_DIR`.
+
+Report back to the user, from the printed summary:
+- how many documents were selected out of how many, and the reduction ratio
+- the **document types** table — every row must show `selected >= 1`
+- how many were kept as outliers
+- the chosen **k** and the projected cost vs. the full corpus
+
+Then **ask whether to proceed**. Do not add `--yes` on your own judgement.
+
+If they want a different sample, re-run with:
+- `--selection-k-max N` — more clusters, larger and more granular subset
+- `--outlier-sigma F` — **lower** keeps more outliers (default 2.0)
+
+Re-running is free: per-document vectors and labels are cached under
+`~/.cache/.../corpus_profiles/`, keyed on the document text.
+
+Once they approve the sample, record it (substitute the numbers from the
+report; this is history only — it never becomes the tracker's "suggested next"):
+```
+uv run python scripts/build_state.py record select-corpus docs=<n> selected=<n> types=<n> clusters=<k>
+```
+
+> Sanity-check the types yourself before recommending approval. If a corpus you
+> know to be a mix of, say, filings and drug labels comes back as one type, the
+> labelling has failed and the subset is not trustworthy — say so rather than
+> approving it.
+
+## Step 2d — MANDATORY GATE: size the run against THIS machine
 ```
 uv run python scripts/tpm_check.py "<DOCS>"
+```
+If Step 2e ran, point this at the selected subset instead, so the numbers
+describe the real workload:
+```
+uv run python scripts/tpm_check.py "<DOCS>" --selection "<SEL_DIR>/selection.json"
 ```
 One command answers three questions: provider rate limits, how much RAM this
 box actually has free, and how the corpus divides into batches. It prints a
@@ -273,16 +348,22 @@ and note that these are NOT interchangeable:
 
 ## Step 3 — Launch prune-expand DETACHED
 
-> **STOP if Step 2c has not run in this session.** Go back and run it. This step
+> **STOP if Step 2d has not run in this session.** Go back and run it. This step
 > spends real money for hours; launching at unexamined defaults is how a 1.6M-token
-> corpus took 4 hours instead of 25 minutes. The numbers below come FROM Step 2c —
+> corpus took 4 hours instead of 25 minutes. The numbers below come FROM Step 2d —
 > do not invent them, and do not silently fall back to config defaults.
 
 Choose a fresh, unique `RUN_ID` (e.g. `prune_expand_<date+time>`). Launch it detached
 via the harness as a **single-line command** (works in any shell). Append `--tables`
 only if the user opted in, and `--no-table-vision` to skip vision.
 
-**Carry the Step 2c values through as flags.** All six exist; substitute the numbers
+If they approved a subset in Step 2e, append `--select-subset --yes` (plus any
+`--selection-k-max` / `--outlier-sigma` they settled on). **Only add `--yes`
+after they have seen the preview and said go** — it is what turns a cents-level
+selection into the multi-hour paid run. Selection re-runs from cache, so the
+detached run does not re-pay for profiling.
+
+**Carry the Step 2d values through as flags.** All six exist; substitute the numbers
 the user agreed to and drop any you are leaving at config default:
 ```
 uv run python scripts/run_detached.py <RUN_ID> uv run python -m backend.app.cli prune-expand --input "<MERGE_DIR>" --documents "<DOCS>" --output-dir output_ontologies --summarization-concurrency <N> --classification-concurrency <N> --proposal-concurrency <N> --dedup-concurrency <N> --table-mining-concurrency <N>
