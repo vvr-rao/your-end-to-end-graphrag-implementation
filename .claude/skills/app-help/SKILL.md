@@ -80,7 +80,13 @@ Points users regularly get wrong:
 - **Summarization is not wasted.** It writes the shared `eval_summaries/` cache
   that the later full ingest reads.
 - **It previews by default.** Without `--yes` it writes `selection.json`, prints
-  the subset, and stops — selection costs cents, the run it precedes costs $20+.
+  the subset, and stops before the $20+ ontology build.
+- **The preview is not free on a cold corpus.** Clustering needs an embedding of
+  every document, so the preview summarizes the WHOLE corpus first. With a warm
+  `eval_summaries/` cache that is cents (measured $0.01 on 10 docs); cold, it is
+  full summarization — roughly $0.03 per 12k-token window, so ~$14 for a 5M-token
+  corpus. That spend carries over to `register-documents`, but it is real money
+  up front and on a big cold corpus it dwarfs the selection itself.
 - **What it can lose**: a concept appearing in exactly one ordinary (non-outlier)
   document. Tune with `--selection-k-max` (more clusters) and `--outlier-sigma`
   (lower keeps more outliers).
