@@ -134,6 +134,17 @@ def _add_selection_flags(p: argparse.ArgumentParser) -> None:
             "outlier_sigma, 2.0). LOWER keeps more outliers."
         ),
     )
+    p.add_argument(
+        "--selection-concurrency", type=int, default=None, metavar="N",
+        help=(
+            "Parallel document-type labelling + embed-compression calls during "
+            "--select-subset. Unset => corpus_selection.label_concurrency (8). "
+            "These run on a cheap high-TPM model, so 32-64 is usually safe on "
+            "tier 3+; size it with scripts/tpm_check.py. Note the SUMMARIZATION "
+            "inside selection is governed by --summarization-concurrency, and "
+            "on a cold corpus that is the long pole."
+        ),
+    )
 
 
 def _add_input_folder(p: argparse.ArgumentParser) -> None:
@@ -1290,6 +1301,7 @@ def _cmd_prune_expand(args: argparse.Namespace) -> int:
             selection_yes=getattr(args, "yes", False),
             selection_k_max=getattr(args, "selection_k_max", None),
             selection_outlier_sigma=getattr(args, "outlier_sigma", None),
+            selection_concurrency=getattr(args, "selection_concurrency", None),
             summarization_concurrency=getattr(args, "summarization_concurrency", None),
             table_mining_concurrency=getattr(args, "table_mining_concurrency", None),
             expansion_concurrency=getattr(args, "expansion_concurrency", None),
@@ -1321,6 +1333,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
             selection_yes=getattr(args, "yes", False),
             selection_k_max=getattr(args, "selection_k_max", None),
             selection_outlier_sigma=getattr(args, "outlier_sigma", None),
+            selection_concurrency=getattr(args, "selection_concurrency", None),
             summarization_concurrency=getattr(args, "summarization_concurrency", None),
             table_mining_concurrency=getattr(args, "table_mining_concurrency", None),
             expansion_concurrency=getattr(args, "expansion_concurrency", None),

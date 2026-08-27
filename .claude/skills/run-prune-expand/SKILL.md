@@ -126,8 +126,8 @@ Two points worth stating explicitly, because users assume otherwise:
   `~/.cache/.../eval_summaries/` cache the later full ingest reads, so those
   documents are summarized once for both steps.
 
-If they choose the subset, Step 2c runs the preview — and it must come before the Step 2d sizing gate, so that gate measures the documents that
-will actually be processed.
+If they choose the subset, Step 2d runs the preview — after the Step 2c
+sizing gate, whose concurrency values it needs.
 
 ## Step 2 — Mention the `--tables` option and ask what they prefer
 Proactively tell the user that prune-expand has an optional `--tables` flag, and
@@ -170,64 +170,12 @@ Notes:
 - Skip only if the user explicitly wants the verbose descriptions in Stage 2.
 
 
-## Step 2c — Selection preview (ONLY if they chose the subset in Step 1e)
-This runs before the Step 2d sizing gate, so that gate measures the
-documents that will actually be processed, not the whole corpus.
-
-```
-uv run python -m backend.app.cli prune-expand --input "<MERGE_DIR>" --documents "<DOCS>" --output-dir output_ontologies --select-subset
-```
-
-Without `--yes` this **stops after selecting** — it writes `selection.json`
-into a fresh version folder and prints a summary. Note the folder path it
-prints; call it `SEL_DIR`.
-
-**Tell the user what the preview itself costs, BEFORE launching it.** Clustering
-needs an embedding of every document, so the preview summarizes the WHOLE
-corpus even though the ontology will only use a subset:
-- **Warm summary cache** (a prior run over these docs): cents — labelling +
-  embeddings only. Measured $0.01 on 10 documents.
-- **Cold cache**: full summarization of every document. Roughly **$0.03 per
-  12k-token window** — about **$14 for a 5M-token corpus**, and hours of wall
-  time. Run `scripts/tpm_check.py "<DOCS>"` first if you need the window count.
-
-That spend is not wasted — the summaries land in the shared
-`~/.cache/.../eval_summaries/` cache that `register-documents` later reads for
-free — but it is real money up front, and on a big cold corpus it dwarfs the
-selection itself. Say so plainly rather than calling the preview cheap.
-
-Report back to the user, from the printed summary:
-- how many documents were selected out of how many, and the reduction ratio
-- the **document types** table — every row must show `selected >= 1`
-- how many were kept as outliers
-- the chosen **k** and the projected cost vs. the full corpus
-
-Then **ask whether to proceed**. Do not add `--yes` on your own judgement.
-
-If they want a different sample, re-run with:
-- `--selection-k-max N` — more clusters, larger and more granular subset
-- `--outlier-sigma F` — **lower** keeps more outliers (default 2.0)
-
-Re-running is free: per-document vectors and labels are cached under
-`~/.cache/.../corpus_profiles/`, keyed on the document text.
-
-Once they approve the sample, record it (substitute the numbers from the
-report; this is history only — it never becomes the tracker's "suggested next"):
-```
-uv run python scripts/build_state.py record select-corpus docs=<n> selected=<n> types=<n> clusters=<k>
-```
-
-> Sanity-check the types yourself before recommending approval. If a corpus you
-> know to be a mix of, say, filings and drug labels comes back as one type, the
-> labelling has failed and the subset is not trustworthy — say so rather than
-> approving it.
-
-## Step 2d — MANDATORY GATE: size the run against THIS machine
+## Step 2c — MANDATORY GATE: size the run against THIS machine
 ```
 uv run python scripts/tpm_check.py "<DOCS>"
 ```
-If Step 2c ran, point this at the selected subset instead, so the numbers
-describe the real workload:
+If a PREVIOUS run already produced a selection.json for this corpus, point
+this at it so the numbers describe the subset rather than the whole corpus:
 ```
 uv run python scripts/tpm_check.py "<DOCS>" --selection "<SEL_DIR>/selection.json"
 ```
@@ -361,24 +309,89 @@ and note that these are NOT interchangeable:
   extractor OOMed partway through a corpus; 1 is a deliberate safe default, not
   an oversight. Raise it only against measured free memory.
 
+## Step 2d — Selection preview (ONLY if they chose the subset in Step 1e)
+**This is a paid, long-running step, so it takes the Step 2c concurrency
+values.** The preview summarizes the ENTIRE corpus (clustering needs an
+embedding of every document), so on a cold cache it is the longest single
+stage of the whole build -- running it at unexamined defaults is exactly the
+mistake Step 2c exists to prevent.
+
+**Launch it DETACHED**, for the same reason Step 3 is detached: on a cold
+cache this runs for hours, and a foreground run dies with the session. Pick a
+fresh `RUN_ID` (e.g. `select_<date+time>`):
+```
+uv run python scripts/run_detached.py <RUN_ID> uv run python -m backend.app.cli prune-expand --input "<MERGE_DIR>" --documents "<DOCS>" --output-dir output_ontologies --select-subset --summarization-concurrency <N> --selection-concurrency <N>
+```
+Monitor it exactly like Step 4: `uv run python scripts/job_status.py <RUN_ID> 40`.
+Watch for `[select] labelling on ... compression on ...` (confirms which models
+it resolved) and `[select] profiled batch N/M`. Do not block the session on it.
+
+Only when the summary cache is already warm for this corpus — a prior
+`--select-subset` or `register-documents` over the same documents — is it short
+enough to run in the foreground without the harness.
+
+Without `--yes` this **stops after selecting** — it writes `selection.json`
+into a fresh version folder and prints a summary. Note the folder path it
+prints; call it `SEL_DIR`.
+
+**Tell the user what the preview itself costs, BEFORE launching it.** Clustering
+needs an embedding of every document, so the preview summarizes the WHOLE
+corpus even though the ontology will only use a subset:
+- **Warm summary cache** (a prior run over these docs): cents — labelling +
+  embeddings only. Measured $0.01 on 10 documents.
+- **Cold cache**: full summarization of every document. Roughly **$0.03 per
+  12k-token window** — about **$14 for a 5M-token corpus**, and hours of wall
+  time. Run `scripts/tpm_check.py "<DOCS>"` first if you need the window count.
+
+That spend is not wasted — the summaries land in the shared
+`~/.cache/.../eval_summaries/` cache that `register-documents` later reads for
+free — but it is real money up front, and on a big cold corpus it dwarfs the
+selection itself. Say so plainly rather than calling the preview cheap.
+
+Report back to the user, from the printed summary:
+- how many documents were selected out of how many, and the reduction ratio
+- the **document types** table — every row must show `selected >= 1`
+- how many were kept as outliers
+- the chosen **k** and the projected cost vs. the full corpus
+
+Then **ask whether to proceed**. Do not add `--yes` on your own judgement.
+
+If they want a different sample, re-run with:
+- `--selection-k-max N` — more clusters, larger and more granular subset
+- `--outlier-sigma F` — **lower** keeps more outliers (default 2.0)
+
+Re-running is free: per-document vectors and labels are cached under
+`~/.cache/.../corpus_profiles/`, keyed on the document text.
+
+Once they approve the sample, record it (substitute the numbers from the
+report; this is history only — it never becomes the tracker's "suggested next"):
+```
+uv run python scripts/build_state.py record select-corpus docs=<n> selected=<n> types=<n> clusters=<k>
+```
+
+> Sanity-check the types yourself before recommending approval. If a corpus you
+> know to be a mix of, say, filings and drug labels comes back as one type, the
+> labelling has failed and the subset is not trustworthy — say so rather than
+> approving it.
+
 ## Step 3 — Launch prune-expand DETACHED
 
-> **STOP if Step 2d has not run in this session.** Go back and run it. This step
+> **STOP if Step 2c has not run in this session.** Go back and run it. This step
 > spends real money for hours; launching at unexamined defaults is how a 1.6M-token
-> corpus took 4 hours instead of 25 minutes. The numbers below come FROM Step 2d —
+> corpus took 4 hours instead of 25 minutes. The numbers below come FROM Step 2c —
 > do not invent them, and do not silently fall back to config defaults.
 
 Choose a fresh, unique `RUN_ID` (e.g. `prune_expand_<date+time>`). Launch it detached
 via the harness as a **single-line command** (works in any shell). Append `--tables`
 only if the user opted in, and `--no-table-vision` to skip vision.
 
-If they approved a subset in Step 2c, append `--select-subset --yes` (plus any
+If they approved a subset in Step 2d, append `--select-subset --yes` (plus any
 `--selection-k-max` / `--outlier-sigma` they settled on). **Only add `--yes`
 after they have seen the preview and said go** — it is what commits to the
 multi-hour, $20+ ontology build. Selection re-runs from cache, so the
 detached run does not re-pay for profiling.
 
-**Carry the Step 2d values through as flags.** All six exist; substitute the numbers
+**Carry the Step 2c values through as flags.** All six exist; substitute the numbers
 the user agreed to and drop any you are leaving at config default:
 ```
 uv run python scripts/run_detached.py <RUN_ID> uv run python -m backend.app.cli prune-expand --input "<MERGE_DIR>" --documents "<DOCS>" --output-dir output_ontologies --summarization-concurrency <N> --classification-concurrency <N> --proposal-concurrency <N> --dedup-concurrency <N> --table-mining-concurrency <N>

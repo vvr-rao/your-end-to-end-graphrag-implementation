@@ -2897,6 +2897,7 @@ async def prune_and_expand_async(
     selection_yes: bool = False,
     selection_k_max: int | None = None,
     selection_outlier_sigma: float | None = None,
+    selection_concurrency: int | None = None,
     summarization_concurrency: int | None = None,
     table_mining_concurrency: int | None = None,
     expansion_concurrency: int | None = None,
@@ -2920,6 +2921,7 @@ async def prune_and_expand_async(
         selection_yes=selection_yes,
         selection_k_max=selection_k_max,
         selection_outlier_sigma=selection_outlier_sigma,
+        selection_concurrency=selection_concurrency,
         summarization_concurrency=summarization_concurrency,
         table_mining_concurrency=table_mining_concurrency,
         expansion_concurrency=expansion_concurrency,
@@ -2945,6 +2947,7 @@ async def build_async(
     selection_yes: bool = False,
     selection_k_max: int | None = None,
     selection_outlier_sigma: float | None = None,
+    selection_concurrency: int | None = None,
     summarization_concurrency: int | None = None,
     table_mining_concurrency: int | None = None,
     expansion_concurrency: int | None = None,
@@ -2973,6 +2976,7 @@ async def build_async(
         selection_yes=selection_yes,
         selection_k_max=selection_k_max,
         selection_outlier_sigma=selection_outlier_sigma,
+        selection_concurrency=selection_concurrency,
         summarization_concurrency=summarization_concurrency,
         table_mining_concurrency=table_mining_concurrency,
         expansion_concurrency=expansion_concurrency,
@@ -2999,6 +3003,7 @@ async def _run(
     selection_yes: bool = False,
     selection_k_max: int | None = None,
     selection_outlier_sigma: float | None = None,
+    selection_concurrency: int | None = None,
     summarization_concurrency: int | None = None,
     table_mining_concurrency: int | None = None,
     expansion_concurrency: int | None = None,
@@ -3053,7 +3058,10 @@ async def _run(
         from backend.app.services import corpus_selection as _cs
 
         sel_cfg = _cs.SelectionConfig.from_app_config(
-            app_cfg, k_max=selection_k_max, outlier_sigma=selection_outlier_sigma
+            app_cfg,
+            k_max=selection_k_max,
+            outlier_sigma=selection_outlier_sigma,
+            label_concurrency=selection_concurrency,
         )
         all_paths = list(ontology_io.iter_documents(documents_dir))
         if not all_paths:

@@ -95,6 +95,7 @@ class SelectionConfig:
         *,
         k_max: int | None = None,
         outlier_sigma: float | None = None,
+        label_concurrency: int | None = None,
     ) -> SelectionConfig:
         raw = (app_cfg.get("corpus_selection", {}) or {})
         cfg = cls(
@@ -114,6 +115,8 @@ class SelectionConfig:
             cfg.k_max = int(k_max)
         if outlier_sigma is not None:
             cfg.outlier_sigma = float(outlier_sigma)
+        if label_concurrency is not None:
+            cfg.label_concurrency = int(label_concurrency)
         return cfg
 
 

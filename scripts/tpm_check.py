@@ -422,6 +422,14 @@ async def main() -> int:
                 print(f"    concurrency.{k:<22} now {now}{flag}")
             print("    chunk_classification is Stage 1: it ran at 4 for a long time only")
             print("    because it shared Stage 2's semaphore. It is independent now.")
+            sel_now = (get_settings().app_config.get("corpus_selection") or {}).get(
+                "label_concurrency", 8)
+            print(f"\n    corpus_selection.label_concurrency  now {sel_now}"
+                  f"{'  <- raise' if isinstance(sel_now, int) and sel_now < m // 2 else ''}")
+            print("    Drives --select-subset's doc-type labelling + embed compression")
+            print("    (cheap model, so it belongs in this tier). Pass it as")
+            print(f"    --selection-concurrency {m}; the SUMMARIZATION inside selection")
+            print("    takes --summarization-concurrency and is the real long pole.")
         if big:
             b = min(big)
             print(f"\nBIG-MODEL stages (~2M TPM, 32k-token requests) -- ceiling ~{b}:")
