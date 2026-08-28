@@ -351,14 +351,37 @@ selection itself. Say so plainly rather than calling the preview cheap.
 Report back to the user, from the printed summary:
 - how many documents were selected out of how many, and the reduction ratio
 - the **document types** table — every row must show `selected >= 1`
-- how many were kept as outliers
-- the chosen **k** and the projected cost vs. the full corpus
+- the `selected because:` breakdown (cluster-representative / type-coverage /
+  outlier) — this says which rule is actually doing the work
+- the projected cost vs. the full corpus
+
+**Always relay the `clustering:` line, including the verdict.** It reads e.g.
+`silhouette 0.110 at k=17 -- WEAK (groups overlap heavily; cluster picks are
+soft)`. Text embeddings score far lower than textbook silhouette bands, so a
+WEAK verdict is common and is NOT a failure — but the user needs to know it,
+because it changes which knob is worth turning:
+
+| Verdict | What it means for the subset |
+|---|---|
+| `strong` / `moderate` | Clustering found real groups; the cluster representatives are meaningful and k is a defensible choice. |
+| `weak` / `negligible` | Documents overlap heavily; **k is a soft pick and `--selection-k-max` will barely move anything**. Coverage is really coming from the type and outlier rules. |
+
+When the verdict is weak or negligible, say so plainly and **offer to keep more
+outliers**, since that is the lever that still works:
+> "Clustering is weak on this corpus (silhouette 0.11), so the cluster count is
+> a soft choice — most of the subset comes from the type-coverage rule. If you
+> want more of the unusual documents kept, I can lower `--outlier-sigma` from
+> 2.0 to ~1.0 and re-run the selection; it's cached, so it costs nothing."
 
 Then **ask whether to proceed**. Do not add `--yes` on your own judgement.
 
 If they want a different sample, re-run with:
-- `--selection-k-max N` — more clusters, larger and more granular subset
-- `--outlier-sigma F` — **lower** keeps more outliers (default 2.0)
+- `--outlier-sigma F` — **lower keeps more outliers** (default 2.0; ~1.0 is a
+  reasonable first step). The most effective knob when clustering is weak.
+- `--selection-k-max N` — raises the ceiling on the k sweep. **Often inert**:
+  it is additionally capped at `2*sqrt(n_docs)`, and if the elbow already chose
+  a k well below the ceiling, raising it changes little. Check the reported k
+  against the ceiling before suggesting this.
 
 Re-running is free: per-document vectors and labels are cached under
 `~/.cache/.../corpus_profiles/`, keyed on the document text.

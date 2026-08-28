@@ -517,20 +517,65 @@ _CORPORATE_SUFFIX_RE = re.compile(
 # whitespace-separated label or a CamelCase label (we split into words
 # before testing); so `FertilizerMarketDashboard` and `Fertilizer Market
 # Dashboard` both match.
-_DOCUMENT_TITLE_TAIL_WORDS = (
-    "Report", "Factbook", "Dashboard", "Tracker", "Index", "Bulletin",
-    "Briefing", "Forecast", "Outlook", "Whitepaper", "Yearbook", "Atlas",
-    "Monitor", "Hub", "Tool", "Database", "Calendar", "Alert", "Portal",
-    "Platform", "Survey", "Directory", "Source", "App", "Service",
-    "Review", "Reviews", "Newsletter", "Brief", "Memo", "Note", "Page",
-    "Site", "Paper",
+# Two tiers, because a single list demoted legitimate classes.
+#
+# Measured on a 30-doc run: 51 demotions, and the ones inspected were
+# `HealthcareService`, `InjectionSite`, `BodyMassIndex`,
+# `CardiologyCareService` -- all genuine abstract classes, not documents.
+# "Index", "Site", "Service", "Report" and friends are the natural head
+# noun of an enormous number of real classes ("Consumer Price Index",
+# "Manufacturing Site", "Adverse Event Report"). A demoted class cannot be
+# a `class_iri` target in extract-entities, so entities that belong to it
+# are then silently dropped -- an invisible, systematic loss biased against
+# one whole shape of class name.
+#
+# STRONG: publication nouns that essentially never head an abstract class.
+# The tail word alone is enough to demote.
+_DOCUMENT_TITLE_STRONG_TAILS = (
+    "Report", "Factbook", "Dashboard", "Tracker", "Bulletin", "Briefing",
+    "Forecast", "Outlook", "Whitepaper", "Yearbook", "Atlas", "Monitor",
+    "Hub", "Tool", "Database", "Calendar", "Alert", "Portal", "Platform",
+    "Survey", "Directory", "Source", "App", "Review", "Reviews",
+    "Newsletter", "Brief", "Memo", "Note", "Page", "Paper",
 )
-_DOCUMENT_TITLE_TAIL_RE = re.compile(
+# WEAK: ambiguous nouns that head both documents and real classes. These
+# demote ONLY alongside a second document-title signal (see
+# `_DOCUMENT_TITLE_SIGNAL_RE`).
+_DOCUMENT_TITLE_WEAK_TAILS = (
+    "Index", "Site", "Service",
+)
+# Kept as the union for callers/tests that want the whole vocabulary.
+_DOCUMENT_TITLE_TAIL_WORDS = (
+    _DOCUMENT_TITLE_STRONG_TAILS + _DOCUMENT_TITLE_WEAK_TAILS
+)
+
+
+def _tail_re(words: tuple[str, ...]) -> re.Pattern[str]:
     # `\s` (NOT `(?:^|\s)`) means the tail word must follow another word.
-    # That keeps generic category names like "Forecast" / "Dashboard" /
+    # That keeps bare category names like "Forecast" / "Dashboard" /
     # "Alert" as legitimate classes while still catching multi-word /
     # CamelCase named documents like "FoodSecurityTracker".
-    r"\s(?:" + "|".join(_DOCUMENT_TITLE_TAIL_WORDS) + r")\s*$",
+    return re.compile(r"\s(?:" + "|".join(words) + r")\s*$", re.IGNORECASE)
+
+
+_DOCUMENT_TITLE_STRONG_RE = _tail_re(_DOCUMENT_TITLE_STRONG_TAILS)
+_DOCUMENT_TITLE_WEAK_RE = _tail_re(_DOCUMENT_TITLE_WEAK_TAILS)
+# Back-compat: the union pattern, still used by the user-extension hook.
+_DOCUMENT_TITLE_TAIL_RE = _tail_re(_DOCUMENT_TITLE_TAIL_WORDS)
+
+# A second signal that a weak-tailed label names a specific DOCUMENT rather
+# than a category: an edition year or quarter ("2025 Outlook"), a possessive
+# ("Vietnam's ... Report"), or title punctuation ("Trade & Supply Report").
+# Deliberately narrow -- a false negative leaves a proper noun as a class,
+# which the dedup and classification-audit layers can still catch, whereas a
+# false positive silently deletes a class and everything that would attach
+# to it.
+_DOCUMENT_TITLE_SIGNAL_RE = re.compile(
+    r"(?:\b(?:19|20)\d{2}\b"      # a year anywhere: "2025 Outlook"
+    r"|\bQ[1-4]\b"                 # a quarter: "Q1 Review"
+    r"|\bFY\d{2,4}\b"              # a fiscal year: "FY2025 Report"
+    r"|'s\b"                       # possessive: "Vietnam's ... Report"
+    r"|[&,:;])",                   # title punctuation
     re.IGNORECASE,
 )
 
@@ -603,7 +648,12 @@ def _looks_like_entity_not_class(
     # Heuristic 3: document/report title ending. Works on both spaced
     # and CamelCase labels (we split CamelCase first).
     split = _split_camel(cleaned)
-    if _DOCUMENT_TITLE_TAIL_RE.search(split):
+    if _DOCUMENT_TITLE_STRONG_RE.search(split):
+        return True, "document-title"
+    # Weak tails need corroboration: "Consumer Price Index" and "Injection
+    # Site" are classes, "2025 Market Outlook" and "Vietnam's Trade Report"
+    # are documents, and only the second signal separates them.
+    if _DOCUMENT_TITLE_WEAK_RE.search(split) and _DOCUMENT_TITLE_SIGNAL_RE.search(cleaned):
         return True, "document-title"
     if extra_tail_word_re is not None and extra_tail_word_re.search(split):
         return True, "document-title"

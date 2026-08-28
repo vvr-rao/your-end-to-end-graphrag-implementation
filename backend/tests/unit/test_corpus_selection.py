@@ -415,3 +415,113 @@ def test_summary_renders_without_error() -> None:
     text = format_selection_summary(selection_report(result, Path("/corpus"), cfg))
     assert "CORPUS SELECTION" in text
     assert "PROJECTED prune-expand cost" in text
+
+
+# --------------------------------------------------------------------------- #
+# Region canonicalization
+# --------------------------------------------------------------------------- #
+
+
+def test_region_synonyms_collapse_to_one_type() -> None:
+    """THE REGRESSION. A 427-doc run produced 60 types, inflated by pure
+    spelling variance: "financial report (KR)" beside "financial report
+    (Korea)", and government reports split across (Asia) / (APAC) /
+    (Asia-Pacific) / (Asia and the Pacific). Every spurious variant claims
+    its own guaranteed coverage slot, so label noise inflates the subset and
+    the bill. The LLM consolidation pass was asked to merge these and did
+    not; this collapse is deterministic."""
+    from backend.app.services.corpus_selection import normalize_label as n
+
+    assert len({n("financial report", r) for r in ("KR", "Korea", "South Korea",
+                                                   "S. Korea", "ROK")}) == 1
+    assert len({n("government report", r) for r in ("APAC", "Asia-Pacific",
+                                                    "Asia and the Pacific")}) == 1
+    assert len({n("financial report", r) for r in ("US", "U.S.", "USA",
+                                                   "United States")}) == 1
+
+
+def test_region_canon_survives_trailing_punctuation() -> None:
+    """"U.S." loses its trailing period to the generic strip, leaving "u.s",
+    which no sane lookup table enumerates separately."""
+    from backend.app.services.corpus_selection import canonical_region as c
+
+    assert c("U.S.") == c("U.S") == c("US") == "US"
+    assert c("U.K.") == "UK"
+
+
+def test_region_canon_is_a_normalizer_not_a_whitelist() -> None:
+    """An unlisted country must survive as a valid qualifier."""
+    from backend.app.services.corpus_selection import canonical_region as c
+
+    assert c("Nigeria") == "Nigeria"
+    assert c("") == ""
+
+
+def test_distinct_scopes_are_not_merged() -> None:
+    """Asia and Asia-Pacific are different coverage scopes."""
+    from backend.app.services.corpus_selection import normalize_label as n
+
+    assert n("government report", "Asia") != n("government report", "APAC")
+
+
+# --------------------------------------------------------------------------- #
+# Clustering-quality reporting
+# --------------------------------------------------------------------------- #
+
+
+def _result_with_silhouette(score: float, k: int = 5) -> "object":
+    from backend.app.services.corpus_selection import DocProfile, SelectionResult
+
+    profs = [DocProfile(path=Path(f"/c/d{i}.txt"), doc_type="a",
+                        doc_type_raw="", vector=[0.0]) for i in range(10)]
+    reasons = {profs[0].path: ["cluster-representative"],
+               profs[1].path: ["type-coverage:a"],
+               profs[2].path: ["outlier"]}
+    return SelectionResult(profiles=profs, selected=sorted(reasons, key=str),
+                           k=k, reasons=reasons, silhouette_curve={k: score})
+
+
+@pytest.mark.parametrize(
+    ("score", "verdict"),
+    [(0.62, "strong"), (0.31, "moderate"), (0.11, "weak"), (0.02, "negligible")],
+)
+def test_clustering_quality_bands(score, verdict) -> None:
+    from backend.app.services.corpus_selection import clustering_quality
+
+    assert clustering_quality(_result_with_silhouette(score))["verdict"] == verdict
+
+
+def test_weak_clustering_advises_outlier_sigma_not_k_max() -> None:
+    """When structure is weak, k is a soft pick and --selection-k-max is
+    largely inert (it is also capped at 2*sqrt(n)). The advice must point at
+    the knob that still works."""
+    from backend.app.services.corpus_selection import clustering_quality
+
+    cq = clustering_quality(_result_with_silhouette(0.11))
+    assert "--outlier-sigma" in cq["advice"]
+    assert "selection-k-max" in cq["advice"]
+    assert cq["selected_by"] == {"cluster-representative": 1,
+                                 "type-coverage": 1, "outlier": 1}
+
+
+def test_strong_clustering_gives_no_nagging_advice() -> None:
+    from backend.app.services.corpus_selection import clustering_quality
+
+    assert clustering_quality(_result_with_silhouette(0.62))["advice"] == ""
+
+
+def test_clustering_quality_handles_the_unclustered_case() -> None:
+    from backend.app.services.corpus_selection import SelectionConfig, clustering_quality
+
+    res = select_representatives(_profiles(_blobs(1, per=2, dim=4)),
+                                 cfg=SelectionConfig())
+    assert clustering_quality(res)["verdict"] == "not-clustered"
+
+
+def test_summary_shows_the_clustering_verdict() -> None:
+    from backend.app.services.corpus_selection import (
+        SelectionConfig, format_selection_summary, selection_report)
+
+    txt = format_selection_summary(
+        selection_report(_result_with_silhouette(0.11), Path("/c"), SelectionConfig()))
+    assert "silhouette" in txt and "WEAK" in txt

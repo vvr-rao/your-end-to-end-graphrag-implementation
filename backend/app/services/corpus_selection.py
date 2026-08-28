@@ -274,21 +274,85 @@ def resolve_compress_task(router: LLMRouter, target_tokens: int) -> str:
     return "document_summarize"
 
 
+# Region synonyms, collapsed DETERMINISTICALLY rather than left to the
+# consolidation call.
+#
+# Measured on a 427-doc run: 60 distinct types, inflated by pure spelling
+# variance -- "financial report (KR)" beside "financial report (Korea)", and
+# "government report" split four ways across (Asia) / (APAC) / (Asia-Pacific)
+# / (Asia and the Pacific). Every spurious variant claims its own guaranteed
+# coverage slot, so label noise directly inflates the subset and the bill.
+# The LLM pass was asked to merge these and did not do it reliably; a lookup
+# table always does.
+#
+# Keys are lowercased; values are the canonical display form.
+_REGION_CANON: dict[str, str] = {
+    # United States
+    "us": "US", "usa": "US", "u.s.": "US", "u.s.a.": "US",
+    "united states": "US", "united states of america": "US", "america": "US",
+    # South Korea
+    "kr": "South Korea", "korea": "South Korea", "s. korea": "South Korea",
+    "s korea": "South Korea", "south korea": "South Korea",
+    "republic of korea": "South Korea", "rok": "South Korea",
+    # Asia-Pacific
+    "apac": "Asia-Pacific", "asia pacific": "Asia-Pacific",
+    "asia-pacific": "Asia-Pacific", "asia and the pacific": "Asia-Pacific",
+    "asia & the pacific": "Asia-Pacific", "asiapac": "Asia-Pacific",
+    # Europe
+    "eu": "EU", "europe": "EU", "european union": "EU",
+    # United Kingdom
+    "uk": "UK", "u.k.": "UK", "united kingdom": "UK", "britain": "UK",
+    "great britain": "UK",
+    # Greater China / others that recur with variants
+    "cn": "China", "prc": "China", "mainland china": "China",
+    "people's republic of china": "China",
+    "jp": "Japan", "in": "India", "vn": "Vietnam", "tw": "Taiwan",
+    "roc": "Taiwan", "sg": "Singapore", "au": "Australia",
+    "asean": "ASEAN", "southeast asia": "Southeast Asia",
+    "south-east asia": "Southeast Asia", "se asia": "Southeast Asia",
+    "global": "Global", "worldwide": "Global", "international": "Global",
+}
+
+
+def canonical_region(region: str) -> str:
+    """Collapse a region string onto its canonical form.
+
+    Unknown regions pass through with whitespace/punctuation tidied and
+    their original case preserved -- this table is a normalizer, not a
+    whitelist, so an unlisted country is still a valid qualifier.
+    """
+    r = re.sub(r"\s+", " ", (region or "").strip()).strip(" .,;:-")
+    if not r:
+        return ""
+    key = r.lower()
+    if key in _REGION_CANON:
+        return _REGION_CANON[key]
+    # Retry without internal punctuation: stripping the trailing period off
+    # "U.S." leaves "u.s", which no sane table would enumerate separately.
+    bare = re.sub(r"[.\-\s]", "", key)
+    for cand, canon in _REGION_CANON.items():
+        if re.sub(r"[.\-\s]", "", cand) == bare:
+            return canon
+    return r
+
+
 def normalize_label(doc_type: str, region: str = "", subject: str = "") -> str:
     """Fold the LLM's three fields into one canonical coverage key.
 
-    Deterministic and cheap; the LLM consolidation pass afterwards handles
-    what string normalization cannot (synonyms, word order).
+    Deterministic and cheap. Region synonyms are collapsed here rather than
+    being left to the LLM consolidation pass, which was measured failing to
+    merge KR/Korea and the four spellings of Asia-Pacific.
     """
     base = re.sub(r"\s+", " ", (doc_type or "").strip().lower())
     base = base.strip(" .,;:-")
     if not base:
         return _UNCLASSIFIED
-    qualifier = (region or "").strip() or (subject or "").strip()
+    qualifier = canonical_region(region) or re.sub(
+        r"\s+", " ", (subject or "").strip()
+    ).strip(" .,;:-")
     if qualifier:
-        qualifier = re.sub(r"\s+", " ", qualifier).strip(" .,;:-")
-        # "US" stays upper, "oncology" stays lower -- preserve the model's case
-        # for short codes, which are conventionally capitalised.
+        # "US" stays upper, "oncology" stays lower -- preserve case, since
+        # short codes are conventionally capitalised.
         return f"{base} ({qualifier})"
     return base
 
@@ -825,6 +889,64 @@ def select_representatives(
 USD_PER_CHUNK = 23.064504 / 212
 
 
+# Silhouette bands. Calibrated for TEXT EMBEDDINGS, where scores run far
+# lower than the textbook bands written for low-dimensional numeric data:
+# 1024-d document vectors of overlapping prose rarely clear 0.3 even when
+# the grouping is genuinely useful. Measured on a 427-doc mixed corpus
+# (news + filings + government reports): 0.07-0.11 across the whole k sweep.
+#
+# The point of reporting this is not to grade the run -- it is to tell the
+# user HOW MUCH of the subset they should attribute to clustering, because
+# when structure is weak the type-coverage and outlier rules are doing the
+# real work and are the levers worth tuning.
+_SILHOUETTE_BANDS = (
+    (0.50, "strong", "documents fall into clearly separated groups"),
+    (0.25, "moderate", "real structure, with overlap between groups"),
+    (0.10, "weak", "groups overlap heavily; cluster picks are soft"),
+    (-1.0, "negligible", "essentially no cluster structure in this corpus"),
+)
+
+
+def clustering_quality(result: SelectionResult) -> dict[str, Any]:
+    """Silhouette at the chosen k, banded, with the practical implication.
+
+    Returned in selection.json and printed in the preview so the choice of
+    subset is not presented as more principled than the data supports.
+    """
+    score = result.silhouette_curve.get(result.k)
+    if score is None or result.k <= 0:
+        return {"silhouette": None, "verdict": "not-clustered",
+                "meaning": result.note or "clustering did not run",
+                "advice": ""}
+    verdict, meaning = _SILHOUETTE_BANDS[-1][1], _SILHOUETTE_BANDS[-1][2]
+    for floor, v, m in _SILHOUETTE_BANDS:
+        if score >= floor:
+            verdict, meaning = v, m
+            break
+    n_cluster = sum(1 for rs in result.reasons.values()
+                    if any(r == "cluster-representative" for r in rs))
+    n_type = sum(1 for rs in result.reasons.values()
+                 if any(r.startswith("type-coverage") for r in rs))
+    n_out = sum(1 for rs in result.reasons.values()
+                if any(r == "outlier" for r in rs))
+    advice = ""
+    if verdict in ("weak", "negligible"):
+        advice = (
+            "Clustering is contributing little here, so k is a soft choice and "
+            "raising --selection-k-max will not help much. Coverage comes "
+            "mostly from the type and outlier rules: lower --outlier-sigma "
+            f"(now driving {n_out} pick(s)) to keep more edge-case documents."
+        )
+    return {
+        "silhouette": round(float(score), 4),
+        "verdict": verdict,
+        "meaning": meaning,
+        "advice": advice,
+        "selected_by": {"cluster-representative": n_cluster,
+                        "type-coverage": n_type, "outlier": n_out},
+    }
+
+
 def selection_report(result: SelectionResult, corpus_dir: Path, cfg: SelectionConfig) -> dict[str, Any]:
     """The `selection.json` payload."""
     type_counts: dict[str, dict[str, int]] = {}
@@ -842,6 +964,7 @@ def selection_report(result: SelectionResult, corpus_dir: Path, cfg: SelectionCo
         "n_selected": len(result.selected),
         "reduction_ratio": round(result.reduction_ratio, 2),
         "k": result.k,
+        "clustering": clustering_quality(result),
         "outlier_sigma": cfg.outlier_sigma,
         "note": result.note,
         "inertia_curve": {str(k): round(v, 4) for k, v in sorted(result.inertia_curve.items())},
@@ -870,6 +993,19 @@ def selection_report(result: SelectionResult, corpus_dir: Path, cfg: SelectionCo
     }
 
 
+def _wrap(text: str, width: int) -> list[str]:
+    out, line = [], ""
+    for word in text.split():
+        if line and len(line) + 1 + len(word) > width:
+            out.append(line)
+            line = word
+        else:
+            line = f"{line} {word}".strip()
+    if line:
+        out.append(line)
+    return out
+
+
 def format_selection_summary(report: dict[str, Any]) -> str:
     """Human-readable preview -- what the user approves or rejects."""
     lines: list[str] = []
@@ -893,6 +1029,17 @@ def format_selection_summary(report: dict[str, Any]) -> str:
     lines.append("-" * 66)
     for doc_type, row in report["doc_types"].items():
         lines.append(f"{doc_type[:41]:<42}{row['selected']:>10}{row['total']:>8}")
+
+    cq = report.get("clustering") or {}
+    if cq.get("silhouette") is not None:
+        lines.append("")
+        lines.append(
+            f"clustering: silhouette {cq['silhouette']:.3f} at k={report['k']} "
+            f"-- {cq['verdict'].upper()} ({cq['meaning']})"
+        )
+        if cq.get("advice"):
+            for chunk in _wrap(cq["advice"], 64):
+                lines.append(f"            {chunk}")
 
     by_reason: dict[str, int] = {}
     for doc in report["documents"]:
