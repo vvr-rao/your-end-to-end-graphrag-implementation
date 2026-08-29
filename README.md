@@ -24,7 +24,38 @@ I have tested this using open source data and common ontologies from Pharma, Fin
 
 </div>
 
+## Why YEGI?
 
+1. **End-to-end in one tool.** Starts with the raw documents and ends with a deployment of a React UI and an MCP server. Supports Document ingestion → ontology curation → entity + intelligence-artifact extraction → ontology-aware retrieval → React UI + MCP server deployed on Postgres (Supabase) + Render. No glue scripts between stages — every step is a subcommand of the same CLI. UI has basic functionality - multi-turn conversation, ability to store and retrieve old conversations etc.
+
+2. **Ontology-based** Supports import of standard `.rdf` / `.owl` / `.ttl` ontologies and expands them with corpus-driven LLM proposals. Tested with multiple domain specific ontologies across Finance(e.g. FIBO), Pharma( e.g. OCRe, HP), Manufacturing and Supply Chain(OntoCAPE) and general/non-domain specific ones(e.g. FOAF, SKOS). Output is a standard OWL — and can be opened and modified in standard tool such as Protege.
+
+3. **RAG Intelligence - not just RAG Retrieval** `Deep Research` mode which provides detailed answers and analysis including `evidence tracking for claims`, `analysis and insights`, `coverage gaps` in the corpus and  `differing opinions` and `contradictions` in the data. Per chunk: typed `Claim` / `Finding` / `Observation` / `Event` artifacts. Per document: `Summary`. Opt-in cross-cluster `Insight` and `Recommendation` artifacts via LLM synthesis. I have created a new Ontology - **VIAO** - with classes to hold this structure. This defines the artifact taxonomy + edge predicates (`derivedFromChunk`, `assertsAbout`, `insightBasedOn`, etc.) providing traceability. 
+
+4. **Tables as first-class objects.** PDFs are scanned by `pdfplumber` (and gpt-4o-mini vision for nested cases), extracted as JSON-LD, and stored as `StructuredTable` artifacts alongside text chunks. Numeric drill-downs become retrievable via the graph structure.
+
+5. **Time + geography expansion, curated upper ontologies.** Temporal mentions in the corpus auto-expand into a year/quarter/month/day hierarchy with parent creation + gap-fill. Geography rides on existing OWL classes from the merged geography ontology. This allows automatic discovery during RAG (e.g. documents talking about "Jan 2024" are retrievable in queries on "2024" and vice-versa, documents talking about "India" are retrievable in queries on "Asia" and vice-versa) 
+
+6. **Identity layer — corpus-mined synonyms and acronyms.** The same thing is rarely called the same thing twice (brand vs generic drug name, ticker vs company, acronym vs expansion, nickname vs full name), and embeddings do NOT know these are equivalent — `tirzepatide` and `MOUNJARO` are as far apart in vector space as two unrelated words. The system mines these equivalences out of the corpus itself, deterministically and with no LLM, by reading the conventions authors already use (`MOUNJARO (tirzepatide)`, `Securities and Exchange Commission (SEC)`, `also known as`) plus any `skos:altLabel` annotations in your ontology. The pairs then widen graph seeding, ride into the vector probes, survive misspelled queries, and are handed to the answer LLM so it treats the names as one entity. See **[Identity Layer](#identity-layer)**.
+
+7. **Output formatting.** 2 modes of information retrieval - *simple_qa* and *deep_research*. *deep_research* does a deep search, identifies facts, provides the analysis and insights on the facts, identifies claims made and **calls out whether or not the claim is backed with evidence** (I feel this is important), identifies **imbalances in data within the corpus** (e.g. more information on one company/country/product etc. than another - a key issue I see in real world RAG applications). 
+
+### Platform support
+
+**LLMs Used** - Multi-LLM support via config presets: default (Groq + OpenAI), OpenAI-only, or Anthropic-only chat. Provider/model per task is set in `config/models.yaml`. Embeddings always run on OpenAI (Anthropic has no embeddings API).
+
+**Database** - Postgres to hold the knowledge graph and Vectors. A cloud based Postgres DB (e.f. Supabase/AWS RDS) works. If none is provided, one is created in a local Docker for you. It needs to have pgvector enabled.
+
+**Hosting(optional)** - Render for the React UI and MCP Server endpoints. You should be able to move things around to other platforms if you prefer.
+
+**Claude Code(optional by recomended)** - 
+The Claude Code build flow works natively on **Linux, macOS, and Windows**. The skills drive small cross-platform **Python helpers** invoked with `uv run python` — and the skill commands are written **shell-neutrally** (no bash arrays, `$(…)` capture, `tail`/`head` pipes, line-continuations, or `python3`-only names), so they run unchanged in any shell. The durable-run harness (`scripts/run_detached.py`) uses the OS's own process-session primitives — no `setsid` dependency. On **Windows**, Claude Code uses **Git Bash** if [Git for Windows](https://git-scm.com/downloads/win) is installed, otherwise its **PowerShell tool**; the shell-neutral commands work under either. [WSL2](https://learn.microsoft.com/windows/wsl/install) is still the smoothest Windows path (a full Linux environment, plus the best Docker / Postgres / `uv` support). CI exercises the helpers + harness on Linux, macOS, **and** Windows; the end-to-end *conversational* flow isn't CI-driven, so native Windows is best-effort-but-supported. `uv` and Python 3.12+ are required everywhere. Caching is filesystem-based under `~/.cache/…` and works on every platform.
+
+## UI
+
+![Screenshot of the React UI showing a conversation thread with a simple_qa answer and a follow-up in deep_research mode](images/screenshot.png)
+
+Conversation view: a prior *simple_qa* turn with its cited answer, plus a *deep_research* follow-up being composed. Top nav switches between **Ask** (single questions), **History** (browse + replay), and **Settings** (paste your bearer token).
 
 ## Build it by chatting with Claude Code
 
@@ -84,39 +115,6 @@ What makes it safe and resumable:
 
 Render deploys from **your** GitHub repository via the `render.yaml` blueprint, so to deploy you must **fork this repo to your own GitHub account** (or push a copy there), then point Claude / `render-init` at your fork. You can build and run everything locally without forking — the fork is only needed for the Render deploy step.
 
-### Platform support
-
-The Claude Code build flow works natively on **Linux, macOS, and Windows**. The skills drive small cross-platform **Python helpers** invoked with `uv run python` — and the skill commands are written **shell-neutrally** (no bash arrays, `$(…)` capture, `tail`/`head` pipes, line-continuations, or `python3`-only names), so they run unchanged in any shell. The durable-run harness (`scripts/run_detached.py`) uses the OS's own process-session primitives — no `setsid` dependency. On **Windows**, Claude Code uses **Git Bash** if [Git for Windows](https://git-scm.com/downloads/win) is installed, otherwise its **PowerShell tool**; the shell-neutral commands work under either. [WSL2](https://learn.microsoft.com/windows/wsl/install) is still the smoothest Windows path (a full Linux environment, plus the best Docker / Postgres / `uv` support). CI exercises the helpers + harness on Linux, macOS, **and** Windows; the end-to-end *conversational* flow isn't CI-driven, so native Windows is best-effort-but-supported. `uv` and Python 3.12+ are required everywhere. Caching is filesystem-based under `~/.cache/…` and works on every platform.
-
-## UI
-
-![Screenshot of the React UI showing a conversation thread with a simple_qa answer and a follow-up in deep_research mode](images/screenshot.png)
-
-Conversation view: a prior *simple_qa* turn with its cited answer, plus a *deep_research* follow-up being composed. Top nav switches between **Ask** (single questions), **History** (browse + replay), and **Settings** (paste your bearer token).
-
-## Architecture Notes
-
-**LLMs Used** - Multi-LLM support via config presets: default (Groq + OpenAI), OpenAI-only, or Anthropic-only chat. Provider/model per task is set in `config/models.yaml`. Embeddings always run on OpenAI (Anthropic has no embeddings API).
-
-**Database** - Postgres to hold the knowledge graph and Vectors. I used Supabase but any Postgres DB should work. It needs to have pgvector enabled.
-
-**Hosting** - Render for the React UI and MCP Server endpoints. You should be able to move things around to other platforms if you prefer.
-
-## Key differentiators from other RAG and GraphRAG libraries
-
-1. **End-to-end in one tool.** Starts with the raw documents and ends with a deployment of a React UI and an MCP server. Supports Document ingestion → ontology curation → entity + intelligence-artifact extraction → ontology-aware retrieval → React UI + MCP server deployed on Postgres (Supabase) + Render. No glue scripts between stages — every step is a subcommand of the same CLI. UI has basic functionality - multi-turn conversation, ability to store and retrieve old conversations etc.
-
-2. **Ontology-based** Supports import of standard `.rdf` / `.owl` / `.ttl` ontologies and expands them with corpus-driven LLM proposals. Tested with multiple domain specific ontologies across Finance(e.g. FIBO), Pharma( e.g. OCRe, HP), Manufacturing and Supply Chain(OntoCAPE) and general/non-domain specific ones(e.g. FOAF, SKOS). Output is a standard OWL — and can be opened and modified in standard tool such as Protege.
-
-3. **Automatic intelligence-artifact extraction.** Per chunk: typed `Claim` / `Finding` / `Observation` / `Event` artifacts. Per document: `Summary`. Opt-in cross-cluster `Insight` and `Recommendation` artifacts via gpt-4.1 synthesis. Created a new Ontology - **VIAO** - with classes to hold this structure. This defines the artifact taxonomy + edge predicates (`derivedFromChunk`, `assertsAbout`, `insightBasedOn`, etc.) providing traceability. 
-
-4. **Tables as first-class objects.** PDFs are scanned by `pdfplumber` (and gpt-4o-mini vision for nested cases), extracted as JSON-LD, and stored as `StructuredTable` artifacts alongside text chunks. Numeric drill-downs become retrievable via the graph structure.
-
-5. **Time + geography expansion, curated upper ontologies.** Temporal mentions in the corpus auto-expand into a year/quarter/month/day hierarchy with parent creation + gap-fill. Geography rides on existing OWL classes from the merged geography ontology. This allows automatic discovery during RAG (e.g. documents talking about "Jan 2024" are retrievable in queries on "2024" and vice-versa, documents talking about "India" are retrievable in queries on "Asia" and vice-versa) 
-
-6. **Identity layer — corpus-mined synonyms and acronyms.** The same thing is rarely called the same thing twice (brand vs generic drug name, ticker vs company, acronym vs expansion, nickname vs full name), and embeddings do NOT know these are equivalent — `tirzepatide` and `MOUNJARO` are as far apart in vector space as two unrelated words. The system mines these equivalences out of the corpus itself, deterministically and with no LLM, by reading the conventions authors already use (`MOUNJARO (tirzepatide)`, `Securities and Exchange Commission (SEC)`, `also known as`) plus any `skos:altLabel` annotations in your ontology. The pairs then widen graph seeding, ride into the vector probes, survive misspelled queries, and are handed to the answer LLM so it treats the names as one entity. See **[Identity Layer](#identity-layer)**.
-
-7. **Output formatting.** 2 modes of information retrieval - *simple_qa* and *deep_research*. *deep_research* does a deep search, identifies facts, provides the analysis and insights on the facts, identifies claims made and **calls out whether or not the claim is backed with evidence** (I feel this is important), identifies **imbalances in data within the corpus** (e.g. more information on one company/country/product etc. than another - a key issue I see in real world RAG applications). 
 
 ## Notes
 
