@@ -44,11 +44,11 @@ I have tested this using open source data and common ontologies from Pharma, Fin
 
 **LLMs Used** - Multi-LLM support via config presets: default (Groq + OpenAI), OpenAI-only, or Anthropic-only chat. Provider/model per task is set in `config/models.yaml`. Embeddings always run on OpenAI (Anthropic has no embeddings API).
 
-**Database** - Postgres to hold the knowledge graph and Vectors. A cloud based Postgres DB (e.f. Supabase/AWS RDS) works. If none is provided, one is created in a local Docker for you. It needs to have pgvector enabled.
+**Database** - Postgres to hold the knowledge graph and Vectors. A cloud based Postgres DB (e.g. Supabase/AWS RDS) works. If none is provided, one is created in a local Docker for you. It needs to have pgvector enabled.
 
 **Hosting(optional)** - Render for the React UI and MCP Server endpoints. You should be able to move things around to other platforms if you prefer.
 
-**Claude Code(optional by recomended)** - 
+**Claude Code(optional but recommended)** - 
 The Claude Code build flow works natively on **Linux, macOS, and Windows**. The skills drive small cross-platform **Python helpers** invoked with `uv run python` — and the skill commands are written **shell-neutrally** (no bash arrays, `$(…)` capture, `tail`/`head` pipes, line-continuations, or `python3`-only names), so they run unchanged in any shell. The durable-run harness (`scripts/run_detached.py`) uses the OS's own process-session primitives — no `setsid` dependency. On **Windows**, Claude Code uses **Git Bash** if [Git for Windows](https://git-scm.com/downloads/win) is installed, otherwise its **PowerShell tool**; the shell-neutral commands work under either. [WSL2](https://learn.microsoft.com/windows/wsl/install) is still the smoothest Windows path (a full Linux environment, plus the best Docker / Postgres / `uv` support). CI exercises the helpers + harness on Linux, macOS, **and** Windows; the end-to-end *conversational* flow isn't CI-driven, so native Windows is best-effort-but-supported. `uv` and Python 3.12+ are required everywhere. Caching is filesystem-based under `~/.cache/…` and works on every platform.
 
 ## UI
