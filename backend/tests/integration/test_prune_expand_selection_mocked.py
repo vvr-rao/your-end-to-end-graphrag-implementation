@@ -93,8 +93,17 @@ def _stub_chat_factory(classified: list[str]):
 
 
 def _stub_embedder(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Deterministic vectors clustered by document type -- no OpenAI call."""
+    """Deterministic vectors clustered by document type -- no OpenAI call.
+
+    `__post_init__` is neutralised as well as `embed`. Embedder builds a real
+    AsyncOpenAI client at CONSTRUCTION time, which raises without an API key
+    even though this test never sends a request -- so stubbing only `embed`
+    left a hidden dependency on the developer's .env that passed locally and
+    failed in CI.
+    """
     from backend.app.services.embeddings import Embedder
+
+    monkeypatch.setattr(Embedder, "__post_init__", lambda self: None)
 
     async def fake_embed(self, texts: list[str]) -> list[list[float]]:
         out = []
