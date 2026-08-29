@@ -15,8 +15,6 @@ _Requires Python 3.12+. CI runs the test suite on CPython 3.12, 3.13, and 3.14._
 
 Three surfaces, one process: REST at `/`, MCP at `/mcp`, and a React UI hosted on Render alongside the backend on Postgres.
 
-> **v3 — 2026-07-27:** YEGI now ships as a **Claude Code extension**. Clone the repo, open [Claude Code](https://claude.com/claude-code), and _chat_ your way through the entire build — choose an LLM mode, set up the database, merge ontologies, run prune-expand, ingest documents, and deploy — with the long steps run and monitored for you. See **[Build it by chatting with Claude Code](#build-it-by-chatting-with-claude-code)**.
-
 I have tested this using open source data and common ontologies from Pharma, Finance and Manufacturing and Supply Chain domains.
 <div align="center">
 
