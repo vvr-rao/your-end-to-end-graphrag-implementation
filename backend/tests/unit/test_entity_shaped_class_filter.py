@@ -59,7 +59,6 @@ _DEFAULT_KNOWN_PLACES = frozenset({"myanmar", "vietnam", "asia", "tokyo",
         ("MonetaryPolicyTracker", "document-title"),
         ("CompanyDatabase", "document-title"),
         ("ReleaseCalendar", "document-title"),
-        ("ConsumerPriceIndex", "document-title"),
         ("InflationDataSource", "document-title"),
         ("InvestorDirectory", "document-title"),
         ("AgricultureNewsPlatform", "document-title"),
@@ -87,6 +86,29 @@ def test_entity_shaped_labels_are_flagged(label: str, reason_prefix: str) -> Non
     "label",
     [
         # Abstract category names -- these are LEGITIMATE class proposals
+        #
+        # The "Index"/"Site"/"Service" group was RECLASSIFIED (2026-08-28).
+        # These three tail words were previously enough on their own to demote
+        # a label, and a 30-doc run showed the cost: HealthcareService,
+        # InjectionSite, BodyMassIndex and CardiologyCareService were all
+        # demoted out of the class hierarchy. A demoted class cannot be a
+        # class_iri target in extract-entities, so every entity that belonged
+        # to it is then silently dropped by the `class_iri not in cand_iris`
+        # check -- invisible, and biased against one whole shape of class name.
+        #
+        # ConsumerPriceIndex moved here from the flagged list for the same
+        # reason. CPI is a KIND of indicator with many instances (US CPI, EU
+        # HICP), so it is a defensible class, and the error is asymmetric: a
+        # wrongly-demoted class loses data silently, whereas a wrongly-kept
+        # class is still caught downstream by dedup and the Layer-H
+        # classification audit. These three now demote only alongside a second
+        # document signal (year, quarter, FY, possessive, title punctuation).
+        "ConsumerPriceIndex",
+        "BodyMassIndex",
+        "InjectionSite",
+        "HealthcareService",
+        "ManufacturingSite",
+        "WebService",
         "CarManufacturer",
         "FertilizerProducer",
         "TradeAgreement",

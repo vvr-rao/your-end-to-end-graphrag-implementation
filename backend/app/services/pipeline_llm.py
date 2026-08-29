@@ -517,20 +517,65 @@ _CORPORATE_SUFFIX_RE = re.compile(
 # whitespace-separated label or a CamelCase label (we split into words
 # before testing); so `FertilizerMarketDashboard` and `Fertilizer Market
 # Dashboard` both match.
-_DOCUMENT_TITLE_TAIL_WORDS = (
-    "Report", "Factbook", "Dashboard", "Tracker", "Index", "Bulletin",
-    "Briefing", "Forecast", "Outlook", "Whitepaper", "Yearbook", "Atlas",
-    "Monitor", "Hub", "Tool", "Database", "Calendar", "Alert", "Portal",
-    "Platform", "Survey", "Directory", "Source", "App", "Service",
-    "Review", "Reviews", "Newsletter", "Brief", "Memo", "Note", "Page",
-    "Site", "Paper",
+# Two tiers, because a single list demoted legitimate classes.
+#
+# Measured on a 30-doc run: 51 demotions, and the ones inspected were
+# `HealthcareService`, `InjectionSite`, `BodyMassIndex`,
+# `CardiologyCareService` -- all genuine abstract classes, not documents.
+# "Index", "Site", "Service", "Report" and friends are the natural head
+# noun of an enormous number of real classes ("Consumer Price Index",
+# "Manufacturing Site", "Adverse Event Report"). A demoted class cannot be
+# a `class_iri` target in extract-entities, so entities that belong to it
+# are then silently dropped -- an invisible, systematic loss biased against
+# one whole shape of class name.
+#
+# STRONG: publication nouns that essentially never head an abstract class.
+# The tail word alone is enough to demote.
+_DOCUMENT_TITLE_STRONG_TAILS = (
+    "Report", "Factbook", "Dashboard", "Tracker", "Bulletin", "Briefing",
+    "Forecast", "Outlook", "Whitepaper", "Yearbook", "Atlas", "Monitor",
+    "Hub", "Tool", "Database", "Calendar", "Alert", "Portal", "Platform",
+    "Survey", "Directory", "Source", "App", "Review", "Reviews",
+    "Newsletter", "Brief", "Memo", "Note", "Page", "Paper",
 )
-_DOCUMENT_TITLE_TAIL_RE = re.compile(
+# WEAK: ambiguous nouns that head both documents and real classes. These
+# demote ONLY alongside a second document-title signal (see
+# `_DOCUMENT_TITLE_SIGNAL_RE`).
+_DOCUMENT_TITLE_WEAK_TAILS = (
+    "Index", "Site", "Service",
+)
+# Kept as the union for callers/tests that want the whole vocabulary.
+_DOCUMENT_TITLE_TAIL_WORDS = (
+    _DOCUMENT_TITLE_STRONG_TAILS + _DOCUMENT_TITLE_WEAK_TAILS
+)
+
+
+def _tail_re(words: tuple[str, ...]) -> re.Pattern[str]:
     # `\s` (NOT `(?:^|\s)`) means the tail word must follow another word.
-    # That keeps generic category names like "Forecast" / "Dashboard" /
+    # That keeps bare category names like "Forecast" / "Dashboard" /
     # "Alert" as legitimate classes while still catching multi-word /
     # CamelCase named documents like "FoodSecurityTracker".
-    r"\s(?:" + "|".join(_DOCUMENT_TITLE_TAIL_WORDS) + r")\s*$",
+    return re.compile(r"\s(?:" + "|".join(words) + r")\s*$", re.IGNORECASE)
+
+
+_DOCUMENT_TITLE_STRONG_RE = _tail_re(_DOCUMENT_TITLE_STRONG_TAILS)
+_DOCUMENT_TITLE_WEAK_RE = _tail_re(_DOCUMENT_TITLE_WEAK_TAILS)
+# Back-compat: the union pattern, still used by the user-extension hook.
+_DOCUMENT_TITLE_TAIL_RE = _tail_re(_DOCUMENT_TITLE_TAIL_WORDS)
+
+# A second signal that a weak-tailed label names a specific DOCUMENT rather
+# than a category: an edition year or quarter ("2025 Outlook"), a possessive
+# ("Vietnam's ... Report"), or title punctuation ("Trade & Supply Report").
+# Deliberately narrow -- a false negative leaves a proper noun as a class,
+# which the dedup and classification-audit layers can still catch, whereas a
+# false positive silently deletes a class and everything that would attach
+# to it.
+_DOCUMENT_TITLE_SIGNAL_RE = re.compile(
+    r"(?:\b(?:19|20)\d{2}\b"      # a year anywhere: "2025 Outlook"
+    r"|\bQ[1-4]\b"                 # a quarter: "Q1 Review"
+    r"|\bFY\d{2,4}\b"              # a fiscal year: "FY2025 Report"
+    r"|'s\b"                       # possessive: "Vietnam's ... Report"
+    r"|[&,:;])",                   # title punctuation
     re.IGNORECASE,
 )
 
@@ -603,7 +648,12 @@ def _looks_like_entity_not_class(
     # Heuristic 3: document/report title ending. Works on both spaced
     # and CamelCase labels (we split CamelCase first).
     split = _split_camel(cleaned)
-    if _DOCUMENT_TITLE_TAIL_RE.search(split):
+    if _DOCUMENT_TITLE_STRONG_RE.search(split):
+        return True, "document-title"
+    # Weak tails need corroboration: "Consumer Price Index" and "Injection
+    # Site" are classes, "2025 Market Outlook" and "Vietnam's Trade Report"
+    # are documents, and only the second signal separates them.
+    if _DOCUMENT_TITLE_WEAK_RE.search(split) and _DOCUMENT_TITLE_SIGNAL_RE.search(cleaned):
         return True, "document-title"
     if extra_tail_word_re is not None and extra_tail_word_re.search(split):
         return True, "document-title"
@@ -2181,6 +2231,7 @@ async def stream_summarize_and_chunk_async(
     use_cache: bool = True,
     concurrency: int = 4,
     batch_size: int = 16,
+    paths: list[Path] | None = None,
 ) -> list[TextChunk]:
     """Walk `documents_dir` in fixed-size batches, summarize each batch
     via `summarize_long_documents_async`, chunk the (possibly
@@ -2201,8 +2252,11 @@ async def stream_summarize_and_chunk_async(
 
     Set `batch_size=0` to fall back to that legacy "load all at once"
     behaviour (useful for tests or environments with plenty of RAM).
+
+    `paths`, when given, replaces the folder walk -- corpus selection passes
+    its chosen subset so only those documents reach the paid LLM stages.
     """
-    paths = list(ontology_io.iter_documents(documents_dir))
+    paths = list(paths) if paths is not None else list(ontology_io.iter_documents(documents_dir))
     if not paths:
         raise RuntimeError(f"No PDF/TXT documents found in {documents_dir}")
 
@@ -2308,6 +2362,7 @@ async def stream_evaluated_summarize_and_chunk_async(
     concurrency: int = 4,
     batch_size: int = 16,
     max_cost_usd: float | None = None,
+    paths: list[Path] | None = None,
 ) -> list[TextChunk]:
     """Evaluated (near-lossless) counterpart of stream_summarize_and_chunk_async
     used when `summarization.method == 'evaluated'`. Walks `documents_dir` in
@@ -2317,13 +2372,16 @@ async def stream_evaluated_summarize_and_chunk_async(
     cache with the SAME key params register-documents uses, so a later
     register-documents run reuses these summaries for free.
 
-    `batch_size <= 0` loads everything at once (tests / high-RAM)."""
+    `batch_size <= 0` loads everything at once (tests / high-RAM).
+
+    `paths`, when given, replaces the folder walk -- corpus selection passes
+    its chosen subset so only those documents reach the paid LLM stages."""
     from backend.app.services.evaluated_summarizer import (
         evaluated_result_to_chunks,
         evaluated_summarize_documents_async,
     )
 
-    paths = list(ontology_io.iter_documents(documents_dir))
+    paths = list(paths) if paths is not None else list(ontology_io.iter_documents(documents_dir))
     if not paths:
         raise RuntimeError(f"No PDF/TXT documents found in {documents_dir}")
 
@@ -2532,6 +2590,9 @@ async def _run_llm_stages(
     suggested_new_classes: list[dict[str, Any]] | None = None,
     extra_stage2_results: list[dict[str, Any]] | None = None,
     single_pass_summaries: bool = False,
+    # Corpus selection: the chosen subset. None => every document in the
+    # folder, i.e. today's behaviour.
+    selected_paths: list[Path] | None = None,
     # CLI overrides (prune-expand/build --summarization-concurrency /
     # --expansion-concurrency). None => fall back to config.
     summarization_concurrency: int | None = None,
@@ -2614,6 +2675,7 @@ async def _run_llm_stages(
                 concurrency=_summ_concurrency,
                 batch_size=streaming_batch_size,
                 max_cost_usd=max_cost_usd,
+                paths=selected_paths,
             )
     else:
         with timer.stage("summarize"):
@@ -2629,6 +2691,7 @@ async def _run_llm_stages(
                 use_cache=use_cache,
                 concurrency=_summ_concurrency,
                 batch_size=streaming_batch_size,
+                paths=selected_paths,
             )
     print(f"[llm] produced {len(chunks)} chunk(s)")
     if not chunks:
@@ -2880,6 +2943,11 @@ async def prune_and_expand_async(
     extract_tables: bool = False,
     table_vision: bool = True,
     single_pass_summaries: bool = False,
+    select_subset: bool = False,
+    selection_yes: bool = False,
+    selection_k_max: int | None = None,
+    selection_outlier_sigma: float | None = None,
+    selection_concurrency: int | None = None,
     summarization_concurrency: int | None = None,
     table_mining_concurrency: int | None = None,
     expansion_concurrency: int | None = None,
@@ -2899,6 +2967,11 @@ async def prune_and_expand_async(
         extract_tables=extract_tables,
         table_vision=table_vision,
         single_pass_summaries=single_pass_summaries,
+        select_subset=select_subset,
+        selection_yes=selection_yes,
+        selection_k_max=selection_k_max,
+        selection_outlier_sigma=selection_outlier_sigma,
+        selection_concurrency=selection_concurrency,
         summarization_concurrency=summarization_concurrency,
         table_mining_concurrency=table_mining_concurrency,
         expansion_concurrency=expansion_concurrency,
@@ -2920,6 +2993,11 @@ async def build_async(
     extract_tables: bool = False,
     table_vision: bool = True,
     single_pass_summaries: bool = False,
+    select_subset: bool = False,
+    selection_yes: bool = False,
+    selection_k_max: int | None = None,
+    selection_outlier_sigma: float | None = None,
+    selection_concurrency: int | None = None,
     summarization_concurrency: int | None = None,
     table_mining_concurrency: int | None = None,
     expansion_concurrency: int | None = None,
@@ -2944,6 +3022,11 @@ async def build_async(
         extract_tables=extract_tables,
         table_vision=table_vision,
         single_pass_summaries=single_pass_summaries,
+        select_subset=select_subset,
+        selection_yes=selection_yes,
+        selection_k_max=selection_k_max,
+        selection_outlier_sigma=selection_outlier_sigma,
+        selection_concurrency=selection_concurrency,
         summarization_concurrency=summarization_concurrency,
         table_mining_concurrency=table_mining_concurrency,
         expansion_concurrency=expansion_concurrency,
@@ -2966,6 +3049,11 @@ async def _run(
     extract_tables: bool = False,
     table_vision: bool = True,
     single_pass_summaries: bool = False,
+    select_subset: bool = False,
+    selection_yes: bool = False,
+    selection_k_max: int | None = None,
+    selection_outlier_sigma: float | None = None,
+    selection_concurrency: int | None = None,
     summarization_concurrency: int | None = None,
     table_mining_concurrency: int | None = None,
     expansion_concurrency: int | None = None,
@@ -3006,6 +3094,120 @@ async def _run(
     if documents_dir.exists():
         document_io.preflight_documents(documents_dir)
 
+    # Corpus selection: build the ontology from a representative SUBSET.
+    #
+    # Runs BEFORE table extraction so a run never pays vision costs for
+    # documents the ontology will never see. Summarization here writes to the
+    # shared eval_summaries/ cache, so the selected docs are free to summarize
+    # again below and a later full register-documents reuses them too.
+    #
+    # Default off => `selected_paths` stays None and every downstream stage
+    # walks the folder exactly as before.
+    selected_paths: list[Path] | None = None
+    if select_subset:
+        from backend.app.services import corpus_selection as _cs
+
+        sel_cfg = _cs.SelectionConfig.from_app_config(
+            app_cfg,
+            k_max=selection_k_max,
+            outlier_sigma=selection_outlier_sigma,
+            label_concurrency=selection_concurrency,
+        )
+        all_paths = list(ontology_io.iter_documents(documents_dir))
+        if not all_paths:
+            raise RuntimeError(f"No PDF/TXT documents found in {documents_dir}")
+        print(
+            f"[{operation}] corpus selection: profiling {len(all_paths)} document(s) "
+            f"(summarize -> compress -> label -> embed)"
+        )
+
+        sum_cfg_sel = app_cfg.get("summarization", {}) or {}
+        chunk_cfg_sel = app_cfg.get("chunking", {}) or {}
+        _sel_summ_conc = int(
+            summarization_concurrency
+            if summarization_concurrency is not None
+            else (app_cfg.get("concurrency", {}) or {}).get(
+                "summarization", sum_cfg_sel.get("concurrency", 4)
+            )
+        )
+
+        async def _summarize_for_selection(docs: list[LoadedDocument]) -> list[Any]:
+            from backend.app.services.evaluated_summarizer import (
+                evaluated_summarize_documents_async,
+            )
+
+            return await evaluated_summarize_documents_async(
+                docs,
+                router,
+                threshold_tokens=int(chunk_cfg_sel.get("summarization_threshold_tokens", 2000)),
+                eval_rounds=int(sum_cfg_sel.get("eval_rounds", 3)),
+                questions_per_chunk=int(sum_cfg_sel.get("questions_per_chunk", 12)),
+                max_chunk_tokens=int(sum_cfg_sel.get("max_chunk_tokens", 12_000)),
+                overlap_tokens=int(sum_cfg_sel.get("overlap_tokens", 500)),
+                summary_chunk_max_tokens=int(sum_cfg_sel.get("summary_chunk_max_tokens", 1_200)),
+                chunk_size=int(chunk_cfg_sel.get("chunk_size", 800)),
+                chunk_overlap=int(chunk_cfg_sel.get("chunk_overlap", 120)),
+                encoding_name=chunk_cfg_sel.get("encoding", "o200k_base"),
+                concurrency=_sel_summ_conc,
+                use_cache=bool(chunk_cfg_sel.get("use_summary_cache", True)),
+                max_cost_usd=effective_cost_cap if effective_cost_cap else 1000.0,
+            )
+
+        with timer.stage("select-corpus"):
+            from backend.app.services.embeddings import Embedder
+
+            profiles, skipped = await _cs.profile_corpus(
+                all_paths,
+                router,
+                Embedder(),
+                cfg=sel_cfg,
+                summarize=_summarize_for_selection,
+                batch_size=int(chunk_cfg_sel.get("streaming_batch_size", 16)),
+            )
+            sel_result = _cs.select_representatives(
+                profiles, cfg=sel_cfg, skipped=skipped
+            )
+
+        report = _cs.selection_report(sel_result, documents_dir, sel_cfg)
+        (version_dir / "selection.json").write_text(
+            json.dumps(report, indent=2), encoding="utf-8"
+        )
+        print(_cs.format_selection_summary(report))
+        print(f"[{operation}] selection written to {version_dir / 'selection.json'}")
+        _append_audit(audit_path, -1, "corpus_selection", None, {
+            "n_documents": report["n_documents"],
+            "n_selected": report["n_selected"],
+            "k": report["k"],
+            "doc_types": list(report["doc_types"].keys()),
+        })
+
+        if not sel_result.selected:
+            raise RuntimeError("Corpus selection produced an empty subset")
+
+        if not selection_yes:
+            # Preview stop. Everything above is cents; everything below is the
+            # $20+ run. The user sees the subset before committing to it.
+            print(
+                f"\n[{operation}] PREVIEW ONLY -- no ontology was built.\n"
+                f"  Review {version_dir / 'selection.json'}, then re-run the same "
+                f"command with --yes to build from these "
+                f"{len(sel_result.selected)} document(s).\n"
+                f"  Selection is disk-cached, so the re-run re-profiles for free."
+            )
+            versioning.write_cost_report(version_dir, router.cost_report())
+            _print_cost_summary(router)
+            timer.print_report()
+            (version_dir / "timings.json").write_text(
+                json.dumps(timer.as_dict(), indent=2), encoding="utf-8"
+            )
+            return version_dir
+
+        selected_paths = list(sel_result.selected)
+        print(
+            f"[{operation}] building ontology from {len(selected_paths)} selected "
+            f"document(s) of {len(all_paths)}"
+        )
+
     # Phase 2a v2 (Option B): table extraction runs in PER-PDF SUBPROCESS
     # workers. Each worker exits before the next starts, so the kernel
     # reclaims all per-PDF memory unconditionally and the parent process
@@ -3028,6 +3230,7 @@ async def _run(
                 run_cache_dir=tables_dir,
                 use_vision=table_vision,
                 concurrency=table_extract.table_extraction_concurrency(),
+                paths=selected_paths,
             )
         total = sum(int(m.get("n_tables", 0) or 0) for m in manifests.values())
         cost = sum(float(m.get("cost_usd", 0.0) or 0.0) for m in manifests.values())
@@ -3115,6 +3318,7 @@ async def _run(
         suggested_new_classes=suggested or None,
         extra_stage2_results=[table_mining_stage2] if table_mining_stage2 else None,
         single_pass_summaries=single_pass_summaries,
+        selected_paths=selected_paths,
         summarization_concurrency=summarization_concurrency,
         expansion_concurrency=expansion_concurrency,
         classification_concurrency=classification_concurrency,

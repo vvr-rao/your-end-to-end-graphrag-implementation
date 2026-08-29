@@ -279,7 +279,35 @@ def advise_memory(batch_size: int, table_conc: int) -> None:
         print(f"    hold 1.5+ GB) before a long paid run.")
 
 
-def analyse_corpus(docs_dir: str, batch_size: int, concurrency: int) -> None:
+def _selected_paths(selection_path: str) -> set[str] | None:
+    """Resolved paths of the documents a selection.json marked selected.
+
+    Returns None (meaning "no filter") if the file is missing or malformed --
+    sizing the whole corpus is a harmless over-estimate, whereas refusing to
+    run would block the mandatory pre-flight gate.
+    """
+    import json
+    from pathlib import Path
+
+    try:
+        report = json.loads(Path(selection_path).read_text(encoding="utf-8"))
+        chosen = {
+            str(Path(d["path"]).resolve())
+            for d in report.get("documents", [])
+            if d.get("selected")
+        }
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"  (could not read {selection_path}: {exc}; sizing the FULL corpus)")
+        return None
+    if not chosen:
+        print(f"  ({selection_path} selected nothing; sizing the FULL corpus)")
+        return None
+    return chosen
+
+
+def analyse_corpus(
+    docs_dir: str, batch_size: int, concurrency: int, selection_path: str | None = None
+) -> None:
     """Explain how batch size and concurrency interact for THIS corpus.
 
     streaming_batch_size is a stop-the-world barrier: pipeline_llm awaits each
@@ -297,6 +325,12 @@ def analyse_corpus(docs_dir: str, batch_size: int, concurrency: int) -> None:
     print("  (extracting + tokenising -- may take a minute on a large corpus)")
     enc = get_encoder()
     docs = list(load_documents(Path(docs_dir)))
+    if selection_path:
+        chosen = _selected_paths(selection_path)
+        if chosen is not None:
+            before = len(docs)
+            docs = [d for d in docs if str(d.path.resolve()) in chosen]
+            print(f"  sizing the SELECTED subset only: {len(docs)} of {before} document(s)")
     if not docs:
         print("  no documents found.")
         return
@@ -388,6 +422,14 @@ async def main() -> int:
                 print(f"    concurrency.{k:<22} now {now}{flag}")
             print("    chunk_classification is Stage 1: it ran at 4 for a long time only")
             print("    because it shared Stage 2's semaphore. It is independent now.")
+            sel_now = (get_settings().app_config.get("corpus_selection") or {}).get(
+                "label_concurrency", 8)
+            print(f"\n    corpus_selection.label_concurrency  now {sel_now}"
+                  f"{'  <- raise' if isinstance(sel_now, int) and sel_now < m // 2 else ''}")
+            print("    Drives --select-subset's doc-type labelling + embed compression")
+            print("    (cheap model, so it belongs in this tier). Pass it as")
+            print(f"    --selection-concurrency {m}; the SUMMARIZATION inside selection")
+            print("    takes --summarization-concurrency and is the real long pole.")
         if big:
             b = min(big)
             print(f"\nBIG-MODEL stages (~2M TPM, 32k-token requests) -- ceiling ~{b}:")
@@ -408,12 +450,24 @@ async def main() -> int:
         int((cfg1.get("concurrency") or {}).get("table_extraction", 1)),
     )
 
-    if len(sys.argv) > 1:
+    # Minimal arg handling: first positional is the corpus, optional
+    # --selection <selection.json> narrows it to a chosen subset.
+    positional = [a for a in sys.argv[1:] if not a.startswith("-")]
+    selection = None
+    if "--selection" in sys.argv:
+        i = sys.argv.index("--selection")
+        if i + 1 < len(sys.argv):
+            selection = sys.argv[i + 1]
+            if selection in positional:
+                positional.remove(selection)
+
+    if positional:
         cfg2 = get_settings().app_config
         analyse_corpus(
-            sys.argv[1],
+            positional[0],
             int((cfg2.get("chunking") or {}).get("streaming_batch_size", 8)),
             int((cfg2.get("concurrency") or {}).get("summarization", 4)),
+            selection_path=selection,
         )
     else:
         print("\nTip: pass a documents directory to also size "

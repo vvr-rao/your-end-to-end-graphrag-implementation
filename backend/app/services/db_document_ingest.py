@@ -36,6 +36,11 @@ from backend.app.db.models.graph import GraphRelationship
 from backend.app.db.session import session_scope
 from backend.app.services.chunking import chunk_documents
 from backend.app.services.document_io import LoadedDocument, load_documents
+from backend.app.services.embed_compress import (
+    EMBED_INPUT_CAP_TOKENS,
+    compress_for_embed,
+    count_embed_tokens,
+)
 from backend.app.services.embeddings import Embedder
 from backend.app.services.evaluated_summarizer import (
     evaluated_result_to_chunks,
@@ -49,178 +54,17 @@ from backend.app.services.predicates import (
     VIAO_DERIVED_FROM_DOCUMENT,
     VIAO_HAS_INTELLIGENCE_ARTIFACT,
 )
-from backend.app.services.prompts import PROMPTS
 
 _VIAO_NS = "https://veerla-ramrao.ai/ontology/intelligence-artifact"
 
 log = logging.getLogger(__name__)
 
-# Embedding model input cap (OpenAI: 8192 hard; 8000 leaves headroom).
-_EMBED_INPUT_CAP_TOKENS = 8000
-# Per gpt-4o-mini call we never feed more than ~100K tokens (matches
-# Phase 1's `max_doc_input_tokens` in `summarize_long_documents_async`).
-# Above that we split + summarize each half + recurse.
-_LLM_INPUT_SPLIT_THRESHOLD = 100_000
-
-
-def _count_embed_tokens(text: str) -> int | None:
-    """Token count under the embedding model's encoder, or None if
-    tiktoken is unavailable (in which case truncation is unknowable here
-    and the embedder reports it instead)."""
-    try:
-        import tiktoken
-        enc = tiktoken.encoding_for_model("text-embedding-3-small")
-    except (ImportError, KeyError):
-        return None
-    return len(enc.encode(text, disallowed_special=()))
-
-
-async def _compress_summary_for_embed(
-    text: str, router: LLMRouter, *, target_tokens: int = _EMBED_INPUT_CAP_TOKENS
-) -> str:
-    """If a doc summary exceeds the embedding model's input cap, run
-    extra gpt-4o-mini pass(es) to compress it BEFORE the embedding API
-    call. Always preserves the original text -- the caller stores the
-    UNCOMPRESSED summary in documents.text_summary; this output is used
-    only to compute documents.embedding.
-
-    Recursive contract:
-      - Returns the input unchanged if it's already <= target_tokens.
-      - For inputs <= 100K tokens: one gpt-4o-mini compression call
-        (max_tokens=4096 by task config, well under target_tokens).
-      - For inputs > 100K tokens: split in half on a paragraph
-        boundary, compress each half independently, recurse on the
-        concatenation. Bounded by an iteration cap so a pathological
-        case can't loop forever.
-    """
-    try:
-        import tiktoken
-        enc = tiktoken.encoding_for_model("text-embedding-3-small")
-    except (ImportError, KeyError):
-        return text  # let the embedder do hard truncation
-
-    def _tok_count(s: str) -> int:
-        return len(enc.encode(s, disallowed_special=()))
-
-    async def _compress_once(s: str) -> str:
-        """One gpt-4o-mini pass via the existing document_summarize task."""
-        system, user = PROMPTS["document_summarize"](s)
-        try:
-            result = await router.chat(
-                "document_summarize", system=system, user=user
-            )
-        except Exception as exc:
-            print(f"[ingest] compression LLM call failed: {exc}")
-            return s
-        return result.text.strip() or s
-
-    async def _digest_once(s: str) -> str:
-        """Fallback tier: a dense retrieval digest rather than prose.
-
-        `document_summarize` writes readable prose and sometimes fails to
-        shrink at all -- at which point the embedder used to hard-truncate,
-        silently dropping the tail of the document out of its vector. This
-        asks for keywords and names instead, which compresses reliably and
-        keeps both the brand and generic name of everything (a vector
-        holding only "MOUNJARO" is unreachable by a query saying
-        "tirzepatide").
-
-        Runs on the SAME `document_summarize` router task -- PROMPTS keys
-        and task names are independent lookups -- so no models.yaml preset
-        needs a new entry on a live deployment.
-        """
-        system, user = PROMPTS["embed_digest"](s, target_tokens)
-        try:
-            result = await router.chat(
-                "document_summarize", system=system, user=user
-            )
-        except Exception as exc:
-            print(f"[ingest] embed-digest LLM call failed: {exc}")
-            return s
-        return result.text.strip() or s
-
-    def _split_on_paragraph(s: str) -> tuple[str, str]:
-        """Split near the middle on a blank-line boundary if one exists."""
-        mid = len(s) // 2
-        # Search outwards for a `\n\n` near the midpoint.
-        right = s.find("\n\n", mid)
-        left = s.rfind("\n\n", 0, mid)
-        if right >= 0 and (left < 0 or right - mid <= mid - left):
-            return s[:right], s[right + 2 :]
-        if left >= 0:
-            return s[:left], s[left + 2 :]
-        return s[:mid], s[mid:]
-
-    n = _tok_count(text)
-    if n <= target_tokens:
-        return text
-
-    print(
-        f"[ingest] doc summary {n:,} tokens > {target_tokens} cap; "
-        f"compressing for embed call (full text still kept in DB)"
-    )
-
-    # Iteration cap so we never loop forever on a pathological input.
-    current = text
-    for iteration in range(4):
-        n = _tok_count(current)
-        if n <= target_tokens:
-            return current
-
-        if n <= _LLM_INPUT_SPLIT_THRESHOLD:
-            compressed = await _compress_once(current)
-            n2 = _tok_count(compressed)
-            if n2 >= n:
-                # Prose summarization didn't shrink it. Previously this
-                # returned immediately and let the embedder hard-truncate,
-                # dropping the tail of the document out of its vector with
-                # only an anonymous "[embed] N/M truncated" line to show
-                # for it. Try the dense-digest tier before giving up.
-                print(
-                    f"[ingest] compression no-op (out={n2:,} >= in={n:,}); "
-                    "falling back to dense embed-digest"
-                )
-                digest = await _digest_once(current)
-                n3 = _tok_count(digest)
-                if n3 < n:
-                    print(
-                        f"[ingest] embed-digest: {n:,} -> {n3:,} tokens"
-                    )
-                    current = digest
-                    continue
-                print(
-                    f"[ingest] embed-digest also failed to shrink "
-                    f"(out={n3:,} >= in={n:,})"
-                )
-                return current
-            print(f"[ingest] compress iter {iteration + 1}: {n:,} -> {n2:,} tokens")
-            current = compressed
-            continue
-
-        # Above split threshold: divide-and-conquer
-        left, right = _split_on_paragraph(current)
-        comp_l = await _compress_once(left) if _tok_count(left) > target_tokens else left
-        comp_r = await _compress_once(right) if _tok_count(right) > target_tokens else right
-        current = comp_l + "\n\n" + comp_r
-        print(
-            f"[ingest] split-and-compress iter {iteration + 1}: "
-            f"{n:,} -> {_tok_count(current):,} tokens"
-        )
-
-    # Last chance before the embedder's hard cut: one dense-digest pass.
-    if _tok_count(current) > target_tokens:
-        digest = await _digest_once(current)
-        if _tok_count(digest) < _tok_count(current):
-            current = digest
-
-    if _tok_count(current) > target_tokens:
-        log.warning(
-            "document embedding input still %s tokens after compression "
-            "(cap %s); the embedder will hard-truncate and the tail of this "
-            "document will not be searchable by its vector",
-            f"{_tok_count(current):,}", f"{target_tokens:,}",
-        )
-    return current
+# Embedding-input compression lives in `embed_compress` because corpus
+# selection needs the identical behaviour. Local aliases keep the call
+# sites below unchanged.
+_EMBED_INPUT_CAP_TOKENS = EMBED_INPUT_CAP_TOKENS
+_count_embed_tokens = count_embed_tokens
+_compress_summary_for_embed = compress_for_embed
 
 
 @dataclass

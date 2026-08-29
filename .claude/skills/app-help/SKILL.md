@@ -43,6 +43,8 @@ domain_concepts) is ALWAYS merged in as well.
    $1.44. Idempotent; edits the merge folder in place.
 4. **prune-expand** — the paid, multi-hour ontology-building step (summarize →
    classify → propose → dedup → prune/extend). Caches summaries + tables on disk.
+   Optionally (`--select-subset`) builds the ontology from a REPRESENTATIVE
+   SUBSET rather than the whole corpus — see below.
 5. **db-init --input** — load the resulting ontology into the DB.
 6. **register-documents** — chunk + embed the corpus.
 7. **extract-entities** — mint entities + relationships per chunk (no new classes).
@@ -53,6 +55,46 @@ domain_concepts) is ALWAYS merged in as well.
     `deep_research` (structured 7-section answer). Full traceability answer →
     artifact → chunk → document.
 11. **Deploy** — `render-init` / `render-deploy --wait` / `render-status`.
+
+## Handling a large corpus: representative-subset selection
+`prune-expand --select-subset` builds the ontology from a chosen sample instead
+of every document. It exists because Stage 2 (`class_proposal`) and Stage 3
+(`match_dedup`) are **~95% of prune-expand's cost** and ~66% of its wall time,
+and both scale with chunk count, hence with document count. Measured on a
+30-doc run: $15.77 of $23.06 was Stage 2 alone.
+
+How the subset is chosen:
+1. Every document is summarized, compressed to ~6000 tokens, type-labelled by a
+   cheap LLM call, and embedded.
+2. k-means over the embeddings; **k** comes from the inertia elbow with a
+   silhouette tiebreak. The document nearest each centroid is kept.
+3. **Every document type is guaranteed at least one document** — US vs EU
+   filings, drug labels by country, papers by area are each their own type.
+4. **Every outlier is kept**, measured by distance to the nearest already-
+   selected document (not to a centroid — a true outlier forms its own cluster,
+   where it IS the centroid and would score zero).
+
+Points users regularly get wrong:
+- **Ingestion is unaffected.** `register-documents` still loads every document.
+  Only the ontology comes from the subset.
+- **Summarization is not wasted.** It writes the shared `eval_summaries/` cache
+  that the later full ingest reads.
+- **It previews by default.** Without `--yes` it writes `selection.json`, prints
+  the subset, and stops before the $20+ ontology build.
+- **The preview is not free on a cold corpus.** Clustering needs an embedding of
+  every document, so the preview summarizes the WHOLE corpus first. With a warm
+  `eval_summaries/` cache that is cents (measured $0.01 on 10 docs); cold, it is
+  full summarization — roughly $0.03 per 12k-token window, so ~$14 for a 5M-token
+  corpus. That spend carries over to `register-documents`, but it is real money
+  up front and on a big cold corpus it dwarfs the selection itself.
+- **What it can lose**: a concept appearing in exactly one ordinary (non-outlier)
+  document. Tune with `--selection-k-max` (more clusters) and `--outlier-sigma`
+  (lower keeps more outliers).
+- Re-running selection is free — per-document vectors and labels are cached in
+  `~/.cache/.../corpus_profiles/`, keyed on the document text.
+
+One thing subsetting does NOT speed up: `stage4-apply` (~20% of wall time) is
+pure CPU and scales with ONTOLOGY size, not document count.
 
 ## CLI (single entrypoint)
 `uv run python -m backend.app.cli <subcommand>`. Discover everything with

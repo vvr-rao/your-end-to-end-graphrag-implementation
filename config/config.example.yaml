@@ -238,6 +238,54 @@ ontology:
 # -----------------------------------------------------------------------------
 # LLM expansion run parameters.
 # -----------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------- #
+# Corpus selection (prune-expand --select-subset)
+# --------------------------------------------------------------------------- #
+# Build the ontology from a REPRESENTATIVE SUBSET of the corpus instead of
+# every document. Off unless --select-subset is passed; ingestion is never
+# affected (register-documents still loads the whole corpus).
+#
+# Why it exists: prune-expand's Stage 2 (class_proposal) + Stage 3
+# (match_dedup) are ~95% of its cost and ~66% of its wall time, and both scale
+# with chunk count, hence with document count. Measured on a 30-doc run:
+# $15.77 of $23.06 went to Stage 2 alone.
+corpus_selection:
+  # k-means sweep bounds. k_max is additionally capped at 2*sqrt(n_docs) and
+  # n_docs-1 -- asking for 40 clusters over 50 documents makes the word
+  # "representative" meaningless.
+  k_min: 2
+  k_max: 40
+  # Best-of-N k-means++ restarts. Lloyd's algorithm is local; restarts guard
+  # against a bad seeding. Cheap at these corpus sizes.
+  kmeans_restarts: 5
+  # Fixed seed => the same corpus always yields the same subset, so a preview
+  # and the run that follows it agree.
+  random_seed: 42
+  # A document is an OUTLIER when its distance to the nearest SELECTED
+  # document exceeds mean + outlier_sigma*std of that distance. LOWER keeps
+  # more outliers. Outliers are always kept -- they are the documents least
+  # represented by anything else in the sample.
+  outlier_sigma: 2.0
+  # Silhouette needs an (n,n) distance matrix; above this many documents it is
+  # estimated on a random subsample. 10k docs unsubsampled is ~800 MB, which
+  # the 2.7 GB dev box will not survive.
+  silhouette_sample_cap: 2000
+  # Document embeddings are summarized down to this many tokens rather than
+  # hard-truncated at the embedder's 8000 cap, so the tail of a long document
+  # still reaches its vector. 6000 leaves headroom under the cap.
+  embed_target_tokens: 6000
+  # One cheap LLM call per document names its TYPE (e.g. "financial report
+  # (US)", "drug label (EU)"), and every distinct type is guaranteed at least
+  # one document in the subset. Disable to select on clustering alone.
+  doc_type_labeling: true
+  # Per-document vectors + labels are cached on disk under
+  # ~/.cache/your-end-to-end-graphrag-implementation/corpus_profiles/, keyed on
+  # the ORIGINAL document text -- so confirming a preview re-profiles for free.
+  use_profile_cache: true
+  # Concurrency for the per-document type-labelling calls.
+  label_concurrency: 8
+
 expansion:
   # How many ontology classes to send per LLM batch (matches notebook's split_dict_by_size).
   ontology_chunk_size: 50

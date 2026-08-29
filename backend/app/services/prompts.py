@@ -1129,6 +1129,140 @@ def embed_digest(text: str, target_tokens: int = 6000) -> tuple[str, str]:
     return system, user
 
 
+def document_type_label(text: str) -> tuple[str, str]:
+    """Corpus selection: name the KIND of document this is, so subset
+    selection can guarantee at least one document per type.
+
+    The label is a coverage key, not a description -- two 10-K filings from
+    different US issuers must produce the SAME string, while a US 10-K and an
+    EU annual report must produce DIFFERENT ones. Jurisdiction and subject
+    area are part of the type precisely because they change the vocabulary an
+    ontology has to cover: US and EU financial disclosure use different
+    regulatory terms, and an oncology paper and a materials-science paper
+    share almost no domain classes.
+
+    Returns bare JSON:
+      {"doc_type": "financial report", "region": "US",
+       "subject": "", "confidence": 0.9}
+
+    `region` and `subject` are optional refinements the caller folds into the
+    final label (-> "financial report (US)"). Both empty is normal for a
+    genre with no meaningful split, e.g. a generic whitepaper.
+
+    Dispatched through the existing `document_summarize` task name -- PROMPTS
+    keys and router task names are independent lookups -- so no models.yaml
+    preset needs a new entry on a live deployment.
+    """
+    system = (
+        "You classify a document by its KIND, for corpus coverage sampling. "
+        "Return ONE JSON object and nothing else -- no prose, no markdown "
+        "fences.\n\n"
+        "Keys:\n"
+        '  - "doc_type": the genre, lowercase, 1-4 words. Examples: '
+        '"financial report", "drug label", "research paper", "whitepaper", '
+        '"news article", "regulatory filing", "clinical trial protocol", '
+        '"press release", "patent", "technical specification".\n'
+        '  - "region": the jurisdiction or country the document belongs to, '
+        'as a short code or name ("US", "EU", "China", "Japan"). Use "" if '
+        "the document is not jurisdiction-specific.\n"
+        '  - "subject": the research area, 1-3 words. Use this ONLY for '
+        "academic or scientific papers, where the field genuinely changes the "
+        'vocabulary ("oncology", "battery chemistry"). For EVERY other genre '
+        'use "" -- a news article about fertilizer is still just a news '
+        "article.\n"
+        '  - "confidence": 0.0-1.0.\n\n'
+        "RULES THAT MATTER:\n"
+        "  - Be CONSISTENT, and prefer the BLUNTEST label that fits. Two "
+        "documents of the same kind must get the identical doc_type string. "
+        "This is a bucketing task, not a description task: a label only you "
+        "would produce is a wrong label.\n"
+        "  - Describe what the document IS, never what it is about. A news "
+        'article about a merger is "news article", not "merger analysis". An '
+        'article forecasting an industry is "news article", not "industry '
+        'outlook report" or "trend report".\n'
+        "  - Prefer a label from this list whenever one fits; only invent one "
+        "if nothing here is close:\n"
+        '      news article, research paper, whitepaper, financial report, '
+        "regulatory filing, drug label, clinical trial protocol, press "
+        "release, patent, technical specification, marketing material, "
+        "legal contract, government report, book or manual\n"
+        '  - Set "region" ONLY when doc_type is one of exactly these:\n'
+        "      financial report, regulatory filing, drug label, clinical "
+        "trial protocol, government report, patent, legal contract\n"
+        "    Those are jurisdiction-bound: the rules differ by country, so "
+        "the vocabulary does. For EVERY other genre leave it \"\" -- a "
+        "whitepaper written in Taiwan is just a whitepaper.\n"
+        "  - An annual report, a 10-K, a 20-F and an audited financial "
+        'statement are ALL "financial report". Do not label some of them '
+        '"regulatory filing" -- reserve that for non-financial regulatory '
+        "submissions.\n"
+        "  - Do not invent a type to be distinctive. Reuse the ordinary name."
+    )
+    user = f"DOCUMENT:\n{text}\n\nReturn the JSON classification now."
+    return system, user
+
+
+def document_type_consolidate(labels: list[str]) -> tuple[str, str]:
+    """Corpus selection: merge near-duplicate document-type labels into a
+    canonical set, in ONE call over the distinct labels only.
+
+    Per-document labeling drifts even at temperature 0 -- "U.S. financial
+    report", "financial report (US)" and "annual financial report (US)" are
+    one type described three ways. Left alone, each spurious variant claims
+    its own guaranteed slot in the subset and quietly inflates the sample.
+    This runs once per corpus over the distinct strings, so it costs one call
+    regardless of corpus size.
+
+    Returns bare JSON mapping EVERY input label to its canonical form:
+      {"U.S. financial report": "financial report (US)", ...}
+    """
+    listing = "\n".join(f"  - {label}" for label in labels)
+    system = (
+        "You canonicalize a list of document-type labels produced "
+        "independently for different documents. The same kind of document "
+        "has often been described several ways; your job is to collapse "
+        "those variants onto one spelling.\n\n"
+        "Return ONE JSON object and nothing else -- no prose, no markdown "
+        "fences. Map EVERY input label to its canonical form. A label that "
+        "needs no change maps to itself. Never drop a label.\n\n"
+        "MERGE these:\n"
+        "  - Spelling, punctuation, word order, abbreviation "
+        '("U.S." = "US"), and redundant qualifiers.\n'
+        "  - Near-synonym genre names for the same kind of document: "
+        '"industry outlook report", "trend report" and "market analysis" are '
+        'all "news article" if that is what they are. Collapse an invented, '
+        "over-specific genre onto the ordinary one already in the list.\n"
+        "  - Same genre differing ONLY by a topic/industry qualifier: "
+        '"news article (fertilizer industry)" merges into "news article". '
+        "The topic is what the document is ABOUT, not what it IS.\n"
+        "  - Same genre where one has a region and another has none: "
+        '"drug label" and "drug label (US)" are one type. Merge onto '
+        "whichever form appears more often in the list.\n"
+        "  - A region qualifier on a genre that is NOT jurisdiction-bound: "
+        '"whitepaper (Taiwan)" and "whitepaper (US)" both merge into '
+        '"whitepaper". Only these genres may keep a region: financial '
+        "report, regulatory filing, drug label, clinical trial protocol, "
+        "government report, patent, legal contract.\n\n"
+        "NEVER merge these:\n"
+        "  - Labels differing by jurisdiction or region. "
+        '"drug label (US)" and "drug label (EU)" are DIFFERENT types and must '
+        "both survive -- merging them erases a distinct regulatory vocabulary "
+        "from the sample.\n"
+        "  - Research/scientific papers differing by field: "
+        '"research paper (oncology)" != "research paper (battery chemistry)".\n'
+        "  - Genuinely different genres "
+        '("research paper" != "whitepaper", "drug label" != "clinical trial '
+        'protocol").\n\n'
+        "Prefer the shortest clear form as canonical, keeping any region (or "
+        'a research field) in parentheses: "financial report (US)".'
+    )
+    user = (
+        f"LABELS:\n{listing}\n\n"
+        "Return the JSON mapping from each label to its canonical form now."
+    )
+    return system, user
+
+
 def question_parse(question: str) -> tuple[str, str]:
     """Phase 2 Milestone F step 3: parse a user question into structured
     constraints the retrieval pipeline can use as graph seeds.
@@ -2660,6 +2794,10 @@ PROMPTS = {
     # router task names are independent lookups, and reusing the task
     # avoids adding an entry to every models.yaml preset on a live deploy.
     "embed_digest": embed_digest,
+    # Corpus selection — dispatched through `document_summarize` for the same
+    # reason as embed_digest above (no models.yaml preset entry needed).
+    "document_type_label": document_type_label,
+    "document_type_consolidate": document_type_consolidate,
     "question_parse": question_parse,
     "concept_expansion": concept_expansion,
     "query_decompose": query_decompose,

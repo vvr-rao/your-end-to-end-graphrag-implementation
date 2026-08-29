@@ -96,6 +96,57 @@ def _add_documents(p: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_selection_flags(p: argparse.ArgumentParser) -> None:
+    """Corpus-selection flags. Default OFF => the full corpus builds the
+    ontology, exactly as before."""
+    p.add_argument(
+        "--select-subset", action="store_true",
+        help=(
+            "Build the ontology from a REPRESENTATIVE SUBSET instead of every "
+            "document. Profiles the corpus (summarize -> compress -> label -> "
+            "embed), clusters it with k-means, then keeps one document per "
+            "cluster, at least one per document type, and every outlier. "
+            "Stops after writing selection.json unless --yes is given. "
+            "Ingestion is unaffected -- register-documents still loads the "
+            "whole corpus. Default: OFF."
+        ),
+    )
+    p.add_argument(
+        "--yes", action="store_true",
+        help=(
+            "Skip the --select-subset preview stop and build the ontology from "
+            "the selected subset immediately."
+        ),
+    )
+    p.add_argument(
+        "--selection-k-max", type=int, default=None,
+        help=(
+            "Upper bound on the k-means cluster sweep (default: "
+            "corpus_selection.k_max, further capped at 2*sqrt(n_docs)). "
+            "Raise it for a larger, more granular subset."
+        ),
+    )
+    p.add_argument(
+        "--outlier-sigma", type=float, default=None,
+        help=(
+            "Outlier threshold in standard deviations of the distance to the "
+            "nearest selected document (default: corpus_selection."
+            "outlier_sigma, 2.0). LOWER keeps more outliers."
+        ),
+    )
+    p.add_argument(
+        "--selection-concurrency", type=int, default=None, metavar="N",
+        help=(
+            "Parallel document-type labelling + embed-compression calls during "
+            "--select-subset. Unset => corpus_selection.label_concurrency (8). "
+            "These run on a cheap high-TPM model, so 32-64 is usually safe on "
+            "tier 3+; size it with scripts/tpm_check.py. Note the SUMMARIZATION "
+            "inside selection is governed by --summarization-concurrency, and "
+            "on a cold corpus that is the long pole."
+        ),
+    )
+
+
 def _add_input_folder(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--input",
@@ -226,6 +277,7 @@ def build_parser() -> argparse.ArgumentParser:
             "them for free; use this to fall back to the cheaper single-pass."
         ),
     )
+    _add_selection_flags(p_pe)
     p_pe.set_defaults(func=_cmd_prune_expand)
 
     p_build = sub.add_parser(
@@ -310,6 +362,7 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
 
+    _add_selection_flags(p_build)
     p_build.set_defaults(func=_cmd_build)
 
     p_sd = sub.add_parser(
@@ -1244,6 +1297,11 @@ def _cmd_prune_expand(args: argparse.Namespace) -> int:
             extract_tables=getattr(args, "tables", False),
             table_vision=getattr(args, "table_vision", True),
             single_pass_summaries=getattr(args, "single_pass_summaries", False),
+            select_subset=getattr(args, "select_subset", False),
+            selection_yes=getattr(args, "yes", False),
+            selection_k_max=getattr(args, "selection_k_max", None),
+            selection_outlier_sigma=getattr(args, "outlier_sigma", None),
+            selection_concurrency=getattr(args, "selection_concurrency", None),
             summarization_concurrency=getattr(args, "summarization_concurrency", None),
             table_mining_concurrency=getattr(args, "table_mining_concurrency", None),
             expansion_concurrency=getattr(args, "expansion_concurrency", None),
@@ -1271,6 +1329,11 @@ def _cmd_build(args: argparse.Namespace) -> int:
             extract_tables=getattr(args, "tables", False),
             table_vision=getattr(args, "table_vision", True),
             single_pass_summaries=getattr(args, "single_pass_summaries", False),
+            select_subset=getattr(args, "select_subset", False),
+            selection_yes=getattr(args, "yes", False),
+            selection_k_max=getattr(args, "selection_k_max", None),
+            selection_outlier_sigma=getattr(args, "outlier_sigma", None),
+            selection_concurrency=getattr(args, "selection_concurrency", None),
             summarization_concurrency=getattr(args, "summarization_concurrency", None),
             table_mining_concurrency=getattr(args, "table_mining_concurrency", None),
             expansion_concurrency=getattr(args, "expansion_concurrency", None),

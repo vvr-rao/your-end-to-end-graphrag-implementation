@@ -29,3 +29,4 @@
 {"ts": "2026-08-13T08:05:51-04:00", "step": "extract-entities", "details": {"entities": "846"}}
 {"ts": "2026-08-13T08:11:21-04:00", "step": "enrich-time", "details": {"instances": "633"}}
 {"ts": "2026-08-13T08:22:03-04:00", "step": "generate-artifacts", "details": {"artifacts": "2683"}}
+{"ts": "2026-08-26T05:04:55-04:00", "step": "merge", "details": {"path": "/home/veerlaramrao/your-personal-ontologist/output_ontologies/v20260826T090040Z-merge"}}

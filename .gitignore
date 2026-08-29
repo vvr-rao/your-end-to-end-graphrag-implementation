@@ -85,6 +85,7 @@ source_documents/*
 !source_documents/dailymed_download.py
 !source_documents/websearch_download.py
 !source_documents/financial_report_download.py
+!source_documents/salvage_mangled_pdfs.py
 
 # User-supplied class suggestions are local config (domain-specific hints).
 # Repo ships a *.example.json template; the real file is gitignored.
