@@ -473,6 +473,27 @@ qa:
   # label cannot claim the whole global budget before other documents are seen.
   max_fulltext_chunks_per_document: 50
 
+  # ---- Post-fusion vector rerank (query --rerank) ----
+  # RRF (step 10) fuses rank ORDER and throws distance away, so a chunk that
+  # merely placed well across several probes can outrank one that is genuinely
+  # closer to the question. When enabled, the fused pool is re-sorted by L2
+  # distance to the ORIGINAL question embedding before the per-document cap
+  # and the truncation to top_k.
+  #
+  # The pool is deliberately WIDER than top_k so the rerank can swap a better
+  # chunk INTO the final set -- reordering the ones RRF already chose would not
+  # move precision, which is the point.
+  #
+  # Costs no extra LLM call (the question is already embedded for step 9), just
+  # one additional SQL query. Off by default: it changes which evidence a query
+  # returns, so it is opt-in until measured on your own corpus.
+  #
+  # NOTE: on a reranked run `retrieval_evidence.score` stays the RRF score, so
+  # it is NOT monotonic with rank. `retrieval_runs.retrieval_plan.rerank`
+  # records that the ordering key was the distance, not the score.
+  rerank_after_fusion: false
+  rerank_pool_multiplier: 3
+
 # -----------------------------------------------------------------------------
 # Background jobs (arq).
 # -----------------------------------------------------------------------------

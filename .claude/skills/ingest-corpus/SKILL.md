@@ -179,6 +179,21 @@ uv run python scripts/job_status.py <RUN_ID> 40
 uv run python scripts/build_state.py record extract-entities entities=<n>
 ```
 
+**Entity-to-entity relationships.** This step now also mints typed
+`entity -> entity` edges. Candidate predicates come from the ontology's own
+DOMAIN and RANGE -- a property is offered only when both ends match classes in
+the chunk -- so they cost **no extra LLM call** (they ride in the same
+`entity_extract` request). The run prints a line to report back:
+```
+[extract-entities] entity->entity relationships: N written, M dropped (...)
+```
+- **0 written is a real signal, not necessarily a bug.** The usual cause is
+  that the ontology declares no object property whose domain AND range both
+  match this corpus's classes. The run says so explicitly when it happens --
+  surface that to the user rather than treating it as success.
+- `--no-relationships` reproduces the older entity-only behaviour.
+- An EXISTING graph has none of these edges until extract-entities re-runs.
+
 ## Step 4 — enrich-time (short)
 Temporal enrichment (Year/Quarter/Month/Day, parent creation + gap-fill). Fast and
 cheap — run in the foreground. **Add `--from-fulltext` if Step 2 recorded

@@ -252,6 +252,7 @@ async def retrieve_and_answer(
     max_cost_usd: float = 1.0,
     decompose: bool = True,
     max_probes: int = 3,
+    rerank: bool | None = None,
     conversation_turn_id: uuid.UUID | None = None,
     resolved_query: str | None = None,
     verbose: bool = False,
@@ -309,7 +310,7 @@ async def retrieve_and_answer(
             r1 = await retrieve_and_answer(
                 plan["round1_question"], mode="simple_qa",
                 hops=hops, max_cost_usd=max_cost_usd, decompose=decompose,
-                max_probes=max_probes, verbose=verbose,
+                max_probes=max_probes, rerank=rerank, verbose=verbose,
                 multi_round=False, persist=persist, _round_depth=1,
             )
             # Round 2 (final): enrich the question with round-1 findings so the
@@ -329,7 +330,8 @@ async def retrieve_and_answer(
             r2 = await retrieve_and_answer(
                 enriched_final, mode=mode, top_k=top_k,
                 hops=hops, max_cost_usd=max_cost_usd, decompose=decompose,
-                max_probes=max_probes, conversation_turn_id=conversation_turn_id,
+                max_probes=max_probes, rerank=rerank,
+                conversation_turn_id=conversation_turn_id,
                 verbose=verbose, multi_round=False, persist=persist,
                 _round_depth=1,
             )
@@ -702,11 +704,67 @@ async def retrieve_and_answer(
     if artifact_candidates:
         artifact_rankings.append([aid for aid, _ in artifact_candidates])
 
+    # Records whether step 10b ran, for retrieval_plan (see below).
+    _rerank_note: dict[str, Any] | None = None
+
     # -------- step 10: RRF fusion --------
     if mode == "artifact_only":
         fused_chunks: list[tuple[uuid.UUID, float]] = []
     else:
         _fused_all = rrf_fuse(chunk_rankings)
+        # -------- step 10b: optional vector rerank of the fused pool --------
+        # RRF fuses rank ORDER and throws the distances away (see
+        # `_trim_by_distance`), so a chunk that merely placed well across
+        # several probes can outrank one that is genuinely closer to the
+        # question. This re-sorts the fused pool by L2 distance to the
+        # ORIGINAL question embedding, which is the signal fusion discarded.
+        #
+        # It runs on a pool WIDER than top_k and BEFORE the cap + truncation,
+        # so it can swap a better chunk into the final set rather than merely
+        # reorder the ones RRF already chose -- reordering alone would not
+        # move precision, which is the point of the flag.
+        #
+        # Each chunk keeps its ORIGINAL RRF score: `cap_per_source` reads that
+        # score as higher-is-better, and it is persisted to
+        # `retrieval_evidence.score`. Substituting a distance (lower-is-better)
+        # would silently invert both. The consequence is that score is no
+        # longer monotonic with rank on a reranked run, so the run records
+        # `retrieval_plan.rerank` to say the ordering key is not the score.
+        _rerank_on = (
+            bool(_qa_cfg("rerank_after_fusion", False)) if rerank is None
+            else bool(rerank)
+        )
+        if _rerank_on and _fused_all:
+            _pool_mult = max(1, int(_qa_cfg("rerank_pool_multiplier", 3)))
+            _pool = _fused_all[: top_k * _pool_mult]
+            _pool_ids = [cid for cid, _ in _pool]
+            async with session_scope() as session:
+                _reranked = await retrieval_sql.vector_rerank_chunks(
+                    session, _pool_ids, qvec, top_k=len(_pool_ids)
+                )
+            if _reranked:
+                _rrf_score = dict(_pool)
+                _order = [cid for cid, _ in _reranked]
+                # Anything the rerank did not return (no embedding) keeps its
+                # RRF position behind the reranked head, rather than vanishing.
+                _seen = set(_order)
+                _tail = [cid for cid, _ in _pool if cid not in _seen]
+                _fused_all = (
+                    [(cid, _rrf_score[cid]) for cid in _order + _tail]
+                    + _fused_all[top_k * _pool_mult :]
+                )
+                _rerank_note = {
+                    "applied": True,
+                    "pool": len(_pool_ids),
+                    "pool_multiplier": _pool_mult,
+                    "note": "ordered by distance to the question embedding; "
+                            "score column remains the RRF score",
+                }
+                if verbose:
+                    print(
+                        f"[query] reranked {len(_pool_ids)} fused chunk(s) "
+                        f"against the question embedding"
+                    )
         # Cap one document's share BEFORE truncating to top_k. RRF's usual
         # defence is agreement between independent lists, but all three
         # voters here run over the same candidate pool -- when that pool is
@@ -842,6 +900,7 @@ async def retrieve_and_answer(
             matched_classes=matched_classes, matched_entities=matched_entities,
             matched_times=matched_times, graph_hops=hops,
             conversation_turn_id=conversation_turn_id,
+            rerank_note=_rerank_note,
         )
     else:
         async with session_scope() as session:
@@ -1388,6 +1447,7 @@ async def _persist_run(
     matched_times: list[dict[str, Any]],
     graph_hops: int,
     conversation_turn_id: uuid.UUID | None,
+    rerank_note: dict[str, Any] | None = None,
 ) -> None:
     """INSERT retrieval_runs + retrieval_evidence rows."""
     run_id = uuid.uuid4()
@@ -1430,6 +1490,12 @@ async def _persist_run(
                     # Persisted so citation quality is trendable across runs
                     # rather than only visible in a log line.
                     "invalid_citations": result.invalid_citations,
+                    # Present only on a reranked run. Says the evidence
+                    # ORDER came from distance to the question embedding
+                    # while `score` is still the RRF score -- so score is
+                    # not monotonic with rank here, and sorting evidence
+                    # by score does NOT reproduce what was delivered.
+                    **({"rerank": rerank_note} if rerank_note else {}),
                 }),
                 "gv": gv,
             },

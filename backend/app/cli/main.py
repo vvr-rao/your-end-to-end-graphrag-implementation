@@ -772,6 +772,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Requires the corpus was ingested with --full-text-chunks. Default: summary."
         ),
     )
+    p_ext.add_argument(
+        "--no-relationships", action="store_true",
+        help=(
+            "Skip entity->entity relationship extraction. Candidate "
+            "predicates come from the ontology's own domain/range and ride "
+            "in the SAME LLM call as entities, so relationships cost "
+            "nothing extra; use this only to reproduce pre-relationship "
+            "behaviour."
+        ),
+    )
     p_ext.set_defaults(func=_cmd_extract_entities)
 
     # ---------- Phase 2: Milestone E (artifacts) ----------
@@ -994,6 +1004,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Cap on number of vector-search probes (incl. the original query).",
     )
     p_q.add_argument(
+        "--rerank", action="store_true",
+        help=(
+            "Re-sort the fused chunk pool by distance to the QUESTION "
+            "embedding before truncating to --top-k. RRF fuses rank order and "
+            "discards distance, so a chunk that placed well across several "
+            "probes can outrank one that is genuinely closer to the question; "
+            "this restores that signal and raises precision. Costs no extra LLM "
+            "call (the question is already embedded), just one SQL query. "
+            "Unset => qa.rerank_after_fusion in config.yaml (default off)."
+        ),
+    )
+    p_q.add_argument(
         "--json", action="store_true",
         help="Print the full response envelope as JSON.",
     )
@@ -1103,6 +1125,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_conv_turn.add_argument("--no-decompose", action="store_true")
     p_conv_turn.add_argument("--max-probes", type=int, default=5)
+    p_conv_turn.add_argument(
+        "--rerank", action="store_true",
+        help="Vector-rerank the fused pool against the question embedding "
+             "before truncation (see `query --rerank`).",
+    )
     p_conv_turn.add_argument(
         "--history-window", type=int, default=3,
         help="How many prior turns to feed into follow-up resolution.",
@@ -1626,6 +1653,7 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
             concurrency=_conc,
             max_cost_usd=args.max_cost_usd,
             chunk_kind="fulltext" if getattr(args, "from_fulltext", False) else "summary",
+            extract_relationships=not getattr(args, "no_relationships", False),
         )
     )
     return 0
@@ -1820,6 +1848,7 @@ def _cmd_query(args: argparse.Namespace) -> int:
             max_cost_usd=args.max_cost_usd,
             decompose=not args.no_decompose,
             max_probes=args.max_probes,
+            rerank=True if getattr(args, "rerank", False) else None,
             verbose=args.verbose,
             multi_round=getattr(args, "multi_round", True),
             persist=getattr(args, "persist", True),
@@ -1934,6 +1963,7 @@ def _cmd_conversation_turn(args: argparse.Namespace) -> int:
             max_cost_usd=args.max_cost_usd,
             decompose=not args.no_decompose,
             max_probes=args.max_probes,
+            rerank=True if getattr(args, "rerank", False) else None,
             history_window=args.history_window,
             verbose=args.verbose,
         )

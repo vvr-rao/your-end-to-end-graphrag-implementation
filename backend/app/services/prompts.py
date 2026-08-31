@@ -910,6 +910,7 @@ def artifact_chunk_extract(text: str) -> tuple[str, str]:
 def entity_extract(
     chunk_text: str,
     candidate_classes: list[dict[str, str]],
+    candidate_predicates: list[dict[str, str]] | None = None,
 ) -> tuple[str, str]:
     """Phase 2 Milestone C: extract named entities from a chunk.
 
@@ -918,8 +919,16 @@ def entity_extract(
     ontology_classes. The LLM MUST pick a class_iri from this list
     for each entity (caller validates + drops mismatches).
 
+    `candidate_predicates` (optional) is a list of {iri, label, domain_label,
+    range_label} dicts -- object properties whose declared domain AND range
+    both match classes present in this chunk, so every offered predicate is
+    type-valid for these entities by construction. Omitted/empty => the
+    relationships half of the contract is not requested at all, and the prompt
+    is byte-identical to before.
+
     Returns JSON:
-      {entities: [{canonical_name, short_name, class_iri, confidence}]}
+      {entities: [{canonical_name, short_name, class_iri, confidence}],
+       relationships: [{subject, predicate_iri, object, confidence}]}
 
     Corpus-agnostic: works on any domain (legal, financial, science,
     web search). No keyword baked in.
@@ -934,6 +943,18 @@ def entity_extract(
             + (f" ─ {descr_short}" if descr_short else "")
         )
     candidates_block = "\n".join(candidates_block_lines)
+
+    # Relationships are requested ONLY when the caller supplies predicates.
+    # With none offered there is nothing type-valid to assert, and asking for
+    # relationships anyway would invite invented IRIs.
+    preds = candidate_predicates or []
+    pred_lines: list[str] = []
+    for pr in preds:
+        lbl = (pr.get("label") or "(unlabelled)").strip()
+        dom = (pr.get("domain_label") or "?").strip()
+        rng = (pr.get("range_label") or "?").strip()
+        pred_lines.append(f"  - {pr['iri']} \u2500 {lbl}  [{dom} -> {rng}]")
+    pred_block = "\n".join(pred_lines)
 
     system = (
         "You extract NAMED ENTITIES from text chunks. For each entity you find:\n"
@@ -956,14 +977,49 @@ def entity_extract(
         "if the expansion is unambiguous; otherwise use the abbreviation.\n"
         "  - Return ONLY JSON, no preamble, no markdown."
     )
+    if preds:
+        system += (
+            "\n\nALSO extract RELATIONSHIPS between the entities you just "
+            "listed:\n"
+            "  - subject / object: the canonical_name of TWO entities from "
+            "your own entities list. Never a name you did not extract.\n"
+            "  - predicate_iri: copy ONE IRI VERBATIM from the CANDIDATE "
+            "PREDICATES list. Do not invent, abbreviate or reformat it.\n"
+            "  - confidence: float in [0,1].\n\n"
+            "RELATIONSHIP RULES:\n"
+            "  - Each predicate is annotated [Domain -> Range]. The SUBJECT "
+            "must be of the domain class and the OBJECT of the range class. "
+            "A pair that does not fit any offered predicate is simply not "
+            "emitted -- do not force it.\n"
+            "  - Assert ONLY what this chunk actually states. Do not use "
+            "world knowledge, and do not infer a relationship from two names "
+            "merely appearing near each other.\n"
+            "  - Direction matters: emit subject and object the way the text "
+            "asserts them.\n"
+            "  - 0 to 10 relationships per chunk. Returning an empty list is "
+            "the correct answer when the chunk asserts none."
+        )
     user = (
         "CANDIDATE CLASSES (pick class_iri from this list ONLY):\n"
         + candidates_block
-        + "\n\nTEXT CHUNK:\n```\n"
+    )
+    if preds:
+        user += (
+            "\n\nCANDIDATE PREDICATES (pick predicate_iri from this list "
+            "ONLY; [Domain -> Range] shows which entity types it connects):\n"
+            + pred_block
+        )
+    user += (
+        "\n\nTEXT CHUNK:\n```\n"
         + chunk_text
         + "\n```\n\n"
         "Return JSON: {\"entities\": [{\"canonical_name\": ..., "
-        "\"short_name\": ..., \"class_iri\": ..., \"confidence\": ...}]}"
+        "\"short_name\": ..., \"class_iri\": ..., \"confidence\": ...}]"
+    )
+    user += (
+        ", \"relationships\": [{\"subject\": ..., \"predicate_iri\": ..., "
+        "\"object\": ..., \"confidence\": ...}]}"
+        if preds else "}"
     )
     return system, user
 

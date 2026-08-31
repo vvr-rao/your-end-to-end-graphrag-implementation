@@ -96,6 +96,48 @@ Points users regularly get wrong:
 One thing subsetting does NOT speed up: `stage4-apply` (~20% of wall time) is
 pure CPU and scales with ONTOLOGY size, not document count.
 
+## Retrieval precision: the `--rerank` flag
+
+`query --rerank` re-sorts the fused chunk pool by distance to the **question**
+embedding before truncating to `--top-k`.
+
+Why it helps: step 9 vector-reranks per PROBE, then step 10 fuses those
+rankings with RRF -- and RRF combines rank ORDER only, discarding the distances
+(`_trim_by_distance` drops them explicitly). So a chunk that merely placed well
+across several probes can outrank one that is genuinely closer to what was
+asked. The flag restores that discarded signal as a final pass.
+
+It reranks a pool WIDER than `top_k` (`qa.rerank_pool_multiplier`, default 3x)
+and truncates afterwards, so it can pull a better chunk INTO the evidence set
+rather than only reordering the ones RRF already chose.
+
+- **Costs no extra LLM call** -- the question is already embedded for step 9.
+  One additional SQL query.
+- **Off by default** (`qa.rerank_after_fusion: false`). It changes which
+  evidence a query returns, so it is opt-in until measured on your corpus.
+- **Caveat worth knowing:** on a reranked run `retrieval_evidence.score` stays
+  the RRF score, so it is NOT monotonic with rank -- sorting evidence rows by
+  score does not reproduce the delivered order. The run records
+  `retrieval_runs.retrieval_plan.rerank` to say so.
+
+Reach for it when answers cite loosely-related passages, or when the corpus is
+large and topically mixed so the candidate pool is broad.
+
+## Entity-to-entity relationships
+
+`extract-entities` mints typed `entity -> entity` edges alongside the entities
+themselves. Candidate predicates are derived from the ontology's own DOMAIN and
+RANGE -- an object property is offered only when both ends match classes
+present in the chunk -- so every predicate is type-valid by construction, and
+the write path re-checks it rather than trusting the model.
+
+- **No extra LLM cost**: relationships ride in the same `entity_extract` call.
+- `--no-relationships` reproduces the older entity-only behaviour.
+- An existing graph gets none until `extract-entities` is re-run.
+- If a run reports 0 relationships, the usual cause is that the ontology
+  declares no object property whose domain AND range both match this corpus's
+  classes -- not that the documents assert nothing.
+
 ## CLI (single entrypoint)
 `uv run python -m backend.app.cli <subcommand>`. Discover everything with
 `uv run python -m backend.app.cli --help`. Groups: ontology (`merge`, `prune`,

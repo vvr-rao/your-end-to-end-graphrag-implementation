@@ -34,6 +34,7 @@ from typing import Any
 
 from sqlalchemy import func, select, text as sql_text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.db.graph_version import bump_version, current_version
 from backend.app.db.models.artifacts import IntelligenceArtifact
@@ -76,6 +77,7 @@ class EntityExtractSummary:
     entities_minted: int = 0
     entities_reused: int = 0
     chunk_entity_edges: int = 0
+    entity_relationship_edges: int = 0
     type_edges: int = 0
     tables_scanned: int = 0
     table_entity_edges: int = 0
@@ -260,6 +262,95 @@ def _entity_iri(canonical_name: str, class_iri: str) -> str:
     return f"{_ENTITIES_NS}#{slug}-{digest}"
 
 
+# --------------------------------------------------------------------------- #
+# Entity -> entity relationships (Milestone C, second half)
+# --------------------------------------------------------------------------- #
+# Candidate predicates are derived from the ontology's own DOMAIN and RANGE
+# rather than by vector search. Given the classes actually present in a chunk,
+# an object property is offerable only when its declared domain and range both
+# fall within those classes (or their ancestors) -- so every predicate handed
+# to the LLM is type-valid for these entities BY CONSTRUCTION, and the model
+# picks from a short, already-correct list instead of being asked to guess and
+# be checked afterwards.
+#
+# prune-expand records domain/range for every property it mints (746/746 on the
+# pharma run) and `db_ontology_import` stores the whole record in
+# `extra_metadata`, so this needs no schema change and no embedding column.
+#
+# Ancestors, not descendants: a property declared on `Organization` applies to
+# a `PublicCompany` entity, so the entity's classes are walked UP the
+# subClassOf chain (source=child -> target=parent, as the importer writes it).
+
+_MAX_CANDIDATE_PREDICATES = 40
+
+_ANCESTOR_SQL = sql_text("""
+WITH RECURSIVE up(id) AS (
+    SELECT oc.id FROM graphrag.ontology_classes oc
+     WHERE oc.iri = ANY(CAST(:iris AS text[]))
+  UNION
+    SELECT gr.target_node_id
+      FROM up JOIN graphrag.graph_relationships gr
+        ON gr.source_node_id = up.id
+       AND gr.source_node_type = 'ontology_class'
+       AND gr.target_node_type = 'ontology_class'
+       AND gr.predicate_label  = 'rdfs:subClassOf'
+)
+SELECT DISTINCT oc.iri FROM up JOIN graphrag.ontology_classes oc ON oc.id = up.id
+""")
+
+_CANDIDATE_PREDICATE_SQL = sql_text("""
+SELECT op.iri, op.label,
+       (SELECT d->>'iri' FROM jsonb_array_elements(op.extra_metadata->'domain') d
+         WHERE d->>'iri' = ANY(CAST(:iris AS text[])) LIMIT 1) AS dom_iri,
+       (SELECT r->>'iri' FROM jsonb_array_elements(op.extra_metadata->'range') r
+         WHERE r->>'iri' = ANY(CAST(:iris AS text[])) LIMIT 1) AS rng_iri
+  FROM graphrag.ontology_object_properties op
+ WHERE jsonb_typeof(op.extra_metadata->'domain') = 'array'
+   AND jsonb_typeof(op.extra_metadata->'range')  = 'array'
+   AND EXISTS (SELECT 1 FROM jsonb_array_elements(op.extra_metadata->'domain') d
+                WHERE d->>'iri' = ANY(CAST(:iris AS text[])))
+   AND EXISTS (SELECT 1 FROM jsonb_array_elements(op.extra_metadata->'range') r
+                WHERE r->>'iri' = ANY(CAST(:iris AS text[])))
+ ORDER BY op.label NULLS LAST
+ LIMIT :limit
+""")
+
+
+async def _candidate_predicates(
+    session: AsyncSession, class_iris: set[str]
+) -> tuple[list[dict[str, str]], dict[str, tuple[str, str]]]:
+    """Object properties whose domain AND range both fall in `class_iris`
+    (expanded to include ancestors).
+
+    Returns (rendered_for_prompt, constraints) where `constraints` maps
+    predicate IRI -> (domain_iri, range_iri) so the write path can re-check
+    the model's answer rather than trusting it.
+    """
+    if not class_iris:
+        return [], {}
+    r = await session.execute(_ANCESTOR_SQL, {"iris": list(class_iris)})
+    expanded = {row[0] for row in r.all()} | set(class_iris)
+
+    r = await session.execute(
+        _CANDIDATE_PREDICATE_SQL,
+        {"iris": list(expanded), "limit": _MAX_CANDIDATE_PREDICATES},
+    )
+    labels: dict[str, str] = {}
+    out: list[dict[str, str]] = []
+    constraints: dict[str, tuple[str, str]] = {}
+    for iri, label, dom_iri, rng_iri in r.all():
+        if not dom_iri or not rng_iri:
+            continue
+        constraints[iri] = (dom_iri, rng_iri)
+        out.append({
+            "iri": iri,
+            "label": label or iri.rsplit("#", 1)[-1],
+            "domain_label": labels.get(dom_iri) or dom_iri.rsplit("#", 1)[-1],
+            "range_label": labels.get(rng_iri) or rng_iri.rsplit("#", 1)[-1],
+        })
+    return out, constraints
+
+
 async def extract_entities(
     *,
     scope_document_iri: str | None = None,
@@ -268,6 +359,7 @@ async def extract_entities(
     concurrency: int = 4,
     max_cost_usd: float = 5.0,
     chunk_kind: str = "summary",
+    extract_relationships: bool = True,
 ) -> EntityExtractSummary:
     """Drive entity extraction over chunks that haven't been processed.
 
@@ -324,10 +416,15 @@ async def extract_entities(
     router = LLMRouter()
     cost_before = router.total_cost_usd
     sem = asyncio.Semaphore(concurrency)
-    # Each task returns (chunk_id, chunk_iri, doc_id, list[entity_dict] or None)
-    results: list[tuple[Any, str, Any, list[dict[str, Any]] | None]] = (
-        [None] * len(chunks)  # type: ignore[list-item]
-    )
+    # (chunk_id, chunk_iri, doc_id, list[entity_dict], list[relationship_dict])
+    results: list[
+        tuple[Any, str, Any, list[dict[str, Any]] | None, list[dict[str, Any]]]
+    ] = ([None] * len(chunks))  # type: ignore[list-item]
+    # Why a drop tally: the entity path's `class_iri not in cand_iris` guard
+    # discards silently, which is how losses stayed invisible. Count instead.
+    rel_drops: dict[str, int] = {
+        "unresolved": 0, "bad_predicate": 0, "domain_range": 0,
+    }
     cost_limit_hit = asyncio.Event()
 
     # Progress reporting -- mirrors generate-artifacts pattern.
@@ -386,7 +483,21 @@ async def extract_entities(
                     return
                 cand_iris = {c["iri"] for c in candidates}
 
-                system, user = PROMPTS["entity_extract"](txt, candidates)
+                # Predicates offerable for THESE classes (domain+range both
+                # in scope). Empty => the prompt asks for entities only, so a
+                # corpus whose ontology declares no usable property is
+                # byte-identical to before.
+                pred_list: list[dict[str, str]] = []
+                pred_constraints: dict[str, tuple[str, str]] = {}
+                if extract_relationships:
+                    async with session_scope() as session:
+                        pred_list, pred_constraints = await _candidate_predicates(
+                            session, cand_iris
+                        )
+
+                system, user = PROMPTS["entity_extract"](
+                    txt, candidates, pred_list or None
+                )
                 # Parse-retry: Anthropic has no JSON-grammar mode, so Haiku
                 # occasionally emits an unparseable response. Re-ask once
                 # (non-deterministic -> a retry usually parses) before failing.
@@ -432,7 +543,45 @@ async def extract_entities(
                     "class_iri": class_iri,
                     "confidence": conf,
                 })
-            results[idx] = (chunk_id, chunk_iri, doc_id, kept)
+            # Relationships. Names are resolved to entity ids later (the
+            # ids do not exist yet), so only shape + predicate validity are
+            # checked here. Both ends must be entities THIS chunk extracted.
+            rels: list[dict[str, Any]] = []
+            if pred_constraints:
+                _names = {e["canonical_name"] for e in kept}
+                _class_of = {e["canonical_name"]: e["class_iri"] for e in kept}
+                for rel in (parsed.get("relationships") or []):
+                    if not isinstance(rel, dict):
+                        continue
+                    subj = (rel.get("subject") or "").strip()
+                    obj = (rel.get("object") or "").strip()
+                    pred = (rel.get("predicate_iri") or "").strip()
+                    if not subj or not obj or subj == obj:
+                        continue
+                    if subj not in _names or obj not in _names:
+                        rel_drops["unresolved"] += 1
+                        continue
+                    if pred not in pred_constraints:
+                        rel_drops["bad_predicate"] += 1
+                        continue
+                    # Re-check the type constraint the prompt was told to
+                    # honour: a valid-looking IRI used on the wrong pair is
+                    # exactly the failure the candidate list is meant to make
+                    # impossible, so verify rather than trust.
+                    dom_iri, rng_iri = pred_constraints[pred]
+                    if (_class_of.get(subj) != dom_iri
+                            or _class_of.get(obj) != rng_iri):
+                        rel_drops["domain_range"] += 1
+                        continue
+                    try:
+                        rconf = (float(rel["confidence"])
+                                 if rel.get("confidence") is not None else None)
+                    except (TypeError, ValueError):
+                        rconf = None
+                    rels.append({"subject": subj, "object": obj,
+                                 "predicate_iri": pred, "confidence": rconf})
+
+            results[idx] = (chunk_id, chunk_iri, doc_id, kept, rels)
 
             async with progress_lock:
                 progress_state["done"] += 1
@@ -554,7 +703,7 @@ async def extract_entities(
     for tup in results:
         if tup is None:
             continue
-        chunk_id, chunk_iri, doc_id, kept = tup
+        chunk_id, chunk_iri, doc_id, kept, _rels = tup
         if not kept:
             continue
         for e in kept:
@@ -690,6 +839,93 @@ async def extract_entities(
         })
     summary.chunk_entity_edges = len(edge_payloads)
 
+    # Entity -> entity edges (Milestone C, second half).
+    #
+    # Resolved only now, because entity ids do not exist until the mint/reuse
+    # pass above has run. A name is resolved the same way the entity itself
+    # was keyed -- (normalized_name, class_id) -- so a relationship can only
+    # point at an entity this run actually persisted.
+    #
+    # `graph_relationships` has NO unique constraint, so re-running would
+    # duplicate every edge. Dedupe explicitly, both within this run and
+    # against what the DB already holds.
+    rel_payloads: list[dict[str, Any]] = []
+    if extract_relationships:
+        _pred_label: dict[str, str] = {}
+        rel_seen: set[tuple[Any, str, Any]] = set()
+        for tup in results:
+            if tup is None:
+                continue
+            chunk_id, chunk_iri, doc_id, kept, rels = tup
+            if not rels or not kept:
+                continue
+            _cls_of = {e["canonical_name"]: e["class_iri"] for e in kept}
+
+            def _resolve(name: str, _cls_of=_cls_of) -> Any:
+                ciri = _cls_of.get(name)
+                cid = class_id_by_iri.get(ciri) if ciri else None
+                if cid is None:
+                    return None
+                return seen_in_this_run.get((_normalize_name(name), cid))
+
+            for rel in rels:
+                sid = _resolve(rel["subject"])
+                oid = _resolve(rel["object"])
+                if sid is None or oid is None or sid == oid:
+                    rel_drops["unresolved"] += 1
+                    continue
+                sig = (sid, rel["predicate_iri"], oid)
+                if sig in rel_seen:
+                    continue
+                rel_seen.add(sig)
+                rel_payloads.append({
+                    "source_node_type": "entity",
+                    "source_node_id": sid,
+                    "target_node_type": "entity",
+                    "target_node_id": oid,
+                    "predicate_iri": rel["predicate_iri"],
+                    "predicate_label": _pred_label.get(
+                        rel["predicate_iri"],
+                        rel["predicate_iri"].rsplit("#", 1)[-1],
+                    ),
+                    "relationship_type": rel["predicate_iri"].rsplit("#", 1)[-1],
+                    "relationship_source": "DOCUMENT_EXTRACTION",
+                    "is_authoritative": False,
+                    # Traceability: which chunk asserted it.
+                    "source_chunk_id": chunk_id,
+                    "source_document_id": doc_id,
+                    "source_artifact_id": None,
+                    "graph_version": gv,
+                    "extra_metadata": (
+                        {"confidence": rel["confidence"]}
+                        if rel.get("confidence") is not None else {}
+                    ),
+                })
+
+        # Drop anything the DB already has (idempotent re-runs).
+        if rel_payloads:
+            async with session_scope() as session:
+                existing = await session.execute(
+                    select(
+                        GraphRelationship.source_node_id,
+                        GraphRelationship.predicate_iri,
+                        GraphRelationship.target_node_id,
+                    ).where(
+                        GraphRelationship.source_node_type == "entity",
+                        GraphRelationship.target_node_type == "entity",
+                        GraphRelationship.source_node_id.in_(
+                            [p["source_node_id"] for p in rel_payloads]
+                        ),
+                    )
+                )
+                have = {(s, p, t) for s, p, t in existing.all()}
+            rel_payloads = [
+                p for p in rel_payloads
+                if (p["source_node_id"], p["predicate_iri"],
+                    p["target_node_id"]) not in have
+            ]
+    summary.entity_relationship_edges = len(rel_payloads)
+
     # Type edges: one per minted entity.
     type_edge_payloads = []
     for entity_id, class_id in minted_entity_class_pairs:
@@ -723,6 +959,29 @@ async def extract_entities(
         for i in range(0, len(type_edge_payloads), EDGE_BATCH):
             await session.execute(
                 pg_insert(GraphRelationship).values(type_edge_payloads[i : i + EDGE_BATCH])
+            )
+        for i in range(0, len(rel_payloads), EDGE_BATCH):
+            await session.execute(
+                pg_insert(GraphRelationship).values(rel_payloads[i : i + EDGE_BATCH])
+            )
+
+    if extract_relationships:
+        _dropped = sum(rel_drops.values())
+        print(
+            f"[extract-entities] entity->entity relationships: "
+            f"{len(rel_payloads)} written"
+            + (f", {_dropped} dropped "
+               f"(unresolved={rel_drops['unresolved']}, "
+               f"bad_predicate={rel_drops['bad_predicate']}, "
+               f"domain_range={rel_drops['domain_range']})" if _dropped else "")
+        )
+        if not rel_payloads and summary.chunks_scanned:
+            print(
+                "[extract-entities] NOTE: no relationships written. Either the "
+                "chunks assert none, or the ontology declares no object "
+                "property whose domain AND range both match the classes in "
+                "this corpus -- check with: SELECT count(*) FROM "
+                "graphrag.ontology_object_properties;"
             )
 
     # Phase 2a v2: link StructuredTable artifacts to entities by name. Runs
