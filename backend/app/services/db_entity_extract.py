@@ -427,6 +427,21 @@ async def extract_entities(
 
     router = LLMRouter()
     cost_before = router.total_cost_usd
+    # `relationship_extract` is a NEW models.yaml task. A deployment running an
+    # older config would otherwise raise KeyError once per chunk -- caught, but
+    # 442 identical tracebacks. Check once and degrade to entities-only.
+    if extract_relationships:
+        try:
+            router.task_spec("relationship_extract")
+        except KeyError:
+            print(
+                "[extract-entities] models.yaml has no 'relationship_extract' "
+                "task -- skipping entity->entity relationships. Add it (see "
+                "config/models.example.yaml) or pass --no-relationships to "
+                "silence this."
+            )
+            extract_relationships = False
+
     sem = asyncio.Semaphore(concurrency)
     # (chunk_id, chunk_iri, doc_id, list[entity_dict], list[relationship_dict])
     results: list[

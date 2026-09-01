@@ -775,11 +775,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_ext.add_argument(
         "--no-relationships", action="store_true",
         help=(
-            "Skip entity->entity relationship extraction. Candidate "
-            "predicates come from the ontology's own domain/range and ride "
-            "in the SAME LLM call as entities, so relationships cost "
-            "nothing extra; use this only to reproduce pre-relationship "
-            "behaviour."
+            "Skip entity->entity relationship extraction (a SECOND LLM call "
+            "per chunk, after entities are known so the candidate-predicate "
+            "menu can be narrowed to their actual classes). Measured on 442 "
+            "chunks it is not more expensive than the one-call version -- the "
+            "entity prompt shrinks and the second call is skipped for chunks "
+            "with under two entities or no fitting predicate. Use this only to "
+            "reproduce pre-relationship behaviour."
         ),
     )
     p_ext.set_defaults(func=_cmd_extract_entities)
