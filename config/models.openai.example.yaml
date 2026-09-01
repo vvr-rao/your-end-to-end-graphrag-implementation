@@ -188,6 +188,17 @@ tasks:
     temperature: 0.0
     max_tokens: 8192          # dense chunks w/ many entities (50 candidate classes) exceed 2048 -> truncation
     response_format: json_object
+  # Second pass of Milestone C: relationships between entities already
+  # extracted from a chunk. Separate from entity_extract so the predicate menu
+  # can be narrowed to the entities' ACTUAL classes -- see
+  # db_entity_extract._candidate_predicates. Cheap model: the menu is short and
+  # the output is a small JSON list.
+  relationship_extract:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 120
+    temperature: 0.0
+    max_tokens: 2048
 
   question_parse:
     provider: openai

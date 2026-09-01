@@ -910,7 +910,6 @@ def artifact_chunk_extract(text: str) -> tuple[str, str]:
 def entity_extract(
     chunk_text: str,
     candidate_classes: list[dict[str, str]],
-    candidate_predicates: list[dict[str, str]] | None = None,
 ) -> tuple[str, str]:
     """Phase 2 Milestone C: extract named entities from a chunk.
 
@@ -919,16 +918,8 @@ def entity_extract(
     ontology_classes. The LLM MUST pick a class_iri from this list
     for each entity (caller validates + drops mismatches).
 
-    `candidate_predicates` (optional) is a list of {iri, label, domain_label,
-    range_label} dicts -- object properties whose declared domain AND range
-    both match classes present in this chunk, so every offered predicate is
-    type-valid for these entities by construction. Omitted/empty => the
-    relationships half of the contract is not requested at all, and the prompt
-    is byte-identical to before.
-
     Returns JSON:
-      {entities: [{canonical_name, short_name, class_iri, confidence}],
-       relationships: [{subject, predicate_iri, object, confidence}]}
+      {entities: [{canonical_name, short_name, class_iri, confidence}]}
 
     Corpus-agnostic: works on any domain (legal, financial, science,
     web search). No keyword baked in.
@@ -943,18 +934,6 @@ def entity_extract(
             + (f" ─ {descr_short}" if descr_short else "")
         )
     candidates_block = "\n".join(candidates_block_lines)
-
-    # Relationships are requested ONLY when the caller supplies predicates.
-    # With none offered there is nothing type-valid to assert, and asking for
-    # relationships anyway would invite invented IRIs.
-    preds = candidate_predicates or []
-    pred_lines: list[str] = []
-    for pr in preds:
-        lbl = (pr.get("label") or "(unlabelled)").strip()
-        dom = (pr.get("domain_label") or "?").strip()
-        rng = (pr.get("range_label") or "?").strip()
-        pred_lines.append(f"  - {pr['iri']} \u2500 {lbl}  [{dom} -> {rng}]")
-    pred_block = "\n".join(pred_lines)
 
     system = (
         "You extract NAMED ENTITIES from text chunks. For each entity you find:\n"
@@ -977,49 +956,14 @@ def entity_extract(
         "if the expansion is unambiguous; otherwise use the abbreviation.\n"
         "  - Return ONLY JSON, no preamble, no markdown."
     )
-    if preds:
-        system += (
-            "\n\nALSO extract RELATIONSHIPS between the entities you just "
-            "listed:\n"
-            "  - subject / object: the canonical_name of TWO entities from "
-            "your own entities list. Never a name you did not extract.\n"
-            "  - predicate_iri: copy ONE IRI VERBATIM from the CANDIDATE "
-            "PREDICATES list. Do not invent, abbreviate or reformat it.\n"
-            "  - confidence: float in [0,1].\n\n"
-            "RELATIONSHIP RULES:\n"
-            "  - Each predicate is annotated [Domain -> Range]. The SUBJECT "
-            "must be of the domain class and the OBJECT of the range class. "
-            "A pair that does not fit any offered predicate is simply not "
-            "emitted -- do not force it.\n"
-            "  - Assert ONLY what this chunk actually states. Do not use "
-            "world knowledge, and do not infer a relationship from two names "
-            "merely appearing near each other.\n"
-            "  - Direction matters: emit subject and object the way the text "
-            "asserts them.\n"
-            "  - 0 to 10 relationships per chunk. Returning an empty list is "
-            "the correct answer when the chunk asserts none."
-        )
     user = (
         "CANDIDATE CLASSES (pick class_iri from this list ONLY):\n"
         + candidates_block
-    )
-    if preds:
-        user += (
-            "\n\nCANDIDATE PREDICATES (pick predicate_iri from this list "
-            "ONLY; [Domain -> Range] shows which entity types it connects):\n"
-            + pred_block
-        )
-    user += (
-        "\n\nTEXT CHUNK:\n```\n"
+        + "\n\nTEXT CHUNK:\n```\n"
         + chunk_text
         + "\n```\n\n"
         "Return JSON: {\"entities\": [{\"canonical_name\": ..., "
-        "\"short_name\": ..., \"class_iri\": ..., \"confidence\": ...}]"
-    )
-    user += (
-        ", \"relationships\": [{\"subject\": ..., \"predicate_iri\": ..., "
-        "\"object\": ..., \"confidence\": ...}]}"
-        if preds else "}"
+        "\"short_name\": ..., \"class_iri\": ..., \"confidence\": ...}]}"
     )
     return system, user
 
@@ -1315,6 +1259,77 @@ def document_type_consolidate(labels: list[str]) -> tuple[str, str]:
     user = (
         f"LABELS:\n{listing}\n\n"
         "Return the JSON mapping from each label to its canonical form now."
+    )
+    return system, user
+
+
+def relationship_extract(
+    chunk_text: str,
+    entities: list[dict[str, str]],
+    candidate_predicates: list[dict[str, str]],
+) -> tuple[str, str]:
+    """Phase 2 Milestone C, second pass: relationships between entities ALREADY
+    extracted from this chunk.
+
+    Why a second call rather than one combined request: the predicate menu can
+    only be narrowed to the entities' ACTUAL classes once those entities exist.
+    In the combined version predicates were derived from the chunk's top-50
+    candidate CLASSES, so the model was shown a median of 12 predicates while
+    holding 4-5 entities, most of which no offered predicate fitted -- measured
+    669 of 1,140 proposals rejected on domain/range alone.
+
+    `entities` are {canonical_name, class_label} for this chunk only.
+    `candidate_predicates` are {iri, label, domain_label, range_label} whose
+    domain AND range both match classes those entities actually have.
+
+    Returns JSON:
+      {relationships: [{subject, predicate_iri, object, evidence, confidence}]}
+
+    `evidence` is a VERBATIM span from the chunk. The caller checks it really
+    occurs in the text and drops the relationship otherwise -- narrowing the
+    menu weakens the type check (offer and check now share a basis), so this
+    replaces the protection that removes.
+    """
+    ent_lines = "\n".join(
+        f"  - {e['canonical_name']}  [{e.get('class_label') or '?'}]"
+        for e in entities
+    )
+    pred_lines = "\n".join(
+        f"  - {p['iri']} \u2500 {p.get('label') or '?'}"
+        f"  [{p.get('domain_label') or '?'} -> {p.get('range_label') or '?'}]"
+        for p in candidate_predicates
+    )
+    system = (
+        "You identify RELATIONSHIPS that a passage explicitly asserts between "
+        "entities that have ALREADY been extracted from it. Return ONE JSON "
+        "object and nothing else -- no prose, no markdown fences.\n\n"
+        "For each relationship:\n"
+        "  - subject / object: copy a canonical_name VERBATIM from the ENTITIES "
+        "list. Never introduce a name that is not on that list.\n"
+        "  - predicate_iri: copy ONE IRI VERBATIM from the PREDICATES list. Do "
+        "not invent, abbreviate or reformat it.\n"
+        "  - evidence: the VERBATIM sentence or clause from the passage that "
+        "states this relationship. It must appear in the passage character for "
+        "character. Do not paraphrase.\n"
+        "  - confidence: float in [0,1].\n\n"
+        "RULES THAT MATTER:\n"
+        "  - Assert ONLY what the passage states. Do NOT use world knowledge. "
+        "Two entities appearing near each other is NOT a relationship.\n"
+        "  - If you cannot quote a span that states it, do not emit it.\n"
+        "  - Each predicate shows [Domain -> Range]: the subject must be of the "
+        "domain type and the object of the range type. Respect direction -- "
+        "'A causes B' and 'B causes A' are different claims.\n"
+        "  - RETURNING AN EMPTY LIST IS THE CORRECT ANSWER when the passage "
+        "asserts none of these relationships. Do not force a match merely "
+        "because a predicate is offered.\n"
+        "  - At most 10 relationships."
+    )
+    user = (
+        "ENTITIES (subject/object must come from here):\n" + ent_lines
+        + "\n\nPREDICATES (predicate_iri must come from here):\n" + pred_lines
+        + "\n\nPASSAGE:\n```\n" + chunk_text + "\n```\n\n"
+        'Return JSON: {"relationships": [{"subject": ..., "predicate_iri": ..., '
+        '"object": ..., "evidence": ..., "confidence": ...}]}'
     )
     return system, user
 
@@ -2840,6 +2855,7 @@ PROMPTS = {
     "summary_evaluate": summary_evaluate,
     "summary_revise": summary_revise,
     "entity_extract": entity_extract,
+    "relationship_extract": relationship_extract,
     # Phase 2a — table extraction (vision)
     "table_extract_vision": table_extract_vision,
     # Phase 2a follow-up — table → KG anchor-bucket grouping
