@@ -408,6 +408,15 @@ qa:
   # If even the BEST hit is farther than this, the probe found nothing relevant
   # and contributes no votes at all.
   probe_dist_floor: 1.05
+  # Probe filtering. `probe_rel_band` is the RELATIVE test and takes
+  # precedence when set: drop a probe only if its best hit is worse than the
+  # BEST PROBE IN THIS QUERY plus this band. The old absolute `probe_dist_floor`
+  # could not tell "this probe matched nothing" from "this question is phrased
+  # abstractly" -- measured, five probes for one question spanned 1.0222-1.0973
+  # and the fixed 1.05 discarded four of them. `probe_dist_ceiling` remains as a
+  # loose backstop for when EVERY probe is hopeless.
+  probe_rel_band: 0.10
+  probe_dist_ceiling: 1.25
   # Keep only results within this L2 distance of the probe's own best hit.
   # OFF by default: measured top-30 spread for a relevant probe is only
   # 0.085-0.107, so any band loose enough to be safe is also loose enough to be
@@ -493,6 +502,19 @@ qa:
   # records that the ordering key was the distance, not the score.
   rerank_after_fusion: false
   rerank_pool_multiplier: 3
+  # Entity->entity relationship triples added to the evidence packet.
+  # These BYPASS RRF deliberately: fusion ranks one flat id space (chunk
+  # UUIDs), so a triple has no representation in it -- which is why a graph
+  # holding 14 `defeated` edges still answered "which teams defeated which
+  # other teams" with "no information". 0 disables.
+  max_relationship_evidence: 25
+  # How strictly a triple must sit inside the BFS neighbourhood: "either"
+  # (one endpoint reached) or "both". Measured on "which players signed with
+  # or transferred to new teams": "both" admitted 44 of 132 edges and excluded
+  # every signedWith edge because the club end was never reached; "either"
+  # admits 111 and recovers all three. Safe only because relationship evidence
+  # is RANKED against the question before the cap is applied.
+  relationship_scope: either
 
 # -----------------------------------------------------------------------------
 # Background jobs (arq).

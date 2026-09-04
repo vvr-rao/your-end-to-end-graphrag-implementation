@@ -673,19 +673,42 @@ async def retrieve_and_answer(
     # probes (max_probes) and a smaller candidate set, not concurrency.
     chunk_rankings: list[list[uuid.UUID]] = []
     artifact_rankings: list[list[uuid.UUID]] = []
+    # Score EVERY probe before trimming any: the floor's real question is
+    # "did this probe do worse than its siblings", which is a comparison and
+    # cannot be answered one probe at a time. Trimming inside the loop is what
+    # forced an absolute threshold, and an absolute threshold cannot tell a
+    # probe that matched nothing from a probe whose QUESTION is phrased
+    # abstractly. Measured on "which players signed with or transferred to new
+    # teams": all five probes landed in a 0.075-wide band (1.0222-1.0973) and
+    # the fixed 1.05 cut through the middle of it, discarding four probes that
+    # had found material just as good as the one it kept.
+    _scored: list[tuple[str, list[tuple[uuid.UUID, float]],
+                        list[tuple[uuid.UUID, float]]]] = []
     async with session_scope() as session:
         for probe_text, pvec in zip(probes, probe_vecs, strict=False):
             ranked = await retrieval_sql.vector_rerank_chunks(
                 session, candidate_chunk_ids, pvec, top_k=top_k * 3,
             )
-            chunk_rankings.append(
-                _trim_by_distance(ranked, label=probe_text, verbose=verbose)
-            )
+            ranked_a: list[tuple[uuid.UUID, float]] = []
             if candidate_artifact_ids:
                 ranked_a = await retrieval_sql.vector_rerank_artifacts(
                     session, candidate_artifact_ids, pvec, top_k=top_k,
                 )
-                artifact_rankings.append(_trim_by_distance(ranked_a))
+            _scored.append((probe_text, ranked, ranked_a))
+
+    # Best hit any probe achieved -- the reference point for the relative test.
+    _cohort_best = min(
+        (min(d for _, d in r) for _, r, _ in _scored if r), default=None
+    )
+    for probe_text, ranked, ranked_a in _scored:
+        chunk_rankings.append(
+            _trim_by_distance(ranked, label=probe_text, verbose=verbose,
+                              cohort_best=_cohort_best)
+        )
+        if ranked_a:
+            artifact_rankings.append(
+                _trim_by_distance(ranked_a, cohort_best=_cohort_best)
+            )
 
     # Graph-distance ranking: BFS score per chunk (via its entities). Uses the
     # entity-coverage ranking from step 8, propagated to full-text chunks by the
@@ -830,6 +853,70 @@ async def retrieve_and_answer(
             # retrieval_sql._render_time_span).
             "times": chunk_times.get(cid, ""),
         })
+    # -------- entity -> entity relationships --------
+    #
+    # The third kind of evidence, and the only one not routed through RRF.
+    # Fusion ranks a single flat id space (chunk UUIDs), so a triple cannot
+    # travel through it -- entities were projected to chunks at step 8 and the
+    # relationship was dropped there. Measured consequence: a corpus holding
+    # 14 `defeated`/`advancedOver` edges answered "which teams defeated which
+    # other teams" with "the retrieved evidence contains no information",
+    # because every fact the model can see arrives as chunk prose.
+    #
+    # These are appended, not fused: the edges are already scoped to the
+    # entities BFS reached, and each carries the verbatim quote that
+    # extraction verified, so they are evidence in their own right rather
+    # than candidates competing with passages.
+    _rel_cap = max(0, int(_qa_cfg("max_relationship_evidence", 25)))
+    rel_evidence: list[dict[str, Any]] = []
+    if _rel_cap > 0 and expanded_entity_ids:
+        async with session_scope() as session:
+            # Fetch WIDE, then rank against the question and cut. Fetching
+            # straight to the cap ordered by (support, subject name) meant the
+            # cut was alphabetical and question-blind: on "which players signed
+            # with or transferred to new teams" the three `signedWith` edges
+            # sat at positions 8/45/68 of 132, so a cap of 25 kept one and
+            # discarded two, filling the packet with `marriedTo` pairs that
+            # happened to have higher support and earlier subject names.
+            _rel_pool = await retrieval_sql.fetch_relationships_among_entities(
+                session, expanded_entity_ids, limit=max(_rel_cap * 8, 200),
+                scope=str(_qa_cfg("relationship_scope", "either")),
+            )
+        rel_evidence = _rank_relationships(
+            _rel_pool, resolved_query, question_terms=parsed.get("classes") or [],
+        )[:_rel_cap]
+    for rank, rel in enumerate(rel_evidence, start=1):
+        # Rendered as a sentence rather than a raw triple: the synthesis
+        # prompt reads `text` for every evidence kind, and "Chelsea defeated
+        # Newcastle United" is what the model needs to be able to quote.
+        _stmt = f"{rel['subject']} {rel['predicate']} {rel['object']}."
+        if rel.get("evidence"):
+            _stmt += f" (source text: \"{rel['evidence']}\")"
+        evidence.append({
+            "kind": "relationship",
+            # No primary key is exposed: these are not persisted as
+            # retrieval_evidence rows (that table keys on chunk/artifact ids),
+            # so node_id stays None and the IRI is synthesised for citation.
+            "node_id": None,
+            "iri": (
+                "https://veerla-ramrao.ai/ontology/intelligence-artifact"
+                f"#Relationship_{rank:04d}"
+            ),
+            "rank": rank + len(fused_chunks) + len(fused_artifacts),
+            "score": float(rel.get("support") or 1),
+            "text": _stmt,
+            "entities": [rel["subject"], rel["object"]],
+        })
+    if verbose and rel_evidence:
+        # Report the POOL too: a packet full of the wrong triples and a packet
+        # drawn from a pool that never contained the right ones look identical
+        # from the outside, and they need opposite fixes (ranking vs seeding).
+        print(
+            f"[query] graph relationships added: {len(rel_evidence)} of "
+            f"{len(_rel_pool)} edge(s) among the {len(expanded_entity_ids)} "
+            f"entities BFS reached"
+        )
+
     for rank, (aid, score) in enumerate(fused_artifacts, start=1):
         info = artifact_rows.get(aid)
         if info is None:
@@ -1215,11 +1302,87 @@ async def _query_decompose(router: LLMRouter, q: str) -> list[str]:
     return [s for s in sqs if isinstance(s, str) and s.strip()]
 
 
+_REL_STOPWORDS = frozenset({
+    "which", "what", "who", "whom", "whose", "when", "where", "how", "why",
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "at", "for",
+    "with", "by", "from", "is", "are", "was", "were", "be", "been", "do",
+    "does", "did", "have", "has", "had", "that", "this", "these", "those",
+    "also", "their", "there", "they", "it", "its", "any", "all", "new",
+    "other", "more", "most", "some", "each", "both", "about", "into",
+})
+
+
+def _rank_relationships(
+    rels: list[dict[str, Any]],
+    question: str,
+    *,
+    question_terms: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Order triples by how much they look like an answer to THIS question.
+
+    Free -- no embedding call, no LLM. The signal that matters is lexical
+    overlap with the predicate and the endpoint names, because a predicate
+    label is a verb phrase drawn from the same vocabulary the question uses:
+    "which players SIGNED WITH new teams" against `signedWith`.
+
+    Ties break on support count, so a relationship several passages assert
+    still outranks a one-off at equal relevance. Everything is kept and
+    merely reordered -- the caller applies the cap -- so a question with no
+    lexical hook degrades to the old support-first ordering rather than to an
+    empty list.
+    """
+    if not rels:
+        return []
+
+    def _toks(s: str) -> set[str]:
+        # Predicate labels arrive in both shapes -- `signedWith` from the
+        # minted IRI fragment and "signed with" from the ontology label -- so
+        # camelCase must be split or the question word "signed" never meets
+        # the predicate it names.
+        s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", s or "")
+        return {
+            t for t in re.split(r"[^a-z0-9]+", s.lower())
+            if len(t) > 2 and t not in _REL_STOPWORDS
+        }
+
+    def _stem(t: str) -> str:
+        """Crude suffix stripping, applied in a FIXED order so both sides of
+        the comparison land on the same string. Order matters: handling only
+        one suffix each made "acquired" -> "acquir" but "acquires" ->
+        "acquire", which then failed to match."""
+        if t.endswith("s") and not t.endswith("ss"):
+            t = t[:-1]
+        if t.endswith("ing"):
+            t = t[:-3]
+        elif t.endswith("ed"):
+            t = t[:-2]
+        if len(t) > 3 and t.endswith("e"):
+            t = t[:-1]
+        return t
+
+    q = _toks(question) | {t for term in (question_terms or [])
+                           for t in _toks(term)}
+    # Stems, so "signed"/"signings" reach `signedWith` and "acquired" reaches
+    # `acquires`. Cheap, dependency-free, and enough for verb-phrase labels.
+    q_stem = {_stem(t) for t in q}
+
+    def _score(rel: dict[str, Any]) -> tuple[float, int]:
+        pred_s = {_stem(t) for t in _toks(rel.get("predicate") or "")}
+        ends_t = _toks(rel.get("subject") or "") | _toks(rel.get("object") or "")
+        # The predicate is what the question is ASKING FOR, so it counts far
+        # more than an incidental name collision in the endpoints.
+        s = 3.0 * len(pred_s & q_stem) + 1.0 * len(ends_t & q)
+        return (s, int(rel.get("support") or 1))
+
+    return sorted(rels, key=_score, reverse=True)
+
+
 def _trim_by_distance(
     ranked: list[tuple[uuid.UUID, float]],
     *,
     label: str | None = None,
     verbose: bool = False,
+    cohort_best: float | None = None,
 ) -> list[uuid.UUID]:
     """Drop a probe's weak tail before RRF sees it.
 
@@ -1244,11 +1407,41 @@ def _trim_by_distance(
         return []
     floor = _qa_cfg("probe_dist_floor", None)
     band = _qa_cfg("probe_dist_band", None)
-    if floor is None and band is None:
+    rel_band = _qa_cfg("probe_rel_band", None)
+    if floor is None and band is None and rel_band is None:
         return [cid for cid, _ in ranked]
 
     best = min(dist for _, dist in ranked)
-    if floor is not None and best > float(floor):
+
+    # RELATIVE test, preferred when configured and a cohort best is known.
+    # This is the comparison the absolute floor was reaching for: a probe that
+    # genuinely found nothing sits far behind its siblings, while a probe
+    # answering an abstractly-phrased question sits right next to them. On the
+    # measured failure the five probes spanned 1.0222-1.0973, so a +0.10 band
+    # keeps all five, whereas the original tirzepatide case -- one probe with
+    # no match among probes with real hits -- still lands outside it and
+    # abstains, which is the behaviour worth keeping.
+    if rel_band is not None and cohort_best is not None:
+        cutoff = float(cohort_best) + float(rel_band)
+        if best > cutoff:
+            if verbose:
+                print(
+                    f"[query] probe dropped (best {best:.4f} > cohort best "
+                    f"{cohort_best:.4f} + {float(rel_band):.2f}): {label!r}"
+                )
+            return []
+        # `probe_dist_floor` degrades to a loose sanity ceiling: it still
+        # catches the case where EVERY probe is hopeless, without slicing
+        # through a tight cluster of equally-good ones.
+        ceiling = _qa_cfg("probe_dist_ceiling", None)
+        if ceiling is not None and best > float(ceiling):
+            if verbose:
+                print(
+                    f"[query] probe dropped (best {best:.4f} > ceiling "
+                    f"{float(ceiling):.2f}): {label!r}"
+                )
+            return []
+    elif floor is not None and best > float(floor):
         if verbose:
             print(
                 f"[query] probe dropped (best dist {best:.4f} > floor "

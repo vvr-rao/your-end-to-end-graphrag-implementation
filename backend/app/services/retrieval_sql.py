@@ -101,6 +101,91 @@ async def bfs_expand(
     return out
 
 
+async def fetch_relationships_among_entities(
+    session: AsyncSession,
+    entity_ids: list[uuid.UUID],
+    *,
+    limit: int = 40,
+    scope: str = "either",
+) -> list[dict[str, Any]]:
+    """The entity -> entity edges BFS reached, rendered as readable triples.
+
+    WHY THIS EXISTS. Until now the graph could only influence an answer
+    INDIRECTLY: BFS expanded to entities, step 8 projected those entities down
+    to chunks, and RRF fused chunk-id lists. The relationship itself was
+    discarded at the projection -- `rrf_fuse` takes `list[list[UUID]]`, a
+    single flat id space, so a triple has no representation there. The
+    consequence was measurable: on a 60-doc corpus holding 14 defeated /
+    advancedOver edges, "which teams defeated which other teams" answered
+    "the retrieved evidence contains no information", because the model is
+    shown only chunk text and no chunk states the full picture.
+
+    So this deliberately BYPASSES fusion. Triples are not ranked against
+    chunks -- they are a different kind of thing, and forcing them into one
+    ranked list is what lost them. They are fetched for the entities BFS
+    already found and appended to the evidence packet directly.
+
+    `scope` decides how strictly an edge must sit inside the neighbourhood:
+
+      "both"   -- both endpoints reached by BFS. Safe but lossy: measured on
+                  "which players signed with or transferred to new teams",
+                  only 44 of 132 edges qualified and all three `signedWith`
+                  edges were excluded because one endpoint (the club) was not
+                  reached, so the question was answered "no information" while
+                  the exact facts sat in the graph.
+      "either" -- one endpoint suffices; the same question then sees 111 of
+                  132 and recovers all three. This is only safe because the
+                  caller RANKS by relevance before capping -- with the old
+                  question-blind cut a wider pool would just have admitted
+                  more noise.
+
+    Ordering is support-first here; the caller re-ranks against the question.
+    """
+    if not entity_ids:
+        return []
+    _match = (
+        "(gr.source_node_id = ANY(CAST(:ids AS uuid[]))"
+        " OR gr.target_node_id = ANY(CAST(:ids AS uuid[])))"
+        if scope == "either" else
+        "gr.source_node_id = ANY(CAST(:ids AS uuid[]))"
+        " AND gr.target_node_id = ANY(CAST(:ids AS uuid[]))"
+    )
+    result = await session.execute(
+        sql_text("""
+        SELECT s.name AS subject,
+               coalesce(p.label, split_part(gr.predicate_iri, '#', 2)) AS predicate,
+               o.name AS object,
+               gr.extra_metadata ->> 'evidence' AS evidence,
+               coalesce((gr.extra_metadata ->> 'support_count')::int, 1) AS support,
+               gr.predicate_iri
+          FROM graphrag.graph_relationships gr
+          JOIN graphrag.entities s ON s.id = gr.source_node_id
+          JOIN graphrag.entities o ON o.id = gr.target_node_id
+          LEFT JOIN graphrag.ontology_object_properties p
+                 ON p.iri = gr.predicate_iri
+         WHERE gr.source_node_type = 'entity'
+           AND gr.target_node_type = 'entity'
+           AND __MATCH__
+         ORDER BY support DESC, s.name
+         LIMIT :limit
+        """.replace("__MATCH__", _match)),
+        {"ids": [str(e) for e in entity_ids], "limit": limit},
+    )
+    out: list[dict[str, Any]] = []
+    for subj, pred, obj, ev, support, pred_iri in result.all():
+        if not subj or not obj:
+            continue
+        out.append({
+            "subject": subj,
+            "predicate": pred or "related to",
+            "object": obj,
+            "evidence": (ev or "").strip(),
+            "support": support,
+            "predicate_iri": pred_iri,
+        })
+    return out
+
+
 async def fetch_candidate_chunks_for_entities(
     session: AsyncSession,
     entity_ids: list[uuid.UUID],
