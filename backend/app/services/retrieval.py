@@ -889,9 +889,22 @@ async def retrieve_and_answer(
         # Rendered as a sentence rather than a raw triple: the synthesis
         # prompt reads `text` for every evidence kind, and "Chelsea defeated
         # Newcastle United" is what the model needs to be able to quote.
+        # The claim first, then the quote clearly marked as SUPPORT for that
+        # claim alone. Measured failure: the triple
+        # `Windfield Holdings --subsidiaryOf--> Albemarle Corporation` carried
+        # the honest quote "Windfield Holdings: Australian mining company,
+        # subsidiary of Albemarle; registered office ... Perth", and the answer
+        # reported Perth as ALBEMARLE's headquarters -- it is Charlotte, North
+        # Carolina, on the 10-K cover. A correct edge with an honest quote
+        # produced a confidently wrong, cited answer, because the quote carries
+        # detail about one endpoint only.
         _stmt = f"{rel['subject']} {rel['predicate']} {rel['object']}."
-        if rel.get("evidence"):
-            _stmt += f" (source text: \"{rel['evidence']}\")"
+        _ev = _trim_quote_to_claim(
+            rel.get("evidence") or "", rel["subject"], rel["object"])
+        if _ev:
+            _stmt += (f" [supporting quote for THAT relationship only; any "
+                      f"other detail in it belongs to whichever one it names, "
+                      f"not to both: \"{_ev}\"]")
         evidence.append({
             "kind": "relationship",
             # No primary key is exposed: these are not persisted as
@@ -905,7 +918,13 @@ async def retrieve_and_answer(
             "rank": rank + len(fused_chunks) + len(fused_artifacts),
             "score": float(rel.get("support") or 1),
             "text": _stmt,
-            "entities": [rel["subject"], rel["object"]],
+            # Deliberately NOT tagged with its endpoints. `_format_evidence_block`
+            # renders `entities` as "about: X, Y", and the attribution rule says
+            # a property stated in an item belongs to that item's entities --
+            # which, for a relationship, reads as permission to attribute
+            # anything in the quote to BOTH ends. That is exactly how Perth
+            # (Windfield's registered office) was reported as Albemarle's
+            # headquarters. The endpoints are already named in the sentence.
         })
     if verbose and rel_evidence:
         # Report the POOL too: a packet full of the wrong triples and a packet
@@ -1414,6 +1433,94 @@ _REL_STOPWORDS = frozenset({
     "also", "their", "there", "they", "it", "its", "any", "all", "new",
     "other", "more", "most", "some", "each", "both", "about", "into",
 })
+
+
+def _trim_quote_to_claim(quote: str, subject: str, object_: str) -> str:
+    """Cut a supporting quote down to the span that actually asserts the claim.
+
+    A prompt rule was tried first and did NOT hold: told that the quote proves
+    only the stated relationship, the model still reported Perth -- the
+    registered office of Windfield Holdings -- as the headquarters of
+    Albemarle Corporation, because both names and one address sat in the same
+    sentence. An instruction competes poorly with a fact in plain text beside
+    the entity name, so the fix is to stop shipping the fact.
+
+    Keeps from the first endpoint mention to the end of the clause containing
+    the last one, dropping trailing clauses that belong to only one side
+    ("...; registered office at Level 15, ... Perth"). Nothing is lost from
+    the SYSTEM: every relationship quote is a verbatim substring of a chunk by
+    construction (extraction rejects one that is not), so the full sentence
+    remains available through chunk evidence and in extra_metadata for audit.
+
+    Falls back to the untrimmed quote whenever the span cannot be located --
+    a shorter-but-wrong quote would be worse than the original problem.
+    """
+    q = " ".join((quote or "").split())
+    if not q:
+        return ""
+
+    # Corporate boilerplate is shared by half the names in a filing and must
+    # never be what locates an endpoint.
+    _NOISE = {"co", "ltd", "inc", "corp", "corporation", "company", "limited",
+              "plc", "llc", "pty", "gmbh", "holdings", "group", "the", "and"}
+
+    def _key_tokens(name: str, other: str) -> list[str]:
+        """Tokens that identify `name` and do NOT also occur in `other`.
+
+        Without the exclusion, "Samsung Electronics Co., Ltd." and "Samsung
+        SDI Co., Ltd." both resolve to the first "Samsung" in the quote, the
+        span collapses to nothing, and the claim is destroyed.
+        """
+        other_t = {t.lower() for t in re.split(r"[^\w]+", other or "")}
+        toks = [t for t in re.split(r"[^\w]+", name or "")
+                if len(t) > 1 and t.lower() not in _NOISE]
+        distinctive = [t for t in toks if t.lower() not in other_t]
+        return sorted(distinctive or toks, key=len, reverse=True)
+
+    def _find(name: str, other: str) -> int:
+        for t in _key_tokens(name, other):
+            i = q.lower().find(t.lower())
+            if i >= 0:
+                return i
+        return -1
+
+    i_s, i_o = _find(subject, object_), _find(object_, subject)
+    if i_s < 0 or i_o < 0:
+        return q                      # cannot locate both -- keep as-is
+    start, last = min(i_s, i_o), max(i_s, i_o)
+    # Extend past the later endpoint to the next CLAUSE boundary. Only ';' and
+    # ':' are used: a full stop is unreliable here because "Co.", "Ltd." and
+    # "Inc." end in one, and splitting on those truncated a claim mid-sentence.
+    tail = q[last:]
+    m = re.search(r"[;:]", tail)
+    end = last + (m.start() if m else len(tail))
+    while start > 0 and q[start - 1].isalnum():
+        start -= 1
+    # The distinctive token may sit mid-name ("Electronics" inside "Samsung
+    # Electronics Co., Ltd."), which would open the quote on a fragment. Walk
+    # back over immediately preceding words that belong to either endpoint's
+    # name so the quote starts on a whole name.
+    _name_words = {
+        t.lower()
+        for n in (subject, object_)
+        for t in re.split(r"[^\w]+", n or "") if t
+    }
+    for _ in range(4):
+        head = q[:start].rstrip()
+        m_prev = re.search(r"([\w&]+)\W*$", head)
+        if not m_prev or m_prev.group(1).lower() not in _name_words:
+            break
+        start = m_prev.start(1)
+    trimmed = q[start:end].strip(" ,;:")
+    # A trim that lost either endpoint is worse than no trim at all.
+    low = trimmed.lower()
+    keeps_both = (
+        any(t.lower() in low for t in _key_tokens(subject, object_))
+        and any(t.lower() in low for t in _key_tokens(object_, subject))
+    )
+    if len(trimmed) < 12 or not keeps_both:
+        return q
+    return trimmed
 
 
 def _rank_relationships(

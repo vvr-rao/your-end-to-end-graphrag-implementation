@@ -1824,7 +1824,14 @@ _ATTRIBUTION_RULE = (
     "states are the same thing -- treat those as one entity, and prefer "
     "the name the question used when you write the answer. Two names NOT "
     "listed there are different entities unless an evidence item shows "
-    "them together; never assume it."
+    "them together; never assume it.\n"
+    "  - A [relationship] item asserts ONE fact: the sentence before its "
+    "supporting quote. The quote is shown so you can verify THAT fact, and "
+    "it often carries extra detail belonging to only one of the two named "
+    "things. Never lift such a detail onto the other one. A quote reading "
+    "\"B: an Australian company, subsidiary of A; registered office in "
+    "Perth\" establishes that B is a subsidiary of A -- it says nothing "
+    "whatsoever about where A is located."
 )
 
 

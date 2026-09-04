@@ -149,7 +149,7 @@ def test_triple_renders_as_a_sentence_with_its_source_quote() -> None:
 
     src = inspect.getsource(retrieval.retrieve_and_answer)
     assert "rel['subject']} {rel['predicate']} {rel['object']}" in src
-    assert "source text:" in src
+    assert "supporting quote" in src
 
 
 def test_evidence_block_renders_a_relationship_item() -> None:
@@ -295,3 +295,127 @@ def test_probes_are_scored_before_any_is_trimmed() -> None:
         "trimming must not happen inside the per-probe scoring loop"
     )
     assert "_cohort_best" in src
+
+
+# --------------------------------------------------------------------------- #
+# Attribution leakage from a relationship's supporting quote
+#
+# The worst failure shape a RAG system has: a CORRECT edge carrying an HONEST
+# quote produced a confidently wrong, cited answer.
+#
+#   triple:  Windfield Holdings Pty Ltd --subsidiaryOf--> Albemarle Corporation
+#   quote:   "Windfield Holdings Pty Ltd: Australian mining and exploration
+#             company, subsidiary of Albemarle; registered office at Level 15,
+#             216 St Georges Terrace, Perth..."
+#   answer:  "Albemarle Corporation is ... headquartered at Level 15, 216 St
+#             Georges Terrace, Perth" -- it is Charlotte, North Carolina, on
+#             the 10-K cover page.
+#
+# Two causes, both in the rendering rather than the graph: the quote carries
+# detail about ONE endpoint, and the item was tagged `entities: [subject,
+# object]`, which `_format_evidence_block` renders as "about: X, Y" -- and the
+# attribution rule says a property stated in an item belongs to that item's
+# entities. That is permission to put Perth on Albemarle.
+# --------------------------------------------------------------------------- #
+
+
+def test_relationship_items_are_not_tagged_with_both_endpoints() -> None:
+    """`about: X, Y` on a relationship licenses attributing anything in the
+    quote to BOTH ends. The endpoints are already named in the sentence."""
+    import inspect
+
+    from backend.app.services import retrieval
+
+    src = inspect.getsource(retrieval.retrieve_and_answer)
+    rel_block = src.split('"kind": "relationship"', 1)[1][:1400]
+    assert '"entities": [rel["subject"], rel["object"]]' not in rel_block
+
+
+def test_supporting_quote_is_scoped_to_its_own_claim() -> None:
+    import inspect
+
+    from backend.app.services import retrieval
+
+    src = inspect.getsource(retrieval.retrieve_and_answer)
+    assert "supporting quote for THAT relationship only" in src
+    assert "not to both" in src
+
+
+def test_attribution_rule_covers_relationship_quotes() -> None:
+    from backend.app.services.prompts import _ATTRIBUTION_RULE
+
+    assert "[relationship] item asserts ONE fact" in _ATTRIBUTION_RULE
+    assert "Never lift such a detail onto the other one" in _ATTRIBUTION_RULE
+    # Keeps the concrete counter-example, which is what makes the rule land.
+    assert "Perth" in _ATTRIBUTION_RULE
+
+
+def test_relationship_block_renders_without_an_about_tag() -> None:
+    """End of the chain: the rendered line must not claim the item is ABOUT
+    both entities."""
+    from backend.app.services.prompts import _format_evidence_block
+
+    block = _format_evidence_block([{
+        "kind": "relationship",
+        "iri": "https://veerla-ramrao.ai/ontology/intelligence-artifact"
+               "#Relationship_0016",
+        "text": 'Windfield Holdings Pty Ltd subsidiaryOf Albemarle Corporation.',
+    }])
+    assert "about:" not in block
+    assert "viao:Relationship_0016" in block
+
+
+def test_trim_removes_a_detail_belonging_to_one_endpoint() -> None:
+    """THE FIX. A prompt rule was tried first and did not hold -- the model
+    still reported Windfield's Perth office as Albemarle's headquarters."""
+    from backend.app.services.retrieval import _trim_quote_to_claim
+
+    out = _trim_quote_to_claim(
+        "Windfield Holdings Pty Ltd: Australian mining and exploration "
+        "company, subsidiary of Albemarle; registered office at Level 15, "
+        "216 St Georges Terrace, Perth, Western Australia 6000",
+        "Windfield Holdings Pty Ltd", "Albemarle Corporation",
+    )
+    assert "Perth" not in out
+    assert "subsidiary of Albemarle" in out
+
+
+def test_trim_keeps_the_asserting_verb_phrase() -> None:
+    """Shared name tokens broke the first attempt: both endpoints resolved to
+    the same "Samsung" and the claim collapsed to "Samsung Electronics Co., Ltd"."""
+    from backend.app.services.retrieval import _trim_quote_to_claim
+
+    out = _trim_quote_to_claim(
+        "Samsung Electronics Co., Ltd. (SEC) and its subsidiaries have "
+        "significant influence over Samsung SDI Co., Ltd.",
+        "Samsung Electronics Co., Ltd.", "Samsung SDI Co., Ltd.",
+    )
+    assert "significant influence" in out
+    assert "SDI" in out
+
+
+def test_trim_does_not_split_on_a_corporate_abbreviation() -> None:
+    """'Co.' / 'Ltd.' / 'Inc.' end in a full stop, so sentence-splitting on
+    '.' truncated claims mid-sentence."""
+    from backend.app.services.retrieval import _trim_quote_to_claim
+
+    out = _trim_quote_to_claim(
+        "Acme Co. Ltd. supplies batteries to Beta Inc. under a long contract",
+        "Acme Co. Ltd.", "Beta Inc.",
+    )
+    assert "supplies batteries" in out
+
+
+def test_trim_is_a_no_op_when_the_quote_is_already_tight() -> None:
+    from backend.app.services.retrieval import _trim_quote_to_claim
+
+    q = "Mozilla financially backs Mammoth, a third-party Mastodon app maker."
+    assert _trim_quote_to_claim(q, "Mozilla", "Mammoth") == q
+
+
+def test_trim_falls_back_to_the_original_when_an_endpoint_is_unlocatable() -> None:
+    """A shorter-but-wrong quote is worse than the original problem."""
+    from backend.app.services.retrieval import _trim_quote_to_claim
+
+    q = "The parties entered into an agreement in 2024."
+    assert _trim_quote_to_claim(q, "Acme", "Beta") == q
