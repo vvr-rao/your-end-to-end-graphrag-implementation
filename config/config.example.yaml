@@ -515,6 +515,17 @@ qa:
   # admits 111 and recovers all three. Safe only because relationship evidence
   # is RANKED against the question before the cap is applied.
   relationship_scope: either
+  # Class matching: how far DOWN the subClassOf taxonomy a matched class
+  # expands, and the cap on classes that descent may add. A question naming a
+  # general category ("players") must reach the specific classes its instances
+  # carry -- measured, `Player` matched but `BaseballPlayer` did not, and the
+  # relevant entities are typed with the latter, so the match was inert.
+  class_descend_depth: 3
+  class_descend_cap: 400
+  # Classes kept per parsed class term by the lexical/head-noun match.
+  # "player" -> BaseballPlayer, NFLPlayer, AFLWPlayer ... shortest first, so
+  # the plain category wins before its qualified compounds.
+  class_lexical_per_term: 25
 
 # -----------------------------------------------------------------------------
 # Background jobs (arq).

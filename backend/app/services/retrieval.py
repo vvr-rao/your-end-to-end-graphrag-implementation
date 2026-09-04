@@ -1201,6 +1201,110 @@ async def _ontology_match(
             )
             seeds.append((cid, "ontology_class"))
 
+        # LEXICAL match on the parser's own class terms.
+        #
+        # The vector pass above compares the WHOLE QUESTION against class
+        # labels and keeps 30 of 3,003 -- and `parsed["classes"]` was never
+        # consumed at all, though the parser has been producing it all along.
+        # Measured consequence: "which players signed with or transferred to
+        # new teams" selected BaseballSigning, BaseballTrade and BaseballAgent
+        # but NOT BaseballPlayer or BaseballTeam, the classes the relevant
+        # entities are actually typed as, so BFS never entered that part of
+        # the graph.
+        #
+        # Entity matching has done trigram-on-term since the start; classes
+        # simply never got the same treatment. Plurals are stripped because
+        # questions say "players" while a taxonomy says "Player".
+        _seen_class_ids = {c["id"] for c in matched_classes}
+        for term in (parsed.get("classes") or [])[:8]:
+            term = (term or "").strip()
+            if len(term) < 3:
+                continue
+            variants = {term}
+            if term.lower().endswith("ies"):
+                variants.add(term[:-3] + "y")
+            if term.lower().endswith("s"):
+                variants.add(term[:-1])
+            for variant in variants:
+                # HEAD-NOUN matching does the work here. Ontology class names
+                # are `<Qualifier><HeadNoun>` compounds and the head noun IS
+                # the category: BaseballPlayer, NFLPlayer, AFLWPlayer all end
+                # in "Player". Trigram alone scores BaseballPlayer vs "player"
+                # around 0.45 -- below any threshold safe enough to use -- and
+                # descent cannot help because this ontology puts `Player`
+                # under Organization while `BaseballPlayer` sits under Person,
+                # so the two are in different branches entirely.
+                r = await session.execute(
+                    sql_text("""
+                    SELECT id, iri, label,
+                           similarity(lower(label), lower(:t)) AS sim
+                      FROM graphrag.ontology_classes
+                     WHERE label IS NOT NULL
+                       AND (lower(label) = lower(:t)
+                            OR lower(label) LIKE '%' || lower(:t)
+                            OR similarity(lower(label), lower(:t)) >= 0.55)
+                     ORDER BY (lower(label) = lower(:t)) DESC,
+                              length(label), sim DESC
+                     LIMIT :per_term
+                    """),
+                    {"t": variant,
+                     "per_term": int(_qa_cfg("class_lexical_per_term", 25))},
+                )
+                for cid, iri, label, sim in r.all():
+                    if cid in _seen_class_ids:
+                        continue
+                    _seen_class_ids.add(cid)
+                    matched_classes.append({
+                        "id": cid, "iri": iri, "label": label or "",
+                        "dist": 1.0 - float(sim), "via": "lexical",
+                    })
+                    seeds.append((cid, "ontology_class"))
+
+        # DESCEND the taxonomy from every matched class.
+        #
+        # A question naming a general category ("players") should reach the
+        # specific classes its instances actually carry. `Player` WAS matched
+        # above; `BaseballPlayer` was not, and entities are typed with the
+        # latter -- so without this the match is inert. Ancestors were already
+        # implicitly available through BFS; descendants were not, because
+        # `rdfs:subClassOf` points upward and BFS starts from the general
+        # class, not the specific one.
+        if _seen_class_ids:
+            r = await session.execute(
+                sql_text("""
+                WITH RECURSIVE down(id, depth) AS (
+                    SELECT oc.id, 0 FROM graphrag.ontology_classes oc
+                     WHERE oc.id = ANY(CAST(:ids AS uuid[]))
+                  UNION
+                    SELECT gr.source_node_id, down.depth + 1
+                      FROM down
+                      JOIN graphrag.graph_relationships gr
+                        ON gr.target_node_id = down.id
+                       AND gr.source_node_type = 'ontology_class'
+                       AND gr.target_node_type = 'ontology_class'
+                       AND gr.predicate_label = 'rdfs:subClassOf'
+                     WHERE down.depth < :max_depth
+                )
+                SELECT DISTINCT oc.id, oc.iri, oc.label
+                  FROM down JOIN graphrag.ontology_classes oc ON oc.id = down.id
+                 LIMIT :cap
+                """),
+                {
+                    "ids": [str(c) for c in _seen_class_ids],
+                    "max_depth": int(_qa_cfg("class_descend_depth", 3)),
+                    "cap": int(_qa_cfg("class_descend_cap", 400)),
+                },
+            )
+            for cid, iri, label in r.all():
+                if cid in _seen_class_ids:
+                    continue
+                _seen_class_ids.add(cid)
+                matched_classes.append({
+                    "id": cid, "iri": iri, "label": label or "",
+                    "dist": 1.0, "via": "descend",
+                })
+                seeds.append((cid, "ontology_class"))
+
         # Vector + trgm entity match per parsed entity term. Mined aliases
         # are matched alongside the question's own wording, so a graph
         # entity minted as "MOUNJARO" is seeded by a question that only
