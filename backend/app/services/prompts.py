@@ -347,6 +347,28 @@ def class_identification_and_expansion(
         "DATA_CLASSES, OR (b) as a LABEL in your own MATCH NOT FOUND list. "
         "If a relation references a concept that is not in DATA_CLASSES, "
         "you MUST propose that concept as a MATCH NOT FOUND class first.\n"
+        "  - RELATION DOMAIN/RANGE MUST BE AS GENERAL AS THE RELATION "
+        "TRULY IS -- this is the single most common mistake. Pick the MOST "
+        "ABSTRACT class for which the relation still holds, NOT the specific "
+        "class from the sentence in front of you. A relation is a reusable "
+        "part of the vocabulary; typed too narrowly it can never apply to "
+        "anything else and is dead on arrival.\n"
+        "      WRONG: acquires [DOMAIN=MusicLabel, RANGE=MusicRightsAcquisition] "
+        "-- derived from one music-industry sentence, so it can never express "
+        "'Google acquired DeepMind'.\n"
+        "      RIGHT: acquires [DOMAIN=Organization, RANGE=Organization].\n"
+        "      WRONG: backs [DOMAIN=Mozilla, RANGE=Mammoth] -- a type "
+        "signature naming two specific companies matches exactly one pair in "
+        "the world.\n"
+        "      RIGHT: backs [DOMAIN=Organization, RANGE=Organization].\n"
+        "      Ask: 'could two OTHER things of this kind stand in this "
+        "relation?' If yes, name that kind. Prefer broad classes such as "
+        "Organization, Person, Agent, Product, Place, Event over any narrow "
+        "subtype, unless the relation is genuinely meaningless for the "
+        "broader class.\n"
+        "  - NEVER use a NAMED INDIVIDUAL as a DOMAIN or RANGE. 'Mozilla', "
+        "'OpenAI' and 'Meta' are instances of Organization, not classes. If "
+        "you need one as a relation endpoint, use its TYPE.\n"
         "  - When the chunk introduces multiple concepts whose labels share "
         "a common stem or topic (e.g. 'helium', 'helium market', 'helium "
         "supply', 'helium price'; or 'BMW', 'Honda', 'Hyundai' as siblings "
@@ -449,8 +471,27 @@ def match_dedup(
         "       - Plural/singular and tense variants of relation labels.\n"
         "  3. From MATCH NOT FOUND RELATIONS, collapse entries that propose "
         "the same relation (same LABEL + same DOMAIN + same RANGE, or "
-        "trivially-paraphrased verb labels) into a single entry. Different "
-        "DOMAIN/RANGE pairs are NOT duplicates even with the same LABEL.\n"
+        "trivially-paraphrased verb labels) into a single entry.\n"
+        "     3a. GENERALISE THE ENDPOINTS while collapsing. Each proposal was "
+        "written from ONE sentence, so its DOMAIN/RANGE are usually far too "
+        "narrow to reuse -- and a relation that cannot be reused is dead "
+        "vocabulary. Measured on a real run, 77%% of minted relations were "
+        "unusable for exactly this reason. So:\n"
+        "         - Entries sharing a LABEL but differing only in how specific "
+        "their endpoints are ARE duplicates: collapse them to ONE entry whose "
+        "DOMAIN/RANGE are the most general classes for which the relation "
+        "still holds (e.g. acquires[MusicLabel -> MusicRightsAcquisition] and "
+        "acquires[TechCompany -> AIStartup] collapse to "
+        "acquires[Organization -> Organization]).\n"
+        "         - Even a LONE entry must be widened if its endpoints are "
+        "narrower than the relation truly is. backs[Mozilla -> Mammoth] "
+        "becomes backs[Organization -> Organization].\n"
+        "         - NEVER leave a named individual ('Mozilla', 'OpenAI') as an "
+        "endpoint; replace it with its type.\n"
+        "         - Keep endpoints narrow ONLY where the relation is genuinely "
+        "meaningless for the broader class.\n"
+        "     Two relations with the SAME label that mean genuinely DIFFERENT "
+        "things are still separate entries.\n"
         "  4. COMMON-PARENT INFERENCE (narrowly scoped exception to "
         "'do not add entries'): if you see THREE OR MORE proposed classes "
         "in MATCH NOT FOUND that obviously share a common parent (e.g. "
@@ -1263,6 +1304,146 @@ def document_type_consolidate(labels: list[str]) -> tuple[str, str]:
     return system, user
 
 
+# Catch-all predicates from the upstream vocabularies. These are TRUE of
+# almost any two co-mentioned entities, which is exactly why a model reaches
+# for them when nothing specific fits -- they are demoted in the prompt rather
+# than removed, because occasionally they are the honest answer.
+GENERIC_PREDICATE_IRIS: frozenset[str] = frozenset({
+    "http://xmlns.com/foaf/0.1/topic",
+    "http://xmlns.com/foaf/0.1/knows",
+    "http://xmlns.com/foaf/0.1/interest",
+    "http://xmlns.com/foaf/0.1/made",
+    "http://xmlns.com/foaf/0.1/page",
+    "http://www.w3.org/ns/org#linkedTo",
+    "http://www.w3.org/2004/02/skos/core#related",
+    "http://www.w3.org/2004/02/skos/core#relatedMatch",
+    "http://purl.org/dc/terms/relation",
+})
+
+
+def relationship_repair(
+    chunk_text: str,
+    rejects: list[dict[str, str]],
+    candidate_predicates: list[dict[str, str]],
+) -> tuple[str, str]:
+    """Rescue pass: re-home claims the strict type check rejected.
+
+    These claims are NOT hallucinations. Each already cleared "the quote occurs
+    in this chunk" and "the quote names both entities"; what failed is that the
+    strict menu -- predicates whose declared domain AND range both match the
+    entities' classes -- offered a median of 8 options out of 620 on the news
+    corpus, so a real relationship got forced onto the nearest wrong predicate.
+
+    Here the model sees a WIDER menu (either end matching) and the rejected
+    claim, and is asked to name the relationship properly or drop it. The
+    canonical case: `Google --hasSubOrganization--> DeepMind` quoting "Google
+    acquired DeepMind for $650 million" should become `acquires`, a predicate
+    that was in the ontology the whole time.
+    """
+    reject_lines = "\n".join(
+        f'  [{i}] {r["subject"]} --{r["predicate_label"]}--> {r["object"]}\n'
+        f'      quote: "{r["evidence"]}"'
+        for i, r in enumerate(rejects)
+    )
+    pred_lines = "\n".join(
+        f"  - {p['iri']} ─ {p.get('label') or '?'}"
+        f"  [{p.get('domain_label') or '?'} -> {p.get('range_label') or '?'}]"
+        for p in candidate_predicates
+    )
+    system = (
+        "Each claim below was extracted from the passage with a quote that "
+        "really occurs in it and really names both entities -- but the "
+        "predicate chosen was a poor fit, because the model that produced it "
+        "had only a handful of predicates to choose from. You are given a "
+        "WIDER list. Re-express each claim with the predicate that actually "
+        "fits, or drop it.\n\n"
+        "Return ONE JSON object and nothing else -- no prose, no fences.\n\n"
+        "RULES THAT MATTER:\n"
+        "  - subject / object: copy VERBATIM from the claim. You may SWAP them "
+        "if the quote states the relationship the other way round; do not "
+        "rename them.\n"
+        "  - predicate_iri: copy ONE IRI VERBATIM from the PREDICATES list.\n"
+        "  - evidence: keep the SAME quote. Do not substitute another.\n"
+        "  - Choose the predicate the QUOTE supports, reading it literally. "
+        "'X acquired Y' is an acquisition, not a sub-organization. 'Y received "
+        "funding from X' means Y is funded by X.\n"
+        "  - DROPPING IS CORRECT when no predicate in the list expresses what "
+        "the quote says. Emit fewer relationships than you were given rather "
+        "than forcing a fit -- a wrong edge is worse than a missing one.\n"
+        "  - Do not invent claims. Every output must correspond to an input "
+        "claim, with at most its predicate changed and its ends swapped."
+    )
+    user = (
+        "PREDICATES (predicate_iri must come from here):\n" + pred_lines
+        + "\n\nPASSAGE:\n```\n" + chunk_text + "\n```\n\n"
+        + "CLAIMS TO RE-EXPRESS OR DROP:\n" + reject_lines
+        + '\n\nReturn JSON: {"relationships": [{"subject": ..., '
+          '"predicate_iri": ..., "object": ..., "evidence": ...}]}'
+    )
+    return system, user
+
+
+def relationship_verify(
+    chunk_text: str,
+    claims: list[dict[str, str]],
+) -> tuple[str, str]:
+    """Third pass: does each quoted span ACTUALLY support its claim?
+
+    The evidence check in the write path verifies a quote OCCURS in the chunk.
+    It cannot verify the quote SAYS the thing -- and on the news corpus that
+    gap produced edges whose own evidence contradicted them, most starkly
+    `OpenAI --filesLawsuitAgainst--> Sara Silverman` quoting "Copyright
+    lawsuits filed against OpenAI BY Sara Silverman", plus
+    `OpenAI --hasMember--> Bill Gates` quoting a sentence about demonstrating
+    GPT-4 to him.
+
+    One batched call per chunk judges every surviving claim at once, so the
+    cost is one cheap call rather than one per edge. The model returns a
+    verdict per claim by INDEX, and anything it does not affirm is dropped.
+
+    Returns JSON: {verdicts: [{index, verdict, reason}]} where verdict is
+      "supported"  -- the quote states this claim in this direction
+      "reversed"   -- the quote states it with subject and object swapped
+      "unsupported"-- the quote does not state this claim at all
+    """
+    claim_lines = "\n".join(
+        f'  [{i}] {c["subject"]} --{c["predicate_label"]}--> {c["object"]}\n'
+        f'      quote: "{c["evidence"]}"'
+        for i, c in enumerate(claims)
+    )
+    system = (
+        "You audit extracted relationship claims against the quote offered as "
+        "proof. Return ONE JSON object and nothing else -- no prose, no "
+        "markdown fences.\n\n"
+        "For each numbered claim, decide what the QUOTE states:\n"
+        '  - "supported"   : the quote asserts this exact claim, subject and '
+        "object in this direction.\n"
+        '  - "reversed"    : the quote asserts the relationship the other way '
+        "round (subject and object swapped).\n"
+        '  - "unsupported" : the quote does not assert this relationship -- it '
+        "is about something else, names only one of the two, or merely "
+        "mentions them together.\n\n"
+        "RULES THAT MATTER:\n"
+        "  - Judge ONLY the quote. Do NOT use world knowledge, and do not use "
+        "the rest of the passage to rescue a quote that does not say it.\n"
+        "  - Co-occurrence is NOT a relationship. 'A demonstrated X to B' does "
+        "not make B a member of A. 'A and B were both listed' does not make "
+        "them related.\n"
+        '  - Direction is the point. "lawsuits filed against A by B" means B '
+        "sued A.\n"
+        "  - Be strict. When in doubt, answer \"unsupported\" -- a dropped "
+        "true edge costs far less than a confident false one.\n"
+        "  - Return a verdict for EVERY index, exactly once."
+    )
+    user = (
+        "PASSAGE (for context only -- judge the quote):\n```\n"
+        + chunk_text + "\n```\n\nCLAIMS:\n" + claim_lines
+        + '\n\nReturn JSON: {"verdicts": [{"index": 0, "verdict": '
+          '"supported"|"reversed"|"unsupported", "reason": "..."}]}'
+    )
+    return system, user
+
+
 def relationship_extract(
     chunk_text: str,
     entities: list[dict[str, str]],
@@ -1294,11 +1475,28 @@ def relationship_extract(
         f"  - {e['canonical_name']}  [{e.get('class_label') or '?'}]"
         for e in entities
     )
-    pred_lines = "\n".join(
-        f"  - {p['iri']} \u2500 {p.get('label') or '?'}"
-        f"  [{p.get('domain_label') or '?'} -> {p.get('range_label') or '?'}]"
-        for p in candidate_predicates
-    )
+
+    def _fmt(p: dict[str, str]) -> str:
+        return (f"  - {p['iri']} \u2500 {p.get('label') or '?'}"
+                f"  [{p.get('domain_label') or '?'} -> "
+                f"{p.get('range_label') or '?'}]")
+
+    # Split the menu. Catch-all predicates fit almost any pair of entities, so
+    # offered flat they crowd out the specific ones: measured on the news
+    # corpus, org:hasMember + org:linkedTo + foaf:topic took 37 of 65 edges
+    # (57%) while every corpus-specific predicate the ontology minted for that
+    # run -- competesWith, filesLawsuitAgainst, integrates, backs -- shared 12.
+    # Listing them separately, under a rule that they are a fallback, makes the
+    # model rule out a precise predicate before reaching for a vague one.
+    specific = [p for p in candidate_predicates
+                if p["iri"] not in GENERIC_PREDICATE_IRIS]
+    generic = [p for p in candidate_predicates
+               if p["iri"] in GENERIC_PREDICATE_IRIS]
+    pred_lines = "\n".join(_fmt(p) for p in specific) or "  (none)"
+    if generic:
+        pred_lines += ("\n\nLAST-RESORT PREDICATES (vague -- use ONLY if no "
+                       "predicate above fits):\n"
+                       + "\n".join(_fmt(p) for p in generic))
     system = (
         "You identify RELATIONSHIPS that a passage explicitly asserts between "
         "entities that have ALREADY been extracted from it. Return ONE JSON "
@@ -1310,12 +1508,20 @@ def relationship_extract(
         "not invent, abbreviate or reformat it.\n"
         "  - evidence: the VERBATIM sentence or clause from the passage that "
         "states this relationship. It must appear in the passage character for "
-        "character. Do not paraphrase.\n"
+        "character. Do not paraphrase. It MUST NAME BOTH the subject and the "
+        "object -- a sentence mentioning only one of them does not state a "
+        "relationship between them.\n"
         "  - confidence: float in [0,1].\n\n"
         "RULES THAT MATTER:\n"
         "  - Assert ONLY what the passage states. Do NOT use world knowledge. "
         "Two entities appearing near each other is NOT a relationship.\n"
         "  - If you cannot quote a span that states it, do not emit it.\n"
+        "  - READ YOUR OWN QUOTE BEFORE EMITTING. It must assert THIS claim in "
+        "THIS direction. 'Lawsuits filed against A by B' means B sued A, NOT "
+        "that A sued B. If the quote states the reverse, swap subject and "
+        "object or drop the relationship.\n"
+        "  - Prefer the MOST SPECIFIC predicate that fits. Reach for a "
+        "last-resort predicate only when no specific one applies.\n"
         "  - Each predicate shows [Domain -> Range]: the subject must be of the "
         "domain type and the object of the range type. Respect direction -- "
         "'A causes B' and 'B causes A' are different claims.\n"
@@ -2856,6 +3062,8 @@ PROMPTS = {
     "summary_revise": summary_revise,
     "entity_extract": entity_extract,
     "relationship_extract": relationship_extract,
+    "relationship_verify": relationship_verify,
+    "relationship_repair": relationship_repair,
     # Phase 2a — table extraction (vision)
     "table_extract_vision": table_extract_vision,
     # Phase 2a follow-up — table → KG anchor-bucket grouping

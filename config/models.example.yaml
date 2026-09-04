@@ -266,6 +266,28 @@ tasks:
     timeout: 120
     temperature: 0.0
     max_tokens: 2048
+  # Third pass: does each relationship's quoted evidence actually SUPPORT the
+  # claim, in the stated direction? The structural checks verify a quote occurs
+  # in the chunk and names both ends; they cannot tell that "lawsuits filed
+  # against A by B" does not mean A sued B. Judgement over a short quote, so
+  # the cheap model is the right one -- but it decides what enters the graph,
+  # so give it room to answer for every claim in a chunk.
+  relationship_verify:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 120
+    temperature: 0.0
+    max_tokens: 2048
+  # Rescue pass: re-home relationship claims whose evidence is sound but whose
+  # predicate failed the domain/range check, using a WIDER predicate menu. The
+  # strict menu offered a median of 8 of 620 predicates on the news corpus, so
+  # real relationships were being forced onto wrong predicates and dropped.
+  relationship_repair:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 120
+    temperature: 0.0
+    max_tokens: 2048
 
   # =================== Milestone F: retrieval pipeline ===================
   question_parse:

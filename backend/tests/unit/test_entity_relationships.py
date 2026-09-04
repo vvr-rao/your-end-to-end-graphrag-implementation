@@ -390,3 +390,293 @@ def test_supporting_chunk_list_is_capped_but_count_is_exact() -> None:
             "supporting_chunks": chunks[:_MAX_SUPPORTING_CHUNKS]}
     assert meta["support_count"] == 500
     assert len(meta["supporting_chunks"]) == _MAX_SUPPORTING_CHUNKS
+
+
+# --------------------------------------------------------------------------- #
+# Precision fixes (news-corpus findings)
+#
+# The 30-doc MultiHop-RAG run wrote 65 edges of which roughly half were wrong
+# on a hand check, DESPITE every one passing the structural gates. Two distinct
+# failure shapes, each guarded below:
+#
+#   one-sided evidence -- `Anthropic --hasMember--> Mustafa Suleyman` quoting a
+#     real sentence about Anthropic founders that never says "Suleyman".
+#   unsupported / reversed -- `OpenAI --filesLawsuitAgainst--> Sara Silverman`
+#     quoting "Copyright lawsuits filed against OpenAI BY Sara Silverman", a
+#     quote that names both ends and states the opposite.
+# --------------------------------------------------------------------------- #
+
+
+def _ent(canonical, short=None):
+    return {"canonical_name": canonical, "short_name": short or canonical,
+            "class_iri": "http://x#Org"}
+
+
+def test_evidence_must_name_both_ends() -> None:
+    from backend.app.services.db_entity_extract import _evidence_names
+
+    ev = ("Anthropic founders denied attempting to oust Altman, stating they "
+          "left OpenAI to pursue controlled AI development.")
+    assert _evidence_names(ev, _ent("Anthropic"))
+    assert not _evidence_names(ev, _ent("Mustafa Suleyman"))
+
+
+def test_evidence_name_match_tolerates_inflection_and_partials() -> None:
+    """Strict about PRESENCE, lenient about FORM -- dropping a true edge over
+    a possessive or a surname is the worse error."""
+    from backend.app.services.db_entity_extract import _evidence_names
+
+    assert _evidence_names("Copyright lawsuits filed against OpenAI by Sara "
+                           "Silverman", _ent("Sara Silverman"))
+    assert _evidence_names("OpenAI's board consists of...", _ent("OpenAI"))
+    assert _evidence_names("the disparity between Israeli cities",
+                           _ent("Israel"))
+
+
+def test_generic_name_tokens_do_not_count_as_a_mention() -> None:
+    """Without this, any sentence containing 'smart' would name the
+    'Ray-Ban Meta smart glasses' entity."""
+    from backend.app.services.db_entity_extract import _evidence_names
+
+    assert not _evidence_names(
+        "The company shipped a smart speaker and a new app.",
+        _ent("Ray-Ban Meta smart glasses"),
+    )
+
+
+def test_verify_prompt_demands_direction_and_strictness() -> None:
+    from backend.app.services.prompts import relationship_verify
+
+    system, user = relationship_verify(
+        "passage",
+        [{"subject": "OpenAI", "predicate_label": "files lawsuit against",
+          "object": "Sara Silverman",
+          "evidence": "Copyright lawsuits filed against OpenAI by Sara "
+                      "Silverman"}],
+    )
+    assert "reversed" in system and "unsupported" in system
+    assert "world knowledge" in system.lower()
+    assert "[0]" in user
+    assert "Sara Silverman" in user
+
+
+def test_generic_predicates_are_listed_separately_as_last_resort() -> None:
+    """org:linkedTo + foaf:topic took 22 of 65 edges on the news run purely by
+    being offered alongside specific predicates."""
+    from backend.app.services.prompts import relationship_extract
+
+    preds = [
+        {"iri": "http://x#suppliedBy", "label": "supplied by",
+         "domain_label": "Organization", "range_label": "Organization"},
+        {"iri": "http://www.w3.org/ns/org#linkedTo", "label": "linked to",
+         "domain_label": "Organization", "range_label": "Organization"},
+        {"iri": "http://xmlns.com/foaf/0.1/topic", "label": "topic",
+         "domain_label": "Organization", "range_label": "Organization"},
+    ]
+    _, user = relationship_extract("text", _ENTS, preds)
+    assert "LAST-RESORT" in user
+    head, tail = user.split("LAST-RESORT", 1)
+    assert "http://x#suppliedBy" in head
+    assert "org#linkedTo" in tail and "foaf/0.1/topic" in tail
+
+
+def test_all_generic_iris_are_absolute_and_lowercase_free_of_typos() -> None:
+    """A typo'd IRI in the demote-list silently stops demoting."""
+    from backend.app.services.prompts import GENERIC_PREDICATE_IRIS
+
+    assert GENERIC_PREDICATE_IRIS
+    for iri in GENERIC_PREDICATE_IRIS:
+        assert iri.startswith("http"), iri
+        assert " " not in iri, iri
+
+
+# --------------------------------------------------------------------------- #
+# Rescue pass + name-level entity identity
+#
+# Two measured defects on the 30-doc news corpus drove these:
+#
+#   STARVED MENU -- the strict rule (predicates whose declared domain AND range
+#     both match the entities' classes) offered a MEDIAN OF 8 predicates out of
+#     620, so real relationships were forced onto a wrong predicate and then
+#     rejected: 114 domain_range drops in one run. `Google --hasSubOrganization
+#     --> DeepMind` came from "Google ACQUIRED DeepMind for $650 million", and
+#     `acquires` was in the ontology the whole time. Matching descendants as
+#     well as ancestors was measured and changed nothing (median stayed 8);
+#     only either-end matching widens it (median 52).
+#
+#   FRAGMENTED ENTITIES -- identity was (normalized_name, class_id), so one
+#     entity typed differently per chunk became many nodes: 901 rows for 624
+#     names, "google" x18, "microsoft" x16. Multi-hop cannot traverse that.
+# --------------------------------------------------------------------------- #
+
+
+def test_repair_prompt_keeps_the_quote_and_permits_only_a_swap() -> None:
+    """The rescue pass may change the PREDICATE and the DIRECTION. It must not
+    invent claims or substitute a different quote -- the evidence already
+    passed the occurs-in-chunk and names-both-ends checks."""
+    from backend.app.services.prompts import relationship_repair
+
+    system, user = relationship_repair(
+        "Google acquired DeepMind for $650 million.",
+        [{"subject": "Google", "predicate_label": "has SubOrganization",
+          "object": "DeepMind",
+          "evidence": "Google acquired DeepMind for $650 million"}],
+        [{"iri": "http://x#acquires", "label": "acquires",
+          "domain_label": "Organization", "range_label": "Organization"}],
+    )
+    assert "keep the SAME quote" in system.lower() or "SAME quote" in system
+    assert "Do not invent claims" in system
+    assert "DROPPING IS CORRECT" in system
+    assert "SWAP" in system
+    assert "http://x#acquires" in user
+    assert "Google acquired DeepMind" in user
+
+
+def test_rescue_marks_its_edges_so_the_two_populations_stay_separable() -> None:
+    """A rescued edge used a relaxed type check; an audit must be able to tell
+    it from one that satisfied domain/range outright."""
+    import inspect
+
+    from backend.app.services import db_entity_extract as dee
+
+    src = inspect.getsource(dee._rescue_relationships)
+    assert '"type_check": "relaxed"' in src
+
+
+def test_rescue_does_not_lower_the_evidence_bar() -> None:
+    """Widening WHICH predicate may be used must not widen what counts as
+    proof -- the rescue path re-applies both evidence checks."""
+    import inspect
+
+    from backend.app.services import db_entity_extract as dee
+
+    src = inspect.getsource(dee._rescue_relationships)
+    assert "_evidence_names(ev, s_ent)" in src
+    assert "_evidence_names(ev, o_ent)" in src
+    assert "ev.lower() not in hay" in src
+
+
+def test_rescue_only_accepts_predicates_from_the_offered_menu() -> None:
+    import inspect
+
+    from backend.app.services import db_entity_extract as dee
+
+    src = inspect.getsource(dee._rescue_relationships)
+    assert "pred not in known_iris" in src
+
+
+def test_wide_menu_matches_either_end_not_both() -> None:
+    """The whole point: both-ends is what starved the menu to 8 of 620."""
+    from backend.app.services.db_entity_extract import _WIDE_PREDICATE_SQL
+
+    sql = str(_WIDE_PREDICATE_SQL)
+    where = sql.split("WHERE", 1)[1]
+    assert " OR EXISTS" in where, "wide menu must be an OR over the two ends"
+
+
+def test_entity_identity_defaults_to_name_level() -> None:
+    """Default must be the fixed behaviour; 'name-class' reproduces the split."""
+    import inspect
+
+    from backend.app.services.db_entity_extract import extract_entities
+
+    sig = inspect.signature(extract_entities)
+    assert sig.parameters["entity_identity"].default == "name"
+    # Rescue defaults OFF: measured on the news corpus it rescued 74 claims
+    # and precision fell from ~75% to ~45%, because the wider either-end menu
+    # admits predicates whose other end is nonsense.
+    assert sig.parameters["rescue_relationships"].default is False
+
+
+def test_majority_vote_picks_the_primary_class() -> None:
+    """One node per name; the class it carries is the one chosen most often."""
+    votes = {"google": {"SearchEngine": 5, "OpenAICompetitor": 2,
+                        "SearchMonopoly": 1}}
+    primary = {n: max(v.items(), key=lambda kv: kv[1])[0]
+               for n, v in votes.items()}
+    assert primary["google"] == "SearchEngine"
+
+
+def test_collapsing_keeps_every_observed_class_as_a_type_edge() -> None:
+    """Merging 18 Googles into one node must not discard the 17 other types --
+    an entity legitimately holds several."""
+    import inspect
+
+    from backend.app.services import db_entity_extract as dee
+
+    src = inspect.getsource(dee.extract_entities)
+    assert "extra_type_classes" in src
+    assert "minted_entity_class_pairs.append((eid, extra_cid))" in src
+
+
+def test_relationship_endpoints_resolve_via_the_STORED_class() -> None:
+    """Under name-level identity the node carries the MAJORITY class, not the
+    one a given chunk assigned. Resolving edges by the per-chunk class misses
+    the key and silently loses the edge: measured 49 spurious `unresolved`
+    drops and edges falling 30 -> 10 before this was fixed."""
+    import inspect
+
+    from backend.app.services import db_entity_extract as dee
+
+    src = inspect.getsource(dee.extract_entities)
+    resolve = src.split("def _resolve(", 1)[1].split("for rel in rels:", 1)[0]
+    assert "primary_class_by_name" in resolve, (
+        "_resolve must key on the stored (majority) class"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# prune-expand: relation endpoints must GENERALISE
+#
+# Root cause of the starved predicate menu, measured on the news corpus: only
+# 29 of 125 corpus-minted predicates (23%) declared a reusable domain. The rest
+# were typed from the single sentence that produced them --
+# `acquires[MusicLabel -> MusicRightsAcquisition]`, so "Google acquired
+# DeepMind" could never use it, and `backs[Mozilla -> Mammoth]`, a signature
+# matching exactly one company pair. That is why `domain_range` was 44% of all
+# relationship rejections.
+# --------------------------------------------------------------------------- #
+
+
+def _proposal_prompt() -> str:
+    from backend.app.services.prompts import PROMPTS
+
+    system, _ = PROMPTS["class_proposal"]("chunk text", "DATA_CLASSES here")
+    return system
+
+
+def test_proposal_prompt_demands_general_relation_endpoints() -> None:
+    sys_p = _proposal_prompt()
+    assert "AS GENERAL AS THE RELATION" in sys_p
+    assert "MusicLabel" in sys_p, "keeps the concrete counter-example"
+    assert "DOMAIN=Organization, RANGE=Organization" in sys_p
+
+
+def test_proposal_prompt_forbids_named_individuals_as_endpoints() -> None:
+    """`backs[Mozilla -> Mammoth]` is the failure this guards."""
+    sys_p = _proposal_prompt()
+    assert "NEVER use a NAMED INDIVIDUAL as a DOMAIN or RANGE" in sys_p
+    assert "Mozilla" in sys_p
+
+
+def test_dedup_prompt_widens_narrow_endpoints() -> None:
+    """Dedup is the second chance to repair an over-narrow signature, and the
+    only one that sees several proposals of the same relation at once."""
+    from backend.app.services.prompts import PROMPTS
+
+    system, _ = PROMPTS["match_dedup"]({}, [])
+    assert "GENERALISE THE ENDPOINTS" in system
+    assert "most general classes for which the relation" in system
+    assert "backs[Mozilla -> Mammoth]" in system
+    # The older rule said differing DOMAIN/RANGE were never duplicates, which
+    # is precisely what preserved the fragmentation.
+    assert "ARE duplicates" in system
+
+
+def test_dedup_still_separates_genuinely_different_relations() -> None:
+    """Widening must not collapse two same-labelled relations that mean
+    different things."""
+    from backend.app.services.prompts import PROMPTS
+
+    system, _ = PROMPTS["match_dedup"]({}, [])
+    assert "genuinely DIFFERENT" in system

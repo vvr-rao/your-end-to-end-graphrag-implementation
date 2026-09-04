@@ -784,6 +784,44 @@ def build_parser() -> argparse.ArgumentParser:
             "reproduce pre-relationship behaviour."
         ),
     )
+    p_ext.add_argument(
+        "--no-verify-relationships", action="store_true",
+        help=(
+            "Skip the THIRD pass that checks each relationship's quoted "
+            "evidence actually SUPPORTS the claim. The structural checks "
+            "verify a quote occurs in the chunk and names both entities; they "
+            "cannot tell that 'lawsuits filed against A by B' does not mean A "
+            "sued B. On a 30-doc news corpus roughly half of a hand-checked "
+            "sample was wrong despite passing every structural gate. Costs one "
+            "extra cheap call per chunk that produced relationships."
+        ),
+    )
+    p_ext.add_argument(
+        "--rescue-relationships", action="store_true",
+        help=(
+            "EXPERIMENTAL, OFF by default -- it MEASURED WORSE. Re-asks for "
+            "claims whose evidence is sound but whose predicate failed the "
+            "domain/range check, using a wider menu (either end matching "
+            "instead of both). The motivation is real: the strict menu offered "
+            "a median of 8 of 620 predicates on a news corpus. But on that "
+            "corpus it rescued 74 claims and precision fell from ~75%% to "
+            "~45%% -- the wider menu lets through predicates whose OTHER end "
+            "is nonsense ('Nvidia based_near Gaza', 'Warner Music Group "
+            "hasSubOrganization David Bowie'). Needs a per-pair menu, not a "
+            "per-chunk one, before it earns its place."
+        ),
+    )
+    p_ext.add_argument(
+        "--entity-identity", choices=("name", "name-class"), default="name",
+        help=(
+            "What makes two mentions the SAME entity. 'name' (default): one "
+            "node per name, primary class by majority vote, other observed "
+            "classes kept as extra rdf:type edges. 'name-class' is the old "
+            "behaviour, which split one entity into a node per class -- "
+            "measured 18 separate 'Google' nodes on a 30-doc corpus, which "
+            "breaks multi-hop traversal."
+        ),
+    )
     p_ext.set_defaults(func=_cmd_extract_entities)
 
     # ---------- Phase 2: Milestone E (artifacts) ----------
@@ -1656,6 +1694,11 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
             max_cost_usd=args.max_cost_usd,
             chunk_kind="fulltext" if getattr(args, "from_fulltext", False) else "summary",
             extract_relationships=not getattr(args, "no_relationships", False),
+            verify_relationships=not getattr(
+                args, "no_verify_relationships", False),
+            rescue_relationships=getattr(
+                args, "rescue_relationships", False),
+            entity_identity=getattr(args, "entity_identity", "name"),
         )
     )
     return 0
