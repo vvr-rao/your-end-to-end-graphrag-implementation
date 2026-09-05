@@ -123,6 +123,80 @@ rather than only reordering the ones RRF already chose.
 Reach for it when answers cite loosely-related passages, or when the corpus is
 large and topically mixed so the candidate pool is broad.
 
+## Graph relationships in the answer
+
+Every query now carries a THIRD kind of evidence beside chunks and artifacts:
+`entity -> entity` triples, rendered as a sentence plus the verbatim quote
+extraction verified. They appear in citations as `[viao:Relationship_NNNN]`.
+
+Why they are appended rather than fused: RRF ranks ONE flat id space (chunk
+UUIDs), so a triple has no representation in it. Entities are projected down to
+chunks at step 8 and the relationship was dropped there -- which is why a graph
+holding 14 `defeated` edges once answered "which teams defeated which other
+teams" with "no information". Triples now bypass fusion entirely.
+
+- **Both modes get them.** `simple_qa` and `deep_research` alike; the count is
+  `qa.max_relationship_evidence` (default 25) and does not vary by mode.
+- `qa.relationship_scope` (default `either`) decides how strictly a triple must
+  sit inside the BFS neighbourhood. `both` requires both endpoints to have been
+  reached -- safe but lossy: on one question it admitted 44 of 132 edges and
+  excluded every relevant one. `either` is safe only because triples are RANKED
+  against the question before the cap applies.
+- **They are ranked lexically**, predicate weighted 3x the endpoint names, so a
+  question saying "signed with" promotes a `signedWith` edge. A question with
+  no vocabulary overlap falls back to support-count order.
+- **A triple's quote is trimmed** to the span that asserts the claim. Without
+  that, a correct edge (`Windfield Holdings subsidiaryOf Albemarle`) whose quote
+  also carried Windfield's Perth address made the answer report Perth as
+  ALBEMARLE's headquarters. A prompt rule alone did NOT fix this.
+
+If a relationship question returns "no information", check the verbose line
+`graph relationships added: N of M edge(s) among the K entities BFS reached`.
+`M` small means BFS never reached the right part of the graph (a seeding
+problem); `N of M` with M large means ranking put the wrong triples first.
+
+## Multi-hop questions need `--mode deep_research`
+
+A question like "which clubs did X play against", where X's club must be
+resolved first, needs the round-2 bridge: a planner runs a cheap round 1 to
+discover entities, then rewrites round 2 with them substituted.
+
+**That planner is `deep_research`-only.** `simple_qa` ignores `multi_round`
+entirely -- passing it changes nothing. In `simple_qa` a 2-hop question only
+works when a single chunk happens to resolve the second hop.
+
+Cost measured on the same questions: **deep_research is 25-30x simple_qa**
+($0.0012-0.0021 vs $0.035-0.061 per question) and 1.2-2x the wall time, because
+it synthesises with gpt-4.1 at 4x the token ceiling over 50% more evidence, and
+pays an extra retrieval round when the bridge fires. Both are cheap in absolute
+terms; the ratio only matters at volume.
+
+## Probe filtering
+
+Query decomposition makes several probes; each votes into RRF. A probe that
+matched nothing still votes -- and it votes for whatever is topically nearest,
+manufacturing the consensus RRF trusts. `qa.probe_rel_band` (default 0.10)
+drops a probe only if its best hit is worse than the BEST PROBE IN THIS QUERY
+plus that band.
+
+It replaced an absolute `probe_dist_floor`, which could not tell "matched
+nothing" from "question phrased abstractly": five probes for one question
+spanned 1.0222-1.0973 and the fixed 1.05 discarded four of them.
+`qa.probe_dist_ceiling` (1.25) remains as a backstop for when every probe is
+hopeless.
+
+## Class matching
+
+`qa.class_descend_depth` / `class_lexical_per_term` control how a question's
+category words reach the classes entities actually carry. Matching is now
+vector + lexical + **head-noun** (`player` -> `BaseballPlayer`, `NFLPlayer`) +
+taxonomy descent.
+
+The head-noun rule does most of the work, and deliberately ignores the
+hierarchy -- generated ontologies get it locally wrong. Measured: one ontology
+put `Player` under `Organization` while `BaseballPlayer` sat under `Person`, so
+no downward walk could connect them.
+
 ## Entity-to-entity relationships
 
 `extract-entities` mints typed `entity -> entity` edges. It runs as **TWO LLM

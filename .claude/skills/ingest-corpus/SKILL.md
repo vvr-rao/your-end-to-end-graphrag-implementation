@@ -188,15 +188,21 @@ those entities' actual classes. The run prints a line to report back:
     (unresolved=.., bad_predicate=.., domain_range=.., no_evidence=..)
 ```
 
-**Before launching, confirm `relationship_extract` is in `config/models.yaml`.**
-It is a NEW task; a config predating it makes the step print a one-line notice
-and continue with entities ONLY -- easy to miss in a long log, and the run
-looks successful:
+**Before launching, confirm all THREE relationship tasks are in
+`config/models.yaml`.** They are NEW tasks; a config predating them makes the
+step print a one-line notice and quietly do less -- easy to miss in a long log,
+because the run still looks successful:
 ```
-uv run python -c "import yaml;print('relationship_extract' in yaml.safe_load(open('config/models.yaml'))['tasks'])"
+uv run python -c "import yaml;t=yaml.safe_load(open('config/models.yaml'))['tasks'];\
+print({k:(k in t) for k in ('relationship_extract','relationship_verify','relationship_repair')})"
 ```
-If that prints False, run **choose-llm-mode** to refresh the preset, or copy the
-`relationship_extract` block from `config/models.example.yaml`.
+Any False: run **choose-llm-mode** to refresh the preset, or copy the missing
+blocks from `config/models.example.yaml`. What each one costs you if absent:
+- `relationship_extract` missing -> **no entity->entity edges at all**.
+- `relationship_verify` missing -> edges are written **without the
+  support check**, so quotes that contradict their own claim get through.
+- `relationship_repair` missing -> only matters with `--rescue-relationships`,
+  which is off by default.
 
 What to tell the user afterwards:
 - **It is not more expensive.** Measured on 442 chunks: 305 edges at $0.31 as
@@ -208,10 +214,31 @@ What to tell the user afterwards:
 - **0 written is a real signal, not necessarily a bug** -- usually the ontology
   declares no object property whose domain AND range both match this corpus's
   classes. The run says so explicitly; surface it rather than calling it done.
-- **Quality is good, not perfect.** The evidence check confirms the quote
-  EXISTS in the chunk, not that it supports the claim, so a minority of edges
-  quote a nearby-but-unrelated sentence. Do not present these edges as clean.
+- **Quality is good, not perfect.** Three gates now stand between a proposal
+  and an edge: the quote must occur in the chunk, must NAME BOTH ends, and a
+  third LLM pass judges whether it actually supports the claim in that
+  direction. Hand-checked precision rose from ~50% to ~85% across three
+  corpora. It is not 100% -- do not present the edges as clean.
+- **Acceptance is deliberately low.** Roughly 15-22% of proposals become edges.
+  The largest rejection bucket is `domain_range`: the ontology offers no
+  predicate whose declared domain AND range fit that pair. That is usually a
+  vocabulary gap, not a bad extraction.
 - `--no-relationships` reproduces the older entity-only behaviour.
+- `--no-verify-relationships` skips the third pass. Only for reproducing
+  pre-verification behaviour; it lets contradicting quotes through.
+- `--rescue-relationships` (**off by default, it measured WORSE**) re-asks for
+  type-rejected claims using a wider either-end predicate menu. It rescued 74
+  claims on one corpus and precision fell ~75% -> ~45%, because the wider menu
+  admits predicates whose OTHER end is nonsense. Do not enable it casually.
+- `--entity-identity name|name-class`. Default `name` gives ONE node per name,
+  primary class by majority vote, other observed classes kept as extra
+  `rdf:type` edges. `name-class` restores the old behaviour, which split one
+  entity into a node per class -- measured 18 separate "Google" nodes on a
+  30-doc corpus, which breaks multi-hop traversal. Use `name-class` only if
+  your corpus has genuine homonyms that must stay distinct.
+- **Watch the identity line in the log.** `name-level identity: N name(s) seen
+  with more than one class collapsed to a single node` tells you how much
+  fragmentation was repaired. Zero on a large corpus is suspicious.
 - An EXISTING graph has none of these edges until extract-entities re-runs.
 
 ## Step 4 — enrich-time (short)
