@@ -94,7 +94,15 @@ _TABLE_TYPE_BUCKET_IRI = (
 
 # Cache version: bump when this module's prompt / routing changes
 # materially.  Combined with the table's @id into the on-disk cache key.
-_GROUPING_VERSION = "p2a-follow-1"
+# p2a-follow-2: row labels became proposal targets (see `table_concept_grouping`).
+# p2a-follow-3: domain rejection (`no_anchor_fits`) + table-type naming.
+_GROUPING_VERSION = "p2a-follow-3"
+
+# How many row labels to hand the classifier per table. Rows are proposal
+# targets now, so this bounds how many line items one table can contribute.
+# 40 covers a full income statement or balance sheet without letting a
+# pathological 400-row table dominate the prompt.
+_MAX_ROW_LABELS = 40
 
 # Label-similarity threshold for layer-1 "reuse existing class" match.
 _EXISTING_MATCH_RATIO = 0.85
@@ -118,6 +126,39 @@ _UNIT_SUFFIXES = (
 )
 
 _PUNCT_RE = re.compile(r"[^a-z0-9]+")
+
+# Structural rows: totals, subtotals and the opening/closing balances that
+# bracket a reconciliation. They are arithmetic over the other rows, not
+# concepts in their own right -- minting `TotalSalesUSDM` alongside
+# `JanuviaSalesUSDM` adds a class that means "the sum of its siblings".
+#
+# The prompt asks the model to omit these (rule 5) and it does not comply:
+# a live 3-table smoke returned TotalSalesUSDM, BalanceJanuary1 and
+# BalanceDecember31 among 16 row proposals. Filtering deterministically is
+# both cheaper and more reliable than restating the instruction.
+_STRUCTURAL_ROW_RE = re.compile(
+    r"^(?:"
+    r"(?:grand\s+|net\s+|sub[-\s]?)?totals?\b"
+    r"|balances?\s+(?:at|as\s+of|january|december|beginning|end|brought|carried)"
+    r"|(?:opening|closing|beginning|ending)\s+balances?\b"
+    r")",
+    re.IGNORECASE,
+)
+
+# "TotalSalesUSDM" -> "Total Sales USDM", so the same pattern catches both
+# the verbatim source label and the CamelCase label the model proposed.
+_CAMEL_SPLIT_RE = re.compile(r"(?<!^)(?=[A-Z])")
+
+
+def _is_structural_row_label(source_label: str, proposed_label: str) -> bool:
+    """True when a row is a total / subtotal / bracketing balance."""
+    for candidate in (
+        source_label,
+        _CAMEL_SPLIT_RE.sub(" ", proposed_label),
+    ):
+        if candidate and _STRUCTURAL_ROW_RE.match(candidate.strip()):
+            return True
+    return False
 
 
 def _normalize_label(label: str) -> str:
@@ -261,8 +302,14 @@ def _extract_table_fields(table: dict[str, Any]) -> tuple[str, str, list[dict[st
     JSON-LD table payload.
 
     `columns` is a list of {column_index, label} dicts.
-    `row_label_samples` is up to 3 row labels (rowLabel field), skipping
-    empty / header rows.
+    `row_labels` is up to `_MAX_ROW_LABELS` row labels (rowLabel field),
+    skipping empty / header rows.
+
+    Row labels are proposal TARGETS, not just prompt context -- in a
+    financial statement the rows carry the line items, which are the
+    concepts worth minting. The cap used to be 3, which was fine for
+    disambiguating context but far too tight once the rows themselves
+    drive proposals.
     """
     tid = str(table.get("@id") or "")
     caption = str(table.get("caption") or "")
@@ -292,7 +339,7 @@ def _extract_table_fields(table: dict[str, Any]) -> tuple[str, str, list[dict[st
         lab = r.get("rowLabel") or ""
         if isinstance(lab, str) and lab.strip():
             row_labels.append(lab.strip())
-        if len(row_labels) >= 3:
+        if len(row_labels) >= _MAX_ROW_LABELS:
             break
 
     return tid, caption, columns, row_labels
@@ -307,7 +354,11 @@ async def _classify_one_table(
     with `table_class` + `columns` keys, or None on failure.
     """
     table_id, caption, columns, row_labels = _extract_table_fields(table)
-    if not table_id or not columns:
+    # A table needs SOME labelled axis to classify. Requiring `columns`
+    # specifically discarded whole tables whose extraction produced row
+    # labels but no column headers -- common on vision output, and the
+    # rows are exactly the axis carrying the concepts.
+    if not table_id or (not columns and not row_labels):
         return None
 
     cache_key = _grouping_cache_key(table_id)
@@ -425,6 +476,8 @@ async def mine_table_concepts_async(
 
     n_reused = 0
     n_dropped_bad_parent = 0
+    n_dropped_structural = 0   # totals / subtotals / bracketing balances
+    n_rejected_domain = 0      # tables the model judged non-financial
 
     for table, parsed in zip(tables, raw_results, strict=False):
         if parsed is None:
@@ -436,13 +489,32 @@ async def mine_table_concepts_async(
                 {"table_id": table_id, "caption": caption, "llm_output": parsed},
             )
 
+        # ----- domain rejection -----
+        # The 6 anchors describe FINANCIAL reporting. A clinical-trial or
+        # drug-composition table has no honest home among them, and the
+        # code used to give it one anyway: `parent_iri` was hardcoded to
+        # FinancialTable for every table, and row/column concepts were
+        # filed under Measure/Dimension regardless of domain. A pharma
+        # label yielded `NonFatalStroke` and `Nausea` as siblings of
+        # `RevenueUSDM`. Phase 2 cannot add or correct classes later, so a
+        # miscategorised concept is permanent -- minting nothing is the
+        # right outcome.
+        if parsed.get("no_anchor_fits") is True:
+            n_rejected_domain += 1
+            if audit_callback is not None:
+                audit_callback(
+                    "table_concept_domain_reject",
+                    {"table_id": table_id, "caption": caption},
+                )
+            continue
+
         # ----- table-class candidate -----
         tc = parsed.get("table_class")
         if isinstance(tc, dict):
             label = (tc.get("proposed_label") or "").strip()
             definition = (tc.get("definition") or "").strip()
-            # The table-class anchor is always FinancialTable; even if the
-            # LLM emits a different one we coerce it.
+            # A table that survived the domain check IS financial, so its
+            # type class belongs under FinancialTable.
             parent_iri = _TABLE_TYPE_BUCKET_IRI
             if label:
                 existing = _existing_match(label, parent_iri, classes_index)
@@ -464,10 +536,15 @@ async def mine_table_concepts_async(
                         "snippet": caption or label,
                     })
 
-        # ----- column-class candidates -----
-        cols = parsed.get("columns")
-        if isinstance(cols, list):
-            for c in cols:
+        # ----- column-class + row-class candidates -----
+        # Both axes are handled identically. Rows matter most on financial
+        # statements, where the columns are fiscal periods and the rows
+        # carry the line items.
+        for axis, snippet_key in (("columns", "label"), ("rows", "row_label")):
+            entries = parsed.get(axis)
+            if not isinstance(entries, list):
+                continue
+            for c in entries:
                 if not isinstance(c, dict):
                     continue
                 label = (c.get("proposed_label") or "").strip()
@@ -477,15 +554,32 @@ async def mine_table_concepts_async(
                     if parent_iri is None and label:
                         n_dropped_bad_parent += 1
                     continue
+                via = "column" if axis == "columns" else "row"
+                # Prefer the verbatim source label as the evidence snippet
+                # so Stage 3 sees the text the proposal came from.
+                source_text = c.get(snippet_key)
+                snippet = (
+                    source_text.strip()
+                    if isinstance(source_text, str) and source_text.strip()
+                    else label
+                )
+                if axis == "rows" and _is_structural_row_label(snippet, label):
+                    n_dropped_structural += 1
+                    if audit_callback is not None:
+                        audit_callback(
+                            "table_concept_structural_drop",
+                            {"label": label, "source_label": snippet},
+                        )
+                    continue
                 existing = _existing_match(label, parent_iri, classes_index)
                 if existing is not None:
-                    matches.append(_stage2_match_entry(existing, label))
+                    matches.append(_stage2_match_entry(existing, snippet))
                     n_reused += 1
                     if audit_callback is not None:
                         audit_callback(
                             "table_concept_match",
                             {"label": label, "matched_iri": existing,
-                             "via": "column"},
+                             "via": via},
                         )
                 else:
                     raw_candidates.append({
@@ -493,7 +587,7 @@ async def mine_table_concepts_async(
                         "description": definition or f"Subclass of {_IRI_TO_LABEL[parent_iri]} for {label}.",
                         "parent_iri": parent_iri,
                         "source_id": table_id,
-                        "snippet": label,
+                        "snippet": snippet,
                     })
 
     # ----- Layer 2: across-table collapse -----
@@ -541,6 +635,8 @@ async def mine_table_concepts_async(
     print(
         f"[table-mining] done: {len(matches)} reused, {len(proposals)} new "
         f"proposed, {n_dropped_bad_parent} dropped (bad parent_iri), "
+        f"{n_dropped_structural} dropped (total/subtotal row), "
+        f"{n_rejected_domain} rejected (non-financial domain), "
         f"from {len(tables)} tables"
     )
     if audit_callback is not None:
@@ -551,6 +647,8 @@ async def mine_table_concepts_async(
                 "n_reused": n_reused,
                 "n_proposed": len(proposals),
                 "n_dropped_bad_parent": n_dropped_bad_parent,
+                "n_dropped_structural": n_dropped_structural,
+                "n_rejected_domain": n_rejected_domain,
             },
         )
 

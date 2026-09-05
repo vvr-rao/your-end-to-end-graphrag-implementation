@@ -2941,6 +2941,7 @@ async def prune_and_expand_async(
     use_owl: bool = False,
     suggested_new_classes: Path | None = None,
     extract_tables: bool = False,
+    mine_table_concepts: bool = False,
     table_vision: bool = True,
     single_pass_summaries: bool = False,
     select_subset: bool = False,
@@ -2965,6 +2966,7 @@ async def prune_and_expand_async(
         dry_run,
         suggestions_path=suggested_new_classes,
         extract_tables=extract_tables,
+        mine_table_concepts=mine_table_concepts,
         table_vision=table_vision,
         single_pass_summaries=single_pass_summaries,
         select_subset=select_subset,
@@ -2991,6 +2993,7 @@ async def build_async(
     dry_run: bool,
     suggested_new_classes: Path | None = None,
     extract_tables: bool = False,
+    mine_table_concepts: bool = False,
     table_vision: bool = True,
     single_pass_summaries: bool = False,
     select_subset: bool = False,
@@ -3020,6 +3023,7 @@ async def build_async(
         dry_run,
         suggestions_path=suggested_new_classes,
         extract_tables=extract_tables,
+        mine_table_concepts=mine_table_concepts,
         table_vision=table_vision,
         single_pass_summaries=single_pass_summaries,
         select_subset=select_subset,
@@ -3047,6 +3051,7 @@ async def _run(
     suggestions_path: Path | None = None,
     *,
     extract_tables: bool = False,
+    mine_table_concepts: bool = False,
     table_vision: bool = True,
     single_pass_summaries: bool = False,
     select_subset: bool = False,
@@ -3270,7 +3275,14 @@ async def _run(
     # cross-table duplicates, then emit MATCH NOT FOUND proposals anchored under
     # the 6 buckets in domain_concepts.owl.
     table_mining_stage2: dict[str, Any] | None = None
-    if extract_tables and not dry_run:
+    # Mining is OPT-IN separately from extraction. `--tables` on its own
+    # extracts StructuredTable payloads (useful on any corpus, and what
+    # Phase 2 retrieval consumes); minting ONTOLOGY CLASSES from them
+    # only makes sense for financial corpora, because the 6 anchor
+    # buckets in domain_concepts.owl are financial by definition. Phase 2
+    # cannot correct the taxonomy afterwards, so the class-minting half
+    # needs its own deliberate opt-in.
+    if extract_tables and mine_table_concepts and not dry_run:
         from backend.app.services import table_ontology_mining
 
         def _audit_table_mining(task: str, payload: dict[str, Any]) -> None:

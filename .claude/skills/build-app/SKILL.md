@@ -60,8 +60,8 @@ in a third-party tool (Protégé) before the paid prune-expand. Between the merg
 and prune-expand, run `summarize-descriptions` on the merge folder — it costs
 cents, is idempotent, and cut prune-expand from $1.79 to $1.44 in testing by
 shrinking Stage 2's prompts by 78%. THEN ask for the
-corpus, mention the `--tables` option and ask their preference, and run
-prune-expand. Walk it one step at a time; never race ahead to a paid step.
+corpus, mention the `--tables` option (plus `--table-mining` if the corpus is
+financial) and ask their preference, and run prune-expand. Walk it one step at a time; never race ahead to a paid step.
 
 ## The sequence
 
@@ -83,7 +83,9 @@ path, **ask whether to build the ontology from the FULL corpus or from a
 representative subset** (`--select-subset` — clusters the corpus and keeps one
 document per cluster, one per document type, and every outlier; several-fold
 cheaper, and ingestion still uses every document), **mention the `--tables` flag
-and ask their preference**, then launch prune-expand **detached**, monitoring to
+and ask their preference** (and `--table-mining` only for a FINANCIAL corpus --
+it mints ontology classes from table labels, which Phase 2 cannot correct
+later), then launch prune-expand **detached**, monitoring to
 completion. First multi-hour paid step;
 capture the resulting `v*-prune-expand/` folder. Note the edit-and-resubmit gotcha
 (hand-edited `merged.owl` needs `--use-owl` or a re-merge, or edits are ignored).
