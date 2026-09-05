@@ -408,6 +408,15 @@ qa:
   # If even the BEST hit is farther than this, the probe found nothing relevant
   # and contributes no votes at all.
   probe_dist_floor: 1.05
+  # Probe filtering. `probe_rel_band` is the RELATIVE test and takes
+  # precedence when set: drop a probe only if its best hit is worse than the
+  # BEST PROBE IN THIS QUERY plus this band. The old absolute `probe_dist_floor`
+  # could not tell "this probe matched nothing" from "this question is phrased
+  # abstractly" -- measured, five probes for one question spanned 1.0222-1.0973
+  # and the fixed 1.05 discarded four of them. `probe_dist_ceiling` remains as a
+  # loose backstop for when EVERY probe is hopeless.
+  probe_rel_band: 0.10
+  probe_dist_ceiling: 1.25
   # Keep only results within this L2 distance of the probe's own best hit.
   # OFF by default: measured top-30 spread for a relevant probe is only
   # 0.085-0.107, so any band loose enough to be safe is also loose enough to be
@@ -472,6 +481,51 @@ qa:
   # Per-document window inside the document-mediated fetches, so a single large
   # label cannot claim the whole global budget before other documents are seen.
   max_fulltext_chunks_per_document: 50
+
+  # ---- Post-fusion vector rerank (query --rerank) ----
+  # RRF (step 10) fuses rank ORDER and throws distance away, so a chunk that
+  # merely placed well across several probes can outrank one that is genuinely
+  # closer to the question. When enabled, the fused pool is re-sorted by L2
+  # distance to the ORIGINAL question embedding before the per-document cap
+  # and the truncation to top_k.
+  #
+  # The pool is deliberately WIDER than top_k so the rerank can swap a better
+  # chunk INTO the final set -- reordering the ones RRF already chose would not
+  # move precision, which is the point.
+  #
+  # Costs no extra LLM call (the question is already embedded for step 9), just
+  # one additional SQL query. Off by default: it changes which evidence a query
+  # returns, so it is opt-in until measured on your own corpus.
+  #
+  # NOTE: on a reranked run `retrieval_evidence.score` stays the RRF score, so
+  # it is NOT monotonic with rank. `retrieval_runs.retrieval_plan.rerank`
+  # records that the ordering key was the distance, not the score.
+  rerank_after_fusion: false
+  rerank_pool_multiplier: 3
+  # Entity->entity relationship triples added to the evidence packet.
+  # These BYPASS RRF deliberately: fusion ranks one flat id space (chunk
+  # UUIDs), so a triple has no representation in it -- which is why a graph
+  # holding 14 `defeated` edges still answered "which teams defeated which
+  # other teams" with "no information". 0 disables.
+  max_relationship_evidence: 25
+  # How strictly a triple must sit inside the BFS neighbourhood: "either"
+  # (one endpoint reached) or "both". Measured on "which players signed with
+  # or transferred to new teams": "both" admitted 44 of 132 edges and excluded
+  # every signedWith edge because the club end was never reached; "either"
+  # admits 111 and recovers all three. Safe only because relationship evidence
+  # is RANKED against the question before the cap is applied.
+  relationship_scope: either
+  # Class matching: how far DOWN the subClassOf taxonomy a matched class
+  # expands, and the cap on classes that descent may add. A question naming a
+  # general category ("players") must reach the specific classes its instances
+  # carry -- measured, `Player` matched but `BaseballPlayer` did not, and the
+  # relevant entities are typed with the latter, so the match was inert.
+  class_descend_depth: 3
+  class_descend_cap: 400
+  # Classes kept per parsed class term by the lexical/head-noun match.
+  # "player" -> BaseballPlayer, NFLPlayer, AFLWPlayer ... shortest first, so
+  # the plain category wins before its qualified compounds.
+  class_lexical_per_term: 25
 
 # -----------------------------------------------------------------------------
 # Background jobs (arq).

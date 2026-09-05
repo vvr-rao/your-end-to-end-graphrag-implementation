@@ -772,6 +772,56 @@ def build_parser() -> argparse.ArgumentParser:
             "Requires the corpus was ingested with --full-text-chunks. Default: summary."
         ),
     )
+    p_ext.add_argument(
+        "--no-relationships", action="store_true",
+        help=(
+            "Skip entity->entity relationship extraction (a SECOND LLM call "
+            "per chunk, after entities are known so the candidate-predicate "
+            "menu can be narrowed to their actual classes). Measured on 442 "
+            "chunks it is not more expensive than the one-call version -- the "
+            "entity prompt shrinks and the second call is skipped for chunks "
+            "with under two entities or no fitting predicate. Use this only to "
+            "reproduce pre-relationship behaviour."
+        ),
+    )
+    p_ext.add_argument(
+        "--no-verify-relationships", action="store_true",
+        help=(
+            "Skip the THIRD pass that checks each relationship's quoted "
+            "evidence actually SUPPORTS the claim. The structural checks "
+            "verify a quote occurs in the chunk and names both entities; they "
+            "cannot tell that 'lawsuits filed against A by B' does not mean A "
+            "sued B. On a 30-doc news corpus roughly half of a hand-checked "
+            "sample was wrong despite passing every structural gate. Costs one "
+            "extra cheap call per chunk that produced relationships."
+        ),
+    )
+    p_ext.add_argument(
+        "--rescue-relationships", action="store_true",
+        help=(
+            "EXPERIMENTAL, OFF by default -- it MEASURED WORSE. Re-asks for "
+            "claims whose evidence is sound but whose predicate failed the "
+            "domain/range check, using a wider menu (either end matching "
+            "instead of both). The motivation is real: the strict menu offered "
+            "a median of 8 of 620 predicates on a news corpus. But on that "
+            "corpus it rescued 74 claims and precision fell from ~75%% to "
+            "~45%% -- the wider menu lets through predicates whose OTHER end "
+            "is nonsense ('Nvidia based_near Gaza', 'Warner Music Group "
+            "hasSubOrganization David Bowie'). Needs a per-pair menu, not a "
+            "per-chunk one, before it earns its place."
+        ),
+    )
+    p_ext.add_argument(
+        "--entity-identity", choices=("name", "name-class"), default="name",
+        help=(
+            "What makes two mentions the SAME entity. 'name' (default): one "
+            "node per name, primary class by majority vote, other observed "
+            "classes kept as extra rdf:type edges. 'name-class' is the old "
+            "behaviour, which split one entity into a node per class -- "
+            "measured 18 separate 'Google' nodes on a 30-doc corpus, which "
+            "breaks multi-hop traversal."
+        ),
+    )
     p_ext.set_defaults(func=_cmd_extract_entities)
 
     # ---------- Phase 2: Milestone E (artifacts) ----------
@@ -994,6 +1044,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Cap on number of vector-search probes (incl. the original query).",
     )
     p_q.add_argument(
+        "--rerank", action="store_true",
+        help=(
+            "Re-sort the fused chunk pool by distance to the QUESTION "
+            "embedding before truncating to --top-k. RRF fuses rank order and "
+            "discards distance, so a chunk that placed well across several "
+            "probes can outrank one that is genuinely closer to the question; "
+            "this restores that signal and raises precision. Costs no extra LLM "
+            "call (the question is already embedded), just one SQL query. "
+            "Unset => qa.rerank_after_fusion in config.yaml (default off)."
+        ),
+    )
+    p_q.add_argument(
         "--json", action="store_true",
         help="Print the full response envelope as JSON.",
     )
@@ -1103,6 +1165,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_conv_turn.add_argument("--no-decompose", action="store_true")
     p_conv_turn.add_argument("--max-probes", type=int, default=5)
+    p_conv_turn.add_argument(
+        "--rerank", action="store_true",
+        help="Vector-rerank the fused pool against the question embedding "
+             "before truncation (see `query --rerank`).",
+    )
     p_conv_turn.add_argument(
         "--history-window", type=int, default=3,
         help="How many prior turns to feed into follow-up resolution.",
@@ -1626,6 +1693,12 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
             concurrency=_conc,
             max_cost_usd=args.max_cost_usd,
             chunk_kind="fulltext" if getattr(args, "from_fulltext", False) else "summary",
+            extract_relationships=not getattr(args, "no_relationships", False),
+            verify_relationships=not getattr(
+                args, "no_verify_relationships", False),
+            rescue_relationships=getattr(
+                args, "rescue_relationships", False),
+            entity_identity=getattr(args, "entity_identity", "name"),
         )
     )
     return 0
@@ -1820,6 +1893,7 @@ def _cmd_query(args: argparse.Namespace) -> int:
             max_cost_usd=args.max_cost_usd,
             decompose=not args.no_decompose,
             max_probes=args.max_probes,
+            rerank=True if getattr(args, "rerank", False) else None,
             verbose=args.verbose,
             multi_round=getattr(args, "multi_round", True),
             persist=getattr(args, "persist", True),
@@ -1934,6 +2008,7 @@ def _cmd_conversation_turn(args: argparse.Namespace) -> int:
             max_cost_usd=args.max_cost_usd,
             decompose=not args.no_decompose,
             max_probes=args.max_probes,
+            rerank=True if getattr(args, "rerank", False) else None,
             history_window=args.history_window,
             verbose=args.verbose,
         )

@@ -252,6 +252,7 @@ async def retrieve_and_answer(
     max_cost_usd: float = 1.0,
     decompose: bool = True,
     max_probes: int = 3,
+    rerank: bool | None = None,
     conversation_turn_id: uuid.UUID | None = None,
     resolved_query: str | None = None,
     verbose: bool = False,
@@ -309,7 +310,7 @@ async def retrieve_and_answer(
             r1 = await retrieve_and_answer(
                 plan["round1_question"], mode="simple_qa",
                 hops=hops, max_cost_usd=max_cost_usd, decompose=decompose,
-                max_probes=max_probes, verbose=verbose,
+                max_probes=max_probes, rerank=rerank, verbose=verbose,
                 multi_round=False, persist=persist, _round_depth=1,
             )
             # Round 2 (final): enrich the question with round-1 findings so the
@@ -329,7 +330,8 @@ async def retrieve_and_answer(
             r2 = await retrieve_and_answer(
                 enriched_final, mode=mode, top_k=top_k,
                 hops=hops, max_cost_usd=max_cost_usd, decompose=decompose,
-                max_probes=max_probes, conversation_turn_id=conversation_turn_id,
+                max_probes=max_probes, rerank=rerank,
+                conversation_turn_id=conversation_turn_id,
                 verbose=verbose, multi_round=False, persist=persist,
                 _round_depth=1,
             )
@@ -671,19 +673,42 @@ async def retrieve_and_answer(
     # probes (max_probes) and a smaller candidate set, not concurrency.
     chunk_rankings: list[list[uuid.UUID]] = []
     artifact_rankings: list[list[uuid.UUID]] = []
+    # Score EVERY probe before trimming any: the floor's real question is
+    # "did this probe do worse than its siblings", which is a comparison and
+    # cannot be answered one probe at a time. Trimming inside the loop is what
+    # forced an absolute threshold, and an absolute threshold cannot tell a
+    # probe that matched nothing from a probe whose QUESTION is phrased
+    # abstractly. Measured on "which players signed with or transferred to new
+    # teams": all five probes landed in a 0.075-wide band (1.0222-1.0973) and
+    # the fixed 1.05 cut through the middle of it, discarding four probes that
+    # had found material just as good as the one it kept.
+    _scored: list[tuple[str, list[tuple[uuid.UUID, float]],
+                        list[tuple[uuid.UUID, float]]]] = []
     async with session_scope() as session:
         for probe_text, pvec in zip(probes, probe_vecs, strict=False):
             ranked = await retrieval_sql.vector_rerank_chunks(
                 session, candidate_chunk_ids, pvec, top_k=top_k * 3,
             )
-            chunk_rankings.append(
-                _trim_by_distance(ranked, label=probe_text, verbose=verbose)
-            )
+            ranked_a: list[tuple[uuid.UUID, float]] = []
             if candidate_artifact_ids:
                 ranked_a = await retrieval_sql.vector_rerank_artifacts(
                     session, candidate_artifact_ids, pvec, top_k=top_k,
                 )
-                artifact_rankings.append(_trim_by_distance(ranked_a))
+            _scored.append((probe_text, ranked, ranked_a))
+
+    # Best hit any probe achieved -- the reference point for the relative test.
+    _cohort_best = min(
+        (min(d for _, d in r) for _, r, _ in _scored if r), default=None
+    )
+    for probe_text, ranked, ranked_a in _scored:
+        chunk_rankings.append(
+            _trim_by_distance(ranked, label=probe_text, verbose=verbose,
+                              cohort_best=_cohort_best)
+        )
+        if ranked_a:
+            artifact_rankings.append(
+                _trim_by_distance(ranked_a, cohort_best=_cohort_best)
+            )
 
     # Graph-distance ranking: BFS score per chunk (via its entities). Uses the
     # entity-coverage ranking from step 8, propagated to full-text chunks by the
@@ -702,11 +727,67 @@ async def retrieve_and_answer(
     if artifact_candidates:
         artifact_rankings.append([aid for aid, _ in artifact_candidates])
 
+    # Records whether step 10b ran, for retrieval_plan (see below).
+    _rerank_note: dict[str, Any] | None = None
+
     # -------- step 10: RRF fusion --------
     if mode == "artifact_only":
         fused_chunks: list[tuple[uuid.UUID, float]] = []
     else:
         _fused_all = rrf_fuse(chunk_rankings)
+        # -------- step 10b: optional vector rerank of the fused pool --------
+        # RRF fuses rank ORDER and throws the distances away (see
+        # `_trim_by_distance`), so a chunk that merely placed well across
+        # several probes can outrank one that is genuinely closer to the
+        # question. This re-sorts the fused pool by L2 distance to the
+        # ORIGINAL question embedding, which is the signal fusion discarded.
+        #
+        # It runs on a pool WIDER than top_k and BEFORE the cap + truncation,
+        # so it can swap a better chunk into the final set rather than merely
+        # reorder the ones RRF already chose -- reordering alone would not
+        # move precision, which is the point of the flag.
+        #
+        # Each chunk keeps its ORIGINAL RRF score: `cap_per_source` reads that
+        # score as higher-is-better, and it is persisted to
+        # `retrieval_evidence.score`. Substituting a distance (lower-is-better)
+        # would silently invert both. The consequence is that score is no
+        # longer monotonic with rank on a reranked run, so the run records
+        # `retrieval_plan.rerank` to say the ordering key is not the score.
+        _rerank_on = (
+            bool(_qa_cfg("rerank_after_fusion", False)) if rerank is None
+            else bool(rerank)
+        )
+        if _rerank_on and _fused_all:
+            _pool_mult = max(1, int(_qa_cfg("rerank_pool_multiplier", 3)))
+            _pool = _fused_all[: top_k * _pool_mult]
+            _pool_ids = [cid for cid, _ in _pool]
+            async with session_scope() as session:
+                _reranked = await retrieval_sql.vector_rerank_chunks(
+                    session, _pool_ids, qvec, top_k=len(_pool_ids)
+                )
+            if _reranked:
+                _rrf_score = dict(_pool)
+                _order = [cid for cid, _ in _reranked]
+                # Anything the rerank did not return (no embedding) keeps its
+                # RRF position behind the reranked head, rather than vanishing.
+                _seen = set(_order)
+                _tail = [cid for cid, _ in _pool if cid not in _seen]
+                _fused_all = (
+                    [(cid, _rrf_score[cid]) for cid in _order + _tail]
+                    + _fused_all[top_k * _pool_mult :]
+                )
+                _rerank_note = {
+                    "applied": True,
+                    "pool": len(_pool_ids),
+                    "pool_multiplier": _pool_mult,
+                    "note": "ordered by distance to the question embedding; "
+                            "score column remains the RRF score",
+                }
+                if verbose:
+                    print(
+                        f"[query] reranked {len(_pool_ids)} fused chunk(s) "
+                        f"against the question embedding"
+                    )
         # Cap one document's share BEFORE truncating to top_k. RRF's usual
         # defence is agreement between independent lists, but all three
         # voters here run over the same candidate pool -- when that pool is
@@ -772,6 +853,89 @@ async def retrieve_and_answer(
             # retrieval_sql._render_time_span).
             "times": chunk_times.get(cid, ""),
         })
+    # -------- entity -> entity relationships --------
+    #
+    # The third kind of evidence, and the only one not routed through RRF.
+    # Fusion ranks a single flat id space (chunk UUIDs), so a triple cannot
+    # travel through it -- entities were projected to chunks at step 8 and the
+    # relationship was dropped there. Measured consequence: a corpus holding
+    # 14 `defeated`/`advancedOver` edges answered "which teams defeated which
+    # other teams" with "the retrieved evidence contains no information",
+    # because every fact the model can see arrives as chunk prose.
+    #
+    # These are appended, not fused: the edges are already scoped to the
+    # entities BFS reached, and each carries the verbatim quote that
+    # extraction verified, so they are evidence in their own right rather
+    # than candidates competing with passages.
+    _rel_cap = max(0, int(_qa_cfg("max_relationship_evidence", 25)))
+    rel_evidence: list[dict[str, Any]] = []
+    if _rel_cap > 0 and expanded_entity_ids:
+        async with session_scope() as session:
+            # Fetch WIDE, then rank against the question and cut. Fetching
+            # straight to the cap ordered by (support, subject name) meant the
+            # cut was alphabetical and question-blind: on "which players signed
+            # with or transferred to new teams" the three `signedWith` edges
+            # sat at positions 8/45/68 of 132, so a cap of 25 kept one and
+            # discarded two, filling the packet with `marriedTo` pairs that
+            # happened to have higher support and earlier subject names.
+            _rel_pool = await retrieval_sql.fetch_relationships_among_entities(
+                session, expanded_entity_ids, limit=max(_rel_cap * 8, 200),
+                scope=str(_qa_cfg("relationship_scope", "either")),
+            )
+        rel_evidence = _rank_relationships(
+            _rel_pool, resolved_query, question_terms=parsed.get("classes") or [],
+        )[:_rel_cap]
+    for rank, rel in enumerate(rel_evidence, start=1):
+        # Rendered as a sentence rather than a raw triple: the synthesis
+        # prompt reads `text` for every evidence kind, and "Chelsea defeated
+        # Newcastle United" is what the model needs to be able to quote.
+        # The claim first, then the quote clearly marked as SUPPORT for that
+        # claim alone. Measured failure: the triple
+        # `Windfield Holdings --subsidiaryOf--> Albemarle Corporation` carried
+        # the honest quote "Windfield Holdings: Australian mining company,
+        # subsidiary of Albemarle; registered office ... Perth", and the answer
+        # reported Perth as ALBEMARLE's headquarters -- it is Charlotte, North
+        # Carolina, on the 10-K cover. A correct edge with an honest quote
+        # produced a confidently wrong, cited answer, because the quote carries
+        # detail about one endpoint only.
+        _stmt = f"{rel['subject']} {rel['predicate']} {rel['object']}."
+        _ev = _trim_quote_to_claim(
+            rel.get("evidence") or "", rel["subject"], rel["object"])
+        if _ev:
+            _stmt += (f" [supporting quote for THAT relationship only; any "
+                      f"other detail in it belongs to whichever one it names, "
+                      f"not to both: \"{_ev}\"]")
+        evidence.append({
+            "kind": "relationship",
+            # No primary key is exposed: these are not persisted as
+            # retrieval_evidence rows (that table keys on chunk/artifact ids),
+            # so node_id stays None and the IRI is synthesised for citation.
+            "node_id": None,
+            "iri": (
+                "https://veerla-ramrao.ai/ontology/intelligence-artifact"
+                f"#Relationship_{rank:04d}"
+            ),
+            "rank": rank + len(fused_chunks) + len(fused_artifacts),
+            "score": float(rel.get("support") or 1),
+            "text": _stmt,
+            # Deliberately NOT tagged with its endpoints. `_format_evidence_block`
+            # renders `entities` as "about: X, Y", and the attribution rule says
+            # a property stated in an item belongs to that item's entities --
+            # which, for a relationship, reads as permission to attribute
+            # anything in the quote to BOTH ends. That is exactly how Perth
+            # (Windfield's registered office) was reported as Albemarle's
+            # headquarters. The endpoints are already named in the sentence.
+        })
+    if verbose and rel_evidence:
+        # Report the POOL too: a packet full of the wrong triples and a packet
+        # drawn from a pool that never contained the right ones look identical
+        # from the outside, and they need opposite fixes (ranking vs seeding).
+        print(
+            f"[query] graph relationships added: {len(rel_evidence)} of "
+            f"{len(_rel_pool)} edge(s) among the {len(expanded_entity_ids)} "
+            f"entities BFS reached"
+        )
+
     for rank, (aid, score) in enumerate(fused_artifacts, start=1):
         info = artifact_rows.get(aid)
         if info is None:
@@ -842,6 +1006,7 @@ async def retrieve_and_answer(
             matched_classes=matched_classes, matched_entities=matched_entities,
             matched_times=matched_times, graph_hops=hops,
             conversation_turn_id=conversation_turn_id,
+            rerank_note=_rerank_note,
         )
     else:
         async with session_scope() as session:
@@ -1055,6 +1220,110 @@ async def _ontology_match(
             )
             seeds.append((cid, "ontology_class"))
 
+        # LEXICAL match on the parser's own class terms.
+        #
+        # The vector pass above compares the WHOLE QUESTION against class
+        # labels and keeps 30 of 3,003 -- and `parsed["classes"]` was never
+        # consumed at all, though the parser has been producing it all along.
+        # Measured consequence: "which players signed with or transferred to
+        # new teams" selected BaseballSigning, BaseballTrade and BaseballAgent
+        # but NOT BaseballPlayer or BaseballTeam, the classes the relevant
+        # entities are actually typed as, so BFS never entered that part of
+        # the graph.
+        #
+        # Entity matching has done trigram-on-term since the start; classes
+        # simply never got the same treatment. Plurals are stripped because
+        # questions say "players" while a taxonomy says "Player".
+        _seen_class_ids = {c["id"] for c in matched_classes}
+        for term in (parsed.get("classes") or [])[:8]:
+            term = (term or "").strip()
+            if len(term) < 3:
+                continue
+            variants = {term}
+            if term.lower().endswith("ies"):
+                variants.add(term[:-3] + "y")
+            if term.lower().endswith("s"):
+                variants.add(term[:-1])
+            for variant in variants:
+                # HEAD-NOUN matching does the work here. Ontology class names
+                # are `<Qualifier><HeadNoun>` compounds and the head noun IS
+                # the category: BaseballPlayer, NFLPlayer, AFLWPlayer all end
+                # in "Player". Trigram alone scores BaseballPlayer vs "player"
+                # around 0.45 -- below any threshold safe enough to use -- and
+                # descent cannot help because this ontology puts `Player`
+                # under Organization while `BaseballPlayer` sits under Person,
+                # so the two are in different branches entirely.
+                r = await session.execute(
+                    sql_text("""
+                    SELECT id, iri, label,
+                           similarity(lower(label), lower(:t)) AS sim
+                      FROM graphrag.ontology_classes
+                     WHERE label IS NOT NULL
+                       AND (lower(label) = lower(:t)
+                            OR lower(label) LIKE '%' || lower(:t)
+                            OR similarity(lower(label), lower(:t)) >= 0.55)
+                     ORDER BY (lower(label) = lower(:t)) DESC,
+                              length(label), sim DESC
+                     LIMIT :per_term
+                    """),
+                    {"t": variant,
+                     "per_term": int(_qa_cfg("class_lexical_per_term", 25))},
+                )
+                for cid, iri, label, sim in r.all():
+                    if cid in _seen_class_ids:
+                        continue
+                    _seen_class_ids.add(cid)
+                    matched_classes.append({
+                        "id": cid, "iri": iri, "label": label or "",
+                        "dist": 1.0 - float(sim), "via": "lexical",
+                    })
+                    seeds.append((cid, "ontology_class"))
+
+        # DESCEND the taxonomy from every matched class.
+        #
+        # A question naming a general category ("players") should reach the
+        # specific classes its instances actually carry. `Player` WAS matched
+        # above; `BaseballPlayer` was not, and entities are typed with the
+        # latter -- so without this the match is inert. Ancestors were already
+        # implicitly available through BFS; descendants were not, because
+        # `rdfs:subClassOf` points upward and BFS starts from the general
+        # class, not the specific one.
+        if _seen_class_ids:
+            r = await session.execute(
+                sql_text("""
+                WITH RECURSIVE down(id, depth) AS (
+                    SELECT oc.id, 0 FROM graphrag.ontology_classes oc
+                     WHERE oc.id = ANY(CAST(:ids AS uuid[]))
+                  UNION
+                    SELECT gr.source_node_id, down.depth + 1
+                      FROM down
+                      JOIN graphrag.graph_relationships gr
+                        ON gr.target_node_id = down.id
+                       AND gr.source_node_type = 'ontology_class'
+                       AND gr.target_node_type = 'ontology_class'
+                       AND gr.predicate_label = 'rdfs:subClassOf'
+                     WHERE down.depth < :max_depth
+                )
+                SELECT DISTINCT oc.id, oc.iri, oc.label
+                  FROM down JOIN graphrag.ontology_classes oc ON oc.id = down.id
+                 LIMIT :cap
+                """),
+                {
+                    "ids": [str(c) for c in _seen_class_ids],
+                    "max_depth": int(_qa_cfg("class_descend_depth", 3)),
+                    "cap": int(_qa_cfg("class_descend_cap", 400)),
+                },
+            )
+            for cid, iri, label in r.all():
+                if cid in _seen_class_ids:
+                    continue
+                _seen_class_ids.add(cid)
+                matched_classes.append({
+                    "id": cid, "iri": iri, "label": label or "",
+                    "dist": 1.0, "via": "descend",
+                })
+                seeds.append((cid, "ontology_class"))
+
         # Vector + trgm entity match per parsed entity term. Mined aliases
         # are matched alongside the question's own wording, so a graph
         # entity minted as "MOUNJARO" is seeded by a question that only
@@ -1156,11 +1425,175 @@ async def _query_decompose(router: LLMRouter, q: str) -> list[str]:
     return [s for s in sqs if isinstance(s, str) and s.strip()]
 
 
+_REL_STOPWORDS = frozenset({
+    "which", "what", "who", "whom", "whose", "when", "where", "how", "why",
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "at", "for",
+    "with", "by", "from", "is", "are", "was", "were", "be", "been", "do",
+    "does", "did", "have", "has", "had", "that", "this", "these", "those",
+    "also", "their", "there", "they", "it", "its", "any", "all", "new",
+    "other", "more", "most", "some", "each", "both", "about", "into",
+})
+
+
+def _trim_quote_to_claim(quote: str, subject: str, object_: str) -> str:
+    """Cut a supporting quote down to the span that actually asserts the claim.
+
+    A prompt rule was tried first and did NOT hold: told that the quote proves
+    only the stated relationship, the model still reported Perth -- the
+    registered office of Windfield Holdings -- as the headquarters of
+    Albemarle Corporation, because both names and one address sat in the same
+    sentence. An instruction competes poorly with a fact in plain text beside
+    the entity name, so the fix is to stop shipping the fact.
+
+    Keeps from the first endpoint mention to the end of the clause containing
+    the last one, dropping trailing clauses that belong to only one side
+    ("...; registered office at Level 15, ... Perth"). Nothing is lost from
+    the SYSTEM: every relationship quote is a verbatim substring of a chunk by
+    construction (extraction rejects one that is not), so the full sentence
+    remains available through chunk evidence and in extra_metadata for audit.
+
+    Falls back to the untrimmed quote whenever the span cannot be located --
+    a shorter-but-wrong quote would be worse than the original problem.
+    """
+    q = " ".join((quote or "").split())
+    if not q:
+        return ""
+
+    # Corporate boilerplate is shared by half the names in a filing and must
+    # never be what locates an endpoint.
+    _NOISE = {"co", "ltd", "inc", "corp", "corporation", "company", "limited",
+              "plc", "llc", "pty", "gmbh", "holdings", "group", "the", "and"}
+
+    def _key_tokens(name: str, other: str) -> list[str]:
+        """Tokens that identify `name` and do NOT also occur in `other`.
+
+        Without the exclusion, "Samsung Electronics Co., Ltd." and "Samsung
+        SDI Co., Ltd." both resolve to the first "Samsung" in the quote, the
+        span collapses to nothing, and the claim is destroyed.
+        """
+        other_t = {t.lower() for t in re.split(r"[^\w]+", other or "")}
+        toks = [t for t in re.split(r"[^\w]+", name or "")
+                if len(t) > 1 and t.lower() not in _NOISE]
+        distinctive = [t for t in toks if t.lower() not in other_t]
+        return sorted(distinctive or toks, key=len, reverse=True)
+
+    def _find(name: str, other: str) -> int:
+        for t in _key_tokens(name, other):
+            i = q.lower().find(t.lower())
+            if i >= 0:
+                return i
+        return -1
+
+    i_s, i_o = _find(subject, object_), _find(object_, subject)
+    if i_s < 0 or i_o < 0:
+        return q                      # cannot locate both -- keep as-is
+    start, last = min(i_s, i_o), max(i_s, i_o)
+    # Extend past the later endpoint to the next CLAUSE boundary. Only ';' and
+    # ':' are used: a full stop is unreliable here because "Co.", "Ltd." and
+    # "Inc." end in one, and splitting on those truncated a claim mid-sentence.
+    tail = q[last:]
+    m = re.search(r"[;:]", tail)
+    end = last + (m.start() if m else len(tail))
+    while start > 0 and q[start - 1].isalnum():
+        start -= 1
+    # The distinctive token may sit mid-name ("Electronics" inside "Samsung
+    # Electronics Co., Ltd."), which would open the quote on a fragment. Walk
+    # back over immediately preceding words that belong to either endpoint's
+    # name so the quote starts on a whole name.
+    _name_words = {
+        t.lower()
+        for n in (subject, object_)
+        for t in re.split(r"[^\w]+", n or "") if t
+    }
+    for _ in range(4):
+        head = q[:start].rstrip()
+        m_prev = re.search(r"([\w&]+)\W*$", head)
+        if not m_prev or m_prev.group(1).lower() not in _name_words:
+            break
+        start = m_prev.start(1)
+    trimmed = q[start:end].strip(" ,;:")
+    # A trim that lost either endpoint is worse than no trim at all.
+    low = trimmed.lower()
+    keeps_both = (
+        any(t.lower() in low for t in _key_tokens(subject, object_))
+        and any(t.lower() in low for t in _key_tokens(object_, subject))
+    )
+    if len(trimmed) < 12 or not keeps_both:
+        return q
+    return trimmed
+
+
+def _rank_relationships(
+    rels: list[dict[str, Any]],
+    question: str,
+    *,
+    question_terms: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Order triples by how much they look like an answer to THIS question.
+
+    Free -- no embedding call, no LLM. The signal that matters is lexical
+    overlap with the predicate and the endpoint names, because a predicate
+    label is a verb phrase drawn from the same vocabulary the question uses:
+    "which players SIGNED WITH new teams" against `signedWith`.
+
+    Ties break on support count, so a relationship several passages assert
+    still outranks a one-off at equal relevance. Everything is kept and
+    merely reordered -- the caller applies the cap -- so a question with no
+    lexical hook degrades to the old support-first ordering rather than to an
+    empty list.
+    """
+    if not rels:
+        return []
+
+    def _toks(s: str) -> set[str]:
+        # Predicate labels arrive in both shapes -- `signedWith` from the
+        # minted IRI fragment and "signed with" from the ontology label -- so
+        # camelCase must be split or the question word "signed" never meets
+        # the predicate it names.
+        s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", s or "")
+        return {
+            t for t in re.split(r"[^a-z0-9]+", s.lower())
+            if len(t) > 2 and t not in _REL_STOPWORDS
+        }
+
+    def _stem(t: str) -> str:
+        """Crude suffix stripping, applied in a FIXED order so both sides of
+        the comparison land on the same string. Order matters: handling only
+        one suffix each made "acquired" -> "acquir" but "acquires" ->
+        "acquire", which then failed to match."""
+        if t.endswith("s") and not t.endswith("ss"):
+            t = t[:-1]
+        if t.endswith("ing"):
+            t = t[:-3]
+        elif t.endswith("ed"):
+            t = t[:-2]
+        if len(t) > 3 and t.endswith("e"):
+            t = t[:-1]
+        return t
+
+    q = _toks(question) | {t for term in (question_terms or [])
+                           for t in _toks(term)}
+    # Stems, so "signed"/"signings" reach `signedWith` and "acquired" reaches
+    # `acquires`. Cheap, dependency-free, and enough for verb-phrase labels.
+    q_stem = {_stem(t) for t in q}
+
+    def _score(rel: dict[str, Any]) -> tuple[float, int]:
+        pred_s = {_stem(t) for t in _toks(rel.get("predicate") or "")}
+        ends_t = _toks(rel.get("subject") or "") | _toks(rel.get("object") or "")
+        # The predicate is what the question is ASKING FOR, so it counts far
+        # more than an incidental name collision in the endpoints.
+        s = 3.0 * len(pred_s & q_stem) + 1.0 * len(ends_t & q)
+        return (s, int(rel.get("support") or 1))
+
+    return sorted(rels, key=_score, reverse=True)
+
+
 def _trim_by_distance(
     ranked: list[tuple[uuid.UUID, float]],
     *,
     label: str | None = None,
     verbose: bool = False,
+    cohort_best: float | None = None,
 ) -> list[uuid.UUID]:
     """Drop a probe's weak tail before RRF sees it.
 
@@ -1185,11 +1618,41 @@ def _trim_by_distance(
         return []
     floor = _qa_cfg("probe_dist_floor", None)
     band = _qa_cfg("probe_dist_band", None)
-    if floor is None and band is None:
+    rel_band = _qa_cfg("probe_rel_band", None)
+    if floor is None and band is None and rel_band is None:
         return [cid for cid, _ in ranked]
 
     best = min(dist for _, dist in ranked)
-    if floor is not None and best > float(floor):
+
+    # RELATIVE test, preferred when configured and a cohort best is known.
+    # This is the comparison the absolute floor was reaching for: a probe that
+    # genuinely found nothing sits far behind its siblings, while a probe
+    # answering an abstractly-phrased question sits right next to them. On the
+    # measured failure the five probes spanned 1.0222-1.0973, so a +0.10 band
+    # keeps all five, whereas the original tirzepatide case -- one probe with
+    # no match among probes with real hits -- still lands outside it and
+    # abstains, which is the behaviour worth keeping.
+    if rel_band is not None and cohort_best is not None:
+        cutoff = float(cohort_best) + float(rel_band)
+        if best > cutoff:
+            if verbose:
+                print(
+                    f"[query] probe dropped (best {best:.4f} > cohort best "
+                    f"{cohort_best:.4f} + {float(rel_band):.2f}): {label!r}"
+                )
+            return []
+        # `probe_dist_floor` degrades to a loose sanity ceiling: it still
+        # catches the case where EVERY probe is hopeless, without slicing
+        # through a tight cluster of equally-good ones.
+        ceiling = _qa_cfg("probe_dist_ceiling", None)
+        if ceiling is not None and best > float(ceiling):
+            if verbose:
+                print(
+                    f"[query] probe dropped (best {best:.4f} > ceiling "
+                    f"{float(ceiling):.2f}): {label!r}"
+                )
+            return []
+    elif floor is not None and best > float(floor):
         if verbose:
             print(
                 f"[query] probe dropped (best dist {best:.4f} > floor "
@@ -1388,6 +1851,7 @@ async def _persist_run(
     matched_times: list[dict[str, Any]],
     graph_hops: int,
     conversation_turn_id: uuid.UUID | None,
+    rerank_note: dict[str, Any] | None = None,
 ) -> None:
     """INSERT retrieval_runs + retrieval_evidence rows."""
     run_id = uuid.uuid4()
@@ -1430,6 +1894,12 @@ async def _persist_run(
                     # Persisted so citation quality is trendable across runs
                     # rather than only visible in a log line.
                     "invalid_citations": result.invalid_citations,
+                    # Present only on a reranked run. Says the evidence
+                    # ORDER came from distance to the question embedding
+                    # while `score` is still the RRF score -- so score is
+                    # not monotonic with rank here, and sorting evidence
+                    # by score does NOT reproduce what was delivered.
+                    **({"rerank": rerank_note} if rerank_note else {}),
                 }),
                 "gv": gv,
             },

@@ -696,6 +696,48 @@ class MinedPair:
     occurrences: int = 1
 
 
+def _is_bare_common_noun(surface: str) -> bool:
+    """A single lowercase-in-source common noun -- never an alias.
+
+    The discriminator is CASE, not a word list. `_GENERIC_TERMS` is a
+    hand-built vocabulary grown from pharma and finance corpora ("patients",
+    "doses", "trials"), so it silently fails on any other domain: on a sports
+    corpus the parenthetical rule mined `Miranda Sissons <-> teams`, and
+    because retrieval injects aliases into every probe, one bad pair rewrote
+    all four probes of "which teams defeated which other teams" as
+    "which teams (Miranda Sissons) defeated...", destroying the search.
+
+    English writes proper names capitalized, so a bare lowercase word in the
+    source text is a common noun. Lowercase alias tokens that ARE legitimate
+    -- generic drug names like "tirzepatide" -- are multi-syllable coinages
+    absent from any stoplist, so this cannot be a wordlist test either; what
+    separates them is that a real alias is paired with its OWN referent, not
+    with an unrelated proper name. Hence the rule is applied to the PAIR:
+    a lowercase common word may not alias a capitalized proper name.
+    """
+    s = surface.strip()
+    if not s or " " in s or "-" in s:
+        return False              # multi-word terms are handled elsewhere
+    if not s[0].isalpha():
+        return False
+    # Capitalized or all-caps => proper name or acronym, keep.
+    if s[0].isupper():
+        return False
+    # Lowercase single word. Short ones are the risk: "teams", "leg",
+    # "scores". A long lowercase token is far more likely a coined generic
+    # name ("tirzepatide", "semaglutide") than an English common noun.
+    return len(s) <= 8
+
+
+def _looks_like_proper_name(surface: str) -> bool:
+    """Capitalized, non-acronym -- i.e. a name a person or org goes by."""
+    s = surface.strip()
+    if not s:
+        return False
+    words = [w for w in re.split(r"\s+", s) if w]
+    return bool(words) and all(w[:1].isupper() for w in words) and not s.isupper()
+
+
 def make_pair(
     left: str, right: str, kind: str, ref: str | None = None
 ) -> MinedPair | None:
@@ -706,6 +748,14 @@ def make_pair(
     """
     ln, rn = normalize_term(left), normalize_term(right)
     if not ln or not rn or ln == rn:
+        return None
+    # A proper name's alias is another name, an acronym or a coined generic --
+    # never a short lowercase common noun. Rejecting the combination keeps
+    # `MOUNJARO (tirzepatide)` (long lowercase coinage) and `MLS (Major League
+    # Soccer)` (acronym) while dropping `Miranda Sissons (teams)`, whose cost
+    # is paid on every query using the word "teams".
+    if ((_is_bare_common_noun(left) and _looks_like_proper_name(right))
+            or (_is_bare_common_noun(right) and _looks_like_proper_name(left))):
         return None
     if ln < rn:
         return MinedPair(ln, rn, _strip_marks(left), _strip_marks(right), kind, ref)

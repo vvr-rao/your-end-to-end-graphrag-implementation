@@ -96,6 +96,80 @@ Points users regularly get wrong:
 One thing subsetting does NOT speed up: `stage4-apply` (~20% of wall time) is
 pure CPU and scales with ONTOLOGY size, not document count.
 
+## Retrieval precision: the `--rerank` flag
+
+`query --rerank` re-sorts the fused chunk pool by distance to the **question**
+embedding before truncating to `--top-k`.
+
+Why it helps: step 9 vector-reranks per PROBE, then step 10 fuses those
+rankings with RRF -- and RRF combines rank ORDER only, discarding the distances
+(`_trim_by_distance` drops them explicitly). So a chunk that merely placed well
+across several probes can outrank one that is genuinely closer to what was
+asked. The flag restores that discarded signal as a final pass.
+
+It reranks a pool WIDER than `top_k` (`qa.rerank_pool_multiplier`, default 3x)
+and truncates afterwards, so it can pull a better chunk INTO the evidence set
+rather than only reordering the ones RRF already chose.
+
+- **Costs no extra LLM call** -- the question is already embedded for step 9.
+  One additional SQL query.
+- **Off by default** (`qa.rerank_after_fusion: false`). It changes which
+  evidence a query returns, so it is opt-in until measured on your corpus.
+- **Caveat worth knowing:** on a reranked run `retrieval_evidence.score` stays
+  the RRF score, so it is NOT monotonic with rank -- sorting evidence rows by
+  score does not reproduce the delivered order. The run records
+  `retrieval_runs.retrieval_plan.rerank` to say so.
+
+Reach for it when answers cite loosely-related passages, or when the corpus is
+large and topically mixed so the candidate pool is broad.
+
+## Entity-to-entity relationships
+
+`extract-entities` mints typed `entity -> entity` edges. It runs as **TWO LLM
+calls per chunk**: pass 1 extracts entities (unchanged), pass 2 asks for
+relationships between the entities pass 1 just found.
+
+Why two calls rather than one: the candidate-predicate menu can only be
+narrowed to the entities' ACTUAL classes once those entities exist. Deriving it
+from the chunk's top-50 candidate CLASSES instead offered a median of 12
+predicates against 4-5 entities, most inapplicable -- measured 669 of 1,140
+proposals rejected on domain/range alone.
+
+**Measured on 442 chunks (2026-08-29), same corpus, same models:**
+
+| | one call | **two passes** |
+|---|---:|---:|
+| edges written | 84 | **305** |
+| invented predicate IRIs | 45 | **0** |
+| acceptance rate | 7.4% | **42%** |
+| cost | $0.32 | **$0.31** |
+
+It is not more expensive: the entity prompt shrank (no predicate list) and the
+second call is skipped whenever a chunk has fewer than two entities or no
+predicate fits their classes.
+
+**Every edge carries a verified evidence quote.** The model must quote the span
+asserting the relationship, and the span is checked to really occur in the
+chunk before the edge is written. This replaces protection lost by narrowing
+the menu (offer and check now share a basis, so the type check is weaker).
+
+**Quality is good, not perfect -- say so when asked.** Spot-checked sample:
+- Sound: `COVID-19 lockdown measures -prevents-> COVID-19`
+- Wrong: `MECP2 Duplication Syndrome -associatedWith-> S.pneumoniae`, whose
+  quote is real and in the chunk but never mentions MECP2. The check verifies
+  the quote EXISTS, not that it supports the claim.
+- Over-broad: generic `foaf:`/`org:` predicates fit almost anything and get
+  over-selected, e.g. `Ozempic -foaf:...-> acute pancreatitis`.
+
+Other things worth knowing:
+- `--no-relationships` reproduces the older entity-only behaviour.
+- An existing graph gets none until `extract-entities` is re-run.
+- Needs the `relationship_extract` task in `models.yaml`. On an older config
+  the step says so once and continues with entities only.
+- If a run reports 0 relationships, the usual cause is that the ontology
+  declares no object property whose domain AND range both match this corpus's
+  classes -- not that the documents assert nothing.
+
 ## CLI (single entrypoint)
 `uv run python -m backend.app.cli <subcommand>`. Discover everything with
 `uv run python -m backend.app.cli --help`. Groups: ontology (`merge`, `prune`,

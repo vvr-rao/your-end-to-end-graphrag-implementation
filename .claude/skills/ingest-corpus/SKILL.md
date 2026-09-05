@@ -179,6 +179,41 @@ uv run python scripts/job_status.py <RUN_ID> 40
 uv run python scripts/build_state.py record extract-entities entities=<n>
 ```
 
+**Entity-to-entity relationships (TWO LLM calls per chunk).** This step now
+also mints typed `entity -> entity` edges. Pass 1 extracts entities as before;
+pass 2 asks for relationships between them, using a predicate menu narrowed to
+those entities' actual classes. The run prints a line to report back:
+```
+[extract-entities] entity->entity relationships: N written, M dropped
+    (unresolved=.., bad_predicate=.., domain_range=.., no_evidence=..)
+```
+
+**Before launching, confirm `relationship_extract` is in `config/models.yaml`.**
+It is a NEW task; a config predating it makes the step print a one-line notice
+and continue with entities ONLY -- easy to miss in a long log, and the run
+looks successful:
+```
+uv run python -c "import yaml;print('relationship_extract' in yaml.safe_load(open('config/models.yaml'))['tasks'])"
+```
+If that prints False, run **choose-llm-mode** to refresh the preset, or copy the
+`relationship_extract` block from `config/models.example.yaml`.
+
+What to tell the user afterwards:
+- **It is not more expensive.** Measured on 442 chunks: 305 edges at $0.31 as
+  two passes, versus 84 edges at $0.32 as one call. The entity prompt shrank
+  and the second call is skipped when a chunk has under two entities or no
+  fitting predicate.
+- **Every edge carries a verified evidence quote**, stored on the edge, so an
+  edge can be audited without re-reading the chunk.
+- **0 written is a real signal, not necessarily a bug** -- usually the ontology
+  declares no object property whose domain AND range both match this corpus's
+  classes. The run says so explicitly; surface it rather than calling it done.
+- **Quality is good, not perfect.** The evidence check confirms the quote
+  EXISTS in the chunk, not that it supports the claim, so a minority of edges
+  quote a nearby-but-unrelated sentence. Do not present these edges as clean.
+- `--no-relationships` reproduces the older entity-only behaviour.
+- An EXISTING graph has none of these edges until extract-entities re-runs.
+
 ## Step 4 — enrich-time (short)
 Temporal enrichment (Year/Quarter/Month/Day, parent creation + gap-fill). Fast and
 cheap — run in the foreground. **Add `--from-fulltext` if Step 2 recorded
