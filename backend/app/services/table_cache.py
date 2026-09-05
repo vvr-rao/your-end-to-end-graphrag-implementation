@@ -48,7 +48,7 @@ from typing import Any
 # backstop. Without this bump, cached p2a-1 payloads (which contain fabricated
 # tables invented from single-header-cell crops) would keep being served and the
 # fix would never run.
-EXTRACTOR_VERSION = "p2a-2"
+EXTRACTOR_VERSION = "p2a-4"
 
 
 @dataclass

@@ -272,6 +272,14 @@ Other things worth knowing:
 - Some steps have known caveats worth mentioning: garbled/unreadable PDFs are
   flagged by a preflight check before paid work; structured-table extraction is
   opt-in (`--tables`).
+- **Tables have TWO separate opt-ins.** `--tables` extracts them (JSON-LD
+  payloads, retrievable in Phase 2). `--table-mining` additionally mints
+  ONTOLOGY CLASSES from their row/column labels, and is only appropriate for
+  FINANCIAL corpora -- the six anchor buckets in `domain_concepts.owl`
+  (`FinancialTable`, `Measure`, `Metric`, `Dimension`, `TimePeriod`,
+  `FinancialObservation`) are financial by definition. The classifier judges
+  each table individually and skips non-financial ones, so a mixed corpus is
+  safe. Retrieval never needs `--table-mining`.
 - **If the user asks why a run is slow:** run `uv run python scripts/tpm_check.py`
   first, then recommend raising concurrency. It reads OpenAI's rate-limit headers
   and suggests a value per stage. Measured on a tier-4 account at concurrency 32:

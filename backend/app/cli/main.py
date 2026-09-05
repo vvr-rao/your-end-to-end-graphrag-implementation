@@ -259,6 +259,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_pe.add_argument(
+        "--table-mining", action="store_true",
+        help=(
+            "Mint ONTOLOGY CLASSES from the extracted tables (requires --tables). Separate from extraction because the 6 anchor buckets in domain_concepts.owl are FINANCIAL by definition -- on a non-financial corpus this files clinical or engineering concepts beside RevenueUSDM, and Phase 2 cannot correct the taxonomy afterwards. Tables are still extracted and still reach Phase 2 retrieval without this flag. Default: OFF."
+        ),
+    )
+    p_pe.add_argument(
         "--no-table-vision",
         dest="table_vision", action="store_false", default=True,
         help=(
@@ -292,6 +298,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_build.add_argument(
         "--tables", action="store_true",
         help="Phase 2a (opt-in): extract structured tables from PDF documents.",
+    )
+    p_build.add_argument(
+        "--table-mining", action="store_true",
+        help=(
+            "Mint ONTOLOGY CLASSES from the extracted tables (requires --tables). Separate from extraction because the 6 anchor buckets in domain_concepts.owl are FINANCIAL by definition -- on a non-financial corpus this files clinical or engineering concepts beside RevenueUSDM, and Phase 2 cannot correct the taxonomy afterwards. Tables are still extracted and still reach Phase 2 retrieval without this flag. Default: OFF."
+        ),
     )
     p_build.add_argument(
         "--no-table-vision",
@@ -1362,6 +1374,7 @@ def _cmd_prune_expand(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
             suggested_new_classes=args.suggested_new_classes,
             extract_tables=getattr(args, "tables", False),
+            mine_table_concepts=getattr(args, "table_mining", False),
             table_vision=getattr(args, "table_vision", True),
             single_pass_summaries=getattr(args, "single_pass_summaries", False),
             select_subset=getattr(args, "select_subset", False),
@@ -1394,6 +1407,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
             suggested_new_classes=args.suggested_new_classes,
             extract_tables=getattr(args, "tables", False),
+            mine_table_concepts=getattr(args, "table_mining", False),
             table_vision=getattr(args, "table_vision", True),
             single_pass_summaries=getattr(args, "single_pass_summaries", False),
             select_subset=getattr(args, "select_subset", False),

@@ -2747,6 +2747,17 @@ def table_concept_grouping(
     - Each COLUMN is classified as a subclass of one of:
       Metric, Dimension, Measure, TimePeriod, FinancialObservation.
       The LLM picks the best fit. If no anchor fits a column, omit it.
+    - Each ROW LABEL is classified the same way.
+
+    Rows are proposal targets, not just context. In a financial statement
+    the columns are fiscal periods ("2018", "2017(1)") and the ROWS carry
+    the line items ("Costs of services", "Depreciation and amortization")
+    -- i.e. the actual domain concepts. An earlier version passed row
+    labels only as disambiguating context and emitted proposals for the
+    table and its columns alone, so the stage structurally could not mint
+    a term for a financial line item: it yielded one class proposal out of
+    799 on a financial corpus, because a fiscal year is correctly rejected
+    as a concept and nothing else was ever offered.
 
     `anchor_buckets`: list of {iri, label, description} for the 6
     bucket classes the LLM may pick as parent_iri. The validator drops
@@ -2761,6 +2772,12 @@ def table_concept_grouping(
         },
         "columns": [
           {"column_index": <int>,
+           "parent_iri": "<bucket IRI>",
+           "proposed_label": "<CamelCase short label>",
+           "definition": "<one-sentence definition>"}
+        ],
+        "rows": [
+          {"row_label": "<the source row label, verbatim>",
            "parent_iri": "<bucket IRI>",
            "proposed_label": "<CamelCase short label>",
            "definition": "<one-sentence definition>"}
@@ -2789,12 +2806,23 @@ def table_concept_grouping(
     )
 
     system = (
-        "You classify ONE extracted financial-report table + its columns "
-        "into a small fixed set of anchor bucket classes. You will emit a "
-        "JSON object naming a candidate subclass for the table itself "
-        "(under FinancialTable) and for each column (under one of the "
-        "other 5 buckets: Metric / Dimension / Measure / TimePeriod / "
-        "FinancialObservation).\n\n"
+        "You classify ONE extracted financial-report table, its columns "
+        "AND its row labels into a small fixed set of anchor bucket "
+        "classes. You will emit a JSON object naming a candidate subclass "
+        "for the table itself (under FinancialTable) and for each column "
+        "and each row label (under one of the other 5 buckets: Metric / "
+        "Dimension / Measure / TimePeriod / FinancialObservation).\n\n"
+        "ORIENTATION -- READ THIS FIRST:\n"
+        "  In a financial statement the COLUMNS are usually reporting "
+        "periods ('2018', '2017(1)', 'Q3 FY24') and the ROWS carry the "
+        "line items ('Costs of services', 'Depreciation and "
+        "amortization', 'Net revenue'). The line items are the domain "
+        "concepts worth minting. Do NOT treat the row labels as mere "
+        "context: each meaningful row label deserves its own proposal, "
+        "usually under Measure or Metric. A bare fiscal period is a "
+        "TimePeriod; it is not a subject-matter concept.\n"
+        "  Some tables are transposed (periods down the side, line items "
+        "across the top). Judge by content, not by position.\n\n"
         "BUCKET DEFINITIONS:\n"
         "  - FinancialTable: parent for the TABLE-as-a-whole's "
         "type subclass (e.g. RevenueBySegmentTable).\n"
@@ -2818,12 +2846,28 @@ def table_concept_grouping(
         "disambiguates (e.g. RevenueUSDM vs Revenue).\n"
         "  3. definition is one short sentence stating what the class "
         "represents.\n"
-        "  4. The TABLE-level proposal goes under FinancialTable. If "
-        "you cannot judge a sensible table type, set proposed_label to "
-        "'GenericFinancialTable'.\n"
-        "  5. Columns whose meaning is unclear or empty: OMIT them. Do "
-        "not invent.\n"
-        "  6. Return ONLY the JSON object. No prose, no markdown, no "
+        "  4. The TABLE-level proposal goes under FinancialTable and MUST "
+        "name what kind of table it is, derived from the caption and the "
+        "row/column labels -- e.g. RevenueBySegmentTable, "
+        "BalanceSheetTable, UnrecognizedTaxBenefitsTable, "
+        "ProductSalesTable, CostsAndExpensesTable. "
+        "'GenericFinancialTable' is a LAST RESORT for a table whose "
+        "subject genuinely cannot be named; do not reach for it when the "
+        "caption or the row labels tell you what the table is about.\n"
+        "  5. Columns or rows whose meaning is unclear or empty: OMIT "
+        "them. Do not invent. Totals and subtotals ('Total', 'Balance at "
+        "end of year') are structural, not concepts -- omit those too.\n"
+        "  6. In the `rows` array, echo the source label verbatim in "
+        "`row_label` so the caller can tie the proposal back to the row.\n"
+        "  7. DOMAIN CHECK -- these buckets describe FINANCIAL reporting. "
+        "If this table belongs to a different domain entirely (clinical "
+        "trial results, adverse-reaction rates, drug composition, "
+        "laboratory measurements, engineering specifications), do NOT "
+        "force its concepts into these buckets. Return exactly "
+        '{\"no_anchor_fits\": true} and nothing else. Filing '
+        "'NonFatalStroke' or 'Nausea' beside 'RevenueUSDM' corrupts the "
+        "taxonomy; minting nothing is the correct outcome.\n"
+        "  8. Return ONLY the JSON object. No prose, no markdown, no "
         "comments."
     )
 
@@ -2834,15 +2878,19 @@ def table_concept_grouping(
         + f"  caption: {caption or '(none)'}\n"
         + "  columns:\n"
         + cols_block
-        + "\n  sample row labels:\n"
+        + "\n  row labels:\n"
         + samples_block
         + "\n\nReturn JSON:\n"
         '{\n'
         '  "table_class": {"parent_iri": ..., "proposed_label": ..., '
         '"definition": ...},\n'
         '  "columns": [{"column_index": ..., "parent_iri": ..., '
+        '"proposed_label": ..., "definition": ...}],\n'
+        '  "rows": [{"row_label": ..., "parent_iri": ..., '
         '"proposed_label": ..., "definition": ...}]\n'
-        '}'
+        '}\n\n'
+        "OR, if this table is not financial (see rule 7):\n"
+        '{"no_anchor_fits": true}'
     )
     return system, user
 

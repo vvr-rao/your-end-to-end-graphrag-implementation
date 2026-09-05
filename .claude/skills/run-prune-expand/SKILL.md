@@ -143,6 +143,32 @@ ask their preference — don't silently pick. Lay out the trade-off:
 Only matters for PDF corpora (no effect on plain text). Set the flags in Step 3
 to match their answer.
 
+### `--table-mining` — only for FINANCIAL corpora
+`--tables` extracts tables; it does NOT add their labels to the ontology. Minting
+ontology classes from tables is a second opt-in, `--table-mining` (requires
+`--tables`).
+
+Ask for it **only when the corpus is financial** — filings, annual reports,
+statements. The six anchor buckets it classifies into (`FinancialTable`,
+`Measure`, `Metric`, `Dimension`, `TimePeriod`, `FinancialObservation`) live in
+`domain_concepts.owl` and are financial by definition. On a clinical or
+engineering corpus there is nothing sensible for a table's concepts to hang from.
+
+The classifier judges each table on its own and returns `no_anchor_fits` for
+non-financial ones, so a MIXED corpus is safe — the financial tables get mined
+and the rest are skipped. Measured on a 4-doc smoke (3 SEC filings + 1 drug
+label): 3 tables mined, 14 rejected, no clinical concepts minted. Watch the
+`rejected (non-financial domain)` count in the `[table-mining] done:` line.
+
+Why this is a separate flag: Phase 2 cannot add or correct ontology classes
+(`register-documents` only attaches entities to classes that already exist), so
+anything minted here is permanent until prune-expand is re-run. Without the
+domain check an earlier build filed `Nausea` and `NonFatalStroke` as siblings of
+`RevenueUSDM`.
+
+Retrieval does NOT need this flag — StructuredTable artifacts reach Phase 2 from
+`--tables` alone.
+
 ## Step 2b — Compact the class descriptions first (cheap; cuts the big step)
 **Always run this before prune-expand.** It is fast, costs cents, and lowers the
 most expensive stage that follows:
@@ -406,7 +432,8 @@ uv run python scripts/build_state.py record select-corpus docs=<n> selected=<n> 
 
 Choose a fresh, unique `RUN_ID` (e.g. `prune_expand_<date+time>`). Launch it detached
 via the harness as a **single-line command** (works in any shell). Append `--tables`
-only if the user opted in, and `--no-table-vision` to skip vision.
+only if the user opted in, `--table-mining` only if they opted in AND the corpus is
+financial, and `--no-table-vision` to skip vision.
 
 If they approved a subset in Step 2d, append `--select-subset --yes` (plus any
 `--selection-k-max` / `--outlier-sigma` they settled on). **Only add `--yes`
@@ -436,7 +463,7 @@ on different models with different rate limits:
 --classification-concurrency N    # Stage 1 chunk_classification (mini, ~10M TPM)
 --proposal-concurrency N          # Stage 2 class_proposal     (gpt-4.1, ~2M TPM)
 --dedup-concurrency N             # Stage 3 match_dedup        (gpt-4.1, ~2M TPM)
---table-mining-concurrency N      # --tables only              (mini, ~10M TPM)
+--table-mining-concurrency N      # --tables --table-mining    (mini, ~10M TPM)
 --expansion-concurrency N         # LEGACY: sets Stage 1 + 2 together
 ```
 
@@ -460,7 +487,7 @@ command above when the user wants a per-run value; otherwise edit
 |---|---|---|---|
 | `concurrency.summarization` | evaluated summarizer | mini, ~10M TPM | 32-64 (tier 3+), 8 (tier 1-2) |
 | `concurrency.chunk_classification` | Stage 1 | mini, ~10M TPM | 32-64 (tier 3+), 8 (tier 1-2) |
-| `concurrency.table_mining` | one call per table, `--tables` only | mini, ~10M TPM | 32-64 (tier 3+), 8 (tier 1-2) |
+| `concurrency.table_mining` | one call per table, `--tables --table-mining` only | mini, ~10M TPM | 32-64 (tier 3+), 8 (tier 1-2) |
 | `concurrency.class_proposal` | Stage 2 | gpt-4.1 @ 32k, ~2M TPM | **12** measured safe; 16 is the ceiling |
 | `concurrency.dedup` | Stage 3 batches | gpt-4.1 @ 32k, ~2M TPM | **8** measured safe |
 | `concurrency.table_extraction` | PDF subprocesses | **MEMORY**, not rate | ~1 per 200 MB free |

@@ -221,8 +221,20 @@ _BIB_TOKENS = re.compile(
     re.IGNORECASE,
 )
 
-# Page-number-ish cell values: a few digits, optional Roman numerals, dashes.
-_PAGE_NUMBER_RE = re.compile(r"^\s*[ivxlcdmIVXLCDM\d\-,\s]+\s*$")
+# Page-number-ish cell values: a bare integer of at most 4 digits, a Roman
+# numeral, or a hyphenated range of either ("12-15", "iv-vi").
+#
+# Deliberately does NOT admit thousands separators or decimals. The earlier
+# pattern (`[ivxlcdmIVXLCDM\d\-,\s]+`) accepted any run of digits, commas and
+# spaces, so a financial table whose last column held plain figures --
+# '3,324', '2,667', '1,363' -- read as a table of contents and was dropped.
+# That never fired while single-row fragments were being discarded upstream;
+# reassembling them into whole tables exposed it. A real page number is a
+# small integer; a comma-grouped figure is data.
+_PAGE_NUMBER_RE = re.compile(
+    r"^\s*(?:[ivxlcdm]+|\d{1,4})(?:\s*[-–]\s*(?:[ivxlcdm]+|\d{1,4}))?\s*$",  # noqa: RUF001
+    re.IGNORECASE,
+)
 
 # Section / heading prefix tokens commonly used in TOCs and indexes.
 _TOC_HEAD_TOKENS = re.compile(
@@ -309,9 +321,11 @@ def _content_filter_reason(
     # TOC / index: last column dominated by page numbers (>= 70%).
     non_empty_last = [c for c in last_col if c]
     if non_empty_last:
+        # `_PAGE_NUMBER_RE` already covers bare digits; testing `isdigit()`
+        # separately would re-admit the long unseparated figures ('48047')
+        # that the tightened pattern exists to exclude.
         looks_pagenum = sum(
-            1 for c in non_empty_last
-            if c.isdigit() or _PAGE_NUMBER_RE.match(c)
+            1 for c in non_empty_last if _PAGE_NUMBER_RE.match(c)
         )
         if looks_pagenum / len(non_empty_last) >= 0.7 and len(non_empty_last) >= 5:
             return "toc-or-index"
@@ -325,6 +339,182 @@ def _content_filter_reason(
     return None
 
 
+# ---------- Fragment merging: reassemble row-per-candidate tables ------------
+# SEC-style filings underline each row of figures and draw no outer box and no
+# vertical rules. A line-based detector therefore has no evidence that
+# consecutive ruled rows belong to one table, so it reports each row as its own
+# single-row candidate about 15 pt tall -- just under the 2% thin-band guard,
+# which then drops all of them. Measured over a 148-PDF SEC corpus: 62 of 83
+# candidates were single-row, 73.5% fell under the guard, and 137 documents
+# yielded no table at all.
+#
+# Lowering the guard would be the wrong fix -- it would admit exactly the
+# running-text bands the guard exists to reject. Instead reassemble the
+# fragments BEFORE filtering: consecutive single-row candidates that share
+# column boundaries and sit within a normal line gap are one table.
+#
+# The merge deliberately only ever combines SINGLE-ROW fragments. Any candidate
+# that already extracts >= 2 rows passes through untouched, so corpora whose
+# tables are fully ruled (drug labels, boxed 10-K tables) are unaffected.
+_MERGE_X_TOL = 3.0        # column-boundary alignment tolerance, pt
+_MERGE_GAP_TOL = 30.0     # max vertical gap between stacked fragments, pt
+_HEADER_BAND_PT = 60.0    # how far above a merged table to look for headers
+_HEADER_CLEARANCE_PT = 2.0  # lift the caption band clear of the header line
+
+
+def _column_bounds(table: Any) -> list[float] | None:
+    """The x edges delimiting each column of `table`'s first row, as
+    `len(columns) + 1` ascending floats. Returns None when the row carries
+    a merged (None) cell, since then the column grid is ambiguous and the
+    candidate must not be merged with anything."""
+    try:
+        cells = table.rows[0].cells
+    except (AttributeError, IndexError):
+        return None
+    if not cells or any(c is None for c in cells):
+        return None
+    try:
+        bounds = [float(c[0]) for c in cells]
+        bounds.append(float(cells[-1][2]))
+    except (TypeError, IndexError, ValueError):
+        return None
+    return bounds
+
+
+def _bounds_match(a: list[float] | None, b: list[float] | None) -> bool:
+    """True when two candidates share the same column grid within tolerance.
+    Stricter than comparing column COUNTS: two unrelated tables that happen
+    to have the same number of columns will not be merged unless their
+    column edges actually line up."""
+    if a is None or b is None or len(a) != len(b):
+        return False
+    return all(abs(x - y) <= _MERGE_X_TOL for x, y in zip(a, b, strict=True))
+
+
+def _merge_row_fragments(
+    tables: list[Any],
+) -> list[tuple[tuple[float, float, float, float], list[list[Any]],
+               list[float] | None, int]]:
+    """Group consecutive single-row candidates into whole tables.
+
+    Returns `(bbox, grid, col_bounds, n_fragments)` per surviving candidate.
+    `n_fragments > 1` marks an assembled table -- those have no header row
+    (the header sits above the ruled region, outside every fragment), which
+    is why the caller recovers one via `_recover_header_row`."""
+    entries: list[dict[str, Any]] = []
+    for tbl in tables:
+        try:
+            grid = tbl.extract() or []
+        except Exception:
+            grid = []
+        single = len(grid) == 1
+        entries.append({
+            "bbox": tuple(float(v) for v in tbl.bbox),
+            "grid": grid,
+            # Column geometry is only needed for merge decisions, so skip
+            # the work for candidates that can never be merged.
+            "bounds": _column_bounds(tbl) if single else None,
+            "single": single,
+        })
+    entries.sort(key=lambda e: e["bbox"][1])
+
+    out: list[tuple[tuple[float, float, float, float], list[list[Any]],
+                    list[float] | None, int]] = []
+    i = 0
+    while i < len(entries):
+        e = entries[i]
+        if not e["single"] or e["bounds"] is None:
+            out.append((e["bbox"], e["grid"], e["bounds"], 1))
+            i += 1
+            continue
+        group = [e]
+        j = i + 1
+        while j < len(entries):
+            nxt = entries[j]
+            if not nxt["single"] or nxt["bounds"] is None:
+                break
+            # Fragments are stacked top-to-bottom; a small negative gap is
+            # tolerated because adjacent rules can share a y coordinate.
+            gap = nxt["bbox"][1] - group[-1]["bbox"][3]
+            if gap > _MERGE_GAP_TOL or gap < -1.0:
+                break
+            if not _bounds_match(group[-1]["bounds"], nxt["bounds"]):
+                break
+            group.append(nxt)
+            j += 1
+        if len(group) == 1:
+            out.append((e["bbox"], e["grid"], e["bounds"], 1))
+            i += 1
+            continue
+        merged_bbox = (
+            min(g["bbox"][0] for g in group),
+            min(g["bbox"][1] for g in group),
+            max(g["bbox"][2] for g in group),
+            max(g["bbox"][3] for g in group),
+        )
+        merged_grid = [row for g in group for row in g["grid"]]
+        out.append((merged_bbox, merged_grid, group[0]["bounds"], len(group)))
+        i = j
+    return out
+
+
+def _recover_header_row(
+    page: Any,
+    bbox: tuple[float, float, float, float],
+    col_bounds: list[float],
+) -> tuple[list[str], float] | None:
+    """Read column labels out of the text band immediately above a merged
+    table.
+
+    Fragment merging assembles DATA rows only -- in an unboxed filing the
+    column header ("(in millions) 2018 2017 2016") sits above the first
+    rule, so it belongs to no fragment. Without this the first data row
+    would be misread as the header and its values lost.
+
+    Words on the bottom-most text line of the band are bucketed into
+    columns by their horizontal midpoint.
+
+    Returns `(labels, header_top)` -- the second element is the y of the
+    top of the header line, which the caller needs so `_caption_hint`
+    can look for the caption ABOVE the header instead of returning the
+    header itself. Returns None when nothing usable is above the table."""
+    x0, top, x1, _bottom = bbox
+    band_top = max(0.0, top - _HEADER_BAND_PT)
+    if band_top >= top:
+        return None
+    try:
+        words = page.crop((x0, band_top, x1, top)).extract_words() or []
+    except Exception:
+        return None
+    if not words:
+        return None
+    # The header is the line resting directly on the table, not the prose
+    # further up the band.
+    bottom_most = max(float(w["bottom"]) for w in words)
+    line = [w for w in words if bottom_most - float(w["bottom"]) <= 3.0]
+    if not line:
+        return None
+
+    n_cols = len(col_bounds) - 1
+    buckets: list[list[tuple[float, str]]] = [[] for _ in range(n_cols)]
+    for w in line:
+        mid = (float(w["x0"]) + float(w["x1"])) / 2.0
+        for ci in range(n_cols):
+            lo = col_bounds[ci] - _MERGE_X_TOL
+            hi = col_bounds[ci + 1] + _MERGE_X_TOL
+            if lo <= mid < hi:
+                buckets[ci].append((float(w["x0"]), str(w.get("text") or "")))
+                break
+    labels = [
+        " ".join(t for _, t in sorted(b)).strip() if b else ""
+        for b in buckets
+    ]
+    if not any(labels):
+        return None
+    header_top = min(float(w["top"]) for w in line)
+    return labels, header_top
+
+
 # ---------- pdfplumber path: simple flat extraction ---------------------------
 
 
@@ -335,6 +525,7 @@ def _build_jsonld_from_grid(
     table_index: int,
     caption: str | None,
     page_number: int,
+    header_row: list[str] | None = None,
 ) -> dict[str, Any]:
     """Convert a clean rectangular grid into JSON-LD.
 
@@ -342,7 +533,15 @@ def _build_jsonld_from_grid(
     as the column-header row. The first column is treated as a row-label
     column when its non-header cells are all non-numeric (lets the
     `pdfplumber` route cope with the common "metric name in col 0,
-    numbers in col 1..N" pattern of financial tables)."""
+    numbers in col 1..N" pattern of financial tables).
+
+    `header_row`, when supplied, carries column labels recovered from the
+    text band above the table (see `_recover_header_row`). It is passed
+    only for candidates assembled by `_merge_row_fragments`, whose rows are
+    ALL data rows -- taking `grid[0]` as the header there would silently
+    eat the first line item. Ignored unless its width matches the grid, so
+    a bad recovery degrades to the normal heuristic rather than
+    misaligning every column."""
     iri = table_jsonld.build_table_iri(doc_sha, table_index)
     payload = table_jsonld.empty_payload(
         doc_sha, table_index,
@@ -351,8 +550,13 @@ def _build_jsonld_from_grid(
         page_number=page_number,
     )
 
-    first_row = [str(c).strip() for c in grid[0]]
-    data_rows = grid[1:]
+    grid_width = max((len(r) for r in grid), default=0)
+    if header_row is not None and len(header_row) == grid_width:
+        first_row = [str(c or "").strip() for c in header_row]
+        data_rows = grid
+    else:
+        first_row = [str(c).strip() for c in grid[0]]
+        data_rows = grid[1:]
     width = len(first_row)
 
     # Decide whether column 0 is a row-label column.
@@ -424,10 +628,48 @@ def _looks_numeric(s: str) -> bool:
 # ---------- Caption hint: text immediately above the table -------------------
 
 
-def _caption_hint(page: Any, bbox: tuple[float, float, float, float]) -> str | None:
+# A caption is prose; a header line is mostly periods, dates and units.
+# Used to walk back past a multi-line header block (a spanning header can
+# run three lines: "Fiscal Years Ended | Percentage of Revenues" /
+# "March 31, March 31, April 1," / "(in millions) 2018 2017(1) 2016(1)").
+_MONTH_RE = re.compile(
+    r"^(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", re.IGNORECASE
+)
+# How many header-ish lines to skip before giving up and taking what's there.
+_MAX_HEADER_LINES = 4
+
+
+def _looks_header_like(line: str) -> bool:
+    """True when a line reads as part of a column-header block rather than
+    a caption: mostly numbers, month names, or one/two-character tokens."""
+    tokens = line.split()
+    if not tokens:
+        return True
+    headerish = 0
+    for t in tokens:
+        stripped = t.strip("(),.$%:;")
+        if not stripped or len(stripped) <= 2:
+            headerish += 1
+        elif _looks_numeric(stripped) or _MONTH_RE.match(stripped):
+            headerish += 1
+    return headerish / len(tokens) >= 0.5
+
+
+def _caption_hint(
+    page: Any,
+    bbox: tuple[float, float, float, float],
+    *,
+    skip_header_lines: bool = False,
+) -> str | None:
     """Pull the line of text immediately ABOVE the table's top edge as a
     cheap caption hint. Useful for the vision prompt + as a fallback
-    caption when extraction is otherwise label-less."""
+    caption when extraction is otherwise label-less.
+
+    `skip_header_lines` is set for merged candidates, whose bbox top is a
+    DATA row: the lines directly above are the column-header block, and
+    returning one of those makes the caption a restatement of the headers
+    ("2013 2012 2011") rather than a description of the table. Walks back
+    past header-shaped lines to the first line that reads as prose."""
     x0, top, x1, bottom = bbox
     band_top = max(0.0, top - 36.0)  # ~half-inch above
     try:
@@ -443,6 +685,11 @@ def _caption_hint(page: Any, bbox: tuple[float, float, float, float]) -> str | N
     if not lines:
         return None
     candidate = lines[-1]
+    if skip_header_lines:
+        for ln in reversed(lines[-(_MAX_HEADER_LINES + 1):]):
+            if not _looks_header_like(ln):
+                candidate = ln
+                break
     if len(candidate) > 200:
         candidate = candidate[:200].rsplit(" ", 1)[0] + " ..."
     return candidate
@@ -858,6 +1105,8 @@ async def extract_tables_async(
     pages_truncated = False
 
     n_skipped_filter = 0
+    n_merged = 0          # tables assembled from >1 detected fragment
+    n_headers_recovered = 0
     skip_reasons: dict[str, int] = {}
 
     try:
@@ -885,10 +1134,13 @@ async def extract_tables_async(
                     tables = []
                 page_kept_before = len(payloads)
                 page_skipped_filter = 0
-                for tbl in tables:
+                # Reassemble row-per-candidate fragments BEFORE any filter --
+                # each fragment is individually thin enough to be dropped by
+                # the bbox guard, while the table they form is not.
+                candidates = _merge_row_fragments(tables)
+                for bbox, grid, col_bounds, n_fragments in candidates:
                     if table_index >= _MAX_TABLES_PER_DOC:
                         break
-                    bbox = tbl.bbox
 
                     # Filter 1: bbox geometry (header/footer/thin bands)
                     reason = _bbox_filter_reason(bbox, page_w, page_h)
@@ -899,11 +1151,36 @@ async def extract_tables_async(
                         table_index += 1
                         continue
 
-                    try:
-                        grid = tbl.extract() or []
-                    except Exception:
-                        grid = []
-                    caption = _caption_hint(page, bbox)
+                    # Recover the header BEFORE the caption. Merging pulls
+                    # the bbox top down to the first DATA row, so the line
+                    # immediately above it is the column header -- reading
+                    # the caption from there returned the header verbatim
+                    # ("2013 2012 2011"), which is also what we feed the
+                    # mining prompt as the table's description. Knowing
+                    # where the header sits lets the caption band start
+                    # above it instead.
+                    header_row: list[str] | None = None
+                    header_top: float | None = None
+                    if n_fragments > 1 and col_bounds is not None:
+                        n_merged += 1
+                        recovered = _recover_header_row(page, bbox, col_bounds)
+                        if recovered is not None:
+                            header_row, header_top = recovered
+                            n_headers_recovered += 1
+
+                    # Nudge the band above the header's own top edge:
+                    # pdfplumber's crop keeps objects that INTERSECT the
+                    # box, so cutting exactly at `header_top` re-admits the
+                    # header line (clipped to a fragment like '2013').
+                    caption_bbox = (
+                        bbox if header_top is None
+                        else (bbox[0], header_top - _HEADER_CLEARANCE_PT,
+                              bbox[2], bbox[3])
+                    )
+                    caption = _caption_hint(
+                        page, caption_bbox,
+                        skip_header_lines=header_top is not None,
+                    )
 
                     # Filter 2: content patterns (TOC/index/bibliography +
                     # content-aware header/footer detection)
@@ -926,6 +1203,7 @@ async def extract_tables_async(
                             table_index=table_index,
                             caption=caption,
                             page_number=page_no,
+                            header_row=header_row,
                         )
                         n_pdfplumber += 1
                     elif use_vision:
@@ -1023,6 +1301,8 @@ async def extract_tables_async(
         "n_vision_llm": n_vision,
         "n_dropped": n_dropped,
         "n_skipped_filter": n_skipped_filter,
+        "n_merged": n_merged,
+        "n_headers_recovered": n_headers_recovered,
         "skip_reasons": skip_reasons,
         "cost_usd": round(cost_usd, 5),
         "wall_seconds": wall,
@@ -1032,6 +1312,7 @@ async def extract_tables_async(
     print(
         f"[tables] {p.name}: DONE -- {len(payloads)} kept "
         f"(pdfplumber={n_pdfplumber}, vision={n_vision}, "
+        f"merged={n_merged}, headers-recovered={n_headers_recovered}, "
         f"filter-skip={n_skipped_filter}, vision-drop={n_dropped}) "
         f"over {pages_processed} pages in {wall:.1f}s, cost=${cost_usd:.4f}",
         flush=True,
