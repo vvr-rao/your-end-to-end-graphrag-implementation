@@ -680,3 +680,27 @@ def test_dedup_still_separates_genuinely_different_relations() -> None:
 
     system, _ = PROMPTS["match_dedup"]({}, [])
     assert "genuinely DIFFERENT" in system
+
+
+def test_skos_semantic_relation_is_demoted_with_its_children() -> None:
+    """`related` and `relatedMatch` were demoted but `semanticRelation` -- their
+    PARENT, and the one with the broadest domain -- was not, so it stayed
+    promoted and took 6 of 21 edges (29%) on the financial corpus. Every one
+    was a related-party disclosure for which `hasSignificantInfluenceOver`, the
+    precise IFRS concept, existed in the same ontology."""
+    from backend.app.services.prompts import GENERIC_PREDICATE_IRIS
+
+    skos = "http://www.w3.org/2004/02/skos/core#"
+    for p in ("semanticRelation", "related", "relatedMatch", "broader",
+              "narrower"):
+        assert skos + p in GENERIC_PREDICATE_IRIS, p
+
+
+def test_precise_predicates_are_never_demoted() -> None:
+    """The demote list must hold only catch-alls; demoting a specific
+    predicate would starve the menu it is meant to unclutter."""
+    from backend.app.services.prompts import GENERIC_PREDICATE_IRIS
+
+    for p in ("hasSignificantInfluenceOver", "subsidiaryOf", "acquires",
+              "jointVentureWith", "largestShareholder", "competesWith"):
+        assert not any(i.endswith("#" + p) for i in GENERIC_PREDICATE_IRIS), p

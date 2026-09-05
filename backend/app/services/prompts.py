@@ -1317,6 +1317,15 @@ GENERIC_PREDICATE_IRIS: frozenset[str] = frozenset({
     "http://www.w3.org/ns/org#linkedTo",
     "http://www.w3.org/2004/02/skos/core#related",
     "http://www.w3.org/2004/02/skos/core#relatedMatch",
+    # The PARENT property of the two above, and the one actually reached for:
+    # `related` and `relatedMatch` were listed while `semanticRelation` was
+    # not, so the catch-all with the broadest domain stayed promoted. On the
+    # financial corpus it took 6 of 21 edges (29%) -- all of them related-party
+    # disclosures for which `hasSignificantInfluenceOver`, the precise IFRS
+    # concept, existed in the same ontology and was used correctly once.
+    "http://www.w3.org/2004/02/skos/core#semanticRelation",
+    "http://www.w3.org/2004/02/skos/core#broader",
+    "http://www.w3.org/2004/02/skos/core#narrower",
     "http://purl.org/dc/terms/relation",
 })
 
