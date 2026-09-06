@@ -43,9 +43,17 @@ from backend.app.db.models.entities import Entity
 from backend.app.db.models.graph import GraphRelationship
 from backend.app.db.models.ontology import OntologyClass
 from backend.app.db.session import session_scope
+from backend.app.helpers.ontology_pruning import split_disjunction_label
 from backend.app.services.db_artifact_gen import _extract_json
 from backend.app.services.embeddings import Embedder
 from backend.app.services.llm_router import LLMRouter
+# Sibling import: pipeline_llm does NOT import this module, so no cycle. Reused
+# rather than re-implemented so the ontology-build guard and the extraction-time
+# menu filter can never disagree about what an entity-shaped label looks like.
+from backend.app.services.pipeline_llm import (
+    _looks_like_entity_not_class,
+    _split_camel,
+)
 from backend.app.services.predicates import (
     RDF_TYPE,
     VIAO_ASSERTS_ABOUT,
@@ -53,6 +61,228 @@ from backend.app.services.predicates import (
 from backend.app.services.prompts import PROMPTS
 
 _ENTITIES_NS = "https://veerla-ramrao.ai/ontology/entities"
+
+# The sentinel the extractor returns when no candidate class denotes the KIND
+# of an entity it found. Before this existed the prompt said "SKIP that
+# entity", which is indistinguishable from "there is no entity here" -- so the
+# model always picked a same-topic sibling instead. That is how a furniture
+# retailer became a ContainerShippingCarrier and a canal became a region.
+ABSTAIN_SENTINEL = "NONE_OF_THESE"
+
+# The verdicts `entity_validate` may return. An unrecognised string is treated
+# as "correct" -- fail open per item, matching the pass-level policy below.
+_VALID_VERDICTS = frozenset({
+    "correct", "wrong_class", "not_an_entity", "no_class_fits", "not_in_text",
+})
+# Verdicts that remove the entity from the kept set.
+_DROPPING_VERDICTS = {
+    "not_an_entity": "reviewer_removed",
+    "not_in_text": "reviewer_removed",
+    "no_class_fits": "abstained",
+}
+
+
+def _filter_entities(
+    raw_entities: Any,
+    cand_iris: set[str],
+    ent_drops: dict[str, int],
+    abstained: list[dict[str, Any]],
+    abstain_cap: int = 200,
+) -> list[dict[str, Any]]:
+    """Validate one `entity_extract` response into the kept-entity list.
+
+    Pure (no DB, no I/O) so the drop accounting is unit-testable. Every
+    rejection increments a named counter rather than vanishing -- the previous
+    version used a single bare `continue`, which is why nobody could see how
+    often the model went off-menu.
+    """
+    kept: list[dict[str, Any]] = []
+    if not isinstance(raw_entities, list):
+        return kept
+    for e in raw_entities:
+        if not isinstance(e, dict):
+            continue
+        name = (e.get("canonical_name") or "").strip()
+        short = (e.get("short_name") or name).strip()
+        class_iri = (e.get("class_iri") or "").strip()
+        if not name:
+            ent_drops["no_name"] += 1
+            continue
+        if class_iri == ABSTAIN_SENTINEL:
+            # The model found a real entity and honestly reported that no
+            # candidate class denotes its kind. `entities.class_id` is NOT
+            # NULL, so this cannot be persisted without a migration -- record
+            # it instead. A rising count is the signal that the ontology is
+            # missing a branch, which is actionable in a way a wrong type
+            # never was.
+            ent_drops["abstained"] += 1
+            if len(abstained) < abstain_cap:
+                abstained.append({
+                    "canonical_name": name,
+                    "proposed_type": (e.get("proposed_type") or "").strip(),
+                })
+            continue
+        if not class_iri or class_iri not in cand_iris:
+            ent_drops["off_menu_iri"] += 1
+            continue
+        try:
+            conf = float(e.get("confidence")) if e.get("confidence") is not None else None
+        except (TypeError, ValueError):
+            conf = None
+        kept.append({
+            "canonical_name": name,
+            "short_name": short,
+            "class_iri": class_iri,
+            "confidence": conf,
+        })
+    return kept
+
+
+def _sanitise_verdicts(
+    parsed: dict[str, Any],
+    kept: list[dict[str, Any]],
+    cand_iris: set[str],
+    class_meta: dict[str, dict[str, str]],
+    allowlist: frozenset[str] | None = None,
+) -> dict[str, Any]:
+    """Clean one `entity_validate` response before it is acted on.
+
+    The reviewer is not trusted either. It can name an IRI that was never on
+    the menu, suggest a class that is itself instance-shaped (which would just
+    swap one bad type for another), index an entity that does not exist, or
+    invent a verdict. Each of those is neutralised here rather than deeper in
+    the loop, so the caller only ever sees well-formed input.
+    """
+    out_verdicts: list[dict[str, Any]] = []
+    seen_idx: set[int] = set()
+    for v in (parsed.get("verdicts") or []):
+        if not isinstance(v, dict):
+            continue
+        try:
+            idx = int(v.get("index"))
+        except (TypeError, ValueError):
+            continue
+        if idx < 0 or idx >= len(kept) or idx in seen_idx:
+            continue
+        seen_idx.add(idx)
+        verdict = str(v.get("verdict") or "").strip().lower()
+        if verdict not in _VALID_VERDICTS:
+            verdict = "correct"
+        better = (v.get("better_class_iri") or "").strip() or None
+        if verdict == "wrong_class":
+            meta = class_meta.get(better or "", {})
+            unfit, _r = _is_menu_unfit_class(
+                meta.get("label", ""), meta.get("description", ""), allowlist
+            )
+            # A suggestion that is off-menu or itself unusable is no
+            # suggestion at all: downgrade rather than drop, so a bad
+            # reviewer costs precision but never costs the entity.
+            if not better or better not in cand_iris or unfit:
+                verdict, better = "correct", None
+        else:
+            better = None
+        out_verdicts.append({
+            "index": idx,
+            "verdict": verdict,
+            "better_class_iri": better,
+            "reason": str(v.get("reason") or "").strip()[:300],
+        })
+
+    out_missing: list[dict[str, Any]] = []
+    for m in (parsed.get("missing_entities") or []):
+        if not isinstance(m, dict):
+            continue
+        name = (m.get("canonical_name") or "").strip()
+        if not name:
+            continue
+        iri = (m.get("class_iri") or "").strip()
+        if iri and iri != ABSTAIN_SENTINEL and iri not in cand_iris:
+            iri = ""
+        out_missing.append({
+            "canonical_name": name,
+            "short_name": (m.get("short_name") or name).strip(),
+            "class_iri": iri,
+            "reason": str(m.get("reason") or "").strip()[:300],
+        })
+
+    actionable = (
+        any(v["verdict"] != "correct" for v in out_verdicts) or bool(out_missing)
+    )
+    return {
+        "verdicts": out_verdicts,
+        "missing_entities": out_missing,
+        "note": str(parsed.get("note") or "").strip()[:400],
+        "_actionable": actionable,
+    }
+
+
+def _is_generated_class(extra_metadata: Any) -> bool:
+    """Was this class minted by the expansion pipeline, or does it come from a
+    source ontology?
+
+    prune-expand stamps `annotations.generated = [true]` and
+    `review_status = ["proposed"]` on everything it creates
+    (`create_new_class_entry`). Source-ontology classes carry neither. On the
+    live DB this is 550 of 2,244 classes -- and it is the same
+    newly-created distinction the Layer-H audit already gates on, so the two
+    passes agree about whose vocabulary is open to question.
+    """
+    if not isinstance(extra_metadata, dict):
+        return False
+    ann = extra_metadata.get("annotations")
+    if not isinstance(ann, dict):
+        return False
+    gen = ann.get("generated")
+    if gen is True or (isinstance(gen, list) and True in gen):
+        return True
+    rev = ann.get("review_status")
+    return isinstance(rev, list) and "proposed" in rev
+
+
+def _is_menu_unfit_class(
+    label: str,
+    description: str = "",
+    allowlist: frozenset[str] | None = None,
+) -> tuple[bool, str]:
+    """Should this class be withheld from the extractor's candidate menu?
+
+    Not a claim the class is wrong -- a claim that OFFERING it invites a wrong
+    answer. prune-expand mints individuals as classes (`ChollaUnit4`,
+    `ASU2019-01`) and disjunctions from unresolved relation endpoints
+    (`SegmentOperatingExpense or SegmentAsset`). Neither is a KIND, so no
+    entity can legitimately instantiate them -- yet both rank high in the
+    vector search precisely because they are lexically close to the entities
+    they were derived from.
+
+    Deliberately uses only the STRONG tier plus disjunctions. There is no LLM
+    adjudication on this path, so a wrong exclusion here silently removes a
+    legitimate typing target -- the same asymmetric loss the Stage-2 filter
+    documents. Borderline shapes stay in the menu and are caught by the
+    validator instead.
+
+    Callers must restrict this to LLM-GENERATED classes -- see
+    `_is_generated_class`. The heuristics were built to judge fresh Stage-2
+    proposals, and turning them loose on a whole merged ontology mis-fires on
+    established vocabulary: measured against the live DB it withheld
+    `promissory note` and `floating rate note` (the "Note" document tail),
+    `bank holding company` and `clearing corporation` (the corporate-suffix
+    rule), and `loan or credit account` (a real FIBO label that happens to
+    contain "or"). None of those came from an LLM, so none of them should be
+    second-guessed by a rule written for LLM output.
+    """
+    if not isinstance(label, str) or not label.strip():
+        return False, ""
+    cleaned = label.strip()
+    if allowlist and cleaned.lower() in allowlist:
+        return False, ""
+    if split_disjunction_label(cleaned) or split_disjunction_label(_split_camel(cleaned)):
+        return True, "disjunction"
+    unfit, reason = _looks_like_entity_not_class(
+        cleaned,
+        description=description if isinstance(description, str) else "",
+        allowlist=allowlist,
+    )
+    return (True, reason) if unfit else (False, "")
 
 
 # Warn (not raise) above this share of failed chunks: partial results are real
@@ -87,6 +317,17 @@ class EntityExtractSummary:
     wall_seconds: float = 0.0
     new_graph_version: int = 0
     samples: list[dict[str, Any]] = field(default_factory=list)
+    # Why these exist: the entity path used to drop candidates silently at the
+    # `class_iri not in cand_iris` guard, which is how the loss stayed
+    # invisible while ChollaUnit4 accumulated 19 mistyped entities. The
+    # relationship path already had `rel_drops`; this is the entity mirror.
+    entity_drops: dict[str, int] = field(default_factory=dict)
+    entity_validation: dict[str, int] = field(default_factory=dict)
+    # Names the model declined to type because no candidate class denoted
+    # their KIND. A rising count here is the honest signal that the ontology
+    # is missing a branch -- act on it with a prune-expand run.
+    abstained_samples: list[dict[str, Any]] = field(default_factory=list)
+    menu_classes_withheld: int = 0
 
 
 def _normalize_name(name: str) -> str:
@@ -613,6 +854,89 @@ async def _candidate_predicates(
     return out, constraints, ancestors
 
 
+async def report_candidate_distances(
+    *,
+    chunk_kind: str = "summary",
+    sample: int = 300,
+) -> None:
+    """Print the chunk->class embedding distance distribution by rank.
+
+    Exists because `max_candidate_l2` must be set from measurement, not from a
+    guess: too tight and chunks lose every candidate, too loose and it does
+    nothing. Reports both the raw per-rank spread AND the distances of the
+    assignments that were actually written, which is the more useful number --
+    a ceiling below the p99 of real assignments would start discarding work
+    the pipeline currently does correctly.
+    """
+    async with session_scope() as session:
+        rows = (await session.execute(
+            sql_text("""
+                WITH s AS (
+                  SELECT id, embedding FROM graphrag.chunks
+                   WHERE status='ACTIVE' AND kind=:kind AND embedding IS NOT NULL
+                   ORDER BY random() LIMIT :n
+                ), d AS (
+                  SELECT s.id,
+                         row_number() OVER (
+                           PARTITION BY s.id ORDER BY oc.embedding <-> s.embedding
+                         ) AS rnk,
+                         (oc.embedding <-> s.embedding) AS l2
+                    FROM s JOIN graphrag.ontology_classes oc
+                      ON oc.embedding IS NOT NULL
+                )
+                SELECT rnk,
+                       percentile_cont(0.05) WITHIN GROUP (ORDER BY l2),
+                       percentile_cont(0.50) WITHIN GROUP (ORDER BY l2),
+                       percentile_cont(0.95) WITHIN GROUP (ORDER BY l2)
+                  FROM d WHERE rnk IN (1,5,10,25,50)
+                 GROUP BY rnk ORDER BY rnk
+            """),
+            {"kind": chunk_kind, "n": sample},
+        )).all()
+        if not rows:
+            print(f"[candidate-distances] no {chunk_kind} chunks with embeddings")
+            return
+        print(f"[candidate-distances] chunk->class L2 by rank "
+              f"(sample={sample}, kind={chunk_kind}):")
+        print(f"    {'rank':>5}  {'p05':>7}  {'p50':>7}  {'p95':>7}")
+        for rnk, p05, p50, p95 in rows:
+            print(f"    {rnk:>5}  {p05:>7.4f}  {p50:>7.4f}  {p95:>7.4f}")
+
+        assigned = (await session.execute(
+            sql_text("""
+                SELECT percentile_cont(0.50) WITHIN GROUP (ORDER BY dist),
+                       percentile_cont(0.90) WITHIN GROUP (ORDER BY dist),
+                       percentile_cont(0.99) WITHIN GROUP (ORDER BY dist),
+                       count(*)
+                  FROM (
+                    SELECT (oc.embedding <-> c.embedding) AS dist
+                      FROM graphrag.graph_relationships gr
+                      JOIN graphrag.chunks c ON c.id = gr.source_chunk_id
+                      JOIN graphrag.entities e ON e.id = gr.target_node_id
+                      JOIN graphrag.ontology_classes oc ON oc.id = e.class_id
+                     WHERE gr.predicate_iri = :pred
+                       AND gr.source_node_type = 'chunk'
+                       AND c.embedding IS NOT NULL
+                       AND oc.embedding IS NOT NULL
+                  ) t
+            """),
+            {"pred": VIAO_ASSERTS_ABOUT},
+        )).first()
+    if assigned and assigned[3]:
+        print(
+            f"\n[candidate-distances] distances of assignments ACTUALLY written "
+            f"(n={assigned[3]:,}): p50={assigned[0]:.4f} p90={assigned[1]:.4f} "
+            f"p99={assigned[2]:.4f}"
+        )
+        print(
+            f"[candidate-distances] a ceiling near p99 ({assigned[2]:.2f}) keeps "
+            f"today's correct assignments while cutting the long tail. Set it "
+            f"as extraction.max_candidate_l2 or --max-candidate-l2."
+        )
+    else:
+        print("\n[candidate-distances] no existing assignments to calibrate against")
+
+
 async def extract_entities(
     *,
     scope_document_iri: str | None = None,
@@ -625,6 +949,11 @@ async def extract_entities(
     verify_relationships: bool = True,
     rescue_relationships: bool = False,
     entity_identity: str = "name",
+    validate_entities: bool = False,
+    validation_rounds: int = 2,
+    filter_candidate_menu: bool = True,
+    max_candidate_l2: float | None = None,
+    menu_filter_allowlist: frozenset[str] | None = None,
 ) -> EntityExtractSummary:
     """Drive entity extraction over chunks that haven't been processed.
 
@@ -632,6 +961,17 @@ async def extract_entities(
     Summary is cheap but only captures what survived summarization; 'fulltext'
     mines the verbatim chunks (far more complete, e.g. every clinical study),
     at ~18x the LLM calls + more DB rows. Requires --full-text-chunks at ingest.
+
+    `validate_entities` (default OFF) turns on the review loop: a stronger
+    model audits each chunk's entities + class assignments and, when it finds
+    something actionable, extraction re-runs for that chunk with the critique
+    appended. `validation_rounds` caps the validate->re-extract cycles.
+
+    `filter_candidate_menu` withholds instance-shaped and disjunction-shaped
+    class labels from the top-K menu. `max_candidate_l2` (None = no ceiling)
+    caps how far a candidate class may sit from the chunk in embedding space;
+    without it every chunk gets exactly K classes however unrelated, so the
+    model always has a same-topic sibling to force an entity into.
     """
     t0 = time.time()
     summary = EntityExtractSummary()
@@ -707,6 +1047,56 @@ async def extract_entities(
                 "config/models.example.yaml) for higher precision."
             )
             verify_relationships = False
+    # Same degradation for the entity reviewer: an older models.yaml should
+    # lose the review pass, not raise once per chunk.
+    if validate_entities:
+        try:
+            router.task_spec("entity_validate")
+        except KeyError:
+            print(
+                "[extract-entities] models.yaml has no 'entity_validate' task "
+                "-- entities will be written WITHOUT the class-assignment "
+                "review pass. Add it (see config/models.example.yaml) to "
+                "enable --validate-entities."
+            )
+            validate_entities = False
+    if validate_entities and validation_rounds < 1:
+        validate_entities = False
+
+    # Candidate-menu quality filter, computed ONCE per run: one query over
+    # labels + descriptions, no vectors. Withholding a class here is cheaper
+    # and safer than trying to repair the answer afterwards -- the extractor
+    # cannot pick what it was never shown.
+    menu_excluded: set[str] = set()
+    if filter_candidate_menu:
+        _reasons: dict[str, int] = {}
+        async with session_scope() as session:
+            r = await session.execute(
+                select(
+                    OntologyClass.iri,
+                    OntologyClass.label,
+                    OntologyClass.description,
+                    OntologyClass.extra_metadata,
+                )
+            )
+            for iri, label, descr, meta in r.all():
+                # Only LLM-minted classes are candidates for withholding. A
+                # source ontology's vocabulary is not ours to second-guess.
+                if not _is_generated_class(meta):
+                    continue
+                unfit, reason = _is_menu_unfit_class(
+                    label or "", descr or "", menu_filter_allowlist
+                )
+                if unfit:
+                    menu_excluded.add(iri)
+                    _reasons[reason] = _reasons.get(reason, 0) + 1
+        summary.menu_classes_withheld = len(menu_excluded)
+        if menu_excluded:
+            _detail = ", ".join(f"{k}={v}" for k, v in sorted(_reasons.items()))
+            print(
+                f"[extract-entities] candidate-menu filter: "
+                f"{len(menu_excluded)} class(es) withheld ({_detail})"
+            )
 
     sem = asyncio.Semaphore(concurrency)
     # (chunk_id, chunk_iri, doc_id, list[entity_dict], list[relationship_dict])
@@ -720,6 +1110,19 @@ async def extract_entities(
         "no_evidence": 0, "one_sided_evidence": 0,
         "unsupported": 0, "reversed": 0,
     }
+    # The entity mirror of `rel_drops`. Line-for-line, the old code did a bare
+    # `continue` for every one of these -- so the corpus could lose entities
+    # steadily with nothing in the output to show for it.
+    ent_drops: dict[str, int] = {
+        "off_menu_iri": 0, "no_name": 0, "abstained": 0,
+        "reviewer_removed": 0, "no_candidates": 0,
+    }
+    val_stats: dict[str, int] = {
+        "clean": 0, "revised": 0, "reclassified": 0, "removed": 0,
+        "added": 0, "empty_reextract_rejected": 0, "validator_failed": 0,
+    }
+    abstained: list[dict[str, Any]] = []
+    _abstain_sample_cap = 200
     # Verification pass repairs as well as rejects: a claim whose quote states
     # the relationship backwards is re-emitted with the ends swapped rather
     # than discarded, since the model found a real assertion and only mis-read
@@ -749,22 +1152,147 @@ async def extract_entities(
         )
 
     async def _candidate_classes(chunk_embedding: list[float]) -> list[dict[str, str]]:
-        """Top-K class IRIs nearest the chunk's embedding."""
+        """Top-K class IRIs nearest the chunk's embedding.
+
+        Two guards beyond the plain ANN query:
+
+        * `menu_excluded` drops instance-shaped / disjunction labels. We
+          over-fetch 3x first so filtering rarely shrinks the menu below K.
+        * `max_candidate_l2` caps the distance. Without a ceiling this is a
+          pure `ORDER BY ... LIMIT K`, so a chunk ALWAYS receives exactly K
+          classes no matter how unrelated they are -- which is what leaves the
+          model a plausible-looking sibling to force every entity into.
+        """
+        over_fetch = (
+            candidate_classes_per_chunk * 3
+            if menu_excluded
+            else candidate_classes_per_chunk
+        )
         async with session_scope() as session:
-            r = await session.execute(
-                select(
-                    OntologyClass.iri,
-                    OntologyClass.label,
-                    OntologyClass.description,
+            stmt = select(
+                OntologyClass.iri,
+                OntologyClass.label,
+                OntologyClass.description,
+            ).where(OntologyClass.embedding.isnot(None))
+            if max_candidate_l2 is not None:
+                stmt = stmt.where(
+                    OntologyClass.embedding.l2_distance(chunk_embedding)
+                    <= max_candidate_l2
                 )
-                .where(OntologyClass.embedding.isnot(None))
-                .order_by(OntologyClass.embedding.l2_distance(chunk_embedding))
-                .limit(candidate_classes_per_chunk)
+            r = await session.execute(
+                stmt.order_by(OntologyClass.embedding.l2_distance(chunk_embedding))
+                .limit(over_fetch)
             )
-            return [
+            out = [
                 {"iri": iri, "label": label or "", "description": descr or ""}
                 for iri, label, descr in r.all()
+                if iri not in menu_excluded
             ]
+            return out[:candidate_classes_per_chunk]
+
+    async def _validate_pass(
+        txt: str,
+        candidates: list[dict[str, str]],
+        kept: list[dict[str, Any]],
+        cand_iris: set[str],
+        class_meta: dict[str, dict[str, str]],
+        chunk_iri: str,
+    ) -> dict[str, Any] | None:
+        """One `entity_validate` call, sanitised. None => fail open.
+
+        Applies the reviewer's DROP verdicts here (they need no second
+        extraction) and leaves `wrong_class` / `missing_entities` to the
+        re-extraction, which is the only pass that can reconsider what to
+        pull out of the passage in the first place.
+        """
+        entities_for_review = [
+            {
+                "index": i,
+                "canonical_name": e["canonical_name"],
+                "short_name": e["short_name"],
+                "class_iri": e["class_iri"],
+                "class_label": class_meta.get(e["class_iri"], {}).get("label", ""),
+                "class_description":
+                    class_meta.get(e["class_iri"], {}).get("description", ""),
+            }
+            for i, e in enumerate(kept)
+        ]
+        try:
+            v_sys, v_user = PROMPTS["entity_validate"](
+                txt, candidates, entities_for_review
+            )
+            out = await router.chat("entity_validate", system=v_sys, user=v_user)
+            parsed = _extract_json(out.text)
+        except Exception as exc:
+            print(f"[extract-entities] chunk {chunk_iri} validator failed: {exc}")
+            val_stats["validator_failed"] += 1
+            return None
+        if not isinstance(parsed, dict):
+            val_stats["validator_failed"] += 1
+            return None
+
+        feedback = _sanitise_verdicts(
+            parsed, kept, cand_iris, class_meta, menu_filter_allowlist
+        )
+        # Count what the reviewer actually asked for, so the run summary can
+        # show whether the pass is earning its cost.
+        for v in feedback["verdicts"]:
+            if v["verdict"] == "wrong_class":
+                val_stats["reclassified"] += 1
+            elif v["verdict"] in _DROPPING_VERDICTS:
+                val_stats["removed"] += 1
+        val_stats["added"] += len(feedback["missing_entities"])
+
+        # Apply the drop verdicts immediately: removing a hallucinated or
+        # generic entity needs no re-extraction, and dropping it now keeps it
+        # out of the PRIOR ATTEMPT block so the next round is not re-primed
+        # with the thing we just rejected.
+        drops = {
+            v["index"]: _DROPPING_VERDICTS[v["verdict"]]
+            for v in feedback["verdicts"]
+            if v["verdict"] in _DROPPING_VERDICTS
+        }
+        if drops:
+            n_before = len(kept)
+            for i, bucket in drops.items():
+                ent_drops[bucket] += 1
+                if bucket == "abstained" and len(abstained) < _abstain_sample_cap:
+                    abstained.append({
+                        "canonical_name": kept[i]["canonical_name"],
+                        "proposed_type": "(reviewer: no class fits)",
+                    })
+            kept[:] = [e for i, e in enumerate(kept) if i not in drops]
+            # Verdict indices refer to the PRE-drop ordering, so rebuild them
+            # against the surviving list before they are rendered into the
+            # feedback block -- otherwise the re-extraction prompt points its
+            # critique at the wrong entities.
+            remap = {
+                old: new
+                for new, old in enumerate(
+                    i for i in range(n_before) if i not in drops
+                )
+            }
+            feedback["verdicts"] = [
+                {**v, "index": remap[v["index"]]}
+                for v in feedback["verdicts"]
+                if v["index"] in remap
+            ]
+        # Recompute: the drops are already applied, so they no longer justify
+        # paying for a re-extraction. Only an unresolved reclassification or a
+        # missed entity does -- both need the extractor to look again.
+        feedback["_actionable"] = (
+            any(v["verdict"] == "wrong_class" for v in feedback["verdicts"])
+            or bool(feedback["missing_entities"])
+        )
+        feedback["prior"] = [
+            {
+                "canonical_name": e["canonical_name"],
+                "class_iri": e["class_iri"],
+                "class_label": class_meta.get(e["class_iri"], {}).get("label", ""),
+            }
+            for e in kept
+        ]
+        return feedback
 
     async def _one(idx: int, chunk_id: Any, chunk_iri: str, txt: str,
                    chunk_emb: list[float], doc_id: Any) -> None:
@@ -776,23 +1304,58 @@ async def extract_entities(
             try:
                 candidates = await _candidate_classes(chunk_emb)
                 if not candidates:
-                    summary.chunks_failed += 1
+                    # Not a failure. With an L2 ceiling set, a chunk whose
+                    # subject matter the ontology simply does not cover
+                    # legitimately has no candidates -- and routing that into
+                    # `chunks_failed` would pollute the failure-rate warning
+                    # and could trip EntityExtractionFailedError, turning a
+                    # too-tight ceiling into a hard abort mid-run.
+                    ent_drops["no_candidates"] += 1
+                    results[idx] = (chunk_id, chunk_iri, doc_id, [], [])
+                    summary.chunks_scanned += 1
                     async with progress_lock:
                         progress_state["done"] += 1
-                        progress_state["fail"] += 1
+                        progress_state["ok"] += 1
                     return
                 cand_iris = {c["iri"] for c in candidates}
+                class_meta = {
+                    c["iri"]: {"label": c["label"], "description": c["description"]}
+                    for c in candidates
+                }
 
-                system, user = PROMPTS["entity_extract"](txt, candidates)
-                # Parse-retry: Anthropic has no JSON-grammar mode, so Haiku
-                # occasionally emits an unparseable response. Re-ask once
-                # (non-deterministic -> a retry usually parses) before failing.
-                parsed = None
-                for _attempt in range(2):
-                    out = await router.chat("entity_extract", system=system, user=user)
-                    parsed = _extract_json(out.text)
-                    if isinstance(parsed, dict):
-                        break
+                async def _extract_pass(
+                    feedback: dict[str, Any] | None,
+                ) -> list[dict[str, Any]] | None:
+                    """One entity_extract call + parse-retry + filtering.
+
+                    Returns None when the response never parsed, so the caller
+                    can keep the previous round's result rather than treating
+                    an unparseable retry as "no entities here"."""
+                    system, user = PROMPTS["entity_extract"](
+                        txt, candidates, feedback=feedback
+                    )
+                    # Parse-retry: Anthropic has no JSON-grammar mode, so Haiku
+                    # occasionally emits an unparseable response. Re-ask once
+                    # (non-deterministic -> a retry usually parses).
+                    parsed_local = None
+                    for _attempt in range(2):
+                        out = await router.chat(
+                            "entity_extract", system=system, user=user
+                        )
+                        parsed_local = _extract_json(out.text)
+                        if isinstance(parsed_local, dict):
+                            break
+                    if not isinstance(parsed_local, dict):
+                        return None
+                    return _filter_entities(
+                        parsed_local.get("entities"),
+                        cand_iris,
+                        ent_drops,
+                        abstained,
+                        _abstain_sample_cap,
+                    )
+
+                kept = await _extract_pass(None)
             except Exception as exc:
                 print(f"[extract-entities] chunk {chunk_iri} call failed: {exc}")
                 summary.chunks_failed += 1
@@ -801,7 +1364,7 @@ async def extract_entities(
                     progress_state["fail"] += 1
                 return
 
-            if not isinstance(parsed, dict):
+            if kept is None:
                 print(f"[extract-entities] chunk {chunk_iri} unparseable response (after retry)")
                 summary.chunks_failed += 1
                 async with progress_lock:
@@ -809,26 +1372,44 @@ async def extract_entities(
                     progress_state["fail"] += 1
                 return
 
-            raw_entities = parsed.get("entities") or []
-            kept: list[dict[str, Any]] = []
-            for e in raw_entities:
-                if not isinstance(e, dict):
-                    continue
-                name = (e.get("canonical_name") or "").strip()
-                short = (e.get("short_name") or name).strip()
-                class_iri = (e.get("class_iri") or "").strip()
-                if not name or not class_iri or class_iri not in cand_iris:
-                    continue
-                try:
-                    conf = float(e.get("confidence")) if e.get("confidence") is not None else None
-                except (TypeError, ValueError):
-                    conf = None
-                kept.append({
-                    "canonical_name": name,
-                    "short_name": short,
-                    "class_iri": class_iri,
-                    "confidence": conf,
-                })
+            # ---- Review loop: validate -> critique -> re-extract ----
+            #
+            # The reviewer FAILS OPEN. On any exception or unparseable
+            # response we keep the pass-1 entities. This is deliberately the
+            # opposite of `relationship_verify`, where a missing verdict means
+            # "unsupported": there the default discards one claim, here it
+            # would discard an entire chunk's entities. An unreachable or
+            # misbehaving reviewer must never empty the graph.
+            if validate_entities and kept:
+                for _round in range(validation_rounds):
+                    feedback = await _validate_pass(
+                        txt, candidates, kept, cand_iris, class_meta, chunk_iri,
+                    )
+                    if feedback is None:
+                        break
+                    if not feedback["_actionable"]:
+                        val_stats["clean"] += 1
+                        break
+                    try:
+                        revised = await _extract_pass(feedback)
+                    except Exception as exc:
+                        print(
+                            f"[extract-entities] chunk {chunk_iri} re-extract "
+                            f"failed: {exc}"
+                        )
+                        break
+                    if revised is None:
+                        break
+                    if not revised:
+                        # A re-extraction that empties a chunk which had
+                        # entities is a regression, not a correction. Keep
+                        # pass-1 rather than letting one bad round delete the
+                        # chunk's contribution to the graph.
+                        val_stats["empty_reextract_rejected"] += 1
+                        break
+                    val_stats["revised"] += 1
+                    kept = revised
+
             # ---- Second pass: relationships ----
             #
             # Runs only now, because the predicate menu can only be narrowed
@@ -1520,6 +2101,44 @@ async def extract_entities(
             await session.execute(
                 pg_insert(GraphRelationship).values(rel_payloads[i : i + EDGE_BATCH])
             )
+
+    # Entity-side accounting. Previously every one of these was a silent
+    # `continue`, so a corpus could lose entities steadily with nothing in the
+    # output to show for it.
+    summary.entity_drops = dict(ent_drops)
+    summary.abstained_samples = abstained
+    _ent_dropped = sum(ent_drops.values())
+    if _ent_dropped:
+        print(
+            f"[extract-entities] entity drops: {_ent_dropped} "
+            f"(off_menu_iri={ent_drops['off_menu_iri']}, "
+            f"no_name={ent_drops['no_name']}, "
+            f"abstained={ent_drops['abstained']}, "
+            f"reviewer_removed={ent_drops['reviewer_removed']}, "
+            f"no_candidates={ent_drops['no_candidates']})"
+        )
+    if ent_drops["abstained"]:
+        _names = ", ".join(
+            repr(a["canonical_name"]) for a in abstained[:5]
+        )
+        print(
+            f"[extract-entities] {ent_drops['abstained']} entity mention(s) had "
+            f"no fitting class in the ontology and were NOT minted "
+            f"(e.g. {_names}). A high count here means the ontology is missing "
+            f"a branch -- consider a prune-expand run over this corpus."
+        )
+    if validate_entities:
+        summary.entity_validation = dict(val_stats)
+        print(
+            f"[extract-entities] entity review ({validation_rounds} round(s) max): "
+            f"{val_stats['clean']} chunk(s) clean, "
+            f"{val_stats['revised']} re-extracted "
+            f"(reclassified={val_stats['reclassified']}, "
+            f"removed={val_stats['removed']}, added={val_stats['added']}); "
+            f"{val_stats['empty_reextract_rejected']} empty re-extract(s) "
+            f"rejected; {val_stats['validator_failed']} validator call(s) "
+            f"failed (kept the unreviewed result)"
+        )
 
     if extract_relationships:
         _dropped = sum(rel_drops.values())

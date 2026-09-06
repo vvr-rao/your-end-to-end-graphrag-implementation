@@ -18,6 +18,7 @@ import json
 import logging
 import sys
 from pathlib import Path
+from typing import Any
 
 
 class _BenignAsyncTeardownFilter(logging.Filter):
@@ -35,6 +36,33 @@ class _BenignAsyncTeardownFilter(logging.Filter):
         if "Event loop is closed" in msg and "never retrieved" in msg:
             return False
         return True
+
+
+def _extraction_cfg() -> dict:
+    """The `extraction:` block in config.yaml.
+
+    Named `extraction` rather than `entity_extraction` so it does not read as
+    a sibling of `concurrency.entity_extraction`, which is about throughput
+    while this is about correctness.
+    """
+    from backend.app.core.config import get_settings
+
+    return (get_settings().app_config.get("extraction", {}) or {})
+
+
+def _resolve_extraction_opt(
+    args: argparse.Namespace, attr: str, key: str, default: Any
+) -> Any:
+    """CLI flag > extraction.<key> in config.yaml > default.
+
+    Same precedence contract as `_resolve_concurrency`; an explicit flag
+    always wins so a run can be reproduced from its command line alone.
+    """
+    explicit = getattr(args, attr, None)
+    if explicit is not None:
+        return explicit
+    cfg = _extraction_cfg()
+    return cfg[key] if key in cfg and cfg[key] is not None else default
 
 
 def _resolve_concurrency(args: argparse.Namespace, stage: str) -> int:
@@ -832,6 +860,70 @@ def build_parser() -> argparse.ArgumentParser:
             "behaviour, which split one entity into a node per class -- "
             "measured 18 separate 'Google' nodes on a 30-doc corpus, which "
             "breaks multi-hop traversal."
+        ),
+    )
+    p_ext.add_argument(
+        "--validate-entities", action="store_true",
+        help=(
+            "Turn on the review loop (OFF by default). After entities are "
+            "extracted, a DIFFERENT and stronger model (models.yaml task "
+            "`entity_validate`) sees the same candidate-class menu plus the "
+            "entities just extracted, returns a verdict per entity and any it "
+            "thinks were missed, and anything actionable triggers a "
+            "re-extraction of that chunk with the critique appended. Catches "
+            "what the structural checks cannot: an entity forced under a "
+            "same-topic sibling because the menu had nothing better (a "
+            "furniture retailer typed ContainerShippingCarrier), and entities "
+            "typed to classes that are really individuals ('ChollaUnit4' -- "
+            "19 unrelated power plants). Costs up to 2 extra calls per chunk "
+            "per round; raise --max-cost-usd accordingly, especially with "
+            "--from-fulltext."
+        ),
+    )
+    p_ext.add_argument(
+        "--validation-rounds", type=int, default=None,
+        help=(
+            "How many validate->re-extract rounds per chunk when "
+            "--validate-entities is on. Unset => extraction.validation_rounds "
+            "in config.yaml (default 2). Each round is one validator call "
+            "plus, ONLY when the validator finds something actionable, one "
+            "re-extraction call -- so a clean chunk costs one extra call, not "
+            "two. 0 disables the loop."
+        ),
+    )
+    p_ext.add_argument(
+        "--no-menu-filter", action="store_true",
+        help=(
+            "Do NOT withhold instance-shaped and disjunction-shaped class "
+            "labels from the candidate menu. prune-expand can mint "
+            "individuals as classes ('ChollaUnit4') and disjunctions from "
+            "unresolved relation endpoints ('SegmentOperatingExpense or "
+            "SegmentAsset'); neither is a KIND, so no entity can legitimately "
+            "instantiate them, yet both rank high in the vector search "
+            "because they are lexically close to the entity. Use this only to "
+            "reproduce pre-filter behaviour."
+        ),
+    )
+    p_ext.add_argument(
+        "--max-candidate-l2", type=float, default=None,
+        help=(
+            "Hard L2-distance ceiling for the candidate-class vector search. "
+            "Unset => extraction.max_candidate_l2 in config.yaml (default: no "
+            "ceiling). Without one, EVERY chunk receives exactly "
+            "--candidate-classes classes however unrelated they are, so the "
+            "model always has a plausible-looking sibling to force an entity "
+            "into. With one, a chunk can get fewer -- or zero, in which case "
+            "it is SKIPPED, not failed. Embeddings are unit-normalised, so "
+            "the useful range is 0..2; measure with "
+            "--report-candidate-distances before setting it."
+        ),
+    )
+    p_ext.add_argument(
+        "--report-candidate-distances", action="store_true",
+        help=(
+            "Diagnostic: print the distribution of chunk->class embedding "
+            "distances by rank, then exit without extracting. Use it to pick "
+            "--max-candidate-l2 from measurement rather than guesswork."
         ),
     )
     p_ext.set_defaults(func=_cmd_extract_entities)
@@ -1696,7 +1788,32 @@ def _cmd_enrich_time(args: argparse.Namespace) -> int:
 
 def _cmd_extract_entities(args: argparse.Namespace) -> int:
     _conc = _resolve_concurrency(args, "entity_extraction")
+    _chunk_kind = "fulltext" if getattr(args, "from_fulltext", False) else "summary"
+
+    if getattr(args, "report_candidate_distances", False):
+        from backend.app.services.db_entity_extract import (
+            report_candidate_distances,
+        )
+
+        asyncio.run(report_candidate_distances(chunk_kind=_chunk_kind))
+        return 0
+
+    _rounds = int(_resolve_extraction_opt(
+        args, "validation_rounds", "validation_rounds", 2))
+    _validate = getattr(args, "validate_entities", False)
+    _l2 = _resolve_extraction_opt(
+        args, "max_candidate_l2", "max_candidate_l2", None)
+    _menu_filter = not getattr(args, "no_menu_filter", False) and bool(
+        _extraction_cfg().get("filter_candidate_menu", True))
+    _allow = frozenset(
+        s.strip().lower()
+        for s in (_extraction_cfg().get("menu_filter_allowlist") or [])
+        if isinstance(s, str) and s.strip()
+    )
+
     print(f"[extract-entities] concurrency = {_conc}")
+    if _validate:
+        print(f"[extract-entities] entity review ON, up to {_rounds} round(s)")
     from backend.app.services.db_entity_extract import extract_entities
 
     asyncio.run(
@@ -1706,13 +1823,18 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
             candidate_classes_per_chunk=args.candidate_classes,
             concurrency=_conc,
             max_cost_usd=args.max_cost_usd,
-            chunk_kind="fulltext" if getattr(args, "from_fulltext", False) else "summary",
+            chunk_kind=_chunk_kind,
             extract_relationships=not getattr(args, "no_relationships", False),
             verify_relationships=not getattr(
                 args, "no_verify_relationships", False),
             rescue_relationships=getattr(
                 args, "rescue_relationships", False),
             entity_identity=getattr(args, "entity_identity", "name"),
+            validate_entities=_validate,
+            validation_rounds=_rounds,
+            filter_candidate_menu=_menu_filter,
+            max_candidate_l2=float(_l2) if _l2 is not None else None,
+            menu_filter_allowlist=_allow or None,
         )
     )
     return 0

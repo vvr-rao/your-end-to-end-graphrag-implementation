@@ -215,3 +215,96 @@ def test_dedup_concurrency_is_its_own_key() -> None:
     block = yaml.safe_load(open("config/config.example.yaml")).get("concurrency") or {}
     for key in ("chunk_classification", "class_proposal", "dedup"):
         assert key in block, f"config.example.yaml missing concurrency.{key}"
+
+
+# --------------------------------------------------------------------------- #
+# extraction.* correctness knobs -- same precedence contract as concurrency:
+# an explicit flag always wins, so a run is reproducible from its command line.
+# --------------------------------------------------------------------------- #
+
+from backend.app.cli.main import _resolve_extraction_opt  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "attr,key,default,config_value,flag_value",
+    [
+        ("validation_rounds", "validation_rounds", 2, 3, 1),
+        ("max_candidate_l2", "max_candidate_l2", None, 1.15, 0.9),
+    ],
+)
+def test_extraction_flag_beats_config_beats_default(
+    attr, key, default, config_value, flag_value, cfg
+) -> None:
+    cfg({"extraction": {key: config_value}})
+
+    explicit = argparse.Namespace(**{attr: flag_value})
+    assert _resolve_extraction_opt(explicit, attr, key, default) == flag_value
+
+    unset = argparse.Namespace(**{attr: None})
+    assert _resolve_extraction_opt(unset, attr, key, default) == config_value
+
+    cfg({})
+    assert _resolve_extraction_opt(unset, attr, key, default) == default
+
+
+def test_null_in_config_falls_through_to_the_default(cfg) -> None:
+    """`max_candidate_l2: null` ships as the disabled default; a YAML null
+    must not be read as "configured to None" in a way that shadows a future
+    non-None default."""
+    cfg({"extraction": {"max_candidate_l2": None}})
+    args = argparse.Namespace(max_candidate_l2=None)
+    assert _resolve_extraction_opt(
+        args, "max_candidate_l2", "max_candidate_l2", 1.5) == 1.5
+
+
+def test_missing_attr_is_treated_as_unset_for_extraction(cfg) -> None:
+    cfg({"extraction": {"validation_rounds": 4}})
+    assert _resolve_extraction_opt(
+        argparse.Namespace(), "validation_rounds", "validation_rounds", 2) == 4
+
+
+def test_shipped_config_defines_the_extraction_knobs() -> None:
+    """These are read on every extract-entities run; a missing key would fall
+    back silently rather than surfacing."""
+    from pathlib import Path
+
+    import yaml
+
+    root = Path(__file__).resolve().parents[3]
+    for name in ("config.yaml", "config.example.yaml"):
+        path = root / "config" / name
+        if not path.exists():
+            continue
+        block = (yaml.safe_load(path.read_text()) or {}).get("extraction")
+        assert isinstance(block, dict), f"{name}: no `extraction:` section"
+        for key in ("validation_rounds", "filter_candidate_menu",
+                    "menu_filter_allowlist", "max_candidate_l2"):
+            assert key in block, f"{name}: extraction.{key} missing"
+        assert block["validation_rounds"] == 2, (
+            f"{name}: the shipped default is 2 rounds"
+        )
+
+
+@pytest.mark.parametrize(
+    "flag",
+    ["--validate-entities", "--validation-rounds", "--no-menu-filter",
+     "--max-candidate-l2", "--report-candidate-distances"],
+)
+def test_extract_entities_exposes_each_new_flag(flag) -> None:
+    from backend.app.cli.main import build_parser
+
+    parser = build_parser()
+    sub = parser._subparsers._group_actions[0]
+    assert flag in sub.choices["extract-entities"].format_help(), (
+        f"{flag} not exposed on extract-entities"
+    )
+
+
+def test_review_loop_is_off_by_default() -> None:
+    """Opt-in, like --tables and --full-text-chunks: the unflagged run must
+    stay byte-identical in behaviour AND cost."""
+    from backend.app.cli.main import build_parser
+
+    args = build_parser().parse_args(["extract-entities"])
+    assert args.validate_entities is False
+    assert args.validation_rounds is None  # => config default

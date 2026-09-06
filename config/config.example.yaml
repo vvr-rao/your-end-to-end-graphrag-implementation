@@ -339,10 +339,57 @@ expansion:
     # noun places NOT already in the loaded ontology. Usually empty --
     # the dynamic lookup handles geography automatically.
     extra_known_place_labels: []
+    # Extra RAW REGEX patterns (not escaped -- these express a shape, not a
+    # literal) matched against a proposal's DESCRIPTION to mark it as
+    # describing one specific individual rather than a category. Built-ins
+    # already cover "a specific ...", "this particular ...", and
+    # "<Name>, a <kind> referenced in <X>". An invalid pattern is skipped with
+    # a warning rather than aborting the run.
+    extra_instance_description_patterns: []
+    # Labels that look entity-shaped to the heuristics but are genuine classes
+    # in THIS domain. Case-insensitive exact match, checked FIRST so it
+    # overrides every other rule. Use it when a domain legitimately names a
+    # category the way other domains name individuals.
+    class_filter_allowlist: []
 
 # -----------------------------------------------------------------------------
 # RAG QA defaults (Phase 2).
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# extract-entities (Milestone C) correctness knobs. Throughput lives under
+# `concurrency.entity_extraction` above; this section is about accuracy.
+# -----------------------------------------------------------------------------
+extraction:
+  # Validate-and-review loop, enabled per run with --validate-entities (OFF by
+  # default). After entities are extracted, a DIFFERENT model (models.yaml task
+  # `entity_validate`) reviews each entity + its class assignment; anything
+  # actionable triggers a re-extraction of that chunk with the critique
+  # appended. This value caps the validate->re-extract cycles. A clean chunk
+  # costs ONE extra call (the review) and stops; only chunks with a real
+  # problem pay for a re-extraction. 0 disables.
+  validation_rounds: 2
+  # Candidate-menu quality filter. Withholds instance-shaped class labels
+  # ("Cholla Unit 4") and disjunction labels ("SegmentOperatingExpense or
+  # SegmentAsset") from the top-K menu handed to the extractor. Neither is a
+  # KIND, so no entity can legitimately instantiate them -- but they rank high
+  # in the vector search precisely because they are lexically close to the
+  # entity. The extractor cannot pick what it was never shown.
+  filter_candidate_menu: true
+  # Labels that look instance-shaped to the heuristic but are genuine classes
+  # in THIS domain. Case-insensitive exact match. The per-domain escape hatch:
+  # a rule tuned on "ChollaUnit4" also describes "Interleukin6", and losing a
+  # class is silent (the class goes AND every entity that would instantiate it
+  # is dropped). Empty = built-in behaviour.
+  menu_filter_allowlist: []
+  # Hard L2-distance ceiling on the candidate-class vector search. Without one
+  # the query is a pure `ORDER BY <-> LIMIT K`, so EVERY chunk receives exactly
+  # K classes however unrelated they are -- which is what leaves the model a
+  # plausible-looking sibling to force every entity into. Embeddings are
+  # unit-normalised (text-embedding-3-small @ 1024), so L2 is in [0,2] and
+  # l2 = sqrt(2 - 2*cos). null = disabled (behaviour-preserving default).
+  # MEASURE before setting: `extract-entities --report-candidate-distances`.
+  max_candidate_l2: null
+
 qa:
   # Top-k candidate classes from class-summary ANN.
   k_classes: 15

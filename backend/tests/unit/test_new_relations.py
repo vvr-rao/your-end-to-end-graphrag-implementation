@@ -213,3 +213,113 @@ def test_missing_relations_section_is_a_noop() -> None:
     assert created == []
     assert skipped == []
     assert extended["object_properties_dict"] == {}
+
+
+# --------------------------------------------------------------------------- #
+# Disjunction endpoints
+#
+# `match_dedup` rule 3a asks the model to GENERALISE relation DOMAIN/RANGE.
+# When no single class covers both ends it hedges -- "Organization or
+# AppStoreOperator" -- and that string used to be auto-minted VERBATIM as a
+# class. The live DB carries 7 of them, each with an
+# `auto_created_from_relation` annotation proving the path. A disjunction is
+# not a class: no entity can ever instantiate it, yet it sits in the candidate
+# menu forever.
+# --------------------------------------------------------------------------- #
+
+
+def _disjunction_case(domain: str, classes: list[tuple[str, dict]]) -> tuple:
+    ontology = {
+        "classes_dict": dict(classes),
+        "object_properties_dict": {},
+        "data_properties_dict": {},
+        "instances_dict": {},
+    }
+    results = {
+        "MATCH NOT FOUND RELATIONS": [
+            {"LABEL": "allocatedTo", "DESCRIPTION": "",
+             "DOMAIN": domain, "RANGE": "Drug"},
+        ]
+    }
+    return add_new_relations_from_match_results(
+        ontology, results,
+        new_property_base_iri=BASE_IRI,
+        new_class_base_iri=BASE_IRI,
+    )
+
+
+def test_disjunction_endpoint_is_never_minted_verbatim() -> None:
+    """Neither side resolves -> skip the relation, do NOT mint 'X or Y'.
+
+    Trading a junk class for a SILENT drop would be no improvement, so the
+    skip must be counted in `skipped` where the stage-4 log line reports it.
+    """
+    extended, created, skipped, auto_minted = _disjunction_case(
+        "Organization or AppStoreOperator",
+        [_cls("http://example.org/Drug", "Drug")],
+    )
+    assert not created
+    assert not auto_minted, "a disjunction must never become a class"
+    assert len(skipped) == 1
+    assert "disjunction" in skipped[0]["reason"]
+    labels = [
+        lbl
+        for rec in extended["classes_dict"].values()
+        for lbl in rec.get("labels", [])
+    ]
+    assert not any(" or " in lbl for lbl in labels)
+
+
+def test_disjunction_with_one_resolvable_side_uses_that_side() -> None:
+    extended, created, skipped, auto_minted = _disjunction_case(
+        "Organization or AppStoreOperator",
+        [
+            _cls("http://example.org/Drug", "Drug"),
+            _cls("http://example.org/Organization", "Organization"),
+        ],
+    )
+    assert len(created) == 1
+    assert not skipped
+    assert not auto_minted
+    prop = extended["object_properties_dict"][created[0]]
+    assert prop["domain"][0]["iri"] == "http://example.org/Organization"
+
+
+def test_disjunction_with_both_sides_resolvable_picks_the_more_general() -> None:
+    """Rule 3a asks for the common parent. When both alternatives are real
+    classes, the shallower one is the reusable endpoint -- pinning the
+    relation to the narrow side is what made 77% of minted relations
+    unusable."""
+    general = _cls("http://example.org/Asset", "Asset")
+    narrow_iri = "http://example.org/SegmentAsset"
+    narrow = (narrow_iri, {
+        "iri": narrow_iri,
+        "name": "SegmentAsset",
+        "labels": ["SegmentAsset"],
+        "superclasses": [{"iri": "http://example.org/Asset"}],
+        "restrictions_and_class_constructs": [],
+    })
+    extended, created, _skipped, auto_minted = _disjunction_case(
+        "SegmentAsset or Asset",
+        [_cls("http://example.org/Drug", "Drug"), general, narrow],
+    )
+    assert len(created) == 1
+    assert not auto_minted
+    prop = extended["object_properties_dict"][created[0]]
+    assert prop["domain"][0]["iri"] == "http://example.org/Asset"
+
+
+def test_split_disjunction_label_only_fires_on_real_disjunctions() -> None:
+    from backend.app.helpers.ontology_pruning import split_disjunction_label
+
+    assert split_disjunction_label("Organization or AppStoreOperator") == [
+        "Organization", "AppStoreOperator",
+    ]
+    assert split_disjunction_label("A and/or B") == ["A", "B"]
+    assert split_disjunction_label("A | B") == ["A", "B"]
+    assert split_disjunction_label("Foo / Bar") == ["Foo", "Bar"]
+    # Not disjunctions -- these must survive untouched.
+    assert split_disjunction_label("Organization") == []
+    assert split_disjunction_label("Doctor") == []
+    assert split_disjunction_label("") == []
+    assert split_disjunction_label(None) == []

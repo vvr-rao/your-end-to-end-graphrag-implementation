@@ -18,6 +18,7 @@ from backend.app.services.pipeline_llm import (
     _compile_extra_word_regex,
     _filter_entity_shaped_classes,
     _looks_like_entity_not_class,
+    _looks_like_individual_weak,
     _split_camel,
 )
 
@@ -373,3 +374,238 @@ def test_compile_extras_return_none_on_empty_or_garbage() -> None:
     assert _compile_extra_suffix_regex([""]) is None
     assert _compile_extra_word_regex(None) is None
     assert _compile_extra_word_regex(["", "   "]) is None
+
+
+# --------------------------------------------------------------------------- #
+# Cross-domain matrix (individual-vs-class, heuristics 5-7)
+#
+# The failure that motivated these: `ChollaUnit4` -- ONE power plant unit --
+# was minted as a class and then used to type 18 unrelated plants in four
+# other states, making it the 5th most-used class in the graph.
+#
+# These tests exist to enforce GENERALIZATION rather than assert it. The
+# corpora span finance, energy, pharma, legal and news, and the danger is
+# asymmetric: a rule tuned on `ChollaUnit4` also describes `Interleukin6`, and
+# demoting a real class deletes it AND silently drops every entity that would
+# have instantiated it. So the negative table below is the load-bearing one.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "label,description,reason",
+    [
+        # Energy -- spaced enumerated unit names.
+        ("Cholla Unit 4", "", "trailing-enumerator"),
+        ("Craig Unit 2", "", "trailing-enumerator"),
+        ("Hayden Units 1 and 2", "", "trailing-enumerator"),
+        ("Naughton Unit 3", "", "trailing-enumerator"),
+        # Legal / regulatory.
+        ("SEC Rule 10b-5", "", "trailing-enumerator"),
+        ("Annex IV", "", "trailing-enumerator"),
+        # Pharma / research.
+        ("Study 301", "", "trailing-enumerator"),
+        ("Protocol 12B", "", "trailing-enumerator"),
+        # News -- CamelCase year prefix, which the pre-fix heuristic 4 missed
+        # because it was gated on the label already containing a space.
+        ("2025Factbook", "", "document-title"),
+        # The description signal: the strongest and most domain-neutral one,
+        # and the ONLY thing that catches the real `ChollaUnit4` label
+        # deterministically. This description is verbatim from the live DB.
+        (
+            "ChollaUnit4",
+            "Cholla Unit 4, a specific power plant unit referenced in Arizona SIP.",
+            "individual-description",
+        ),
+        (
+            "Gadsby Peakers, a specific peaking plant operated in Utah",
+            "Gadsby Peakers, a specific peaking plant operated in Utah.",
+            "individual-description",
+        ),
+    ],
+)
+def test_individual_shaped_labels_are_demoted(
+    label: str, description: str, reason: str
+) -> None:
+    is_entity, got = _looks_like_entity_not_class(
+        label, description=description, known_places=_DEFAULT_KNOWN_PLACES,
+    )
+    assert is_entity is True, f"expected {label!r} to be demoted to an instance"
+    assert got == reason
+
+
+@pytest.mark.parametrize(
+    "label,description",
+    [
+        # Pharma / chemistry: digits are INTERNAL, a kind-noun follows. These
+        # are the cases a naive "label contains a digit" rule destroys.
+        ("Type2Diabetes", ""),
+        ("Phase3ClinicalTrial", ""),
+        ("Interleukin6", "A cytokine involved in inflammation."),
+        ("HER2", "A receptor tyrosine kinase."),
+        ("CYP3A4", "A cytochrome P450 enzyme."),
+        ("PM2.5", "Fine particulate matter."),
+        ("CO2", "Carbon dioxide."),
+        ("COVID19", "An infectious respiratory disease."),
+        # Finance / supply chain: same shape, genuine categories.
+        ("Scope3Emission", ""),
+        ("Tier1Supplier", ""),
+        ("B2BTransaction", ""),
+        # Energy: the KIND, as opposed to the named unit.
+        ("CoalFiredGeneratingUnit", ""),
+        ("PowerPlantUnit", ""),
+        ("GeneratingUnit", ""),
+        ("Unit", ""),
+        # The series CLASS, as opposed to one item in the series.
+        ("AccountingStandardUpdate", ""),
+        ("ConsumerPriceIndex", ""),
+        # A normal class description must never trip heuristic 7.
+        (
+            "ElectricityGenerationFacility",
+            "A facility that generates electricity for supply to the grid.",
+        ),
+    ],
+)
+def test_genuine_kinds_survive_the_individual_heuristics(
+    label: str, description: str
+) -> None:
+    is_entity, reason = _looks_like_entity_not_class(
+        label, description=description, known_places=_DEFAULT_KNOWN_PLACES,
+    )
+    assert is_entity is False, (
+        f"expected {label!r} to stay a CLASS (got reason {reason!r}). "
+        "Demoting a genuine class also drops every entity that would have "
+        "instantiated it, so a false positive here is silent data loss."
+    )
+
+
+@pytest.mark.parametrize(
+    "label,reason",
+    [
+        ("ASU2019-01", "series-designator"),
+        ("ASU2018-07", "series-designator"),
+        ("NCT02345678", "series-designator"),
+        ("IFRS16", "series-designator"),
+        # `COVID19` has the SAME shape as `ASU2019-01`. It is nominated too,
+        # and that is the point: no regex can separate them, so both go to the
+        # Layer-H LLM audit rather than being deleted on a guess.
+        ("COVID19", "series-designator"),
+        ("ChollaUnit4", "trailing-enumerator-camel"),
+        ("DaveJohnstonUnit4", "trailing-enumerator-camel"),
+    ],
+)
+def test_weak_shapes_are_nominated_for_llm_audit_not_demoted(
+    label: str, reason: str
+) -> None:
+    """The weak tier NOMINATES, it does not decide.
+
+    These labels must reach `classification_audit` (which owns the
+    CONVERT_TO_INSTANCE verdict) and must NOT be demoted deterministically.
+    """
+    weak, got = _looks_like_individual_weak(label)
+    assert weak is True, f"expected {label!r} to be nominated for the audit"
+    assert got == reason
+    strong, _ = _looks_like_entity_not_class(
+        label, known_places=_DEFAULT_KNOWN_PLACES,
+    )
+    assert strong is False, (
+        f"{label!r} must NOT be demoted by the deterministic tier -- it is "
+        "shape-ambiguous and only an LLM can settle it"
+    )
+
+
+@pytest.mark.parametrize(
+    "label",
+    ["HER2", "CO2", "PM2.5", "CYP3A4", "Interleukin6", "IL6"],
+)
+def test_single_stem_symbols_are_not_even_nominated(label: str) -> None:
+    """Cost control: without the multi-word requirement, every gene, chemical
+    and biomarker symbol in a pharma corpus gets nominated for the PAID audit
+    and all of them come back "keep"."""
+    weak, reason = _looks_like_individual_weak(label)
+    assert weak is False, f"{label!r} should not reach the paid audit ({reason})"
+
+
+def test_domain_allowlist_overrides_every_heuristic() -> None:
+    """The per-domain escape hatch, checked before anything else."""
+    label, descr = "Cholla Unit 4", "a specific power plant unit"
+    assert _looks_like_entity_not_class(label, description=descr)[0] is True
+    assert _looks_like_entity_not_class(
+        label, description=descr, allowlist=frozenset({"cholla unit 4"}),
+    )[0] is False
+
+
+def test_filter_reads_the_description_from_the_proposal() -> None:
+    """Heuristic 7 only works if `_filter_entity_shaped_classes` actually
+    passes DESCRIPTION through -- it is the sole signal that catches the real
+    `ChollaUnit4` label."""
+    stage2_result = {
+        "MATCH NOT FOUND": [
+            {
+                "LABEL": "ChollaUnit4",
+                "DESCRIPTION":
+                    "Cholla Unit 4, a specific power plant unit referenced "
+                    "in Arizona SIP.",
+                "PARENT_LABEL": "Infrastructure",
+            },
+            {
+                "LABEL": "CoalFiredGeneratingUnit",
+                "DESCRIPTION": "A generating unit fuelled by coal.",
+                "PARENT_LABEL": "Infrastructure",
+            },
+        ],
+    }
+    updated, demotions = _filter_entity_shaped_classes(stage2_result)
+    kept = [e["LABEL"] for e in updated["MATCH NOT FOUND"]]
+    promoted = [e["LABEL"] for e in updated["MATCH NOT FOUND INSTANCES"]]
+    assert kept == ["CoalFiredGeneratingUnit"]
+    assert promoted == ["ChollaUnit4"]
+    assert demotions[0]["reason"] == "individual-description"
+    # The demoted class keeps its parent as its TYPE_LABEL, so the instance
+    # lands under the right kind rather than at owl:Thing.
+    assert updated["MATCH NOT FOUND INSTANCES"][0]["TYPE_LABEL"] == "Infrastructure"
+
+
+@pytest.mark.parametrize(
+    "label,description",
+    [
+        # Measured against the live ontology: the SAME sentence opening, with
+        # opposite correct answers. This is why a bare "a specific ..." only
+        # nominates for the LLM audit and never demotes on its own.
+        ("AffordableCleanEnergyRule",
+         "A specific EPA regulation addressing emissions from power plants."),
+        ("ComplianceDeadline",
+         "A specific date by which regulated entities must comply."),
+        ("TermLoanB", "A specific type of term loan."),
+        ("GovernmentAgency",
+         "A government body responsible for oversight in a specific domain."),
+        ("SegmentOperatingExpense",
+         "Operating expenses allocated to a specific business segment."),
+        ("moratorium",
+         "A temporary suspension of a particular activity, such as rate changes."),
+    ],
+)
+def test_bare_specific_in_a_description_never_demotes_on_its_own(
+    label: str, description: str
+) -> None:
+    """`AffordableCleanEnergyRule` IS one specific rule; `ComplianceDeadline`
+    is a category of date. Both descriptions open "A specific ...", so no
+    regex can separate them -- the weak tier hands them to the audit instead.
+    """
+    strong, reason = _looks_like_entity_not_class(label, description=description)
+    assert strong is False, f"{label!r} demoted on an ambiguous signal ({reason})"
+    weak, wreason = _looks_like_individual_weak(label, description=description)
+    assert weak is True, f"{label!r} should still reach the LLM audit"
+    assert wreason == "individual-description-weak"
+
+
+def test_finance_instrument_notes_survive_the_document_tail_rule() -> None:
+    """"Note" and "Paper" head real debt-instrument classes. They were moved
+    from the STRONG to the WEAK document tails after withholding
+    `promissory note`, `floating rate note` and `ExchangeableNote` from a
+    finance ontology."""
+    for label in ("promissory note", "floating rate note", "medium term note",
+                  "ExchangeableNote", "JuniorSubordinatedNote",
+                  "commercial paper"):
+        assert _looks_like_entity_not_class(label)[0] is False, label
+    # A genuine named document still demotes, because the second signal fires.
+    assert _looks_like_entity_not_class("2025 Outlook Note")[0] is True
