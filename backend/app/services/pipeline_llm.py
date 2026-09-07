@@ -1678,10 +1678,34 @@ def _first_parent_label(rec: dict[str, Any], classes_dict: dict[str, Any]) -> st
     return "owl:Thing"
 
 
+def _instance_label_set(instances_dict: dict[str, Any] | None) -> frozenset[str]:
+    """Lowercased, space-stripped labels of every minted INSTANCE.
+
+    Used to spot eponymous classes -- a class label that is also an instance
+    label almost always means one named thing got minted twice, once as a
+    category and once as the individual it actually is.
+    """
+    out: set[str] = set()
+    for rec in (instances_dict or {}).values():
+        if not isinstance(rec, dict):
+            continue
+        labels = rec.get("labels") or []
+        cands = list(labels) if isinstance(labels, list) else []
+        for extra in (rec.get("canonical_form"), rec.get("name")):
+            if isinstance(extra, str):
+                cands.append(extra)
+        for lbl in cands:
+            if isinstance(lbl, str) and lbl.strip():
+                out.add(re.sub(r"[^a-z0-9]", "", lbl.lower()))
+    out.discard("")
+    return frozenset(out)
+
+
 def _is_suspicious(
     iri: str,
     rec: dict[str, Any],
     classes_dict: dict[str, Any],
+    instance_labels: frozenset[str] | None = None,
 ) -> bool:
     """Quick deterministic filter to decide whether a newly-created class
     is worth a (paid) LLM audit. Returns True if any of:
@@ -1719,6 +1743,16 @@ def _is_suspicious(
     weak, _reason = _looks_like_individual_weak(label)
     if weak:
         return True
+    # Eponymous: this label was ALSO minted as an individual. Measured on a
+    # utility 10-K, 29 of 393 new classes were like this -- `PacifiCorp`,
+    # `MidAmericanEnergy`, `SierraPacific`, and the states `Utah`, `Oregon`,
+    # `California`. Extraction then typed each one to its own eponymous class,
+    # so `AESO` the class had exactly one member: AESO. A shape rule cannot
+    # see this (nothing about "PacifiCorp" looks wrong in isolation) -- only
+    # the coincidence with the instance list can.
+    if instance_labels:
+        if re.sub(r"[^a-z0-9]", "", label.lower()) in instance_labels:
+            return True
     # A disjunction label is never a class. These come from relation-endpoint
     # auto-minting (`SegmentOperatingExpense or SegmentAsset` carries
     # `auto_created_from_relation`); 1d stops new ones, this catches any that
@@ -1743,15 +1777,20 @@ def _classification_audit_cache_key(items: list[dict[str, Any]], model: str) -> 
 
 def _build_audit_items(
     classes_dict: dict[str, Any],
+    instances_dict: dict[str, Any] | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
     """Find every NEWLY-CREATED class whose current placement is
     suspicious. Returns (iri, item_dict_for_llm) tuples preserving
-    classes_dict order so audit batches are deterministic."""
+    classes_dict order so audit batches are deterministic.
+
+    `instances_dict` is optional so existing 1-arg callers keep working; when
+    given it enables the eponymous-class check."""
+    _inst_labels = _instance_label_set(instances_dict)
     items: list[tuple[str, dict[str, Any]]] = []
     for iri, rec in classes_dict.items():
         if not _is_newly_created(rec):
             continue
-        if not _is_suspicious(iri, rec, classes_dict):
+        if not _is_suspicious(iri, rec, classes_dict, _inst_labels):
             continue
         label = _label_of(rec)
         parent_label = _first_parent_label(rec, classes_dict)
@@ -1948,7 +1987,7 @@ async def run_classification_audit_async(
     prefixed with 'audit-v1'. Re-running against the same set of
     suspicious classes costs nothing for LLM calls.
     """
-    items = _build_audit_items(classes_dict)
+    items = _build_audit_items(classes_dict, instances_dict)
     if not items:
         print("[stage4-H] classification_audit: no suspicious classes -- skipping")
         return {"suspicious": 0, "decisions": 0, "kept": 0, "rehomed": 0,

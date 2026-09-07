@@ -387,7 +387,23 @@ extraction:
   # plausible-looking sibling to force every entity into. Embeddings are
   # unit-normalised (text-embedding-3-small @ 1024), so L2 is in [0,2] and
   # l2 = sqrt(2 - 2*cos). null = disabled (behaviour-preserving default).
-  # MEASURE before setting: `extract-entities --report-candidate-distances`.
+  # MEASURED 2026-09-07 on two corpora, and the answer was DON'T SET IT:
+  #
+  #                      50th-nearest class (p50)   assignments written (p99)
+  #   news (382 cls)              1.327                      1.394
+  #   finance (1937 cls)          1.107                      1.366
+  #
+  # A ceiling at the p99 of real assignments sits ABOVE the 50th-nearest
+  # class in both, so it never binds; one low enough to bind would cut
+  # legitimate top-K classes. The zero-candidate path cannot trigger either --
+  # the NEAREST class was within 1.21 for every news chunk sampled. The
+  # assignments out past rank-50's distance are the pinned and
+  # ancestor-closure classes, which bypass the vector query by design and so
+  # are out of a ceiling's reach anyway.
+  #
+  # Keep null unless you raise --candidate-classes a long way or import an
+  # ontology with a long tail of unrelated classes. Re-measure with
+  # `extract-entities --report-candidate-distances` before changing it.
   max_candidate_l2: null
   # Universal classes force-included in EVERY candidate menu, matched on label
   # (case- and punctuation-insensitive) so the same list works whichever upper

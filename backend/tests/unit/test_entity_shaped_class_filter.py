@@ -631,3 +631,81 @@ def test_bare_acronyms_are_nominated_for_audit(label: str) -> None:
 @pytest.mark.parametrize("label", ["GDP", "ESG", "EBITDA", "NAAQS"])
 def test_concept_acronyms_are_never_hard_demoted(label: str) -> None:
     assert _looks_like_entity_not_class(label)[0] is False
+
+
+# --------------------------------------------------------------------------- #
+# Eponymous classes
+#
+# Measured on a utility 10-K: 29 of 393 newly-minted classes carried a label
+# that was ALSO minted as an instance -- `PacifiCorp`, `MidAmericanEnergy`,
+# `SierraPacific`, `AltaLink`, and the states `Utah`, `Oregon`, `California`.
+# Extraction then typed each organization to its own eponymous class, so the
+# class `AESO` had exactly one member: AESO.
+#
+# No shape rule can catch this. Nothing about "PacifiCorp" looks wrong in
+# isolation; only its coincidence with the instance list gives it away.
+# --------------------------------------------------------------------------- #
+
+from backend.app.services.pipeline_llm import (  # noqa: E402
+    _build_audit_items,
+    _instance_label_set,
+    _is_suspicious,
+)
+
+_MINTED = {"semantic_role": {"reasons": ["Created from MATCH NOT FOUND"]}}
+
+
+def _cls(label: str) -> dict:
+    return {"labels": [label], "superclasses": [{"iri": "x#Org"}], **_MINTED}
+
+
+_CLASSES = {
+    "x#PacifiCorp": _cls("PacifiCorp"),
+    "x#Utah": _cls("Utah"),
+    "x#ElectricUtilityCompany": _cls("ElectricUtilityCompany"),
+    "x#Org": {"labels": ["Organization"]},
+}
+
+
+def test_a_class_whose_label_is_also_an_instance_reaches_the_audit() -> None:
+    labels = _instance_label_set({"i": {"labels": ["PacifiCorp"]}})
+    assert _is_suspicious("x#PacifiCorp", _cls("PacifiCorp"), _CLASSES, labels)
+
+
+def test_a_genuine_kind_is_not_flagged_by_the_eponymous_rule() -> None:
+    labels = _instance_label_set({"i": {"labels": ["PacifiCorp"]}})
+    assert not _is_suspicious(
+        "x#ElectricUtilityCompany", _cls("ElectricUtilityCompany"),
+        _CLASSES, labels,
+    )
+
+
+def test_the_rule_is_inert_without_an_instance_list() -> None:
+    """Existing callers pass no instances; they must behave exactly as before."""
+    assert not _is_suspicious("x#PacifiCorp", _cls("PacifiCorp"), _CLASSES)
+    assert _build_audit_items(_CLASSES) == []
+
+
+def test_instance_labels_are_matched_ignoring_case_and_punctuation() -> None:
+    labels = _instance_label_set({
+        "a": {"labels": ["Mid-American Energy"]},
+        "b": {"canonical_form": "SierraPacific"},
+        "c": {"name": "alta link"},
+    })
+    assert "midamericanenergy" in labels
+    assert "sierrapacific" in labels
+    assert "altalink" in labels
+
+
+def test_instance_label_set_survives_malformed_records() -> None:
+    assert _instance_label_set(None) == frozenset()
+    assert _instance_label_set({}) == frozenset()
+    assert _instance_label_set({"a": None, "b": {"labels": None}}) == frozenset()
+    assert _instance_label_set({"a": {"labels": ["", "  "]}}) == frozenset()
+
+
+def test_audit_picks_up_eponymous_classes_when_instances_are_supplied() -> None:
+    items = _build_audit_items(
+        _CLASSES, {"i1": {"labels": ["PacifiCorp"]}, "i2": {"labels": ["Utah"]}}
+    )
+    assert sorted(d["LABEL"] for _, d in items) == ["PacifiCorp", "Utah"]
