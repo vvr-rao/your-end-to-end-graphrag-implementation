@@ -145,6 +145,7 @@ async def add_turn(
     max_cost_usd: float = 1.0,
     decompose: bool = True,
     max_probes: int = 5,
+    rerank: bool | None = None,
     history_window: int = 3,
     verbose: bool = False,
 ) -> dict[str, Any]:
@@ -241,6 +242,7 @@ async def add_turn(
         max_cost_usd=max_cost_usd,
         decompose=decompose,
         max_probes=max_probes,
+        rerank=rerank,
         conversation_turn_id=turn_uid,
         resolved_query=resolved_query,
         verbose=verbose,
