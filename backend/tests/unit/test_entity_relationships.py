@@ -43,17 +43,28 @@ _PREDS = [
 
 def test_entity_extract_is_untouched_by_this_feature() -> None:
     """The entity pass must be EXACTLY what it was: relationships live in a
-    second call, so entity recall cannot regress from prompt overloading."""
+    second call, so entity recall cannot regress from prompt overloading.
+
+    `feedback` was added later for the validate-and-review loop. It is
+    keyword-only and defaulted, and the byte-identity assertion below is the
+    stronger guarantee -- it pins the actual prompt text, not just the
+    signature, so the opt-in loop cannot silently shift the default path.
+    """
     import inspect
 
     from backend.app.services.prompts import entity_extract as ee
 
     assert list(inspect.signature(ee).parameters) == [
-        "chunk_text", "candidate_classes"
+        "chunk_text", "candidate_classes", "feedback"
     ]
+    assert inspect.signature(ee).parameters["feedback"].default is None
     system, user = ee("Tesla is supplied by Panasonic.", _CLASSES)
     assert "relationship" not in system.lower()
     assert "relationship" not in user.lower()
+    # Omitting `feedback` and passing it as None must produce the same bytes.
+    assert (system, user) == ee(
+        "Tesla is supplied by Panasonic.", _CLASSES, feedback=None
+    )
 
 
 _ENTS = [

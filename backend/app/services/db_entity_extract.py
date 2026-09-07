@@ -43,9 +43,17 @@ from backend.app.db.models.entities import Entity
 from backend.app.db.models.graph import GraphRelationship
 from backend.app.db.models.ontology import OntologyClass
 from backend.app.db.session import session_scope
+from backend.app.helpers.ontology_pruning import split_disjunction_label
 from backend.app.services.db_artifact_gen import _extract_json
 from backend.app.services.embeddings import Embedder
 from backend.app.services.llm_router import LLMRouter
+# Sibling import: pipeline_llm does NOT import this module, so no cycle. Reused
+# rather than re-implemented so the ontology-build guard and the extraction-time
+# menu filter can never disagree about what an entity-shaped label looks like.
+from backend.app.services.pipeline_llm import (
+    _looks_like_entity_not_class,
+    _split_camel,
+)
 from backend.app.services.predicates import (
     RDF_TYPE,
     VIAO_ASSERTS_ABOUT,
@@ -53,6 +61,228 @@ from backend.app.services.predicates import (
 from backend.app.services.prompts import PROMPTS
 
 _ENTITIES_NS = "https://veerla-ramrao.ai/ontology/entities"
+
+# The sentinel the extractor returns when no candidate class denotes the KIND
+# of an entity it found. Before this existed the prompt said "SKIP that
+# entity", which is indistinguishable from "there is no entity here" -- so the
+# model always picked a same-topic sibling instead. That is how a furniture
+# retailer became a ContainerShippingCarrier and a canal became a region.
+ABSTAIN_SENTINEL = "NONE_OF_THESE"
+
+# The verdicts `entity_validate` may return. An unrecognised string is treated
+# as "correct" -- fail open per item, matching the pass-level policy below.
+_VALID_VERDICTS = frozenset({
+    "correct", "wrong_class", "not_an_entity", "no_class_fits", "not_in_text",
+})
+# Verdicts that remove the entity from the kept set.
+_DROPPING_VERDICTS = {
+    "not_an_entity": "reviewer_removed",
+    "not_in_text": "reviewer_removed",
+    "no_class_fits": "abstained",
+}
+
+
+def _filter_entities(
+    raw_entities: Any,
+    cand_iris: set[str],
+    ent_drops: dict[str, int],
+    abstained: list[dict[str, Any]],
+    abstain_cap: int = 200,
+) -> list[dict[str, Any]]:
+    """Validate one `entity_extract` response into the kept-entity list.
+
+    Pure (no DB, no I/O) so the drop accounting is unit-testable. Every
+    rejection increments a named counter rather than vanishing -- the previous
+    version used a single bare `continue`, which is why nobody could see how
+    often the model went off-menu.
+    """
+    kept: list[dict[str, Any]] = []
+    if not isinstance(raw_entities, list):
+        return kept
+    for e in raw_entities:
+        if not isinstance(e, dict):
+            continue
+        name = (e.get("canonical_name") or "").strip()
+        short = (e.get("short_name") or name).strip()
+        class_iri = (e.get("class_iri") or "").strip()
+        if not name:
+            ent_drops["no_name"] += 1
+            continue
+        if class_iri == ABSTAIN_SENTINEL:
+            # The model found a real entity and honestly reported that no
+            # candidate class denotes its kind. `entities.class_id` is NOT
+            # NULL, so this cannot be persisted without a migration -- record
+            # it instead. A rising count is the signal that the ontology is
+            # missing a branch, which is actionable in a way a wrong type
+            # never was.
+            ent_drops["abstained"] += 1
+            if len(abstained) < abstain_cap:
+                abstained.append({
+                    "canonical_name": name,
+                    "proposed_type": (e.get("proposed_type") or "").strip(),
+                })
+            continue
+        if not class_iri or class_iri not in cand_iris:
+            ent_drops["off_menu_iri"] += 1
+            continue
+        try:
+            conf = float(e.get("confidence")) if e.get("confidence") is not None else None
+        except (TypeError, ValueError):
+            conf = None
+        kept.append({
+            "canonical_name": name,
+            "short_name": short,
+            "class_iri": class_iri,
+            "confidence": conf,
+        })
+    return kept
+
+
+def _sanitise_verdicts(
+    parsed: dict[str, Any],
+    kept: list[dict[str, Any]],
+    cand_iris: set[str],
+    class_meta: dict[str, dict[str, str]],
+    allowlist: frozenset[str] | None = None,
+) -> dict[str, Any]:
+    """Clean one `entity_validate` response before it is acted on.
+
+    The reviewer is not trusted either. It can name an IRI that was never on
+    the menu, suggest a class that is itself instance-shaped (which would just
+    swap one bad type for another), index an entity that does not exist, or
+    invent a verdict. Each of those is neutralised here rather than deeper in
+    the loop, so the caller only ever sees well-formed input.
+    """
+    out_verdicts: list[dict[str, Any]] = []
+    seen_idx: set[int] = set()
+    for v in (parsed.get("verdicts") or []):
+        if not isinstance(v, dict):
+            continue
+        try:
+            idx = int(v.get("index"))
+        except (TypeError, ValueError):
+            continue
+        if idx < 0 or idx >= len(kept) or idx in seen_idx:
+            continue
+        seen_idx.add(idx)
+        verdict = str(v.get("verdict") or "").strip().lower()
+        if verdict not in _VALID_VERDICTS:
+            verdict = "correct"
+        better = (v.get("better_class_iri") or "").strip() or None
+        if verdict == "wrong_class":
+            meta = class_meta.get(better or "", {})
+            unfit, _r = _is_menu_unfit_class(
+                meta.get("label", ""), meta.get("description", ""), allowlist
+            )
+            # A suggestion that is off-menu or itself unusable is no
+            # suggestion at all: downgrade rather than drop, so a bad
+            # reviewer costs precision but never costs the entity.
+            if not better or better not in cand_iris or unfit:
+                verdict, better = "correct", None
+        else:
+            better = None
+        out_verdicts.append({
+            "index": idx,
+            "verdict": verdict,
+            "better_class_iri": better,
+            "reason": str(v.get("reason") or "").strip()[:300],
+        })
+
+    out_missing: list[dict[str, Any]] = []
+    for m in (parsed.get("missing_entities") or []):
+        if not isinstance(m, dict):
+            continue
+        name = (m.get("canonical_name") or "").strip()
+        if not name:
+            continue
+        iri = (m.get("class_iri") or "").strip()
+        if iri and iri != ABSTAIN_SENTINEL and iri not in cand_iris:
+            iri = ""
+        out_missing.append({
+            "canonical_name": name,
+            "short_name": (m.get("short_name") or name).strip(),
+            "class_iri": iri,
+            "reason": str(m.get("reason") or "").strip()[:300],
+        })
+
+    actionable = (
+        any(v["verdict"] != "correct" for v in out_verdicts) or bool(out_missing)
+    )
+    return {
+        "verdicts": out_verdicts,
+        "missing_entities": out_missing,
+        "note": str(parsed.get("note") or "").strip()[:400],
+        "_actionable": actionable,
+    }
+
+
+def _is_generated_class(extra_metadata: Any) -> bool:
+    """Was this class minted by the expansion pipeline, or does it come from a
+    source ontology?
+
+    prune-expand stamps `annotations.generated = [true]` and
+    `review_status = ["proposed"]` on everything it creates
+    (`create_new_class_entry`). Source-ontology classes carry neither. On the
+    live DB this is 550 of 2,244 classes -- and it is the same
+    newly-created distinction the Layer-H audit already gates on, so the two
+    passes agree about whose vocabulary is open to question.
+    """
+    if not isinstance(extra_metadata, dict):
+        return False
+    ann = extra_metadata.get("annotations")
+    if not isinstance(ann, dict):
+        return False
+    gen = ann.get("generated")
+    if gen is True or (isinstance(gen, list) and True in gen):
+        return True
+    rev = ann.get("review_status")
+    return isinstance(rev, list) and "proposed" in rev
+
+
+def _is_menu_unfit_class(
+    label: str,
+    description: str = "",
+    allowlist: frozenset[str] | None = None,
+) -> tuple[bool, str]:
+    """Should this class be withheld from the extractor's candidate menu?
+
+    Not a claim the class is wrong -- a claim that OFFERING it invites a wrong
+    answer. prune-expand mints individuals as classes (`ChollaUnit4`,
+    `ASU2019-01`) and disjunctions from unresolved relation endpoints
+    (`SegmentOperatingExpense or SegmentAsset`). Neither is a KIND, so no
+    entity can legitimately instantiate them -- yet both rank high in the
+    vector search precisely because they are lexically close to the entities
+    they were derived from.
+
+    Deliberately uses only the STRONG tier plus disjunctions. There is no LLM
+    adjudication on this path, so a wrong exclusion here silently removes a
+    legitimate typing target -- the same asymmetric loss the Stage-2 filter
+    documents. Borderline shapes stay in the menu and are caught by the
+    validator instead.
+
+    Callers must restrict this to LLM-GENERATED classes -- see
+    `_is_generated_class`. The heuristics were built to judge fresh Stage-2
+    proposals, and turning them loose on a whole merged ontology mis-fires on
+    established vocabulary: measured against the live DB it withheld
+    `promissory note` and `floating rate note` (the "Note" document tail),
+    `bank holding company` and `clearing corporation` (the corporate-suffix
+    rule), and `loan or credit account` (a real FIBO label that happens to
+    contain "or"). None of those came from an LLM, so none of them should be
+    second-guessed by a rule written for LLM output.
+    """
+    if not isinstance(label, str) or not label.strip():
+        return False, ""
+    cleaned = label.strip()
+    if allowlist and cleaned.lower() in allowlist:
+        return False, ""
+    if split_disjunction_label(cleaned) or split_disjunction_label(_split_camel(cleaned)):
+        return True, "disjunction"
+    unfit, reason = _looks_like_entity_not_class(
+        cleaned,
+        description=description if isinstance(description, str) else "",
+        allowlist=allowlist,
+    )
+    return (True, reason) if unfit else (False, "")
 
 
 # Warn (not raise) above this share of failed chunks: partial results are real
@@ -87,12 +317,204 @@ class EntityExtractSummary:
     wall_seconds: float = 0.0
     new_graph_version: int = 0
     samples: list[dict[str, Any]] = field(default_factory=list)
+    # Why these exist: the entity path used to drop candidates silently at the
+    # `class_iri not in cand_iris` guard, which is how the loss stayed
+    # invisible while ChollaUnit4 accumulated 19 mistyped entities. The
+    # relationship path already had `rel_drops`; this is the entity mirror.
+    entity_drops: dict[str, int] = field(default_factory=dict)
+    entity_validation: dict[str, int] = field(default_factory=dict)
+    # Names the model declined to type because no candidate class denoted
+    # their KIND. A rising count here is the honest signal that the ontology
+    # is missing a branch -- act on it with a prune-expand run.
+    abstained_samples: list[dict[str, Any]] = field(default_factory=list)
+    menu_classes_withheld: int = 0
 
 
 def _normalize_name(name: str) -> str:
     """Lowercase + strip non-alphanumerics (except internal spaces)."""
     s = re.sub(r"[^\w\s]", "", name, flags=re.UNICODE).strip().lower()
     return re.sub(r"\s+", " ", s)
+
+
+# Legal-form suffixes stripped when deciding whether two names denote the SAME
+# entity. Deliberately a COMPARISON key only -- the stored name keeps its
+# suffix, because "A.P. Moller-Maersk A/S" is the right thing to display.
+_LEGAL_SUFFIX_RE = re.compile(
+    r"\b(?:inc|corp|corporation|co|ltd|limited|llc|llp|lp|nv|n\s*v|"
+    r"gmbh|ag|sa|s\s*a|as|a\s*s|spa|plc|pte|bhd|pty|oyj|ab|asa|se|kk|"
+    r"holdings?|group|company)\b",
+    re.IGNORECASE,
+)
+
+
+def _dedup_key(name: str) -> str:
+    """Comparison key for "is this the same entity?".
+
+    `_normalize_name` alone leaves legal forms attached, so `Hapag-Lloyd` and
+    `Hapag-Lloyd AG` normalise to different strings and the pg_trgm gate
+    (>= 0.85) scores them 0.79 -- just under. Measured on a 3-document news
+    corpus that produced 7 near-duplicate node pairs: CMA CGM / CMA CGM SA,
+    Hapag-Lloyd / Hapag-Lloyd AG, Kovatchev / Stephane Kovatchev.
+
+    Duplicate nodes are not cosmetic: each carries its own edges, so a
+    multi-hop traversal that arrives at one cannot see what is hung off the
+    other -- the same failure that motivated name-level identity below.
+    """
+    base = _normalize_name(name)
+    stripped = _LEGAL_SUFFIX_RE.sub(" ", base)
+    stripped = re.sub(r"\s+", " ", stripped).strip()
+    # Never collapse a name to nothing: "Group" and "Co" are real short names.
+    return stripped or base
+
+
+def _person_surname_merges(
+    names_by_class: dict[str, set[str]],
+    person_class_iris: set[str],
+) -> dict[str, str]:
+    """Merge `Amosi` into `Guy Amosi` -- but never `Utah` into `Utah Utes`.
+
+    Scoped to PERSON-typed entities on purpose. The safe signal is that a
+    person referred to by surname is a strict token SUFFIX of their full name
+    (`Amosi` of `Guy Amosi`, `McMillan` of `Tetairoa McMillan`, `Ben Zvi
+    Klein` of `Or Ben Zvi Klein`), whereas the short forms that must NOT merge
+    are prefixes -- `Utah` of `Utah Utes`, `Arizona` of `Arizona Wildcats`.
+
+    Even so this stays Person-only, because the suffix rule alone would merge
+    `Times` into `New York Times`, and those are different publications.
+    """
+    out: dict[str, str] = {}
+    for cls, names in names_by_class.items():
+        if cls not in person_class_iris:
+            continue
+        ordered = sorted(names, key=lambda n: (-len(n.split()), n))
+        for short in names:
+            st = short.split()
+            for full in ordered:
+                ft = full.split()
+                if len(ft) > len(st) and ft[-len(st):] == st:
+                    out[short] = full
+                    break
+    return out
+
+
+def _word_order_merges(names_by_class: dict[str, set[str]]) -> dict[str, str]:
+    """`Park Naimi` and `Naimi Park` are one thing written two ways.
+
+    Uses exact token-MULTISET equality within a class, which is why it cannot
+    confuse `Arizona State University` with `University of Arizona`: those
+    differ by a token ("state" vs "of"), so their multisets differ.
+    """
+    out: dict[str, str] = {}
+    for names in names_by_class.values():
+        buckets: dict[tuple[str, ...], list[str]] = {}
+        for n in names:
+            buckets.setdefault(tuple(sorted(n.split())), []).append(n)
+        for variants in buckets.values():
+            if len(variants) < 2:
+                continue
+            target = sorted(variants)[0]
+            for v in variants:
+                if v != target:
+                    out[v] = target
+    return out
+
+
+def _resolve_canonical_forms(
+    results: list[Any],
+    person_class_iris: set[str] | None = None,
+) -> tuple[dict[str, str], int]:
+    """Map every extracted name to ONE canonical form for the run.
+
+    Two sources, both grounded in what the model actually saw:
+
+    1. The extractor's own `canonical_name` / `short_name` pairing. When it
+       reports canonical "A.P. Moller-Maersk A/S" with short "Maersk" it is
+       asserting, from that chunk, that the two denote one entity. That pair
+       was previously discarded for identity purposes.
+    2. The legal-suffix-stripped key, which merges `CMA CGM` with
+       `CMA CGM SA`.
+
+    Returns (normalized_variant -> canonical_normalized, n_merged). The
+    surviving form is the LONGEST variant seen, matching the extract prompt's
+    instruction that canonical_name be "the entity's most complete proper
+    name as commonly written".
+    """
+    groups: dict[str, set[str]] = {}
+    longest: dict[str, str] = {}
+
+    def _note(key: str, norm: str) -> None:
+        if not norm:
+            return
+        groups.setdefault(key, set()).add(norm)
+        if len(norm) > len(longest.get(key, "")):
+            longest[key] = norm
+
+    for tup in results or []:
+        if tup is None:
+            continue
+        for e in (tup[3] or []):
+            canon = _normalize_name(e.get("canonical_name") or "")
+            short = _normalize_name(e.get("short_name") or "")
+            if not canon:
+                continue
+            key = _dedup_key(canon)
+            _note(key, canon)
+            # The model's own short form joins the canonical form's group,
+            # even when its stripped key differs ("maersk" vs "a p moller
+            # maersk a s").
+            #
+            # EXCEPT when the short form is a token PREFIX of the canonical
+            # and the entity is not a person. "Utah" reported as the short
+            # form of "Utah Utes", or "Arizona" of "Arizona Wildcats", would
+            # otherwise collapse a state into a sports team. A person's short
+            # form is a suffix (their surname), so people are unaffected --
+            # and a genuine abbreviation ("ASU", "Maersk") is not a prefix
+            # either, so those still merge.
+            if short and short != canon:
+                ct, st_ = canon.split(), short.split()
+                is_prefix = len(st_) < len(ct) and ct[:len(st_)] == st_
+                if not is_prefix or (e.get("class_iri") or "") in (
+                    person_class_iris or set()
+                ):
+                    _note(key, short)
+                    groups.setdefault(_dedup_key(short), set()).add(short)
+
+    alias: dict[str, str] = {}
+    for key, variants in groups.items():
+        target = longest.get(key) or next(iter(variants))
+        for v in variants:
+            if v != target:
+                alias[v] = target
+
+    # Two narrower rules that need the entity's CLASS, so they run separately.
+    names_by_class: dict[str, set[str]] = {}
+    for tup in results or []:
+        if tup is None:
+            continue
+        for e in (tup[3] or []):
+            nrm = _normalize_name(e.get("canonical_name") or "")
+            cls = e.get("class_iri") or ""
+            if nrm and cls:
+                names_by_class.setdefault(cls, set()).add(nrm)
+    for extra in (
+        _person_surname_merges(names_by_class, person_class_iris or set()),
+        _word_order_merges(names_by_class),
+    ):
+        for k, v in extra.items():
+            if k != v and k not in alias:
+                alias[k] = v
+
+    # Collapse chains (a -> b -> c becomes a -> c) so every variant lands on
+    # one final spelling rather than an intermediate one.
+    for k in list(alias):
+        seen = {k}
+        tgt = alias[k]
+        while tgt in alias and tgt not in seen:
+            seen.add(tgt)
+            tgt = alias[tgt]
+        alias[k] = tgt
+    alias = {k: v for k, v in alias.items() if k != v}
+    return alias, len(alias)
 
 
 # Corporate / legal-entity suffixes commonly appended to organization
@@ -613,6 +1035,89 @@ async def _candidate_predicates(
     return out, constraints, ancestors
 
 
+async def report_candidate_distances(
+    *,
+    chunk_kind: str = "summary",
+    sample: int = 300,
+) -> None:
+    """Print the chunk->class embedding distance distribution by rank.
+
+    Exists because `max_candidate_l2` must be set from measurement, not from a
+    guess: too tight and chunks lose every candidate, too loose and it does
+    nothing. Reports both the raw per-rank spread AND the distances of the
+    assignments that were actually written, which is the more useful number --
+    a ceiling below the p99 of real assignments would start discarding work
+    the pipeline currently does correctly.
+    """
+    async with session_scope() as session:
+        rows = (await session.execute(
+            sql_text("""
+                WITH s AS (
+                  SELECT id, embedding FROM graphrag.chunks
+                   WHERE status='ACTIVE' AND kind=:kind AND embedding IS NOT NULL
+                   ORDER BY random() LIMIT :n
+                ), d AS (
+                  SELECT s.id,
+                         row_number() OVER (
+                           PARTITION BY s.id ORDER BY oc.embedding <-> s.embedding
+                         ) AS rnk,
+                         (oc.embedding <-> s.embedding) AS l2
+                    FROM s JOIN graphrag.ontology_classes oc
+                      ON oc.embedding IS NOT NULL
+                )
+                SELECT rnk,
+                       percentile_cont(0.05) WITHIN GROUP (ORDER BY l2),
+                       percentile_cont(0.50) WITHIN GROUP (ORDER BY l2),
+                       percentile_cont(0.95) WITHIN GROUP (ORDER BY l2)
+                  FROM d WHERE rnk IN (1,5,10,25,50)
+                 GROUP BY rnk ORDER BY rnk
+            """),
+            {"kind": chunk_kind, "n": sample},
+        )).all()
+        if not rows:
+            print(f"[candidate-distances] no {chunk_kind} chunks with embeddings")
+            return
+        print(f"[candidate-distances] chunk->class L2 by rank "
+              f"(sample={sample}, kind={chunk_kind}):")
+        print(f"    {'rank':>5}  {'p05':>7}  {'p50':>7}  {'p95':>7}")
+        for rnk, p05, p50, p95 in rows:
+            print(f"    {rnk:>5}  {p05:>7.4f}  {p50:>7.4f}  {p95:>7.4f}")
+
+        assigned = (await session.execute(
+            sql_text("""
+                SELECT percentile_cont(0.50) WITHIN GROUP (ORDER BY dist),
+                       percentile_cont(0.90) WITHIN GROUP (ORDER BY dist),
+                       percentile_cont(0.99) WITHIN GROUP (ORDER BY dist),
+                       count(*)
+                  FROM (
+                    SELECT (oc.embedding <-> c.embedding) AS dist
+                      FROM graphrag.graph_relationships gr
+                      JOIN graphrag.chunks c ON c.id = gr.source_chunk_id
+                      JOIN graphrag.entities e ON e.id = gr.target_node_id
+                      JOIN graphrag.ontology_classes oc ON oc.id = e.class_id
+                     WHERE gr.predicate_iri = :pred
+                       AND gr.source_node_type = 'chunk'
+                       AND c.embedding IS NOT NULL
+                       AND oc.embedding IS NOT NULL
+                  ) t
+            """),
+            {"pred": VIAO_ASSERTS_ABOUT},
+        )).first()
+    if assigned and assigned[3]:
+        print(
+            f"\n[candidate-distances] distances of assignments ACTUALLY written "
+            f"(n={assigned[3]:,}): p50={assigned[0]:.4f} p90={assigned[1]:.4f} "
+            f"p99={assigned[2]:.4f}"
+        )
+        print(
+            f"[candidate-distances] a ceiling near p99 ({assigned[2]:.2f}) keeps "
+            f"today's correct assignments while cutting the long tail. Set it "
+            f"as extraction.max_candidate_l2 or --max-candidate-l2."
+        )
+    else:
+        print("\n[candidate-distances] no existing assignments to calibrate against")
+
+
 async def extract_entities(
     *,
     scope_document_iri: str | None = None,
@@ -625,6 +1130,13 @@ async def extract_entities(
     verify_relationships: bool = True,
     rescue_relationships: bool = False,
     entity_identity: str = "name",
+    validate_entities: bool = False,
+    validation_rounds: int = 2,
+    filter_candidate_menu: bool = True,
+    max_candidate_l2: float | None = None,
+    menu_filter_allowlist: frozenset[str] | None = None,
+    menu_ancestor_closure: bool = True,
+    pinned_class_labels: tuple[str, ...] = (),
 ) -> EntityExtractSummary:
     """Drive entity extraction over chunks that haven't been processed.
 
@@ -632,6 +1144,23 @@ async def extract_entities(
     Summary is cheap but only captures what survived summarization; 'fulltext'
     mines the verbatim chunks (far more complete, e.g. every clinical study),
     at ~18x the LLM calls + more DB rows. Requires --full-text-chunks at ingest.
+
+    `validate_entities` (default OFF) turns on the review loop: a stronger
+    model audits each chunk's entities + class assignments and, when it finds
+    something actionable, extraction re-runs for that chunk with the critique
+    appended. `validation_rounds` caps the validate->re-extract cycles.
+
+    `filter_candidate_menu` withholds instance-shaped and disjunction-shaped
+    class labels from the top-K menu. `max_candidate_l2` (None = no ceiling)
+    caps how far a candidate class may sit from the chunk in embedding space;
+    without it every chunk gets exactly K classes however unrelated, so the
+    model always has a same-topic sibling to force an entity into.
+
+    `menu_ancestor_closure` adds the superclass chain of every menu entry, and
+    `pinned_class_labels` force-includes universal classes (person /
+    organization / place). Together they give the model a general answer to
+    fall back on -- without them a domain corpus fills all K slots with
+    hyper-specific classes and named people get abstained rather than typed.
     """
     t0 = time.time()
     summary = EntityExtractSummary()
@@ -707,6 +1236,80 @@ async def extract_entities(
                 "config/models.example.yaml) for higher precision."
             )
             verify_relationships = False
+    # Same degradation for the entity reviewer: an older models.yaml should
+    # lose the review pass, not raise once per chunk.
+    if validate_entities:
+        try:
+            router.task_spec("entity_validate")
+        except KeyError:
+            print(
+                "[extract-entities] models.yaml has no 'entity_validate' task "
+                "-- entities will be written WITHOUT the class-assignment "
+                "review pass. Add it (see config/models.example.yaml) to "
+                "enable --validate-entities."
+            )
+            validate_entities = False
+    if validate_entities and validation_rounds < 1:
+        validate_entities = False
+
+    # Candidate-menu quality filter, computed ONCE per run: one query over
+    # labels + descriptions, no vectors. Withholding a class here is cheaper
+    # and safer than trying to repair the answer afterwards -- the extractor
+    # cannot pick what it was never shown.
+    menu_excluded: set[str] = set()
+    if filter_candidate_menu:
+        _reasons: dict[str, int] = {}
+        async with session_scope() as session:
+            r = await session.execute(
+                select(
+                    OntologyClass.iri,
+                    OntologyClass.label,
+                    OntologyClass.description,
+                    OntologyClass.extra_metadata,
+                )
+            )
+            for iri, label, descr, meta in r.all():
+                # Only LLM-minted classes are candidates for withholding. A
+                # source ontology's vocabulary is not ours to second-guess.
+                if not _is_generated_class(meta):
+                    continue
+                unfit, reason = _is_menu_unfit_class(
+                    label or "", descr or "", menu_filter_allowlist
+                )
+                if unfit:
+                    menu_excluded.add(iri)
+                    _reasons[reason] = _reasons.get(reason, 0) + 1
+        summary.menu_classes_withheld = len(menu_excluded)
+        if menu_excluded:
+            _detail = ", ".join(f"{k}={v}" for k, v in sorted(_reasons.items()))
+            print(
+                f"[extract-entities] candidate-menu filter: "
+                f"{len(menu_excluded)} class(es) withheld ({_detail})"
+            )
+
+    # Resolve the pinned universal classes once. Matched on LABEL (case- and
+    # space-insensitive) rather than IRI so the same config works whichever
+    # upper ontology a corpus merged -- foaf, org, schema.org.
+    pinned_iris: set[str] = set()
+    if pinned_class_labels:
+        wanted = {
+            re.sub(r"[^a-z0-9]", "", lbl.lower())
+            for lbl in pinned_class_labels if isinstance(lbl, str) and lbl.strip()
+        }
+        async with session_scope() as session:
+            rows = await session.execute(
+                select(OntologyClass.iri, OntologyClass.label)
+                .where(OntologyClass.embedding.isnot(None))
+            )
+            for iri, label in rows.all():
+                if re.sub(r"[^a-z0-9]", "", (label or "").lower()) in wanted:
+                    pinned_iris.add(iri)
+        print(
+            f"[extract-entities] menu backstop: ancestor-closure="
+            f"{'on' if menu_ancestor_closure else 'off'}, "
+            f"{len(pinned_iris)} pinned class(es) resolved from "
+            f"{len(wanted)} configured label(s)"
+        )
 
     sem = asyncio.Semaphore(concurrency)
     # (chunk_id, chunk_iri, doc_id, list[entity_dict], list[relationship_dict])
@@ -720,6 +1323,19 @@ async def extract_entities(
         "no_evidence": 0, "one_sided_evidence": 0,
         "unsupported": 0, "reversed": 0,
     }
+    # The entity mirror of `rel_drops`. Line-for-line, the old code did a bare
+    # `continue` for every one of these -- so the corpus could lose entities
+    # steadily with nothing in the output to show for it.
+    ent_drops: dict[str, int] = {
+        "off_menu_iri": 0, "no_name": 0, "abstained": 0,
+        "reviewer_removed": 0, "no_candidates": 0,
+    }
+    val_stats: dict[str, int] = {
+        "clean": 0, "revised": 0, "reclassified": 0, "removed": 0,
+        "added": 0, "empty_reextract_rejected": 0, "validator_failed": 0,
+    }
+    abstained: list[dict[str, Any]] = []
+    _abstain_sample_cap = 200
     # Verification pass repairs as well as rejects: a claim whose quote states
     # the relationship backwards is re-emitted with the ends swapped rather
     # than discarded, since the model found a real assertion and only mis-read
@@ -749,22 +1365,192 @@ async def extract_entities(
         )
 
     async def _candidate_classes(chunk_embedding: list[float]) -> list[dict[str, str]]:
-        """Top-K class IRIs nearest the chunk's embedding."""
+        """The candidate menu: vector top-K, plus a general-class backstop.
+
+        Guards beyond the plain ANN query:
+
+        * `menu_excluded` drops instance-shaped / disjunction labels. We
+          over-fetch 3x first so filtering rarely shrinks the menu below K.
+        * `max_candidate_l2` caps the distance. Without a ceiling this is a
+          pure `ORDER BY ... LIMIT K`, so a chunk ALWAYS receives exactly K
+          classes no matter how unrelated they are.
+        * ANCESTOR CLOSURE + PINS -- see below.
+
+        Why the backstop exists. A pure top-K menu is dominated by whatever is
+        lexically closest to the chunk, which on a domain corpus means K
+        hyper-specific classes and no general ones. Measured on a shipping
+        article, `foaf:Person` ranked 191st while the top 10 were
+        ShippingBoomBustCycle, ContainerCarrier, FreightRate...; every named
+        person in the passage was dropped because nothing on the menu denoted
+        "a human being". On a utility 10-K the menu offered `AESO` and `MISO`
+        but not `Organization`, and 276 of ~340 mentions were abstained.
+
+        Two additions, in order of principle:
+
+        1. Ancestor closure -- for every class on the menu, its superclass
+           chain is added too. Fully domain-neutral: if `ContainerCarrier` is
+           offered then `Organization` is offered, and if `Israel` is offered
+           then `Country` and `GeographicEntity` are. This is what lets the
+           model answer "what KIND of thing is this?" with the right level of
+           generality instead of the only level it was shown.
+        2. Configured pins -- a short list of universal classes (person,
+           organization, place) that entity extraction needs in EVERY domain.
+           Needed on top of (1) because a chunk whose top-K contains no
+           person-ish class at all has no person ancestor to close over.
+        """
+        over_fetch = (
+            candidate_classes_per_chunk * 3
+            if menu_excluded
+            else candidate_classes_per_chunk
+        )
         async with session_scope() as session:
-            r = await session.execute(
-                select(
-                    OntologyClass.iri,
-                    OntologyClass.label,
-                    OntologyClass.description,
+            stmt = select(
+                OntologyClass.iri,
+                OntologyClass.label,
+                OntologyClass.description,
+            ).where(OntologyClass.embedding.isnot(None))
+            if max_candidate_l2 is not None:
+                stmt = stmt.where(
+                    OntologyClass.embedding.l2_distance(chunk_embedding)
+                    <= max_candidate_l2
                 )
-                .where(OntologyClass.embedding.isnot(None))
-                .order_by(OntologyClass.embedding.l2_distance(chunk_embedding))
-                .limit(candidate_classes_per_chunk)
+            r = await session.execute(
+                stmt.order_by(OntologyClass.embedding.l2_distance(chunk_embedding))
+                .limit(over_fetch)
             )
-            return [
+            out = [
                 {"iri": iri, "label": label or "", "description": descr or ""}
                 for iri, label, descr in r.all()
+                if iri not in menu_excluded
+            ][:candidate_classes_per_chunk]
+
+            have = {c["iri"] for c in out}
+            extra_iris: set[str] = set()
+            if menu_ancestor_closure and out:
+                anc = await session.execute(
+                    _ANCESTOR_SQL, {"iris": [c["iri"] for c in out]}
+                )
+                extra_iris |= {
+                    a for _origin, a in anc.all()
+                    if a not in have and a not in menu_excluded
+                }
+            extra_iris |= {i for i in pinned_iris if i not in have}
+            if not extra_iris:
+                return out
+            rows = await session.execute(
+                select(
+                    OntologyClass.iri, OntologyClass.label, OntologyClass.description
+                ).where(OntologyClass.iri.in_(sorted(extra_iris)))
+            )
+            for iri, label, descr in rows.all():
+                out.append({
+                    "iri": iri, "label": label or "", "description": descr or ""
+                })
+            return out
+
+    async def _validate_pass(
+        txt: str,
+        candidates: list[dict[str, str]],
+        kept: list[dict[str, Any]],
+        cand_iris: set[str],
+        class_meta: dict[str, dict[str, str]],
+        chunk_iri: str,
+    ) -> dict[str, Any] | None:
+        """One `entity_validate` call, sanitised. None => fail open.
+
+        Applies the reviewer's DROP verdicts here (they need no second
+        extraction) and leaves `wrong_class` / `missing_entities` to the
+        re-extraction, which is the only pass that can reconsider what to
+        pull out of the passage in the first place.
+        """
+        entities_for_review = [
+            {
+                "index": i,
+                "canonical_name": e["canonical_name"],
+                "short_name": e["short_name"],
+                "class_iri": e["class_iri"],
+                "class_label": class_meta.get(e["class_iri"], {}).get("label", ""),
+                "class_description":
+                    class_meta.get(e["class_iri"], {}).get("description", ""),
+            }
+            for i, e in enumerate(kept)
+        ]
+        try:
+            v_sys, v_user = PROMPTS["entity_validate"](
+                txt, candidates, entities_for_review
+            )
+            out = await router.chat("entity_validate", system=v_sys, user=v_user)
+            parsed = _extract_json(out.text)
+        except Exception as exc:
+            print(f"[extract-entities] chunk {chunk_iri} validator failed: {exc}")
+            val_stats["validator_failed"] += 1
+            return None
+        if not isinstance(parsed, dict):
+            val_stats["validator_failed"] += 1
+            return None
+
+        feedback = _sanitise_verdicts(
+            parsed, kept, cand_iris, class_meta, menu_filter_allowlist
+        )
+        # Count what the reviewer actually asked for, so the run summary can
+        # show whether the pass is earning its cost.
+        for v in feedback["verdicts"]:
+            if v["verdict"] == "wrong_class":
+                val_stats["reclassified"] += 1
+            elif v["verdict"] in _DROPPING_VERDICTS:
+                val_stats["removed"] += 1
+        val_stats["added"] += len(feedback["missing_entities"])
+
+        # Apply the drop verdicts immediately: removing a hallucinated or
+        # generic entity needs no re-extraction, and dropping it now keeps it
+        # out of the PRIOR ATTEMPT block so the next round is not re-primed
+        # with the thing we just rejected.
+        drops = {
+            v["index"]: _DROPPING_VERDICTS[v["verdict"]]
+            for v in feedback["verdicts"]
+            if v["verdict"] in _DROPPING_VERDICTS
+        }
+        if drops:
+            n_before = len(kept)
+            for i, bucket in drops.items():
+                ent_drops[bucket] += 1
+                if bucket == "abstained" and len(abstained) < _abstain_sample_cap:
+                    abstained.append({
+                        "canonical_name": kept[i]["canonical_name"],
+                        "proposed_type": "(reviewer: no class fits)",
+                    })
+            kept[:] = [e for i, e in enumerate(kept) if i not in drops]
+            # Verdict indices refer to the PRE-drop ordering, so rebuild them
+            # against the surviving list before they are rendered into the
+            # feedback block -- otherwise the re-extraction prompt points its
+            # critique at the wrong entities.
+            remap = {
+                old: new
+                for new, old in enumerate(
+                    i for i in range(n_before) if i not in drops
+                )
+            }
+            feedback["verdicts"] = [
+                {**v, "index": remap[v["index"]]}
+                for v in feedback["verdicts"]
+                if v["index"] in remap
             ]
+        # Recompute: the drops are already applied, so they no longer justify
+        # paying for a re-extraction. Only an unresolved reclassification or a
+        # missed entity does -- both need the extractor to look again.
+        feedback["_actionable"] = (
+            any(v["verdict"] == "wrong_class" for v in feedback["verdicts"])
+            or bool(feedback["missing_entities"])
+        )
+        feedback["prior"] = [
+            {
+                "canonical_name": e["canonical_name"],
+                "class_iri": e["class_iri"],
+                "class_label": class_meta.get(e["class_iri"], {}).get("label", ""),
+            }
+            for e in kept
+        ]
+        return feedback
 
     async def _one(idx: int, chunk_id: Any, chunk_iri: str, txt: str,
                    chunk_emb: list[float], doc_id: Any) -> None:
@@ -776,23 +1562,58 @@ async def extract_entities(
             try:
                 candidates = await _candidate_classes(chunk_emb)
                 if not candidates:
-                    summary.chunks_failed += 1
+                    # Not a failure. With an L2 ceiling set, a chunk whose
+                    # subject matter the ontology simply does not cover
+                    # legitimately has no candidates -- and routing that into
+                    # `chunks_failed` would pollute the failure-rate warning
+                    # and could trip EntityExtractionFailedError, turning a
+                    # too-tight ceiling into a hard abort mid-run.
+                    ent_drops["no_candidates"] += 1
+                    results[idx] = (chunk_id, chunk_iri, doc_id, [], [])
+                    summary.chunks_scanned += 1
                     async with progress_lock:
                         progress_state["done"] += 1
-                        progress_state["fail"] += 1
+                        progress_state["ok"] += 1
                     return
                 cand_iris = {c["iri"] for c in candidates}
+                class_meta = {
+                    c["iri"]: {"label": c["label"], "description": c["description"]}
+                    for c in candidates
+                }
 
-                system, user = PROMPTS["entity_extract"](txt, candidates)
-                # Parse-retry: Anthropic has no JSON-grammar mode, so Haiku
-                # occasionally emits an unparseable response. Re-ask once
-                # (non-deterministic -> a retry usually parses) before failing.
-                parsed = None
-                for _attempt in range(2):
-                    out = await router.chat("entity_extract", system=system, user=user)
-                    parsed = _extract_json(out.text)
-                    if isinstance(parsed, dict):
-                        break
+                async def _extract_pass(
+                    feedback: dict[str, Any] | None,
+                ) -> list[dict[str, Any]] | None:
+                    """One entity_extract call + parse-retry + filtering.
+
+                    Returns None when the response never parsed, so the caller
+                    can keep the previous round's result rather than treating
+                    an unparseable retry as "no entities here"."""
+                    system, user = PROMPTS["entity_extract"](
+                        txt, candidates, feedback=feedback
+                    )
+                    # Parse-retry: Anthropic has no JSON-grammar mode, so Haiku
+                    # occasionally emits an unparseable response. Re-ask once
+                    # (non-deterministic -> a retry usually parses).
+                    parsed_local = None
+                    for _attempt in range(2):
+                        out = await router.chat(
+                            "entity_extract", system=system, user=user
+                        )
+                        parsed_local = _extract_json(out.text)
+                        if isinstance(parsed_local, dict):
+                            break
+                    if not isinstance(parsed_local, dict):
+                        return None
+                    return _filter_entities(
+                        parsed_local.get("entities"),
+                        cand_iris,
+                        ent_drops,
+                        abstained,
+                        _abstain_sample_cap,
+                    )
+
+                kept = await _extract_pass(None)
             except Exception as exc:
                 print(f"[extract-entities] chunk {chunk_iri} call failed: {exc}")
                 summary.chunks_failed += 1
@@ -801,7 +1622,7 @@ async def extract_entities(
                     progress_state["fail"] += 1
                 return
 
-            if not isinstance(parsed, dict):
+            if kept is None:
                 print(f"[extract-entities] chunk {chunk_iri} unparseable response (after retry)")
                 summary.chunks_failed += 1
                 async with progress_lock:
@@ -809,26 +1630,44 @@ async def extract_entities(
                     progress_state["fail"] += 1
                 return
 
-            raw_entities = parsed.get("entities") or []
-            kept: list[dict[str, Any]] = []
-            for e in raw_entities:
-                if not isinstance(e, dict):
-                    continue
-                name = (e.get("canonical_name") or "").strip()
-                short = (e.get("short_name") or name).strip()
-                class_iri = (e.get("class_iri") or "").strip()
-                if not name or not class_iri or class_iri not in cand_iris:
-                    continue
-                try:
-                    conf = float(e.get("confidence")) if e.get("confidence") is not None else None
-                except (TypeError, ValueError):
-                    conf = None
-                kept.append({
-                    "canonical_name": name,
-                    "short_name": short,
-                    "class_iri": class_iri,
-                    "confidence": conf,
-                })
+            # ---- Review loop: validate -> critique -> re-extract ----
+            #
+            # The reviewer FAILS OPEN. On any exception or unparseable
+            # response we keep the pass-1 entities. This is deliberately the
+            # opposite of `relationship_verify`, where a missing verdict means
+            # "unsupported": there the default discards one claim, here it
+            # would discard an entire chunk's entities. An unreachable or
+            # misbehaving reviewer must never empty the graph.
+            if validate_entities and kept:
+                for _round in range(validation_rounds):
+                    feedback = await _validate_pass(
+                        txt, candidates, kept, cand_iris, class_meta, chunk_iri,
+                    )
+                    if feedback is None:
+                        break
+                    if not feedback["_actionable"]:
+                        val_stats["clean"] += 1
+                        break
+                    try:
+                        revised = await _extract_pass(feedback)
+                    except Exception as exc:
+                        print(
+                            f"[extract-entities] chunk {chunk_iri} re-extract "
+                            f"failed: {exc}"
+                        )
+                        break
+                    if revised is None:
+                        break
+                    if not revised:
+                        # A re-extraction that empties a chunk which had
+                        # entities is a regression, not a correction. Keep
+                        # pass-1 rather than letting one bad round delete the
+                        # chunk's contribution to the graph.
+                        val_stats["empty_reextract_rejected"] += 1
+                        break
+                    val_stats["revised"] += 1
+                    kept = revised
+
             # ---- Second pass: relationships ----
             #
             # Runs only now, because the predicate menu can only be narrowed
@@ -1083,6 +1922,67 @@ async def extract_entities(
     # normalized_name -> every class_id the extractor assigned it anywhere, so
     # collapsing to one node still records all of its types.
     extra_type_classes: dict[str, set[Any]] = {}
+
+    # ---- Collapse near-duplicate names BEFORE identity is decided ----------
+    #
+    # Applied here rather than at mint time so that the class vote, the entity
+    # rows and every edge all agree on one spelling. Rewrites canonical_name
+    # in place on the extracted dicts; short_name is left alone because it is
+    # the form the chunk actually used and the table linker wants it.
+    # Person-descendant classes, for the surname rule. Resolved via the same
+    # rdfs:subClassOf walk the predicate menu uses, so a corpus that types
+    # people as `Executive` or `Journalist` is covered without configuration.
+    _person_iris: set[str] = set()
+    async with session_scope() as session:
+        _roots = (await session.execute(
+            select(OntologyClass.iri).where(
+                func.lower(func.replace(OntologyClass.label, " ", "")).in_(
+                    ["person", "agent", "foafperson"])
+            )
+        )).scalars().all()
+        if _roots:
+            _all = (await session.execute(select(OntologyClass.iri))).scalars().all()
+            anc = await session.execute(_ANCESTOR_SQL, {"iris": list(_all)})
+            _rootset = set(_roots)
+            for origin, a in anc.all():
+                if a in _rootset:
+                    _person_iris.add(origin)
+            _person_iris |= _rootset
+
+    _alias_map, _n_alias = _resolve_canonical_forms(results, _person_iris)
+    if _alias_map:
+        _by_norm_canon: dict[str, str] = {}
+        for tup in results:
+            if tup is None:
+                continue
+            for e in (tup[3] or []):
+                nrm = _normalize_name(e.get("canonical_name") or "")
+                tgt = _alias_map.get(nrm)
+                if tgt and tgt != nrm:
+                    # Recover a display form for the target: prefer the
+                    # longest raw spelling seen for it anywhere in the run.
+                    _by_norm_canon.setdefault(tgt, "")
+        for tup in results:
+            if tup is None:
+                continue
+            for e in (tup[3] or []):
+                raw = e.get("canonical_name") or ""
+                nrm = _normalize_name(raw)
+                if nrm in _by_norm_canon and len(raw) > len(_by_norm_canon[nrm]):
+                    _by_norm_canon[nrm] = raw
+        for tup in results:
+            if tup is None:
+                continue
+            for e in (tup[3] or []):
+                nrm = _normalize_name(e.get("canonical_name") or "")
+                tgt = _alias_map.get(nrm)
+                if tgt and tgt != nrm:
+                    e["canonical_name"] = _by_norm_canon.get(tgt) or tgt
+        print(
+            f"[extract-entities] name collapse: {_n_alias} variant spelling(s) "
+            f"merged into their fullest form (legal suffixes + the model's own "
+            f"short_name pairing)"
+        )
 
     # Preload existing (normalized_name, class_id) -> id for O(1) exact match.
     # Cheap: strings + ids (~250 bytes/entity), NOT embeddings.
@@ -1520,6 +2420,44 @@ async def extract_entities(
             await session.execute(
                 pg_insert(GraphRelationship).values(rel_payloads[i : i + EDGE_BATCH])
             )
+
+    # Entity-side accounting. Previously every one of these was a silent
+    # `continue`, so a corpus could lose entities steadily with nothing in the
+    # output to show for it.
+    summary.entity_drops = dict(ent_drops)
+    summary.abstained_samples = abstained
+    _ent_dropped = sum(ent_drops.values())
+    if _ent_dropped:
+        print(
+            f"[extract-entities] entity drops: {_ent_dropped} "
+            f"(off_menu_iri={ent_drops['off_menu_iri']}, "
+            f"no_name={ent_drops['no_name']}, "
+            f"abstained={ent_drops['abstained']}, "
+            f"reviewer_removed={ent_drops['reviewer_removed']}, "
+            f"no_candidates={ent_drops['no_candidates']})"
+        )
+    if ent_drops["abstained"]:
+        _names = ", ".join(
+            repr(a["canonical_name"]) for a in abstained[:5]
+        )
+        print(
+            f"[extract-entities] {ent_drops['abstained']} entity mention(s) had "
+            f"no fitting class in the ontology and were NOT minted "
+            f"(e.g. {_names}). A high count here means the ontology is missing "
+            f"a branch -- consider a prune-expand run over this corpus."
+        )
+    if validate_entities:
+        summary.entity_validation = dict(val_stats)
+        print(
+            f"[extract-entities] entity review ({validation_rounds} round(s) max): "
+            f"{val_stats['clean']} chunk(s) clean, "
+            f"{val_stats['revised']} re-extracted "
+            f"(reclassified={val_stats['reclassified']}, "
+            f"removed={val_stats['removed']}, added={val_stats['added']}); "
+            f"{val_stats['empty_reextract_rejected']} empty re-extract(s) "
+            f"rejected; {val_stats['validator_failed']} validator call(s) "
+            f"failed (kept the unreviewed result)"
+        )
 
     if extract_relationships:
         _dropped = sum(rel_drops.values())

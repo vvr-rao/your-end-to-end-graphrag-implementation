@@ -113,10 +113,12 @@ def class_identification_and_expansion(
         "  If you are tempted to add a class whose LABEL is a proper noun "
         "(corporate suffix like 'Inc' / 'Ltd' / 'N.V.' / 'Corp' / 'GmbH'; a "
         "country or place name on its own; a specific report or dashboard "
-        "title), STOP -- demote that proposal to MATCH NOT FOUND INSTANCES "
-        "(with TYPE_LABEL = the parent class it instantiates). The downstream "
-        "deterministic pass will reject proper-noun classes, so emitting them "
-        "is wasted work.\n\n"
+        "title; a named facility or series designator like 'Cholla Unit 4' "
+        "or 'ASU 2019-01'), STOP -- demote that proposal to MATCH NOT FOUND "
+        "INSTANCES (with TYPE_LABEL = the parent class it instantiates). A "
+        "downstream deterministic pass rejects the clear-cut proper-noun "
+        "classes and an audit pass reviews the borderline ones, so emitting "
+        "them is wasted work at best and a corrupted ontology at worst.\n\n"
         "Your job:\n"
         "  1. Identify every passage substring that maps to an existing class "
         "in DATA_CLASSES. The IRI you return MUST be an exact key of the "
@@ -250,13 +252,42 @@ def class_identification_and_expansion(
         "instance of MiningCompany (which itself has PARENT_LABEL = "
         "foaf:Organization IRI).\n"
         "  3. PHYSICAL FACILITIES (refinery complexes, plants, ports, "
-        "terminals) named after a company or location -- e.g. 'Jamnagar "
+        "terminals, generating units, mines, warehouses) -- e.g. 'Jamnagar "
         "Refinery Complex', 'GS-Caltex Yeosu Refinery', 'Hormuz Oil "
-        "Terminal'. These are INFRASTRUCTURE, not process units.\n"
-        "       - PARENT_LABEL = 'Infrastructure'.\n"
+        "Terminal', 'Cholla Unit 4'. A NAMED facility is an INSTANCE; the "
+        "KIND of facility is the class.\n"
+        "       - Emit the KIND as MATCH NOT FOUND with PARENT_LABEL = "
+        "'Infrastructure' -- 'RefineryComplex', 'OilTerminal', "
+        "'CoalFiredGeneratingUnit'.\n"
+        "       - Emit the NAMED facility as a MATCH NOT FOUND INSTANCES "
+        "entry with TYPE_LABEL = that kind. 'Jamnagar Refinery Complex' -> "
+        "instance of RefineryComplex. 'Cholla Unit 4' -> instance of "
+        "CoalFiredGeneratingUnit.\n"
+        "       - NEVER emit the named facility itself as a class. Doing so "
+        "produced a real failure: 'ChollaUnit4' -- ONE plant in Arizona -- "
+        "became a class and was then used to type 18 unrelated plants in "
+        "four other states.\n"
         "       - Emit a MATCH NOT FOUND RELATION linking the facility "
         "to its owner: LABEL='operatedBy' (or 'owner'), DOMAIN=<facility>, "
         "RANGE=<organization>.\n"
+        "  3.5 SERIES DESIGNATORS. A name that identifies ONE item in a "
+        "numbered or lettered series -- a standard, regulation, rule, "
+        "docket, protocol, study, trial, model, release, patent, or unit "
+        "number. Examples across domains: 'ASU 2019-01', 'IFRS 16', "
+        "'SEC Rule 10b-5', 'NCT02345678', 'Study 301', 'Boeing 737', "
+        "'Annex IV', 'Phase III of the ACME trial'.\n"
+        "       - These are INSTANCES. Emit each as a MATCH NOT FOUND "
+        "INSTANCES entry whose TYPE_LABEL is the SERIES it belongs to "
+        "('AccountingStandardUpdate', 'Regulation', 'ClinicalTrial', "
+        "'AircraftModel', 'GeneratingUnit'). Emit that series as a class "
+        "if it does not already exist.\n"
+        "       - Tell these apart from genuine CATEGORY names that merely "
+        "contain a digit. 'Type2Diabetes', 'Phase3ClinicalTrial', "
+        "'Scope3Emission', 'Tier1Supplier', 'CYP3A4', 'HER2', 'PM2.5', "
+        "'CO2' are KINDS -- keep them as classes. The test is whether the "
+        "name picks out ONE thing ('ASU 2019-01' is one document) or a "
+        "category of things ('Type 2 diabetes' is a condition many people "
+        "have).\n"
         "  4. EVENTS named after a place or entity. Patterns: '<X> "
         "crisis', '<X> closure', '<X> war', '<X> disruption', '<X> "
         "shortage', '<X> conflict', '<X> incident', '<X> shutdown', "
@@ -488,6 +519,14 @@ def match_dedup(
         "becomes backs[Organization -> Organization].\n"
         "         - NEVER leave a named individual ('Mozilla', 'OpenAI') as an "
         "endpoint; replace it with its type.\n"
+        "         - DOMAIN and RANGE must EACH be a SINGLE class label. Never "
+        "a disjunction ('Organization or AppStoreOperator', "
+        "'SegmentOperatingExpense or SegmentAsset'), never a list, never a "
+        "slash-pair. If two classes both apply, name their common parent -- "
+        "that IS the generalisation this rule is asking for. If no common "
+        "parent exists, pick the one the relation is really about. A hedged "
+        "endpoint is not a class: it gets minted as one, and the ontology "
+        "ends up with a pseudo-class no entity can ever instantiate.\n"
         "         - Keep endpoints narrow ONLY where the relation is genuinely "
         "meaningless for the broader class.\n"
         "     Two relations with the SAME label that mean genuinely DIFFERENT "
@@ -948,16 +987,44 @@ def artifact_chunk_extract(text: str) -> tuple[str, str]:
     return system, user
 
 
+def _render_candidate_block(candidate_classes: list[dict[str, str]]) -> str:
+    """Render the candidate-class menu shown to the model.
+
+    Shared by `entity_extract` and `entity_validate` so the reviewer's menu is
+    provably identical to the extractor's. If the two ever diverged, the
+    reviewer could propose an IRI the extractor never saw and the caller's
+    on-menu check would silently discard the verdict.
+    """
+    lines: list[str] = []
+    for c in candidate_classes:
+        label = (c.get("label") or "(unlabelled)").strip()
+        descr = (c.get("description") or "").strip()
+        descr_short = descr[:100] + ("..." if len(descr) > 100 else "")
+        lines.append(
+            f"  - {c['iri']} ─ {label}"
+            + (f" ─ {descr_short}" if descr_short else "")
+        )
+    return "\n".join(lines)
+
+
 def entity_extract(
     chunk_text: str,
     candidate_classes: list[dict[str, str]],
+    *,
+    feedback: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     """Phase 2 Milestone C: extract named entities from a chunk.
 
     `candidate_classes` is a list of {iri, label, description} dicts
     -- the top-K classes the chunk's vector matched against
     ontology_classes. The LLM MUST pick a class_iri from this list
-    for each entity (caller validates + drops mismatches).
+    for each entity (caller validates + drops mismatches), or the
+    ABSTAIN sentinel "NONE_OF_THESE" when none denotes its KIND.
+
+    `feedback` is the sanitised output of a prior `entity_validate` pass.
+    When None (the default) the returned prompt is byte-identical to the
+    pre-validator version -- the review loop is opt-in, so the unflagged
+    path must not shift.
 
     Returns JSON:
       {entities: [{canonical_name, short_name, class_iri, confidence}]}
@@ -965,30 +1032,53 @@ def entity_extract(
     Corpus-agnostic: works on any domain (legal, financial, science,
     web search). No keyword baked in.
     """
-    candidates_block_lines: list[str] = []
-    for c in candidate_classes:
-        label = (c.get("label") or "(unlabelled)").strip()
-        descr = (c.get("description") or "").strip()
-        descr_short = descr[:100] + ("..." if len(descr) > 100 else "")
-        candidates_block_lines.append(
-            f"  - {c['iri']} ─ {label}"
-            + (f" ─ {descr_short}" if descr_short else "")
-        )
-    candidates_block = "\n".join(candidates_block_lines)
+    candidates_block = _render_candidate_block(candidate_classes)
 
     system = (
         "You extract NAMED ENTITIES from text chunks. For each entity you find:\n"
         "  - canonical_name: the full proper form (e.g. \"BYD Company Ltd.\", "
         "\"United Kingdom\", \"Donald Trump\")\n"
         "  - short_name: how it was referred to in this chunk (e.g. \"BYD\", \"UK\")\n"
-        "  - class_iri: pick ONE IRI from the CANDIDATE CLASSES list below. "
-        "Do not invent IRIs. If no candidate is a sensible fit, SKIP that entity.\n"
+        "  - class_iri: pick ONE IRI from the CANDIDATE CLASSES list below, "
+        "or the literal string \"NONE_OF_THESE\". Do not invent IRIs.\n"
         "  - confidence: a float in [0,1] reflecting how clearly the entity "
         "is present + how clearly it instantiates that class.\n\n"
+        "PICKING THE CLASS -- read this before choosing:\n"
+        "  - A class must denote the KIND of thing the entity IS. Ask "
+        "\"what kind of thing is this?\" and pick the answer.\n"
+        "  - Sharing a TOPIC is not the same as being an instance. In an "
+        "article about container shipping, a furniture retailer that appears "
+        "as a shipping CUSTOMER is not a shipping carrier. In a utility "
+        "filing, a city is not a utility. In a bank filing, a city is not a "
+        "loan portfolio.\n"
+        "  - \"NONE_OF_THESE\" is a NORMAL, CORRECT answer, not a failure. It "
+        "is far better than forcing an entity under a class that merely "
+        "shares its subject matter. When you use it, put your own short "
+        "type name in \"proposed_type\" (e.g. \"Canal\", \"Person\") so the "
+        "gap in the ontology can be seen.\n"
+        "  - If a CANDIDATE's label is itself one specific named thing (one "
+        "named plant, one document code) rather than a category, never "
+        "assign an entity to it -- answer \"NONE_OF_THESE\".\n\n"
         "RULES:\n"
         "  - Only PROPER NOUN entities: organizations, people, places, "
         "products, named events, programs. Skip generic terms like "
         "\"the manufacturer\", \"the report\", \"the country\".\n"
+        "  - Do extract named PEOPLE when the passage names them. Named "
+        "people are systematically under-extracted, so check explicitly "
+        "before you finish:\n"
+        "      * anyone QUOTED or paraphrased (\"X said\", \"X told "
+        "reporters\", \"according to X\");\n"
+        "      * anyone given a TITLE or role (\"Chief Financial Officer "
+        "Ramon Fernandez\", \"CEO Jane Doe\", \"Senator Smith\") -- the "
+        "title belongs to the ORGANIZATION, the name is a separate Person "
+        "entity, and BOTH must be extracted;\n"
+        "      * bylined authors and named analysts.\n"
+        "    A person who speaks the passage's central claim is one of the "
+        "most important entities in it -- never skip them.\n"
+        "  - When you extract a CITY or other sub-national place, ALSO "
+        "extract the COUNTRY or state it sits in IF the passage names it, so "
+        "the two can be linked. Do not invent a country the passage never "
+        "mentions.\n"
         "  - 0 to 15 entities per chunk; quality over quantity.\n"
         "  - Years (e.g. \"2024\", \"Q1 2024\", \"January 2024\") are handled "
         "by a separate temporal pass -- DO NOT include them here.\n"
@@ -1005,6 +1095,206 @@ def entity_extract(
         + "\n```\n\n"
         "Return JSON: {\"entities\": [{\"canonical_name\": ..., "
         "\"short_name\": ..., \"class_iri\": ..., \"confidence\": ...}]}"
+    )
+    if feedback:
+        user += "\n\n" + _render_review_feedback(feedback)
+    return system, user
+
+
+_VERDICT_HINT = {
+    "wrong_class": "WRONG CLASS",
+    "not_an_entity": "NOT A NAMED ENTITY",
+    "no_class_fits": "NO CLASS IN THE MENU FITS",
+    "not_in_text": "NOT PRESENT IN THIS PASSAGE",
+}
+
+
+def _render_review_feedback(feedback: dict[str, Any]) -> str:
+    """Render a sanitised `entity_validate` result as a re-extraction brief.
+
+    Two properties of this text decide whether the loop helps or hurts:
+
+      * "return the COMPLETE list, not a diff" -- the caller replaces the
+        entity list wholesale, so a diff protocol would need merge logic and
+        cross-round index bookkeeping.
+      * "you are NOT obliged to agree" -- without it the extractor becomes a
+        rubber stamp for the reviewer, and the loop merely relocates the error
+        from one model to another instead of correcting it.
+    """
+    lines: list[str] = ["PRIOR ATTEMPT (yours, on this same passage):"]
+    prior = feedback.get("prior") or []
+    if prior:
+        for i, e in enumerate(prior):
+            lines.append(
+                f"  [{i}] {e.get('canonical_name', '')!r} -> "
+                f"{e.get('class_label') or e.get('class_iri', '')}"
+            )
+    else:
+        lines.append("  (no entities returned)")
+
+    verdicts = [v for v in (feedback.get("verdicts") or [])
+                if v.get("verdict") and v.get("verdict") != "correct"]
+    if verdicts:
+        lines.append("")
+        lines.append("REVIEWER FEEDBACK:")
+        for v in verdicts:
+            idx = v.get("index")
+            hint = _VERDICT_HINT.get(str(v.get("verdict")), str(v.get("verdict")).upper())
+            line = f"  [{idx}] {hint}"
+            better = v.get("better_class_iri")
+            if better:
+                line += f" -> consider {better}"
+            reason = (v.get("reason") or "").strip()
+            if reason:
+                line += f"  ({reason})"
+            lines.append(line)
+
+    missing = feedback.get("missing_entities") or []
+    if missing:
+        if not verdicts:
+            lines.append("")
+            lines.append("REVIEWER FEEDBACK:")
+        for m in missing:
+            line = f"  MISSED: {m.get('canonical_name', '')!r}"
+            if m.get("class_iri"):
+                line += f" (likely {m['class_iri']})"
+            reason = (m.get("reason") or "").strip()
+            if reason:
+                line += f"  ({reason})"
+            lines.append(line)
+
+    note = (feedback.get("note") or "").strip()
+    if note:
+        lines.append(f"  NOTE: {note}")
+
+    lines.append("")
+    lines.append(
+        "Redo the extraction for this passage, taking the feedback into "
+        "account. You are NOT obliged to agree: keep an assignment the "
+        "reviewer questioned if the passage supports it, and do not add a "
+        "missed entity that is not actually in the passage. Return the "
+        "COMPLETE entity list (not a diff), in the same JSON schema as above."
+    )
+    return "\n".join(lines)
+
+
+def entity_validate(
+    chunk_text: str,
+    candidate_classes: list[dict[str, str]],
+    entities: list[dict[str, Any]],
+) -> tuple[str, str]:
+    """Review a pass of `entity_extract` output: is each entity real, and is
+    its class the right KIND of thing?
+
+    Deliberately run on a DIFFERENT, stronger model than the extractor -- a
+    model reviewing its own output rubber-stamps it, and the errors being
+    hunted here (an individual minted as a class, a same-topic sibling
+    substituted for the real type) are exactly the ones the extractor
+    produced in the first place.
+
+    `entities` carry {index, canonical_name, short_name, class_iri,
+    class_label, class_description}. Rendering the label AND description is
+    load-bearing: shown only `.../merged#ChollaUnit4` a reviewer cannot see
+    the problem, but shown `ChollaUnit4 - "a specific power plant unit
+    referenced in Arizona SIP"` the individual-shaped description is
+    self-evidently disqualifying.
+
+    Returns JSON: {verdicts: [...], missing_entities: [...], note: str}
+    """
+    candidates_block = _render_candidate_block(candidate_classes)
+
+    entity_lines: list[str] = []
+    for e in entities:
+        label = (e.get("class_label") or "").strip()
+        descr = (e.get("class_description") or "").strip()
+        descr_short = descr[:120] + ("..." if len(descr) > 120 else "")
+        entity_lines.append(
+            f"  [{e.get('index')}] {e.get('canonical_name', '')!r}"
+            f" (as written: {e.get('short_name') or e.get('canonical_name', '')!r})"
+            f"\n        assigned class: {e.get('class_iri', '')}"
+            f"\n        class label:    {label or '(unlabelled)'}"
+            + (f"\n        class descr:    {descr_short}" if descr_short else "")
+        )
+    entities_block = "\n".join(entity_lines)
+
+    system = (
+        "You audit entity extraction. Another model read a passage, pulled "
+        "out named entities, and assigned each one an ontology class from a "
+        "fixed menu. Your job is to check that work. Return ONE JSON object "
+        "and nothing else.\n\n"
+        "WHAT MAKES A CLASS ASSIGNMENT WRONG -- the failure that matters most:\n"
+        "  - The assigned \"class\" is not a KIND of thing, it is ONE SPECIFIC "
+        "THING. \"ChollaUnit4\", \"ASU2019-01\", \"Boeing 737 MAX\" are "
+        "individuals; a real class answers \"what kind of thing is it?\" "
+        "(\"PowerPlantUnit\", \"AccountingStandardUpdate\", \"AircraftModel\"). "
+        "If the assigned class is itself a proper noun, a serial or document "
+        "code, or one named facility, the verdict is \"wrong_class\" -- point "
+        "at the nearest genuine KIND in the menu, or \"no_class_fits\" if the "
+        "menu has none.\n"
+        "  - The assigned class is a DISJUNCTION (\"X or Y\"). That is not a "
+        "class.\n"
+        "  - The assigned class merely shares a TOPIC with the entity. Being "
+        "about the same subject is not being an instance of it: a furniture "
+        "retailer named as a shipping CUSTOMER is not a shipping carrier; a "
+        "city in a utility filing is not a utility; a canal is not a region.\n"
+        "  - A named PERSON is typed as an organization, or vice versa.\n\n"
+        "VERDICTS (exactly one per entity):\n"
+        "  correct        -- real entity, and the class is a reasonable KIND for it\n"
+        "  wrong_class    -- real entity, but a better class exists IN THE MENU\n"
+        "  not_an_entity  -- not a proper-noun named entity (a generic phrase, "
+        "a bare year, a section heading)\n"
+        "  no_class_fits  -- real entity, but NOTHING in the menu denotes its kind\n"
+        "  not_in_text    -- this entity does not appear in the passage at all\n\n"
+        "RULES:\n"
+        "  - \"better_class_iri\" MUST be copied verbatim from the CANDIDATE "
+        "CLASSES menu. An IRI that is not on the menu is discarded and your "
+        "verdict is ignored.\n"
+        "  - Judge against the PASSAGE. Do not use world knowledge to justify "
+        "an assignment the passage does not support.\n"
+        "  - \"no_class_fits\" is a NORMAL answer. A menu that lacks the right "
+        "class is a fact about the ontology, not a reason to accept a wrong "
+        "assignment.\n"
+        "  - Do NOT re-verdict an entity as wrong just to look useful. If the "
+        "class is a reasonable KIND for the entity, answer \"correct\" -- a "
+        "near-tie between two sensible classes is \"correct\", not "
+        "\"wrong_class\".\n"
+        "  - missing_entities is NOT optional housekeeping -- it is half the "
+        "job, and in practice the half that gets skipped. Before you answer, "
+        "RE-READ the passage looking specifically for:\n"
+        "      * every named PERSON, especially anyone quoted (\"X said\", "
+        "\"X told reporters\") or given a title (\"Chief Financial Officer "
+        "Ramon Fernandez\"). A person who speaks the passage's central claim "
+        "being absent from the extraction is a serious miss, not a minor "
+        "one;\n"
+        "      * named ORGANIZATIONS and PLACES the extraction passed over.\n"
+        "    List each as a missing entity. Only PROPER NOUNS actually "
+        "written in the passage -- do not invent. Years and dates are handled "
+        "by a separate pass, so never list them.\n"
+        "    canonical_name is the entity's OWN name and nothing else. Strip "
+        "any title or affiliation the passage attaches to it: from \"CMA CGM "
+        "Chief Financial Officer Ramon Fernandez\" the entity is \"Ramon "
+        "Fernandez\", and CMA CGM is a SEPARATE entity. Put the role in "
+        "`reason`, not in the name.\n"
+        "    An extraction with no wrong classes can still be INCOMPLETE. "
+        "Reporting nothing missing is a claim that every named person, "
+        "organization and place in the passage was already captured -- only "
+        "make it after you have checked.\n"
+        "  - Return a verdict for EVERY index, exactly once.\n"
+        "  - Return ONLY JSON, no preamble, no markdown."
+    )
+    user = (
+        "CANDIDATE CLASSES (the same menu the extractor saw):\n"
+        + candidates_block
+        + "\n\nPASSAGE:\n```\n"
+        + chunk_text
+        + "\n```\n\nEXTRACTED ENTITIES TO REVIEW:\n"
+        + (entities_block or "  (none)")
+        + "\n\nReturn JSON: {\"verdicts\": [{\"index\": 0, \"verdict\": "
+        "\"correct|wrong_class|not_an_entity|no_class_fits|not_in_text\", "
+        "\"better_class_iri\": null, \"reason\": \"...\"}], "
+        "\"missing_entities\": [{\"canonical_name\": ..., \"short_name\": ..., "
+        "\"class_iri\": ..., \"reason\": ...}], "
+        "\"note\": \"one or two sentences about this passage as a whole\"}"
     )
     return system, user
 
@@ -3125,6 +3415,7 @@ PROMPTS = {
     "summary_evaluate": summary_evaluate,
     "summary_revise": summary_revise,
     "entity_extract": entity_extract,
+    "entity_validate": entity_validate,
     "relationship_extract": relationship_extract,
     "relationship_verify": relationship_verify,
     "relationship_repair": relationship_repair,

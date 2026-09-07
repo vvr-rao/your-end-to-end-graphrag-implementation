@@ -104,3 +104,35 @@ def test_planner_stays_on_a_cheap_model() -> None:
     for path in _PRESETS:
         model = _tasks(path)["retrieval_rounds_plan"]["model"]
         assert not model.startswith(expensive), f"{path.name}: planner on {model}"
+
+
+def test_entity_validate_is_not_the_same_model_as_entity_extract() -> None:
+    """A model reviewing its OWN output rubber-stamps it.
+
+    The whole value of the review pass is that a different, stronger model
+    reads the same menu. The errors it hunts are systematic, not random: the
+    extractor picked `ChollaUnit4` because the menu offered it and the prompt
+    said "pick ONE", so re-asking the same weights over the same menu
+    reproduces the same reasoning and the pass becomes an expensive no-op.
+
+    This is asserted here rather than left as a comment because the failure
+    mode is silent -- a later config tidy-up that "simplifies" both tasks onto
+    gpt-4o-mini would still run, still cost money, and still report verdicts.
+    """
+    for path in _PRESETS:
+        t = _tasks(path)
+        assert "entity_validate" in t, f"{path.name}: entity_validate missing"
+        assert t["entity_validate"]["model"] != t["entity_extract"]["model"], (
+            f"{path.name}: the entity reviewer must not be the same model as "
+            f"the extractor it reviews"
+        )
+
+
+def test_entity_validate_returns_structured_json_where_supported() -> None:
+    """The caller parses verdicts out of the response, so a provider that has
+    a JSON grammar must be told to use it."""
+    for path in _PRESETS:
+        spec = _tasks(path)["entity_validate"]
+        if spec["provider"] == "anthropic":
+            continue  # no response_format on Anthropic; prompt asks for JSON
+        assert spec["response_format"] == "json_object", path.name

@@ -39,6 +39,7 @@ from backend.app.helpers.ontology_pruning import (
     prune_data_properties_dict,
     prune_instances_dict,
     prune_object_properties_dict,
+    split_disjunction_label,
 )
 from backend.app.services import (
     document_io,
@@ -536,13 +537,21 @@ _DOCUMENT_TITLE_STRONG_TAILS = (
     "Forecast", "Outlook", "Whitepaper", "Yearbook", "Atlas", "Monitor",
     "Hub", "Tool", "Database", "Calendar", "Alert", "Portal", "Platform",
     "Survey", "Directory", "Source", "App", "Review", "Reviews",
-    "Newsletter", "Brief", "Memo", "Note", "Page", "Paper",
+    "Newsletter", "Brief", "Memo", "Page",
 )
 # WEAK: ambiguous nouns that head both documents and real classes. These
 # demote ONLY alongside a second document-title signal (see
 # `_DOCUMENT_TITLE_SIGNAL_RE`).
+#
+# "Note" and "Paper" were moved down from STRONG after they mis-fired on a
+# finance ontology: `promissory note`, `floating rate note`, `medium term
+# note`, `ExchangeableNote`, `JuniorSubordinatedNote` and `commercial paper`
+# are all genuine debt-instrument classes, not documents. Same reasoning as
+# "Index" / "Site" / "Service" above -- an ambiguous head noun needs a second
+# signal, because demoting a real class silently drops every entity that
+# would have instantiated it.
 _DOCUMENT_TITLE_WEAK_TAILS = (
-    "Index", "Site", "Service",
+    "Index", "Site", "Service", "Note", "Paper",
 )
 # Kept as the union for callers/tests that want the whole vocabulary.
 _DOCUMENT_TITLE_TAIL_WORDS = (
@@ -582,6 +591,130 @@ _DOCUMENT_TITLE_SIGNAL_RE = re.compile(
 # Years with optional descriptor (e.g. "2025 Factbook", "Q1 2024 Outlook")
 _YEAR_PREFIX_RE = re.compile(r"^(?:Q[1-4]\s+)?(?:19|20)\d{2}\b")
 
+# ---------------------------------------------------------------------------
+# Individual-vs-class shape signals (heuristics 5-7), in TWO tiers.
+#
+# Measured failure that motivated these: `ChollaUnit4` -- ONE power plant unit
+# in Arizona -- was minted as a CLASS and then used to type 18 unrelated plants
+# across four states, making it the 5th most-used class in the graph. Alongside
+# it, `ASU2019-01` / `ASU2018-07` / `ASU2016-02` (single accounting standards
+# updates) typed 37 more entities between them.
+#
+# These are deliberately SHAPE signals, never domain vocabulary. The corpora
+# here span finance, energy, pharma, legal and news; a hard-coded
+# `Unit|Plant|Refinery` list is energy-only and a `Protocol|Trial` list is
+# pharma-only, so any such list is wrong for most of the corpus.
+#
+# WHY TWO TIERS. Demoting a genuine class is expensive and silent: it deletes
+# the class AND drops every entity that would have instantiated it (the same
+# invisible loss documented for the weak document tails above). Pharma is where
+# a naive "label contains digits" rule does the most damage -- `Type2Diabetes`,
+# `HER2`, `CYP3A4`, `Interleukin6`, `Phase3ClinicalTrial`, `PM2.5`, `CO2`,
+# `COVID19` are all genuine KINDS, and several are structurally identical to
+# the individuals we want to catch (`Interleukin 6` vs `Building 7`).
+#
+# So only signals that are decisive on their own demote deterministically:
+#
+#   STRONG (-> `_looks_like_entity_not_class`, demoted to an INSTANCE here):
+#     H5  a SPACED label ending in a bare enumerator. Class labels are
+#         CamelCase by prompt convention, so a spaced "Cholla Unit 4" is
+#         already off-convention AND enumerated.
+#     H7  the proposal's own DESCRIPTION says it is one particular thing.
+#
+#   WEAK (-> `_looks_like_individual_weak`, routed to the Layer-H
+#         `classification_audit` LLM, which owns the CONVERT_TO_INSTANCE
+#         verdict):
+#     H6  a bare series designator (`ASU2019-01`, `NCT02345678`).
+#     H5c a CamelCase label ending in a bare enumerator (`ChollaUnit4`).
+#
+# The weak tier is where generalization actually lives: no regex can separate
+# `COVID19` from `ASU2019-01` by shape, but an LLM reading both labels and
+# descriptions can, in any domain, including ones these patterns never
+# anticipated. Paying one cheap call beats guessing.
+
+# H5: label ends in a bare enumerator -- arabic number, roman numeral, or
+# number pair -- preceded by an alphabetic word. Applied to the camel-split
+# form; whether it fires alone depends on the ORIGINAL label having spaces.
+# Fires on "Cholla Unit 4", "Craig Unit 2", "Study 301", "Annex IV",
+# "Building 7", "Hayden Units 1 and 2", "SEC Rule 10b-5".
+# Does NOT fire on "Type 2 Diabetes" / "Phase 3 Clinical Trial" / "Scope 3
+# Emission" -- a kind-noun follows the digit, so the number is not trailing,
+# which is exactly what separates a category from an enumerated item.
+_TRAILING_ENUMERATOR_RE = re.compile(
+    r"[A-Za-z]{2,}"                    # a head word...
+    r"(?:\s+\S+)*?"                    # ...then anything...
+    r"\s+"
+    r"(?:"
+    r"\d{1,5}[A-Za-z]?(?:[-.]\d{1,4})?"   # "4", "301", "10b-5"
+    r"|[IVXLC]{1,6}"                      # roman numeral: "IV", "III"
+    r")"
+    r"(?:\s+and\s+\d{1,5})?"           # "Units 1 and 2"
+    r"\s*$"
+)
+
+# H6: a series designator -- an uppercase code immediately followed by a run of
+# 2+ digits, as the ENTIRE label. "ASU2019-01", "NCT02345678", "IFRS16".
+# The `\d{2,}` requirement is load-bearing: it is what excludes the chemistry
+# and biology codes (`CO2`, `HER2`, `PM2.5`, `CYP3A4`, `IL6` all have a single
+# digit after the alpha run, or an alpha char inside it). It does NOT exclude
+# `COVID19`, which is why this tier only nominates for LLM review.
+_SERIES_DESIGNATOR_RE = re.compile(
+    r"^[A-Z]{2,6}[-_ ]?\d{2,}(?:[-._]\d{1,4})?$"
+)
+
+# A bare all-caps acronym as a CLASS label. Measured on a utility 10-K, 20 of
+# 393 minted classes were these -- MISO, AESO, PSALM, CPUC, IPUC, UPSC, WUTC,
+# OPUC, IUB, GEMA -- and every one names ONE organization (Midcontinent ISO,
+# Alberta Electric System Operator, ...). Extraction then typed each
+# organization to its own eponymous class: `AESO` typed `AESO` and `Alberta
+# Electric System Operator`, and nothing else, forever.
+#
+# WEAK only, and necessarily so: an acronym is not reliably an individual.
+# GDP, CPI, ESG, EBITDA, NAAQS name genuine concepts, and telling those from
+# MISO by shape alone is impossible -- one is an economic measure, the other a
+# grid operator, and both are five capital letters. The LLM audit decides.
+_BARE_ACRONYM_RE = re.compile(r"^[A-Z]{3,7}$")
+
+# H7: the proposal's own DESCRIPTION says it is one particular thing. The
+# highest-precision and most domain-neutral signal available -- it reads the
+# model's own words rather than guessing from the label -- and it is already
+# present in the data. The live DB has, verbatim:
+#   ChollaUnit4 -> "Cholla Unit 4, a specific power plant unit referenced in
+#                   Arizona SIP."
+# A genuine class description reads "A facility that generates electricity for
+# supply to the grid" -- indefinite and general.
+# STRONG form: an APPOSITIVE that both describes the subject as one thing AND
+# locates it. "Cholla Unit 4, a specific power plant unit referenced in Arizona
+# SIP." Only a particular can be "referenced in" / "issued by" / "located at"
+# something; a category is not situated anywhere.
+_INDIVIDUAL_DESCRIPTION_RE = re.compile(
+    r",\s+an?\s+[\w\s-]{3,60}?\b(?:referenced|identified|issued|filed"
+    r"|located|operated|designated|promulgated|established|enacted)\s+"
+    r"(?:in|by|at|under|pursuant)\b"
+    r"|\bthis particular\b"
+    r"|\ba single named\b",
+    re.IGNORECASE,
+)
+
+# WEAK form: a bare "a specific ..." anywhere in the description. Measured
+# against the live ontology this is genuinely ambiguous and must NOT decide:
+#
+#   AffordableCleanEnergyRule "A specific EPA regulation addressing emissions
+#                              from power plants."          <- IS an individual
+#   ComplianceDeadline        "A specific date by which regulated entities
+#                              must comply..."              <- is a CLASS
+#   TermLoanB                 "A specific type of term loan" <- is a CLASS
+#   SegmentOperatingExpense   "...allocated to a specific business segment"
+#                                                           <- "specific"
+#                              modifies a DIFFERENT noun, not the subject
+#
+# Same sentence opening, opposite answers. That is precisely the shape that
+# belongs in front of the Layer-H LLM rather than a regex.
+_INDIVIDUAL_DESCRIPTION_WEAK_RE = re.compile(
+    r"\ba specific\b|\bone specific\b|\bthe specific\b|\ba particular\b",
+    re.IGNORECASE,
+)
+
 # CamelCase splitter. Splits "FertilizerMarketDashboard" -> ["Fertilizer",
 # "Market", "Dashboard"]; preserves acronym runs like "WEO" -> ["WEO"],
 # and "EUTrade" -> ["EU", "Trade"]; respects existing whitespace.
@@ -614,26 +747,48 @@ def _split_camel(label: str) -> str:
 def _looks_like_entity_not_class(
     label: str,
     *,
+    description: str = "",
     known_places: frozenset[str] | None = None,
     extra_corporate_suffix_re: re.Pattern[str] | None = None,
     extra_tail_word_re: re.Pattern[str] | None = None,
+    allowlist: frozenset[str] | None = None,
+    extra_individual_description_re: re.Pattern[str] | None = None,
 ) -> tuple[bool, str]:
     """Return (is_entity, reason). When `is_entity` is True, the caller
     should demote the MATCH NOT FOUND class proposal to MATCH NOT FOUND
     INSTANCES instead of letting it land in the ontology as a class.
+
+    This is the STRONG tier only -- every signal here is decisive on its
+    own, because a demotion silently deletes the class and every entity
+    that would have instantiated it. Shapes that are merely suspicious
+    (`ASU2019-01`, `ChollaUnit4`) go to `_looks_like_individual_weak`
+    instead, which nominates them for the Layer-H LLM audit rather than
+    deciding unilaterally.
+
+    `description` is the proposal's DESCRIPTION, used by heuristic 7.
+    Optional and defaulted so existing 1-arg callers keep working.
 
     `known_places` is the set of lowercased place labels that should NOT
     appear as new classes (because the same name already exists as a
     class in the loaded ontology, OR because they're a configured extra).
     Empty set / None -> the place check is skipped.
 
-    `extra_corporate_suffix_re` / `extra_tail_word_re` are optional user-
-    extensions sourced from `config/config.yaml`; same semantics as the
-    built-ins."""
+    `allowlist` is the set of lowercased labels that look entity-shaped
+    in this domain but are genuine classes -- the per-domain escape hatch
+    from `config/config.yaml`. Checked FIRST, so it overrides everything.
+
+    `extra_corporate_suffix_re` / `extra_tail_word_re` /
+    `extra_individual_description_re` are optional user-extensions sourced
+    from `config/config.yaml`; same semantics as the built-ins."""
     if not isinstance(label, str):
         return False, ""
     cleaned = label.strip()
     if not cleaned:
+        return False, ""
+    # Escape hatch first: a domain that legitimately uses an entity-shaped
+    # label as a class name says so once in config rather than losing the
+    # class on every build.
+    if allowlist and cleaned.lower() in allowlist:
         return False, ""
     # Heuristic 1: corporate suffix anywhere in the label (built-in or
     # user-extended).
@@ -659,10 +814,85 @@ def _looks_like_entity_not_class(
         return True, "document-title"
     # Heuristic 4: year prefix (e.g. "2025 Factbook" already caught by
     # heuristic 3; this catches "2025 Strategy Conference" with no tail
-    # word). Multi-word labels only -- a bare "2025" gets caught by the
-    # temporal-instance path elsewhere.
-    if " " in cleaned and _YEAR_PREFIX_RE.match(cleaned):
+    # word). Tested on the CAMEL-SPLIT form so `2025Factbook` is caught
+    # alongside `2025 Factbook` -- but still requires a following word, so
+    # a bare "2025" stays with the temporal-instance path elsewhere.
+    if " " in split and _YEAR_PREFIX_RE.match(split):
         return True, "year-prefix"
+    # Heuristic 7: the proposal's own DESCRIPTION says it is one particular
+    # thing. Strong enough to fire alone, and the only signal that catches
+    # `ChollaUnit4` deterministically ("...a specific power plant unit
+    # referenced in Arizona SIP").
+    if isinstance(description, str) and description.strip():
+        if _INDIVIDUAL_DESCRIPTION_RE.search(description):
+            return True, "individual-description"
+        if (extra_individual_description_re is not None
+                and extra_individual_description_re.search(description)):
+            return True, "individual-description"
+    # Heuristic 5 (strong form): a SPACED label ending in a bare enumerator.
+    # Class labels are CamelCase by prompt convention, so a spaced label that
+    # ALSO ends in an enumerator is doubly off-convention -- "Cholla Unit 4",
+    # "Study 301", "Annex IV". The CamelCase form of the same shape
+    # (`ChollaUnit4`) is only weak evidence, because `Interleukin6` is
+    # structurally identical and is a genuine class; that goes to the LLM.
+    if " " in cleaned and _TRAILING_ENUMERATOR_RE.search(split):
+        return True, "trailing-enumerator"
+    return False, ""
+
+
+def _looks_like_individual_weak(
+    label: str,
+    *,
+    description: str = "",
+    allowlist: frozenset[str] | None = None,
+) -> tuple[bool, str]:
+    """Return (is_suspicious, reason) for label shapes that OFTEN name an
+    individual but cannot be decided by shape alone.
+
+    Callers must not demote on this. It nominates a label for the Layer-H
+    `classification_audit` LLM, which owns the CONVERT_TO_INSTANCE verdict
+    and can read the label and description together.
+
+    The two shapes here are exactly the ones where a regex provably cannot
+    win:
+
+      * series designator -- `ASU2019-01` is an individual, `COVID19` is a
+        disease class, and nothing about their shape distinguishes them.
+      * CamelCase trailing enumerator -- `ChollaUnit4` is one power plant,
+        `Interleukin6` is a cytokine class. Identical shape.
+
+    Deciding these deterministically is how a filter built for one domain
+    quietly deletes another domain's vocabulary."""
+    if not isinstance(label, str):
+        return False, ""
+    cleaned = label.strip()
+    if not cleaned:
+        return False, ""
+    if allowlist and cleaned.lower() in allowlist:
+        return False, ""
+    if isinstance(description, str) and _INDIVIDUAL_DESCRIPTION_WEAK_RE.search(
+        description
+    ):
+        return True, "individual-description-weak"
+    if _SERIES_DESIGNATOR_RE.match(cleaned):
+        return True, "series-designator"
+    if _BARE_ACRONYM_RE.match(cleaned):
+        return True, "bare-acronym"
+    # CamelCase-only form of heuristic 5. The spaced form is already decided
+    # (strongly) above, so restrict this to labels with no whitespace.
+    #
+    # The >=2 multi-character word requirement is a cost control, not a
+    # correctness one: without it every `HER2` / `CO2` / `PM2.5` / `CYP3A4` /
+    # `Interleukin6` in a pharma corpus is nominated for the paid audit, and
+    # all of them come back "keep". A named enumerated item reads as a
+    # compound -- `Cholla Unit 4`, `Dave Johnston Unit 4` -- whereas a
+    # chemical or gene symbol is one stem plus a number.
+    if " " not in cleaned:
+        split = _split_camel(cleaned)
+        if " " in split and _TRAILING_ENUMERATOR_RE.search(split):
+            words = [t for t in split.split() if len(t) >= 2 and t.isalpha()]
+            if len(words) >= 2:
+                return True, "trailing-enumerator-camel"
     return False, ""
 
 
@@ -814,20 +1044,65 @@ def _compile_extra_suffix_regex(suffixes: list[str] | None) -> re.Pattern[str] |
     )
 
 
+def _compile_label_allowlist(labels: list[str] | None) -> frozenset[str]:
+    """Lowercased exact-match allowlist of labels that look entity-shaped in
+    this domain but are genuine classes.
+
+    The per-domain escape hatch. Pharma is the motivating case: a shape rule
+    tuned on `ChollaUnit4` also describes `Interleukin6`, and losing a class
+    is silent (the class goes AND every entity that would instantiate it is
+    dropped). One config line beats a code change per domain."""
+    out = {
+        lbl.strip().lower()
+        for lbl in (labels or [])
+        if isinstance(lbl, str) and lbl.strip()
+    }
+    return frozenset(out)
+
+
+def _compile_extra_pattern_regex(patterns: list[str] | None) -> re.Pattern[str] | None:
+    """Compile a user-supplied list of RAW regex fragments into one
+    alternation. Unlike `_compile_extra_word_regex` these are NOT escaped --
+    they are patterns, so a domain can express a shape rather than a literal.
+
+    An invalid fragment is skipped with a warning rather than aborting the
+    run: a typo in an optional config extra must not kill a paid pipeline."""
+    if not patterns:
+        return None
+    good: list[str] = []
+    for p in patterns:
+        if not isinstance(p, str) or not p.strip():
+            continue
+        try:
+            re.compile(p)
+        except re.error as exc:
+            print(f"[stage2-filter] ignoring invalid config pattern {p!r}: {exc}")
+            continue
+        good.append(p)
+    if not good:
+        return None
+    return re.compile("|".join(f"(?:{p})" for p in good), re.IGNORECASE)
+
+
 def _filter_entity_shaped_classes(
     stage2_result: dict[str, Any] | None,
     *,
     known_places: frozenset[str] | None = None,
     extra_corporate_suffix_re: re.Pattern[str] | None = None,
     extra_tail_word_re: re.Pattern[str] | None = None,
+    allowlist: frozenset[str] | None = None,
+    extra_individual_description_re: re.Pattern[str] | None = None,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
     """Strip entity-shaped entries from MATCH NOT FOUND in a single
     stage-2 chunk result, promoting each to MATCH NOT FOUND INSTANCES.
 
     `known_places` is the dynamic place-class label set built from the
     loaded ontology (see `_build_known_places_from_ontology`); pass
-    `None`/empty to skip the place check entirely. `extra_*_re` come
-    from `config/config.yaml` user extensions.
+    `None`/empty to skip the place check entirely. `extra_*_re` and
+    `allowlist` come from `config/config.yaml` user extensions.
+
+    Only the STRONG tier demotes here. Weak shapes are left in place for
+    the Layer-H audit -- see `_looks_like_individual_weak`.
 
     Returns the updated result + a list of demotion records (for audit).
     Safe on `None` / missing keys."""
@@ -844,11 +1119,15 @@ def _filter_entity_shaped_classes(
             kept_classes.append(entry)
             continue
         label = entry.get("LABEL", "")
+        descr = entry.get("DESCRIPTION", "")
         is_entity, reason = _looks_like_entity_not_class(
             label,
+            description=descr if isinstance(descr, str) else "",
             known_places=known_places,
             extra_corporate_suffix_re=extra_corporate_suffix_re,
             extra_tail_word_re=extra_tail_word_re,
+            allowlist=allowlist,
+            extra_individual_description_re=extra_individual_description_re,
         )
         if not is_entity:
             kept_classes.append(entry)
@@ -1399,10 +1678,34 @@ def _first_parent_label(rec: dict[str, Any], classes_dict: dict[str, Any]) -> st
     return "owl:Thing"
 
 
+def _instance_label_set(instances_dict: dict[str, Any] | None) -> frozenset[str]:
+    """Lowercased, space-stripped labels of every minted INSTANCE.
+
+    Used to spot eponymous classes -- a class label that is also an instance
+    label almost always means one named thing got minted twice, once as a
+    category and once as the individual it actually is.
+    """
+    out: set[str] = set()
+    for rec in (instances_dict or {}).values():
+        if not isinstance(rec, dict):
+            continue
+        labels = rec.get("labels") or []
+        cands = list(labels) if isinstance(labels, list) else []
+        for extra in (rec.get("canonical_form"), rec.get("name")):
+            if isinstance(extra, str):
+                cands.append(extra)
+        for lbl in cands:
+            if isinstance(lbl, str) and lbl.strip():
+                out.add(re.sub(r"[^a-z0-9]", "", lbl.lower()))
+    out.discard("")
+    return frozenset(out)
+
+
 def _is_suspicious(
     iri: str,
     rec: dict[str, Any],
     classes_dict: dict[str, Any],
+    instance_labels: frozenset[str] | None = None,
 ) -> bool:
     """Quick deterministic filter to decide whether a newly-created class
     is worth a (paid) LLM audit. Returns True if any of:
@@ -1412,6 +1715,8 @@ def _is_suspicious(
       - LABEL looks like a person name (regardless of parent -- people
         should be instances, not classes)
       - LABEL matches a role label but parent isn't Role-shaped
+      - LABEL has a WEAK individual shape (`_looks_like_individual_weak`)
+      - LABEL is a disjunction ("X or Y"), which is not a class at all
     """
     label = _label_of(rec)
     if not label:
@@ -1428,6 +1733,31 @@ def _is_suspicious(
     if _looks_like_person_name(label):
         return True
     if label.lower().replace(" ", "") in _ROLE_LABELS and "role" not in parent:
+        return True
+    # Weak individual shapes: series designators (`ASU2019-01`) and CamelCase
+    # trailing enumerators (`ChollaUnit4`). These deliberately do NOT demote
+    # deterministically -- `COVID19` has the same shape as `ASU2019-01` and is
+    # a genuine class -- so this is the one place they get adjudicated, by an
+    # LLM that can read the label and description together. That is what keeps
+    # the guard working on domains these patterns never anticipated.
+    weak, _reason = _looks_like_individual_weak(label)
+    if weak:
+        return True
+    # Eponymous: this label was ALSO minted as an individual. Measured on a
+    # utility 10-K, 29 of 393 new classes were like this -- `PacifiCorp`,
+    # `MidAmericanEnergy`, `SierraPacific`, and the states `Utah`, `Oregon`,
+    # `California`. Extraction then typed each one to its own eponymous class,
+    # so `AESO` the class had exactly one member: AESO. A shape rule cannot
+    # see this (nothing about "PacifiCorp" looks wrong in isolation) -- only
+    # the coincidence with the instance list can.
+    if instance_labels:
+        if re.sub(r"[^a-z0-9]", "", label.lower()) in instance_labels:
+            return True
+    # A disjunction label is never a class. These come from relation-endpoint
+    # auto-minting (`SegmentOperatingExpense or SegmentAsset` carries
+    # `auto_created_from_relation`); 1d stops new ones, this catches any that
+    # still arrive (e.g. straight from a Stage-2 proposal).
+    if split_disjunction_label(_split_camel(label)):
         return True
     return False
 
@@ -1447,15 +1777,20 @@ def _classification_audit_cache_key(items: list[dict[str, Any]], model: str) -> 
 
 def _build_audit_items(
     classes_dict: dict[str, Any],
+    instances_dict: dict[str, Any] | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
     """Find every NEWLY-CREATED class whose current placement is
     suspicious. Returns (iri, item_dict_for_llm) tuples preserving
-    classes_dict order so audit batches are deterministic."""
+    classes_dict order so audit batches are deterministic.
+
+    `instances_dict` is optional so existing 1-arg callers keep working; when
+    given it enables the eponymous-class check."""
+    _inst_labels = _instance_label_set(instances_dict)
     items: list[tuple[str, dict[str, Any]]] = []
     for iri, rec in classes_dict.items():
         if not _is_newly_created(rec):
             continue
-        if not _is_suspicious(iri, rec, classes_dict):
+        if not _is_suspicious(iri, rec, classes_dict, _inst_labels):
             continue
         label = _label_of(rec)
         parent_label = _first_parent_label(rec, classes_dict)
@@ -1652,7 +1987,7 @@ async def run_classification_audit_async(
     prefixed with 'audit-v1'. Re-running against the same set of
     suspicious classes costs nothing for LLM calls.
     """
-    items = _build_audit_items(classes_dict)
+    items = _build_audit_items(classes_dict, instances_dict)
     if not items:
         print("[stage4-H] classification_audit: no suspicious classes -- skipping")
         return {"suspicious": 0, "decisions": 0, "kept": 0, "rehomed": 0,
@@ -2730,11 +3065,47 @@ async def _run_llm_stages(
     extra_tail_re = _compile_extra_word_regex(
         entity_filter_cfg.get("extra_doc_tail_words") or []
     )
+    filter_allowlist = _compile_label_allowlist(
+        entity_filter_cfg.get("class_filter_allowlist") or []
+    )
+    extra_individual_descr_re = _compile_extra_pattern_regex(
+        entity_filter_cfg.get("extra_instance_description_patterns") or []
+    )
     print(
         f"[stage2-filter] known_places={len(known_places)} (from ontology + config), "
         f"extra_suffixes={'on' if extra_suffix_re else 'off'}, "
-        f"extra_tail_words={'on' if extra_tail_re else 'off'}"
+        f"extra_tail_words={'on' if extra_tail_re else 'off'}, "
+        f"allowlist={len(filter_allowlist)}"
     )
+
+    def _apply_entity_shaped_filter(
+        res: dict[str, Any] | None, idx: int, source_name: str
+    ) -> dict[str, Any] | None:
+        """Run the strong-tier filter + write its audit record.
+
+        Shared by the Stage-2 LLM path and the table-mining path so the two
+        cannot drift -- table-mining proposals used to bypass the filter
+        entirely, which is how a 10-K table listing one generating unit per
+        row became one CLASS per row."""
+        if not res:
+            return res
+        res, demotions = _filter_entity_shaped_classes(
+            res,
+            known_places=known_places,
+            extra_corporate_suffix_re=extra_suffix_re,
+            extra_tail_word_re=extra_tail_re,
+            allowlist=filter_allowlist,
+            extra_individual_description_re=extra_individual_descr_re,
+        )
+        if demotions:
+            _append_audit(
+                audit_path,
+                idx,
+                "entity_shaped_class_demotions",
+                source_name,
+                {"demotions": demotions},
+            )
+        return res
 
     async def _classify_one(chunk: TextChunk) -> list[str]:
         async with sem:
@@ -2774,20 +3145,7 @@ async def _run_llm_stages(
                 suggested_new_classes=suggested_new_classes,
             )
             if res:
-                res, demotions = _filter_entity_shaped_classes(
-                    res,
-                    known_places=known_places,
-                    extra_corporate_suffix_re=extra_suffix_re,
-                    extra_tail_word_re=extra_tail_re,
-                )
-                if demotions:
-                    _append_audit(
-                        audit_path,
-                        idx,
-                        "entity_shaped_class_demotions",
-                        chunk.source_name,
-                        {"demotions": demotions},
-                    )
+                res = _apply_entity_shaped_filter(res, idx, chunk.source_name)
                 _append_audit(audit_path, idx, "class_proposal", chunk.source_name, res)
             stage2_done += 1
             if stage2_done == stage2_total or stage2_done % stage2_log_every == 0:
@@ -2844,10 +3202,20 @@ async def _run_llm_stages(
     # via the same recursive merge so Stage 3 dedup collapses table-derived
     # proposals against prose-derived ones uniformly.
     if extra_stage2_results:
-        valid.extend(r for r in extra_stage2_results if r)
+        # These go through the SAME entity-shaped filter as the LLM path.
+        # They used to bypass it, and table mining proposes one class per
+        # non-structural row label -- so a filing's table of generating units
+        # or of issued standards minted one class per row, unfiltered.
+        _filtered_extra = [
+            f for f in (
+                _apply_entity_shaped_filter(r, -1, "table-mining")
+                for r in extra_stage2_results if r
+            ) if f
+        ]
+        valid.extend(_filtered_extra)
         print(
-            f"[stage2] merged {len(extra_stage2_results)} extra Stage-2 "
-            "result(s) from table mining"
+            f"[stage2] merged {len(_filtered_extra)} extra Stage-2 "
+            "result(s) from table mining (entity-shaped filter applied)"
         )
 
     if max_cost_usd is not None and router.total_cost_usd > max_cost_usd:

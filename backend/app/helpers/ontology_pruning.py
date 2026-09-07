@@ -2182,14 +2182,66 @@ def apply_concept_grouping(
     return new_concept_iris, audit
 
 
+# A DOMAIN/RANGE the model refused to commit to: "Organization or
+# AppStoreOperator", "SegmentOperatingExpense or SegmentAsset". `match_dedup`
+# rule 3a asks the model to GENERALISE relation endpoints; when it cannot find
+# one class covering both, it hedges with a disjunction instead. That string
+# then reached `_automint_endpoint_class` and was minted verbatim as a CLASS --
+# the live DB has 7 of them, each carrying an `auto_created_from_relation`
+# annotation that proves the path.
+#
+# A disjunction is not a class. Split it and resolve the parts instead.
+_DISJUNCTION_LABEL_RE = re.compile(
+    r"\s+or\s+|\s+and/or\s+|\s*\|\s*|\s+/\s+", re.IGNORECASE
+)
+
+
+def split_disjunction_label(text: str) -> list[str]:
+    """Split a hedged endpoint label into its alternatives.
+
+    Returns [] when the label is not a disjunction, so callers can use a
+    truthy check as "is this hedged?". Parts are stripped and empties
+    dropped; a single surviving part also returns [] (nothing to choose
+    between)."""
+    if not text or not isinstance(text, str):
+        return []
+    if not _DISJUNCTION_LABEL_RE.search(text):
+        return []
+    parts = [p.strip() for p in _DISJUNCTION_LABEL_RE.split(text)]
+    parts = [p for p in parts if p]
+    return parts if len(parts) >= 2 else []
+
+
+def _class_depth(iri: str | None, classes_dict: dict, _limit: int = 50) -> int:
+    """Length of the superclass chain above `iri`. Used to pick the MORE
+    GENERAL of two resolved disjunction alternatives -- which is what
+    `match_dedup` rule 3a was asking the model for in the first place."""
+    depth = 0
+    seen: set[str] = set()
+    cur = iri
+    while cur and cur not in seen and depth < _limit:
+        seen.add(cur)
+        cur = _first_super_iri(classes_dict.get(cur, {}))
+        if cur:
+            depth += 1
+    return depth
+
+
 def _is_garbage_endpoint(text: str) -> bool:
     """An endpoint label too long to be a class name (probably a sentence)
-    or containing newlines is treated as garbage -- skip the relation."""
+    or containing newlines is treated as garbage -- skip the relation.
+
+    Also rejects a still-unsplit disjunction as a backstop: callers should
+    have resolved it via `split_disjunction_label` first, so reaching here
+    with one means no alternative resolved and minting it verbatim would
+    put another `X or Y` pseudo-class into the ontology."""
     if not text:
         return True
     if "\n" in text or "\r" in text:
         return True
     if len(text) > _MAX_AUTOMINT_LABEL_LEN:
+        return True
+    if split_disjunction_label(text):
         return True
     return False
 
@@ -2328,6 +2380,46 @@ def add_new_relations_from_match_results(
         hit = _fuzzy_lookup_class(text, None, classes_dict, label_index, token_index)
         if hit:
             return hit, text, None
+        # Hedged endpoint ("Organization or AppStoreOperator"): resolve the
+        # alternatives rather than minting the whole string as a class.
+        alternatives = split_disjunction_label(text)
+        if alternatives:
+            resolved = []
+            for part in alternatives:
+                part_iri, _, _ = _try_resolve_simple(part)
+                if part_iri:
+                    resolved.append(part_iri)
+            if len(resolved) == 1:
+                return resolved[0], text, None
+            if len(resolved) > 1:
+                # Both sides are real classes but the model would not choose.
+                # Take the MORE GENERAL one -- that is exactly the
+                # generalisation `match_dedup` rule 3a asks for, and it keeps
+                # the relation reusable instead of pinned to one narrow end.
+                return (
+                    min(resolved, key=lambda i: _class_depth(i, classes_dict)),
+                    text,
+                    None,
+                )
+            # Nothing resolved -> fall through unresolved. `_is_garbage_endpoint`
+            # then skips the relation rather than minting "X or Y" as a class.
+        return None, text, f"could not resolve '{text}' to a class IRI"
+
+    def _try_resolve_simple(text: str) -> tuple[str | None, str | None, str | None]:
+        """`_try_resolve` without the disjunction branch -- used to resolve the
+        individual alternatives of a disjunction without recursing."""
+        if not text:
+            return None, text, "empty"
+        if text in classes_dict:
+            return text, text, None
+        label_index = _build_label_to_iri_index(classes_dict)
+        hit = label_index.get(text.lower())
+        if hit:
+            return hit, text, None
+        token_index = _build_token_index(classes_dict)
+        hit = _fuzzy_lookup_class(text, None, classes_dict, label_index, token_index)
+        if hit:
+            return hit, text, None
         return None, text, f"could not resolve '{text}' to a class IRI"
 
     for item in match_results.get("MATCH NOT FOUND RELATIONS", []):
@@ -2375,7 +2467,12 @@ def add_new_relations_from_match_results(
 
         if d_iri is None:
             if _is_garbage_endpoint(d_text):
-                skipped.append({"relation": item, "reason": f"DOMAIN garbage: '{d_text}'"})
+                _why = (
+                    "unresolvable disjunction"
+                    if split_disjunction_label(d_text or "")
+                    else "garbage"
+                )
+                skipped.append({"relation": item, "reason": f"DOMAIN {_why}: '{d_text}'"})
                 continue
             d_iri = _automint_endpoint_class(
                 label=d_text,
@@ -2390,7 +2487,12 @@ def add_new_relations_from_match_results(
 
         if r_iri is None:
             if _is_garbage_endpoint(r_text):
-                skipped.append({"relation": item, "reason": f"RANGE garbage: '{r_text}'"})
+                _why = (
+                    "unresolvable disjunction"
+                    if split_disjunction_label(r_text or "")
+                    else "garbage"
+                )
+                skipped.append({"relation": item, "reason": f"RANGE {_why}: '{r_text}'"})
                 continue
             r_iri = _automint_endpoint_class(
                 label=r_text,

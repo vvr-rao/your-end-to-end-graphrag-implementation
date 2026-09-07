@@ -339,10 +339,94 @@ expansion:
     # noun places NOT already in the loaded ontology. Usually empty --
     # the dynamic lookup handles geography automatically.
     extra_known_place_labels: []
+    # Extra RAW REGEX patterns (not escaped -- these express a shape, not a
+    # literal) matched against a proposal's DESCRIPTION to mark it as
+    # describing one specific individual rather than a category. Built-ins
+    # already cover "a specific ...", "this particular ...", and
+    # "<Name>, a <kind> referenced in <X>". An invalid pattern is skipped with
+    # a warning rather than aborting the run.
+    extra_instance_description_patterns: []
+    # Labels that look entity-shaped to the heuristics but are genuine classes
+    # in THIS domain. Case-insensitive exact match, checked FIRST so it
+    # overrides every other rule. Use it when a domain legitimately names a
+    # category the way other domains name individuals.
+    class_filter_allowlist: []
 
 # -----------------------------------------------------------------------------
 # RAG QA defaults (Phase 2).
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# extract-entities (Milestone C) correctness knobs. Throughput lives under
+# `concurrency.entity_extraction` above; this section is about accuracy.
+# -----------------------------------------------------------------------------
+extraction:
+  # Validate-and-review loop, enabled per run with --validate-entities (OFF by
+  # default). After entities are extracted, a DIFFERENT model (models.yaml task
+  # `entity_validate`) reviews each entity + its class assignment; anything
+  # actionable triggers a re-extraction of that chunk with the critique
+  # appended. This value caps the validate->re-extract cycles. A clean chunk
+  # costs ONE extra call (the review) and stops; only chunks with a real
+  # problem pay for a re-extraction. 0 disables.
+  validation_rounds: 2
+  # Candidate-menu quality filter. Withholds instance-shaped class labels
+  # ("Cholla Unit 4") and disjunction labels ("SegmentOperatingExpense or
+  # SegmentAsset") from the top-K menu handed to the extractor. Neither is a
+  # KIND, so no entity can legitimately instantiate them -- but they rank high
+  # in the vector search precisely because they are lexically close to the
+  # entity. The extractor cannot pick what it was never shown.
+  filter_candidate_menu: true
+  # Labels that look instance-shaped to the heuristic but are genuine classes
+  # in THIS domain. Case-insensitive exact match. The per-domain escape hatch:
+  # a rule tuned on "ChollaUnit4" also describes "Interleukin6", and losing a
+  # class is silent (the class goes AND every entity that would instantiate it
+  # is dropped). Empty = built-in behaviour.
+  menu_filter_allowlist: []
+  # Hard L2-distance ceiling on the candidate-class vector search. Without one
+  # the query is a pure `ORDER BY <-> LIMIT K`, so EVERY chunk receives exactly
+  # K classes however unrelated they are -- which is what leaves the model a
+  # plausible-looking sibling to force every entity into. Embeddings are
+  # unit-normalised (text-embedding-3-small @ 1024), so L2 is in [0,2] and
+  # l2 = sqrt(2 - 2*cos). null = disabled (behaviour-preserving default).
+  # MEASURED 2026-09-07 on two corpora, and the answer was DON'T SET IT:
+  #
+  #                      50th-nearest class (p50)   assignments written (p99)
+  #   news (382 cls)              1.327                      1.394
+  #   finance (1937 cls)          1.107                      1.366
+  #
+  # A ceiling at the p99 of real assignments sits ABOVE the 50th-nearest
+  # class in both, so it never binds; one low enough to bind would cut
+  # legitimate top-K classes. The zero-candidate path cannot trigger either --
+  # the NEAREST class was within 1.21 for every news chunk sampled. The
+  # assignments out past rank-50's distance are the pinned and
+  # ancestor-closure classes, which bypass the vector query by design and so
+  # are out of a ceiling's reach anyway.
+  #
+  # Keep null unless you raise --candidate-classes a long way or import an
+  # ontology with a long tail of unrelated classes. Re-measure with
+  # `extract-entities --report-candidate-distances` before changing it.
+  max_candidate_l2: null
+  # Universal classes force-included in EVERY candidate menu, matched on label
+  # (case- and punctuation-insensitive) so the same list works whichever upper
+  # ontology a corpus merged. Needed because ancestor closure cannot help a
+  # chunk whose top-K contains no person-ish class at all to close over:
+  # measured on a shipping article foaf:Person ranked 191st of ~380 classes,
+  # and every named person in the passage was dropped.
+  pinned_class_labels:
+    - Person
+    - Agent
+    - Organization
+    - Country
+    - Region
+    - City
+    # AdministrativeArea is pinned alongside City because without it a
+    # utility 10-K typed California, Iowa, Nevada, Oregon, Utah, Wyoming and
+    # five more US STATES as `City` -- City was on the menu and its sibling
+    # was not, so the model took the only place-kind it was shown.
+    - AdministrativeArea
+    - Landform
+    - Place
+    - Event
+
 qa:
   # Top-k candidate classes from class-summary ANN.
   k_classes: 15
@@ -353,10 +437,21 @@ qa:
   # evidence but more candidates + cost. `query --hops N` overrides per-run.
   hops: 3
   # Max characters of each evidence item's text placed in the answer-synthesis
-  # prompt. Raised from the old hard-coded 600 so richer (e.g. evaluated-summary)
-  # chunks aren't clipped down to ~150 tokens at synthesis. ~30 chunks x 1500
-  # chars ~= 11k tokens of chunk-context for deep_research -- fine for gpt-4.1.
-  evidence_char_cap: 1500
+  # prompt. MUST be >= the longest chunk, or evidence is silently discarded
+  # after being correctly retrieved.
+  #
+  # Measured 2026-09-07: chunks run min 1,250 / avg 3,278 / max 4,534 chars,
+  # so the previous 1,500 truncated 93% of them and synthesis saw under half
+  # of the average chunk. That produced a confidently WRONG answer: asked what
+  # CMA CGM's CFO said about price wars, retrieval surfaced the right chunk,
+  # the quote sat at char 2,744, the cap cut it at 1,500, and the model
+  # attributed the title to a Bloomberg credit analyst named earlier in the
+  # text. At 5,000 the same query answers correctly, quoting Ramon Fernandez.
+  #
+  # Cost: ~30 chunks x 5,000 chars ~= 37k tokens of chunk-context for
+  # deep_research, against ~11k before -- roughly $0.09 vs $0.03 per query on
+  # gpt-4.1. Raise `chunking.chunk_size` and this together, never separately.
+  evidence_char_cap: 5000
   # For comparison/enumeration queries over multiple entities ("compare A vs its
   # competitors"), retrieval fans out ONE vector probe per matched entity so each
   # gets even representation (instead of only the 1-2 a generic decompose named).
