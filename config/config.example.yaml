@@ -402,6 +402,12 @@ extraction:
     - Country
     - Region
     - City
+    # AdministrativeArea is pinned alongside City because without it a
+    # utility 10-K typed California, Iowa, Nevada, Oregon, Utah, Wyoming and
+    # five more US STATES as `City` -- City was on the menu and its sibling
+    # was not, so the model took the only place-kind it was shown.
+    - AdministrativeArea
+    - Landform
     - Place
     - Event
 
