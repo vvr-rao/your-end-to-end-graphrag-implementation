@@ -308,3 +308,32 @@ def test_review_loop_is_off_by_default() -> None:
     args = build_parser().parse_args(["extract-entities"])
     assert args.validate_entities is False
     assert args.validation_rounds is None  # => config default
+
+
+def test_shipped_config_pins_the_universal_classes() -> None:
+    """A pure top-K menu is all hyper-specific classes on a domain corpus.
+    Measured: foaf:Person ranked 191st on a shipping article and every named
+    person was dropped; a utility 10-K offered 'AESO' and 'MISO' but not
+    'Organization' and abstained on 276 of ~340 mentions.
+    """
+    from pathlib import Path
+
+    import yaml
+
+    root = Path(__file__).resolve().parents[3]
+    for name in ("config.yaml", "config.example.yaml"):
+        path = root / "config" / name
+        if not path.exists():
+            continue
+        pins = (yaml.safe_load(path.read_text()) or {}).get(
+            "extraction", {}).get("pinned_class_labels") or []
+        lowered = {str(p).lower() for p in pins}
+        for needed in ("person", "organization"):
+            assert needed in lowered, f"{name}: '{needed}' must be pinned"
+
+
+def test_ancestor_closure_is_on_by_default() -> None:
+    from backend.app.cli.main import build_parser
+
+    args = build_parser().parse_args(["extract-entities"])
+    assert args.no_ancestor_closure is False

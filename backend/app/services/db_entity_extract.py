@@ -954,6 +954,8 @@ async def extract_entities(
     filter_candidate_menu: bool = True,
     max_candidate_l2: float | None = None,
     menu_filter_allowlist: frozenset[str] | None = None,
+    menu_ancestor_closure: bool = True,
+    pinned_class_labels: tuple[str, ...] = (),
 ) -> EntityExtractSummary:
     """Drive entity extraction over chunks that haven't been processed.
 
@@ -972,6 +974,12 @@ async def extract_entities(
     caps how far a candidate class may sit from the chunk in embedding space;
     without it every chunk gets exactly K classes however unrelated, so the
     model always has a same-topic sibling to force an entity into.
+
+    `menu_ancestor_closure` adds the superclass chain of every menu entry, and
+    `pinned_class_labels` force-includes universal classes (person /
+    organization / place). Together they give the model a general answer to
+    fall back on -- without them a domain corpus fills all K slots with
+    hyper-specific classes and named people get abstained rather than typed.
     """
     t0 = time.time()
     summary = EntityExtractSummary()
@@ -1098,6 +1106,30 @@ async def extract_entities(
                 f"{len(menu_excluded)} class(es) withheld ({_detail})"
             )
 
+    # Resolve the pinned universal classes once. Matched on LABEL (case- and
+    # space-insensitive) rather than IRI so the same config works whichever
+    # upper ontology a corpus merged -- foaf, org, schema.org.
+    pinned_iris: set[str] = set()
+    if pinned_class_labels:
+        wanted = {
+            re.sub(r"[^a-z0-9]", "", lbl.lower())
+            for lbl in pinned_class_labels if isinstance(lbl, str) and lbl.strip()
+        }
+        async with session_scope() as session:
+            rows = await session.execute(
+                select(OntologyClass.iri, OntologyClass.label)
+                .where(OntologyClass.embedding.isnot(None))
+            )
+            for iri, label in rows.all():
+                if re.sub(r"[^a-z0-9]", "", (label or "").lower()) in wanted:
+                    pinned_iris.add(iri)
+        print(
+            f"[extract-entities] menu backstop: ancestor-closure="
+            f"{'on' if menu_ancestor_closure else 'off'}, "
+            f"{len(pinned_iris)} pinned class(es) resolved from "
+            f"{len(wanted)} configured label(s)"
+        )
+
     sem = asyncio.Semaphore(concurrency)
     # (chunk_id, chunk_iri, doc_id, list[entity_dict], list[relationship_dict])
     results: list[
@@ -1152,16 +1184,38 @@ async def extract_entities(
         )
 
     async def _candidate_classes(chunk_embedding: list[float]) -> list[dict[str, str]]:
-        """Top-K class IRIs nearest the chunk's embedding.
+        """The candidate menu: vector top-K, plus a general-class backstop.
 
-        Two guards beyond the plain ANN query:
+        Guards beyond the plain ANN query:
 
         * `menu_excluded` drops instance-shaped / disjunction labels. We
           over-fetch 3x first so filtering rarely shrinks the menu below K.
         * `max_candidate_l2` caps the distance. Without a ceiling this is a
           pure `ORDER BY ... LIMIT K`, so a chunk ALWAYS receives exactly K
-          classes no matter how unrelated they are -- which is what leaves the
-          model a plausible-looking sibling to force every entity into.
+          classes no matter how unrelated they are.
+        * ANCESTOR CLOSURE + PINS -- see below.
+
+        Why the backstop exists. A pure top-K menu is dominated by whatever is
+        lexically closest to the chunk, which on a domain corpus means K
+        hyper-specific classes and no general ones. Measured on a shipping
+        article, `foaf:Person` ranked 191st while the top 10 were
+        ShippingBoomBustCycle, ContainerCarrier, FreightRate...; every named
+        person in the passage was dropped because nothing on the menu denoted
+        "a human being". On a utility 10-K the menu offered `AESO` and `MISO`
+        but not `Organization`, and 276 of ~340 mentions were abstained.
+
+        Two additions, in order of principle:
+
+        1. Ancestor closure -- for every class on the menu, its superclass
+           chain is added too. Fully domain-neutral: if `ContainerCarrier` is
+           offered then `Organization` is offered, and if `Israel` is offered
+           then `Country` and `GeographicEntity` are. This is what lets the
+           model answer "what KIND of thing is this?" with the right level of
+           generality instead of the only level it was shown.
+        2. Configured pins -- a short list of universal classes (person,
+           organization, place) that entity extraction needs in EVERY domain.
+           Needed on top of (1) because a chunk whose top-K contains no
+           person-ish class at all has no person ancestor to close over.
         """
         over_fetch = (
             candidate_classes_per_chunk * 3
@@ -1187,8 +1241,31 @@ async def extract_entities(
                 {"iri": iri, "label": label or "", "description": descr or ""}
                 for iri, label, descr in r.all()
                 if iri not in menu_excluded
-            ]
-            return out[:candidate_classes_per_chunk]
+            ][:candidate_classes_per_chunk]
+
+            have = {c["iri"] for c in out}
+            extra_iris: set[str] = set()
+            if menu_ancestor_closure and out:
+                anc = await session.execute(
+                    _ANCESTOR_SQL, {"iris": [c["iri"] for c in out]}
+                )
+                extra_iris |= {
+                    a for _origin, a in anc.all()
+                    if a not in have and a not in menu_excluded
+                }
+            extra_iris |= {i for i in pinned_iris if i not in have}
+            if not extra_iris:
+                return out
+            rows = await session.execute(
+                select(
+                    OntologyClass.iri, OntologyClass.label, OntologyClass.description
+                ).where(OntologyClass.iri.in_(sorted(extra_iris)))
+            )
+            for iri, label, descr in rows.all():
+                out.append({
+                    "iri": iri, "label": label or "", "description": descr or ""
+                })
+            return out
 
     async def _validate_pass(
         txt: str,

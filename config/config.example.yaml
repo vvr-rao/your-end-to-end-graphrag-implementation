@@ -389,6 +389,21 @@ extraction:
   # l2 = sqrt(2 - 2*cos). null = disabled (behaviour-preserving default).
   # MEASURE before setting: `extract-entities --report-candidate-distances`.
   max_candidate_l2: null
+  # Universal classes force-included in EVERY candidate menu, matched on label
+  # (case- and punctuation-insensitive) so the same list works whichever upper
+  # ontology a corpus merged. Needed because ancestor closure cannot help a
+  # chunk whose top-K contains no person-ish class at all to close over:
+  # measured on a shipping article foaf:Person ranked 191st of ~380 classes,
+  # and every named person in the passage was dropped.
+  pinned_class_labels:
+    - Person
+    - Agent
+    - Organization
+    - Country
+    - Region
+    - City
+    - Place
+    - Event
 
 qa:
   # Top-k candidate classes from class-summary ANN.

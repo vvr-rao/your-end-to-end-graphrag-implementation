@@ -662,6 +662,19 @@ _SERIES_DESIGNATOR_RE = re.compile(
     r"^[A-Z]{2,6}[-_ ]?\d{2,}(?:[-._]\d{1,4})?$"
 )
 
+# A bare all-caps acronym as a CLASS label. Measured on a utility 10-K, 20 of
+# 393 minted classes were these -- MISO, AESO, PSALM, CPUC, IPUC, UPSC, WUTC,
+# OPUC, IUB, GEMA -- and every one names ONE organization (Midcontinent ISO,
+# Alberta Electric System Operator, ...). Extraction then typed each
+# organization to its own eponymous class: `AESO` typed `AESO` and `Alberta
+# Electric System Operator`, and nothing else, forever.
+#
+# WEAK only, and necessarily so: an acronym is not reliably an individual.
+# GDP, CPI, ESG, EBITDA, NAAQS name genuine concepts, and telling those from
+# MISO by shape alone is impossible -- one is an economic measure, the other a
+# grid operator, and both are five capital letters. The LLM audit decides.
+_BARE_ACRONYM_RE = re.compile(r"^[A-Z]{3,7}$")
+
 # H7: the proposal's own DESCRIPTION says it is one particular thing. The
 # highest-precision and most domain-neutral signal available -- it reads the
 # model's own words rather than guessing from the label -- and it is already
@@ -863,6 +876,8 @@ def _looks_like_individual_weak(
         return True, "individual-description-weak"
     if _SERIES_DESIGNATOR_RE.match(cleaned):
         return True, "series-designator"
+    if _BARE_ACRONYM_RE.match(cleaned):
+        return True, "bare-acronym"
     # CamelCase-only form of heuristic 5. The spaced form is already decided
     # (strongly) above, so restrict this to labels with no whitespace.
     #

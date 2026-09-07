@@ -609,3 +609,25 @@ def test_finance_instrument_notes_survive_the_document_tail_rule() -> None:
         assert _looks_like_entity_not_class(label)[0] is False, label
     # A genuine named document still demotes, because the second signal fires.
     assert _looks_like_entity_not_class("2025 Outlook Note")[0] is True
+
+
+@pytest.mark.parametrize(
+    "label",
+    ["MISO", "AESO", "PSALM", "CPUC", "IPUC", "UPSC", "WUTC", "GEMA"],
+)
+def test_bare_acronyms_are_nominated_for_audit(label: str) -> None:
+    """Measured on a utility 10-K: 20 of 393 minted classes were bare
+    acronyms, and every one named ONE organization. Extraction then typed each
+    organization to its own eponymous class -- `AESO` typed `AESO` and
+    `Alberta Electric System Operator`, and nothing else, ever."""
+    weak, reason = _looks_like_individual_weak(label)
+    assert weak is True
+    assert reason == "bare-acronym"
+    # Never demoted deterministically: GDP / ESG / EBITDA are the same shape
+    # and are genuine concepts. Only the LLM can tell them apart.
+    assert _looks_like_entity_not_class(label)[0] is False
+
+
+@pytest.mark.parametrize("label", ["GDP", "ESG", "EBITDA", "NAAQS"])
+def test_concept_acronyms_are_never_hard_demoted(label: str) -> None:
+    assert _looks_like_entity_not_class(label)[0] is False

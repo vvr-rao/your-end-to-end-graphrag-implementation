@@ -919,6 +919,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_ext.add_argument(
+        "--no-ancestor-closure", action="store_true",
+        help=(
+            "Do NOT add the superclass chain of each menu entry to the "
+            "candidate menu. Closure is on by default because a pure top-K "
+            "menu fills every slot with hyper-specific classes: measured on a "
+            "utility 10-K the menu offered 'AESO' and 'MISO' but not "
+            "'Organization', and 276 of ~340 entity mentions were abstained "
+            "for want of a general class. Use this only to reproduce "
+            "pre-closure behaviour."
+        ),
+    )
+    p_ext.add_argument(
         "--report-candidate-distances", action="store_true",
         help=(
             "Diagnostic: print the distribution of chunk->class embedding "
@@ -1835,6 +1847,9 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
             filter_candidate_menu=_menu_filter,
             max_candidate_l2=float(_l2) if _l2 is not None else None,
             menu_filter_allowlist=_allow or None,
+            menu_ancestor_closure=not getattr(args, "no_ancestor_closure", False),
+            pinned_class_labels=tuple(
+                _extraction_cfg().get("pinned_class_labels") or ()),
         )
     )
     return 0

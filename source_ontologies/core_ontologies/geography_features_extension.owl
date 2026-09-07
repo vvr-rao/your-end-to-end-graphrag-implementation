@@ -1,0 +1,80 @@
+<?xml version="1.0"?>
+<rdf:RDF
+    xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+    xmlns:rdfs="http://www.w3.org/2000/01/rdf-schema#"
+    xmlns:owl="http://www.w3.org/2002/07/owl#"
+    xml:base="https://veerla-ramrao.ai/ontology/geography-features">
+
+  <owl:Ontology rdf:about="https://veerla-ramrao.ai/ontology/geography-features">
+    <rdfs:comment>Sub-national geographic KIND classes, additive to
+geography_ontology.owl.
+
+WHY THIS EXISTS. geography_ontology.owl models countries and regions as
+owl:Class (deliberately -- its own comment says "Document-parsed mentions of
+this geography can be instantiated as members of this class"), giving
+GeographicEntity -> Country | Region | Continent and 251 country classes
+beneath them. What it has no class for is anything SMALLER than a country.
+
+The consequence, measured on two corpora: entity extraction had no class
+denoting "a city", "a canal" or "a rock formation", so it typed each place to
+the nearest thing it was offered -- the containing country or region. Eleven
+Israeli cities (Tel Aviv, Beer Sheva, Sderot...) were typed to the class
+"Israel"; the Panama and Suez Canals were typed "Southern Europe"; the
+Anadarko, Bakken, Delaware and Hugoton basins were typed
+"ElectricityGenerationFacility" for want of anywhere better.
+
+Adding the missing KINDS fixes this without touching the country-as-class
+design: Tel Aviv is a City located in Israel, not an instance of Israel.
+    </rdfs:comment>
+  </owl:Ontology>
+
+  <!-- Populated place -->
+  <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/geography-features#PopulatedPlace">
+    <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/geography#GeographicEntity"/>
+    <rdfs:label>PopulatedPlace</rdfs:label>
+    <rdfs:comment>A named human settlement of any size.</rdfs:comment>
+  </owl:Class>
+  <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/geography-features#City">
+    <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/geography-features#PopulatedPlace"/>
+    <rdfs:label>City</rdfs:label>
+    <rdfs:comment>A city or town. Instances are named cities such as Tel Aviv, Des Moines or Chicago.</rdfs:comment>
+  </owl:Class>
+
+  <!-- Sub-national administrative divisions -->
+  <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/geography-features#AdministrativeArea">
+    <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/geography#GeographicEntity"/>
+    <rdfs:label>AdministrativeArea</rdfs:label>
+    <rdfs:comment>A sub-national administrative division: a state, province, county, territory or district. Instances include California, Alberta and British Columbia.</rdfs:comment>
+  </owl:Class>
+
+  <!-- Physical features -->
+  <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/geography-features#Landform">
+    <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/geography#GeographicEntity"/>
+    <rdfs:label>Landform</rdfs:label>
+    <rdfs:comment>A natural physical feature of the earth's surface.</rdfs:comment>
+  </owl:Class>
+  <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/geography-features#GeologicalFormation">
+    <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/geography-features#Landform"/>
+    <rdfs:label>GeologicalFormation</rdfs:label>
+    <rdfs:comment>A named geological basin, formation, shale or play. Instances include the Anadarko Basin, the Bakken Formation and the Permian Basin. NOT a facility -- nothing is generated or manufactured here.</rdfs:comment>
+  </owl:Class>
+  <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/geography-features#WaterBody">
+    <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/geography-features#Landform"/>
+    <rdfs:label>WaterBody</rdfs:label>
+    <rdfs:comment>A sea, ocean, lake, bay, gulf or river.</rdfs:comment>
+  </owl:Class>
+  <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/geography-features#Waterway">
+    <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/geography-features#Landform"/>
+    <rdfs:label>Waterway</rdfs:label>
+    <rdfs:comment>A navigable channel, canal or strait. Instances include the Panama Canal, the Suez Canal and the Strait of Hormuz. A waterway is NOT a region.</rdfs:comment>
+  </owl:Class>
+
+  <!-- Where a place sits -->
+  <owl:ObjectProperty rdf:about="https://veerla-ramrao.ai/ontology/geography-features#locatedInCountry">
+    <rdfs:label>locatedInCountry</rdfs:label>
+    <rdfs:domain rdf:resource="https://veerla-ramrao.ai/ontology/geography#GeographicEntity"/>
+    <rdfs:range rdf:resource="https://veerla-ramrao.ai/ontology/geography#Country"/>
+    <rdfs:comment>Ties a sub-national place to its country. This is the correct way to say "Tel Aviv is in Israel" -- as a relationship, not by typing Tel Aviv as an instance of Israel.</rdfs:comment>
+  </owl:ObjectProperty>
+
+</rdf:RDF>
