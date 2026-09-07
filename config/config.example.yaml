@@ -437,10 +437,21 @@ qa:
   # evidence but more candidates + cost. `query --hops N` overrides per-run.
   hops: 3
   # Max characters of each evidence item's text placed in the answer-synthesis
-  # prompt. Raised from the old hard-coded 600 so richer (e.g. evaluated-summary)
-  # chunks aren't clipped down to ~150 tokens at synthesis. ~30 chunks x 1500
-  # chars ~= 11k tokens of chunk-context for deep_research -- fine for gpt-4.1.
-  evidence_char_cap: 1500
+  # prompt. MUST be >= the longest chunk, or evidence is silently discarded
+  # after being correctly retrieved.
+  #
+  # Measured 2026-09-07: chunks run min 1,250 / avg 3,278 / max 4,534 chars,
+  # so the previous 1,500 truncated 93% of them and synthesis saw under half
+  # of the average chunk. That produced a confidently WRONG answer: asked what
+  # CMA CGM's CFO said about price wars, retrieval surfaced the right chunk,
+  # the quote sat at char 2,744, the cap cut it at 1,500, and the model
+  # attributed the title to a Bloomberg credit analyst named earlier in the
+  # text. At 5,000 the same query answers correctly, quoting Ramon Fernandez.
+  #
+  # Cost: ~30 chunks x 5,000 chars ~= 37k tokens of chunk-context for
+  # deep_research, against ~11k before -- roughly $0.09 vs $0.03 per query on
+  # gpt-4.1. Raise `chunking.chunk_size` and this together, never separately.
+  evidence_char_cap: 5000
   # For comparison/enumeration queries over multiple entities ("compare A vs its
   # competitors"), retrieval fans out ONE vector probe per matched entity so each
   # gets even representation (instead of only the 1-2 a generic decompose named).
