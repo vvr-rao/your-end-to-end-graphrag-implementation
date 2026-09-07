@@ -715,3 +715,39 @@ def test_precise_predicates_are_never_demoted() -> None:
     for p in ("hasSignificantInfluenceOver", "subsidiaryOf", "acquires",
               "jointVentureWith", "largestShareholder", "competesWith"):
         assert not any(i.endswith("#" + p) for i in GENERIC_PREDICATE_IRIS), p
+
+
+def test_relationship_prompt_asks_for_completeness_without_dropping_precision() -> None:
+    """Proposal recall was the bottleneck, not the gates.
+
+    Probed on a real chunk: `CMA CGM SA --hasMember--> Ramon Fernandez` passes
+    every downstream gate -- predicate offered, domain/range match, evidence
+    quotable and naming both parties -- and simply was not proposed. Across
+    runs the relationship pass wrote 1-2 edges from ~25 proposals while every
+    rule in the prompt pushed toward emitting fewer: "RETURNING AN EMPTY LIST
+    IS THE CORRECT ANSWER", "do not force a match", "at most 10".
+
+    Those rules are right and must stay -- the gates catch real errors, e.g.
+    `Maersk hasMember Stephane Kovatchev` on a sentence where Kovatchev is a
+    Bloomberg analyst quoted ABOUT Maersk. So this asserts the completeness
+    pass was added AND that the precision rules survive alongside it.
+    """
+    from backend.app.services.prompts import relationship_extract
+
+    system, _ = relationship_extract(
+        "text", _ENTS,
+        [{"iri": "http://ex#worksFor", "label": "worksFor",
+          "domain_label": "Person", "range_label": "Organization"}],
+    )
+    low = system.lower()
+    # The completeness pass.
+    assert "completeness check" in low
+    assert "just as much an error as inventing one" in low
+    # The three shapes measured as most-missed.
+    for shape in ("employs or leads", "makes or owns", "treats or causes"):
+        assert shape in low, f"missing shape hint: {shape}"
+    # Precision rules must NOT have been softened to make room.
+    assert "returning an empty list is the correct answer" in low
+    assert "do not use world knowledge" in low
+    assert "it must name both" in low
+    assert "read your own quote before emitting" in low
