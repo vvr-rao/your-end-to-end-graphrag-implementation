@@ -32,8 +32,10 @@ import pytest
 
 from backend.app.services.db_entity_extract import (
     ABSTAIN_SENTINEL,
+    _dedup_key,
     _filter_entities,
     _is_menu_unfit_class,
+    _resolve_canonical_forms,
     _sanitise_verdicts,
 )
 from backend.app.services.prompts import (
@@ -55,6 +57,11 @@ _CLASS_META = {
     c["iri"]: {"label": c["label"], "description": c["description"]}
     for c in _CANDIDATES
 }
+
+
+def _norm(s: str) -> str:
+    from backend.app.services.db_entity_extract import _normalize_name
+    return _normalize_name(s)
 
 
 def _drops() -> dict[str, int]:
@@ -476,3 +483,160 @@ async def test_empty_reextraction_is_rejected() -> None:
     kept, stats = await _run_loop(router, rounds=2, kept=_kept("Suez Canal"))
     assert stats["empty_reextract_rejected"] == 1
     assert [e["canonical_name"] for e in kept] == ["Suez Canal"]
+
+
+# --------------------------------------------------------------------------- #
+# Near-duplicate entity nodes
+#
+# Measured on a 3-document news corpus: 7 near-duplicate node pairs, e.g.
+# `Hapag-Lloyd` / `Hapag-Lloyd AG` at trigram 0.79 -- just under the 0.85 gate
+# the mint path uses. Duplicates are not cosmetic: each node carries its own
+# edges, so multi-hop traversal arriving at one cannot see what hangs off the
+# other. That is the same failure that motivated name-level identity.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "a,b",
+    [
+        ("Hapag-Lloyd AG", "Hapag-Lloyd"),
+        ("CMA CGM SA", "CMA CGM"),
+        ("Lovesac Co.", "Lovesac"),
+        ("Under Armour Inc.", "Under Armour"),
+        ("Siemens GmbH", "Siemens"),
+    ],
+)
+def test_legal_suffixes_do_not_split_an_entity(a: str, b: str) -> None:
+    assert _dedup_key(a) == _dedup_key(b)
+
+
+@pytest.mark.parametrize(
+    "a,b",
+    [
+        ("Utah", "Utah Utes"),          # a state vs a sports team
+        ("Arizona", "Arizona State"),   # different institutions
+        ("CMA CGM", "MSC"),
+    ],
+)
+def test_genuinely_different_names_stay_apart(a: str, b: str) -> None:
+    assert _dedup_key(a) != _dedup_key(b)
+
+
+def test_a_bare_legal_form_is_not_collapsed_to_nothing() -> None:
+    """'Group' and 'Co' are real short names; stripping them to an empty key
+    would merge every such entity into one node."""
+    assert _dedup_key("Group") == "group"
+    assert _dedup_key("Co") == "co"
+
+
+def test_the_models_own_short_name_pairing_merges_variants() -> None:
+    """The extractor already reports canonical_name AND short_name, which is
+    an assertion -- grounded in that chunk -- that the two denote one entity.
+    That pairing was previously discarded for identity purposes, which is why
+    `Maersk` and `A.P. Moller-Maersk A/S` became separate nodes: their
+    suffix-stripped keys differ, so only the pairing can join them."""
+    results = [(None, None, None, [
+        {"canonical_name": "A.P. Moller-Maersk A/S", "short_name": "Maersk"},
+        {"canonical_name": "Maersk", "short_name": "Maersk"},
+        {"canonical_name": "Stephane Kovatchev", "short_name": "Kovatchev"},
+        {"canonical_name": "Kovatchev", "short_name": "Kovatchev"},
+    ], None)]
+    alias, merged = _resolve_canonical_forms(results)
+    assert alias[_norm("Maersk")] == _norm("A.P. Moller-Maersk A/S")
+    assert alias[_norm("Kovatchev")] == _norm("Stephane Kovatchev")
+    assert merged == 2
+
+
+def test_the_fullest_spelling_wins() -> None:
+    """The extract prompt asks for "the entity's most complete proper name",
+    so the surviving node should be that one, not whichever chunk came first."""
+    results = [(None, None, None, [
+        {"canonical_name": "CMA CGM", "short_name": "CMA CGM"},
+        {"canonical_name": "CMA CGM SA", "short_name": "CMA CGM"},
+    ], None)]
+    alias, _ = _resolve_canonical_forms(results)
+    assert alias[_norm("CMA CGM")] == _norm("CMA CGM SA")
+
+
+def test_resolution_is_a_noop_when_names_are_already_distinct() -> None:
+    results = [(None, None, None, [
+        {"canonical_name": "Suez Canal", "short_name": "Suez"},
+        {"canonical_name": "Panama Canal", "short_name": "Panama"},
+    ], None)]
+    alias, _merged = _resolve_canonical_forms(results)
+    # Each short form joins its own canonical's group; nothing cross-merges.
+    assert alias.get(_norm("Panama Canal")) is None
+    assert alias.get(_norm("Suez Canal")) is None
+
+
+def test_resolution_survives_empty_and_malformed_input() -> None:
+    assert _resolve_canonical_forms([]) == ({}, 0)
+    assert _resolve_canonical_forms([None]) == ({}, 0)
+    assert _resolve_canonical_forms([(None, None, None, [], None)]) == ({}, 0)
+
+
+_P = "http://ex#Person"
+_TEAM = "http://ex#CollegeFootballTeam"
+_PROJ = "http://ex#OfficeProject"
+
+
+def _res(rows):
+    return [(None, None, None, rows, None)]
+
+
+def test_a_person_referred_to_by_surname_is_one_node() -> None:
+    """`Amosi` and `Guy Amosi` were two nodes with separate edges, so a
+    traversal reaching one could not see what hung off the other."""
+    alias, _ = _resolve_canonical_forms(_res([
+        {"canonical_name": "Guy Amosi", "short_name": "Amosi", "class_iri": _P},
+        {"canonical_name": "Amosi", "short_name": "Amosi", "class_iri": _P},
+        {"canonical_name": "Tetairoa McMillan", "short_name": "McMillan", "class_iri": _P},
+        {"canonical_name": "McMillan", "short_name": "McMillan", "class_iri": _P},
+    ]), person_class_iris={_P})
+    assert alias[_norm("Amosi")] == _norm("Guy Amosi")
+    assert alias[_norm("McMillan")] == _norm("Tetairoa McMillan")
+
+
+def test_a_place_short_form_is_not_merged_into_a_longer_name() -> None:
+    """The rule that merges `Amosi` into `Guy Amosi` must not merge `Utah`
+    into `Utah Utes`. A surname is a token SUFFIX of the full name; a place
+    short form is a PREFIX -- and the rule is Person-scoped besides."""
+    alias, _ = _resolve_canonical_forms(_res([
+        {"canonical_name": "Utah", "short_name": "Utah", "class_iri": _TEAM},
+        {"canonical_name": "Utah Utes", "short_name": "Utah", "class_iri": _TEAM},
+        {"canonical_name": "Arizona", "short_name": "Arizona", "class_iri": _TEAM},
+        {"canonical_name": "Arizona Wildcats", "short_name": "Arizona", "class_iri": _TEAM},
+    ]), person_class_iris={_P})
+    assert _norm("Utah") not in alias
+    assert _norm("Arizona") not in alias
+
+
+def test_two_different_universities_are_never_merged() -> None:
+    """`Arizona State University` and `University of Arizona` share most of
+    their tokens. Token-MULTISET equality is what keeps them apart -- they
+    differ by "state" vs "of"."""
+    alias, _ = _resolve_canonical_forms(_res([
+        {"canonical_name": "Arizona State University", "short_name": "Arizona State University", "class_iri": _TEAM},
+        {"canonical_name": "University of Arizona", "short_name": "University of Arizona", "class_iri": _TEAM},
+    ]), person_class_iris={_P})
+    assert alias == {}
+
+
+def test_word_order_variants_collapse() -> None:
+    alias, _ = _resolve_canonical_forms(_res([
+        {"canonical_name": "Park Naimi", "short_name": "Park Naimi", "class_iri": _PROJ},
+        {"canonical_name": "Naimi Park", "short_name": "Naimi Park", "class_iri": _PROJ},
+    ]), person_class_iris=set())
+    assert len(alias) == 1
+
+
+def test_alias_chains_resolve_to_one_final_spelling() -> None:
+    """a -> b -> c must land on c, or variants scatter across intermediates."""
+    alias, _ = _resolve_canonical_forms(_res([
+        {"canonical_name": "Or Ben Zvi Klein", "short_name": "Klein", "class_iri": _P},
+        {"canonical_name": "Ben Zvi Klein", "short_name": "Klein", "class_iri": _P},
+        {"canonical_name": "Klein", "short_name": "Klein", "class_iri": _P},
+    ]), person_class_iris={_P})
+    targets = set(alias.values())
+    assert targets == {_norm("Or Ben Zvi Klein")}
+    assert not (set(alias) & targets), "no variant may point at another variant"

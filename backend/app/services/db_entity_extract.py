@@ -336,6 +336,187 @@ def _normalize_name(name: str) -> str:
     return re.sub(r"\s+", " ", s)
 
 
+# Legal-form suffixes stripped when deciding whether two names denote the SAME
+# entity. Deliberately a COMPARISON key only -- the stored name keeps its
+# suffix, because "A.P. Moller-Maersk A/S" is the right thing to display.
+_LEGAL_SUFFIX_RE = re.compile(
+    r"\b(?:inc|corp|corporation|co|ltd|limited|llc|llp|lp|nv|n\s*v|"
+    r"gmbh|ag|sa|s\s*a|as|a\s*s|spa|plc|pte|bhd|pty|oyj|ab|asa|se|kk|"
+    r"holdings?|group|company)\b",
+    re.IGNORECASE,
+)
+
+
+def _dedup_key(name: str) -> str:
+    """Comparison key for "is this the same entity?".
+
+    `_normalize_name` alone leaves legal forms attached, so `Hapag-Lloyd` and
+    `Hapag-Lloyd AG` normalise to different strings and the pg_trgm gate
+    (>= 0.85) scores them 0.79 -- just under. Measured on a 3-document news
+    corpus that produced 7 near-duplicate node pairs: CMA CGM / CMA CGM SA,
+    Hapag-Lloyd / Hapag-Lloyd AG, Kovatchev / Stephane Kovatchev.
+
+    Duplicate nodes are not cosmetic: each carries its own edges, so a
+    multi-hop traversal that arrives at one cannot see what is hung off the
+    other -- the same failure that motivated name-level identity below.
+    """
+    base = _normalize_name(name)
+    stripped = _LEGAL_SUFFIX_RE.sub(" ", base)
+    stripped = re.sub(r"\s+", " ", stripped).strip()
+    # Never collapse a name to nothing: "Group" and "Co" are real short names.
+    return stripped or base
+
+
+def _person_surname_merges(
+    names_by_class: dict[str, set[str]],
+    person_class_iris: set[str],
+) -> dict[str, str]:
+    """Merge `Amosi` into `Guy Amosi` -- but never `Utah` into `Utah Utes`.
+
+    Scoped to PERSON-typed entities on purpose. The safe signal is that a
+    person referred to by surname is a strict token SUFFIX of their full name
+    (`Amosi` of `Guy Amosi`, `McMillan` of `Tetairoa McMillan`, `Ben Zvi
+    Klein` of `Or Ben Zvi Klein`), whereas the short forms that must NOT merge
+    are prefixes -- `Utah` of `Utah Utes`, `Arizona` of `Arizona Wildcats`.
+
+    Even so this stays Person-only, because the suffix rule alone would merge
+    `Times` into `New York Times`, and those are different publications.
+    """
+    out: dict[str, str] = {}
+    for cls, names in names_by_class.items():
+        if cls not in person_class_iris:
+            continue
+        ordered = sorted(names, key=lambda n: (-len(n.split()), n))
+        for short in names:
+            st = short.split()
+            for full in ordered:
+                ft = full.split()
+                if len(ft) > len(st) and ft[-len(st):] == st:
+                    out[short] = full
+                    break
+    return out
+
+
+def _word_order_merges(names_by_class: dict[str, set[str]]) -> dict[str, str]:
+    """`Park Naimi` and `Naimi Park` are one thing written two ways.
+
+    Uses exact token-MULTISET equality within a class, which is why it cannot
+    confuse `Arizona State University` with `University of Arizona`: those
+    differ by a token ("state" vs "of"), so their multisets differ.
+    """
+    out: dict[str, str] = {}
+    for names in names_by_class.values():
+        buckets: dict[tuple[str, ...], list[str]] = {}
+        for n in names:
+            buckets.setdefault(tuple(sorted(n.split())), []).append(n)
+        for variants in buckets.values():
+            if len(variants) < 2:
+                continue
+            target = sorted(variants)[0]
+            for v in variants:
+                if v != target:
+                    out[v] = target
+    return out
+
+
+def _resolve_canonical_forms(
+    results: list[Any],
+    person_class_iris: set[str] | None = None,
+) -> tuple[dict[str, str], int]:
+    """Map every extracted name to ONE canonical form for the run.
+
+    Two sources, both grounded in what the model actually saw:
+
+    1. The extractor's own `canonical_name` / `short_name` pairing. When it
+       reports canonical "A.P. Moller-Maersk A/S" with short "Maersk" it is
+       asserting, from that chunk, that the two denote one entity. That pair
+       was previously discarded for identity purposes.
+    2. The legal-suffix-stripped key, which merges `CMA CGM` with
+       `CMA CGM SA`.
+
+    Returns (normalized_variant -> canonical_normalized, n_merged). The
+    surviving form is the LONGEST variant seen, matching the extract prompt's
+    instruction that canonical_name be "the entity's most complete proper
+    name as commonly written".
+    """
+    groups: dict[str, set[str]] = {}
+    longest: dict[str, str] = {}
+
+    def _note(key: str, norm: str) -> None:
+        if not norm:
+            return
+        groups.setdefault(key, set()).add(norm)
+        if len(norm) > len(longest.get(key, "")):
+            longest[key] = norm
+
+    for tup in results or []:
+        if tup is None:
+            continue
+        for e in (tup[3] or []):
+            canon = _normalize_name(e.get("canonical_name") or "")
+            short = _normalize_name(e.get("short_name") or "")
+            if not canon:
+                continue
+            key = _dedup_key(canon)
+            _note(key, canon)
+            # The model's own short form joins the canonical form's group,
+            # even when its stripped key differs ("maersk" vs "a p moller
+            # maersk a s").
+            #
+            # EXCEPT when the short form is a token PREFIX of the canonical
+            # and the entity is not a person. "Utah" reported as the short
+            # form of "Utah Utes", or "Arizona" of "Arizona Wildcats", would
+            # otherwise collapse a state into a sports team. A person's short
+            # form is a suffix (their surname), so people are unaffected --
+            # and a genuine abbreviation ("ASU", "Maersk") is not a prefix
+            # either, so those still merge.
+            if short and short != canon:
+                ct, st_ = canon.split(), short.split()
+                is_prefix = len(st_) < len(ct) and ct[:len(st_)] == st_
+                if not is_prefix or (e.get("class_iri") or "") in (
+                    person_class_iris or set()
+                ):
+                    _note(key, short)
+                    groups.setdefault(_dedup_key(short), set()).add(short)
+
+    alias: dict[str, str] = {}
+    for key, variants in groups.items():
+        target = longest.get(key) or next(iter(variants))
+        for v in variants:
+            if v != target:
+                alias[v] = target
+
+    # Two narrower rules that need the entity's CLASS, so they run separately.
+    names_by_class: dict[str, set[str]] = {}
+    for tup in results or []:
+        if tup is None:
+            continue
+        for e in (tup[3] or []):
+            nrm = _normalize_name(e.get("canonical_name") or "")
+            cls = e.get("class_iri") or ""
+            if nrm and cls:
+                names_by_class.setdefault(cls, set()).add(nrm)
+    for extra in (
+        _person_surname_merges(names_by_class, person_class_iris or set()),
+        _word_order_merges(names_by_class),
+    ):
+        for k, v in extra.items():
+            if k != v and k not in alias:
+                alias[k] = v
+
+    # Collapse chains (a -> b -> c becomes a -> c) so every variant lands on
+    # one final spelling rather than an intermediate one.
+    for k in list(alias):
+        seen = {k}
+        tgt = alias[k]
+        while tgt in alias and tgt not in seen:
+            seen.add(tgt)
+            tgt = alias[tgt]
+        alias[k] = tgt
+    alias = {k: v for k, v in alias.items() if k != v}
+    return alias, len(alias)
+
+
 # Corporate / legal-entity suffixes commonly appended to organization
 # canonical names. Stripping them yields the "short form" the entity is
 # usually referred to in tables and shorthand mentions ("BYD" rather
@@ -1741,6 +1922,67 @@ async def extract_entities(
     # normalized_name -> every class_id the extractor assigned it anywhere, so
     # collapsing to one node still records all of its types.
     extra_type_classes: dict[str, set[Any]] = {}
+
+    # ---- Collapse near-duplicate names BEFORE identity is decided ----------
+    #
+    # Applied here rather than at mint time so that the class vote, the entity
+    # rows and every edge all agree on one spelling. Rewrites canonical_name
+    # in place on the extracted dicts; short_name is left alone because it is
+    # the form the chunk actually used and the table linker wants it.
+    # Person-descendant classes, for the surname rule. Resolved via the same
+    # rdfs:subClassOf walk the predicate menu uses, so a corpus that types
+    # people as `Executive` or `Journalist` is covered without configuration.
+    _person_iris: set[str] = set()
+    async with session_scope() as session:
+        _roots = (await session.execute(
+            select(OntologyClass.iri).where(
+                func.lower(func.replace(OntologyClass.label, " ", "")).in_(
+                    ["person", "agent", "foafperson"])
+            )
+        )).scalars().all()
+        if _roots:
+            _all = (await session.execute(select(OntologyClass.iri))).scalars().all()
+            anc = await session.execute(_ANCESTOR_SQL, {"iris": list(_all)})
+            _rootset = set(_roots)
+            for origin, a in anc.all():
+                if a in _rootset:
+                    _person_iris.add(origin)
+            _person_iris |= _rootset
+
+    _alias_map, _n_alias = _resolve_canonical_forms(results, _person_iris)
+    if _alias_map:
+        _by_norm_canon: dict[str, str] = {}
+        for tup in results:
+            if tup is None:
+                continue
+            for e in (tup[3] or []):
+                nrm = _normalize_name(e.get("canonical_name") or "")
+                tgt = _alias_map.get(nrm)
+                if tgt and tgt != nrm:
+                    # Recover a display form for the target: prefer the
+                    # longest raw spelling seen for it anywhere in the run.
+                    _by_norm_canon.setdefault(tgt, "")
+        for tup in results:
+            if tup is None:
+                continue
+            for e in (tup[3] or []):
+                raw = e.get("canonical_name") or ""
+                nrm = _normalize_name(raw)
+                if nrm in _by_norm_canon and len(raw) > len(_by_norm_canon[nrm]):
+                    _by_norm_canon[nrm] = raw
+        for tup in results:
+            if tup is None:
+                continue
+            for e in (tup[3] or []):
+                nrm = _normalize_name(e.get("canonical_name") or "")
+                tgt = _alias_map.get(nrm)
+                if tgt and tgt != nrm:
+                    e["canonical_name"] = _by_norm_canon.get(tgt) or tgt
+        print(
+            f"[extract-entities] name collapse: {_n_alias} variant spelling(s) "
+            f"merged into their fullest form (legal suffixes + the model's own "
+            f"short_name pairing)"
+        )
 
     # Preload existing (normalized_name, class_id) -> id for O(1) exact match.
     # Cheap: strings + ids (~250 bytes/entity), NOT embeddings.
