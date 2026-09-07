@@ -144,6 +144,7 @@ class RetrievalResult:
     # Stripped from `answer`; surfaced here (and in retrieval_plan) so a
     # regression is measurable instead of silent.
     invalid_citations: list[str] = field(default_factory=list)
+    unsupported_citations: list[dict[str, Any]] = field(default_factory=list)
     cost_usd: float = 0.0
     wall_seconds: float = 0.0
     graph_version: int = 0
@@ -187,6 +188,137 @@ def _citation_key(raw: str) -> str:
     elif s.lower().startswith("viao:"):
         s = s[5:]
     return s.strip().split()[0] if s.strip() else ""
+
+
+# Tokens too generic to identify what a sentence is ABOUT. A citation that
+# shares only these with the sentence has not been shown to support it.
+_CITE_STOPWORDS = frozenset("""
+about above after also andor approved approximately around because before
+being below between both business company could during each either etc
+first following from further given have having however include includes
+including into itself lessltd many more most much must other over patients
+people rather same several should since some such than that their them then
+there these they this those through under until using very were what when
+where which while with within without would year years
+""".split())
+
+_CITE_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _distinctive_terms(text: str) -> set[str]:
+    """Terms that say what a span is ABOUT -- names, codes, dosages.
+
+    Deliberately shallow: lowercase alphanumerics of length >= 4 that are not
+    generic connective vocabulary, plus any token carrying a digit (doses,
+    trial names, standard numbers). Good enough to tell "this sentence is
+    about semaglutide, Ozempic and Wegovy" from "this one is about Mounjaro
+    and Zepbound", which is the discrimination that matters here.
+    """
+    out: set[str] = set()
+    for raw in re.findall(r"[A-Za-z0-9][A-Za-z0-9.\-]*", text or ""):
+        tok = raw.strip(".-").lower()
+        if not tok:
+            continue
+        if any(c.isdigit() for c in tok) and len(tok) >= 2:
+            out.add(tok)
+        elif len(tok) >= 4 and tok not in _CITE_STOPWORDS:
+            out.add(tok)
+    return out
+
+
+_PROPER_NOUN_RE = re.compile(r"\b([A-Z][A-Za-z0-9][A-Za-z0-9.\-]{2,})")
+# Sentence-initial and heading-ish words are capitalised for grammar, not
+# because they name anything.
+_CAP_STOPWORDS = frozenset("""
+The This That These Those They There Their When While Where Which What With
+Under Over After Before Both Each Either Some Such Most Many More Also And
+But For Nor Yet So As At By In On To Up It Its He She His Her One Two Three
+Type Level Phase Stage Class Group Study Trial Data Results Table Figure
+""".split())
+
+
+def _named_things(text: str) -> set[str]:
+    """Capitalised names in a span: brands, companies, people, standards.
+
+    Used instead of rarity weighting, which INVERTS on a topically narrow
+    corpus: measured on the pharma set, `ozempic` and `wegovy` appeared in
+    20+ of 56 artifacts (common, because every document is about them) while
+    `name` and `brand` appeared in 0-1 (rare, and meaningless). Ranking by
+    rarity therefore picked the generic words and discarded the drug names --
+    the exact opposite of what the check needs.
+
+    Capitalisation is the signal that survives that: a sentence about Ozempic
+    and Wegovy and a claim about Mounjaro and Zepbound share topic vocabulary
+    but no NAMES, and the names are what the sentence is asserting about.
+    """
+    out: set[str] = set()
+    for m in _PROPER_NOUN_RE.finditer(text or ""):
+        tok = m.group(1)
+        if tok in _CAP_STOPWORDS:
+            continue
+        # Skip a token only because it OPENS the span -- mid-sentence
+        # capitalisation is meaningful.
+        if m.start() == 0:
+            continue
+        out.add(tok.strip(".-").lower())
+    return out
+
+
+def _unsupported_citations(
+    answer: str, evidence: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Citations that RESOLVE but do not bear on the sentence carrying them.
+
+    `_validate_citations` only asks whether a cited id exists in the evidence
+    set. It cannot tell a supporting citation from a decorative one, and that
+    difference matters more than an unresolvable id: an answer citing a
+    real-but-irrelevant artifact reads as fully sourced and passes every
+    traceability check we have.
+
+    Measured on the pharma corpus, an answer stated "semaglutide is approved
+    for type 2 diabetes under the brand name Ozempic and for weight management
+    under the brand name Wegovy" and cited a Claim reading, in full, "Mounjaro
+    is approved for Type 2 diabetes, while Zepbound is approved for weight
+    management". True fact, resolvable id, wrong source.
+
+    Compares the NAMES each span asserts about (see `_named_things`). A
+    sentence naming things none of which appear in its citation is flagged.
+    Sentences that name nothing are skipped rather than guessed at.
+
+    Flags rather than strips: a sentence may legitimately paraphrase, and
+    silently deleting a citation trades a visible defect for an invisible one.
+    """
+    if not answer or not evidence:
+        return []
+    by_key = {
+        _citation_key(ev["iri"]): _named_things(
+            ev.get("text") or ev.get("snippet") or "")
+        for ev in evidence if ev.get("iri")
+    }
+    if not by_key:
+        return []
+    flagged: list[dict[str, Any]] = []
+    for sent in _CITE_SENT_SPLIT_RE.split(answer):
+        cites = _CITATION_TOKEN_RE.findall(sent)
+        if not cites:
+            continue
+        bare = _CITATION_TOKEN_RE.sub("", sent).strip()
+        names = _named_things(bare)
+        if len(names) < 2:
+            continue          # too little signal to judge; do not guess
+        ids = [p.strip() for c in cites for p in re.split(r"[;,]", c) if p.strip()]
+        for cid in ids:
+            k = _citation_key(cid)
+            cited = by_key.get(k)
+            if cited is None:
+                continue      # unresolvable ids are _validate_citations' job
+            if not (names & cited):
+                flagged.append({
+                    "citation": k,
+                    "sentence": bare[:160],
+                    "names": sorted(names)[:8],
+                })
+    return flagged
 
 
 def _validate_citations(
@@ -983,6 +1115,16 @@ async def retrieve_and_answer(
 
     # Every cited id must resolve to something we actually retrieved.
     answer, invalid_citations = _validate_citations(answer, evidence)
+    # Resolving is not supporting: a citation can point at a real artifact
+    # that says something else. Reported, not stripped -- see the docstring.
+    unsupported_citations = _unsupported_citations(answer, evidence)
+    if unsupported_citations:
+        log.warning(
+            "%d citation(s) resolve but share no distinctive term with the "
+            "sentence citing them: %s",
+            len(unsupported_citations),
+            ", ".join(c["citation"] for c in unsupported_citations[:6]),
+        )
     if invalid_citations:
         log.warning(
             "stripped %d unresolvable citation(s) from the answer: %s",
@@ -997,6 +1139,7 @@ async def retrieve_and_answer(
         evidence=evidence,
         parsed=parsed,
         invalid_citations=invalid_citations,
+        unsupported_citations=unsupported_citations,
         cost_usd=cost,
         wall_seconds=time.time() - t0,
     )
@@ -1894,6 +2037,7 @@ async def _persist_run(
                     # Persisted so citation quality is trendable across runs
                     # rather than only visible in a log line.
                     "invalid_citations": result.invalid_citations,
+                    "unsupported_citations": result.unsupported_citations,
                     # Present only on a reranked run. Says the evidence
                     # ORDER came from distance to the question embedding
                     # while `score` is still the RRF score -- so score is
