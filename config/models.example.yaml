@@ -255,6 +255,18 @@ tasks:
     temperature: 0.0
     max_tokens: 8192          # dense chunks w/ many entities (50 candidate classes) exceed 2048 -> truncation
     response_format: json_object
+  # Second extraction pass over the SAME chunk, asking only for the CONCEPTS
+  # the passage develops (freight rates, consolidation, overcapacity) rather
+  # than the named things it mentions. Runs only with --concept-pass.
+  # Same tier as entity_extract: this is menu-constrained selection, not
+  # synthesis, and the narrowed one-job prompt is what carries the quality.
+  concept_extract:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 600
+    temperature: 0.0
+    max_tokens: 4096          # <=5 concepts per chunk; far smaller than entity_extract
+    response_format: json_object
   # Review pass over what entity_extract just produced: is each entity real,
   # and is its class the right KIND of thing? Only runs with
   # --validate-entities (off by default).

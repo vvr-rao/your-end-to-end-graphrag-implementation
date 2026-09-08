@@ -323,6 +323,7 @@ class EntityExtractSummary:
     # relationship path already had `rel_drops`; this is the entity mirror.
     entity_drops: dict[str, int] = field(default_factory=dict)
     entity_validation: dict[str, int] = field(default_factory=dict)
+    concept_extraction: dict[str, int] = field(default_factory=dict)
     # Names the model declined to type because no candidate class denoted
     # their KIND. A rising count here is the honest signal that the ontology
     # is missing a branch -- act on it with a prune-expand run.
@@ -757,6 +758,23 @@ _MAX_RESCUE_PREDICATES = 60
 # Supporting chunk ids kept per edge (the COUNT is always exact).
 _MAX_SUPPORTING_CHUNKS = 20
 
+_CONCEPT_CLOSURE_SQL = sql_text("""
+WITH RECURSIVE down(id) AS (
+    SELECT oc.id FROM graphrag.ontology_classes oc
+     WHERE lower(oc.label) = ANY(CAST(:labels AS text[]))
+  UNION
+    SELECT gr.source_node_id
+      FROM down
+      JOIN graphrag.graph_relationships gr
+        ON gr.target_node_id = down.id
+       AND gr.source_node_type = 'ontology_class'
+       AND gr.target_node_type = 'ontology_class'
+       AND gr.predicate_label = 'rdfs:subClassOf'
+)
+SELECT oc.iri FROM down JOIN graphrag.ontology_classes oc ON oc.id = down.id
+""")
+
+
 _ANCESTOR_SQL = sql_text("""
 WITH RECURSIVE up(origin, id) AS (
     SELECT oc.iri, oc.id FROM graphrag.ontology_classes oc
@@ -1132,6 +1150,8 @@ async def extract_entities(
     entity_identity: str = "name",
     validate_entities: bool = False,
     validation_rounds: int = 2,
+    concept_pass: bool = False,
+    concept_class_roots: tuple[str, ...] = (),
     filter_candidate_menu: bool = True,
     max_candidate_l2: float | None = None,
     menu_filter_allowlist: frozenset[str] | None = None,
@@ -1251,6 +1271,53 @@ async def extract_entities(
             validate_entities = False
     if validate_entities and validation_rounds < 1:
         validate_entities = False
+    # Same degradation for the concept pass.
+    if concept_pass:
+        try:
+            router.task_spec("concept_extract")
+        except KeyError:
+            print(
+                "[extract-entities] models.yaml has no 'concept_extract' task "
+                "-- running WITHOUT the concept pass. Add it (see "
+                "config/models.example.yaml) to enable --concept-pass."
+            )
+            concept_pass = False
+    # Which classes the concept pass is allowed to assign to, resolved ONCE.
+    #
+    # The prompt tells the model to use only classes denoting an abstract
+    # kind, and on a concept-POOR document it ignores that: measured on a
+    # WIRED product-deals article it typed "laptop" -> Laptop, "speaker" ->
+    # SpeakerDevice, "battery life" -> FitnessDevice -- bare category nouns
+    # forced under concrete product classes, which is precisely the noise the
+    # old proper-noun-only rule existed to prevent. Restricting the MENU makes
+    # those picks impossible instead of merely discouraged; the model's only
+    # remaining options are a real concept class or abstaining.
+    #
+    # Roots come from config and close over subclasses, so a corpus-specific
+    # `AudioTechnology` under `TechnologyConcept` is included automatically.
+    concept_class_iris: set[str] = set()
+    if concept_pass:
+        _roots = [r.strip().lower() for r in concept_class_roots if r and r.strip()]
+        if _roots:
+            async with session_scope() as session:
+                rows = await session.execute(
+                    _CONCEPT_CLOSURE_SQL, {"labels": _roots}
+                )
+                concept_class_iris = {r[0] for r in rows.all()}
+        if not concept_class_iris:
+            print(
+                "[extract-entities] concept pass ON but no class matched "
+                f"extraction.concept_class_roots ({list(concept_class_roots)}) "
+                "-- the ontology has no concept branch, so the pass is "
+                "disabled rather than left to pick from concrete classes."
+            )
+            concept_pass = False
+        else:
+            print(
+                f"[extract-entities] concept pass menu: "
+                f"{len(concept_class_iris)} class(es) under "
+                f"{len(_roots)} configured root(s)"
+            )
 
     # Candidate-menu quality filter, computed ONCE per run: one query over
     # labels + descriptions, no vectors. Withholding a class here is cheaper
@@ -1333,6 +1400,10 @@ async def extract_entities(
     val_stats: dict[str, int] = {
         "clean": 0, "revised": 0, "reclassified": 0, "removed": 0,
         "added": 0, "empty_reextract_rejected": 0, "validator_failed": 0,
+    }
+    concept_stats: dict[str, int] = {
+        "chunks_run": 0, "added": 0, "duplicate_of_entity": 0, "failed": 0,
+        "no_concept_classes": 0,
     }
     abstained: list[dict[str, Any]] = []
     _abstain_sample_cap = 200
@@ -1667,6 +1738,64 @@ async def extract_entities(
                         break
                     val_stats["revised"] += 1
                     kept = revised
+
+            # ---- Concept pass ----
+            #
+            # A separate call asking ONLY for the concepts the passage
+            # develops. `entity_extract` now permits concepts too, but one
+            # call holding both jobs spends its attention on the named
+            # entities: measured on a shipping chunk, widening that prompt
+            # alone moved concept yield 0 -> 1 while the passage developed at
+            # least five. This pass has one job.
+            #
+            # Fails SOFT, like the reviewer: a concept-pass error must not
+            # cost the chunk its named entities, which are already in `kept`.
+            # Menu narrowed to the concept branch. A chunk whose candidates
+            # contain no concept class costs NO call -- on a concept-free
+            # corpus the pass is free, not merely harmless.
+            c_menu = (
+                [c for c in candidates if c["iri"] in concept_class_iris]
+                if concept_pass else []
+            )
+            if concept_pass and not c_menu:
+                concept_stats["no_concept_classes"] += 1
+            if c_menu:
+                concept_stats["chunks_run"] += 1
+                try:
+                    c_sys, c_user = PROMPTS["concept_extract"](txt, c_menu)
+                    c_out = await router.chat(
+                        "concept_extract", system=c_sys, user=c_user
+                    )
+                    c_parsed = _extract_json(c_out.text)
+                    c_iris = {c["iri"] for c in c_menu}
+                    c_kept = (
+                        _filter_entities(
+                            c_parsed.get("entities"), c_iris, ent_drops,
+                            abstained, _abstain_sample_cap,
+                        )
+                        if isinstance(c_parsed, dict)
+                        else []
+                    )
+                    # entity_extract sees the concept classes too (they are
+                    # in the full menu), so it may already have found what
+                    # this pass returns. Dedup on the same normalised key the
+                    # DB upsert uses, so a duplicate is dropped here rather
+                    # than counted twice in the stats.
+                    seen = {_dedup_key(e["canonical_name"]) for e in kept}
+                    for c in c_kept:
+                        key = _dedup_key(c["canonical_name"])
+                        if key in seen:
+                            concept_stats["duplicate_of_entity"] += 1
+                            continue
+                        seen.add(key)
+                        kept.append(c)
+                        concept_stats["added"] += 1
+                except Exception as exc:
+                    concept_stats["failed"] += 1
+                    print(
+                        f"[extract-entities] chunk {chunk_iri} concept pass "
+                        f"failed: {exc}"
+                    )
 
             # ---- Second pass: relationships ----
             #
@@ -2457,6 +2586,17 @@ async def extract_entities(
             f"{val_stats['empty_reextract_rejected']} empty re-extract(s) "
             f"rejected; {val_stats['validator_failed']} validator call(s) "
             f"failed (kept the unreviewed result)"
+        )
+
+    if concept_pass:
+        summary.concept_extraction = dict(concept_stats)
+        print(
+            f"[extract-entities] concept pass: {concept_stats['added']} "
+            f"concept(s) added over {concept_stats['chunks_run']} chunk(s) "
+            f"({concept_stats['duplicate_of_entity']} already found by the "
+            f"entity pass, {concept_stats['no_concept_classes']} chunk(s) had "
+            f"no concept class on the menu and cost no call, "
+            f"{concept_stats['failed']} call(s) failed)"
         )
 
     if extract_relationships:
