@@ -1771,21 +1771,40 @@ async def extract_entities(
             out = _pool[:candidate_classes_per_chunk]
             # Ambiguous keys resolve to nothing rather than an arbitrary
             # winner -- same rule as the menu index, same reason.
-            _ri: dict[str, str | None] = {}
-            _rm: dict[str, dict[str, str]] = {}
-            if recovery_pool:
-                for c in _pool[:recovery_pool]:
+            def _recovery(menu: list[dict[str, str]]) -> tuple[
+                dict[str, str], dict[str, dict[str, str]]
+            ]:
+                """Build the abstention-recovery index. Called once the MENU is
+                final, because the menu is always recoverable whatever its
+                vector rank.
+
+                Pinned and ancestor-closure classes reach the menu without
+                ranking well. `Organization` -- pinned, and offered on every
+                chunk -- sits at MEDIAN RANK 687 of 1524 on the finance build,
+                inside the top-400 pool for only 3 of 27 chunks. So an
+                abstention proposing "Organization" found nothing to resolve
+                against and the entity was dropped, even though that exact
+                class was on the menu the model had been shown. Anything the
+                extractor was offered is by definition an acceptable answer.
+
+                Ambiguous keys still resolve to nothing.
+                """
+                ri: dict[str, str | None] = {}
+                rm: dict[str, dict[str, str]] = {}
+                if not recovery_pool:
+                    return {}, {}
+                for c in list(_pool[:recovery_pool]) + list(menu):
                     key = _normalise_type_label(c["label"])
                     if not key:
                         continue
-                    if key in _ri and _ri[key] != c["iri"]:
-                        _ri[key] = None
+                    if key in ri and ri[key] != c["iri"]:
+                        ri[key] = None
                     else:
-                        _ri.setdefault(key, c["iri"])
-                    _rm[c["iri"]] = {
+                        ri.setdefault(key, c["iri"])
+                    rm[c["iri"]] = {
                         "label": c["label"], "description": c["description"]
                     }
-            recovery_index = {k: v for k, v in _ri.items() if v is not None}
+                return {k: v for k, v in ri.items() if v is not None}, rm
 
             have = {c["iri"] for c in out}
             extra_iris: set[str] = set()
@@ -1799,7 +1818,8 @@ async def extract_entities(
                 }
             extra_iris |= {i for i in pinned_iris if i not in have}
             if not extra_iris:
-                return out, recovery_index, _rm
+                _idx, _meta = _recovery(out)
+                return out, _idx, _meta
             rows = await session.execute(
                 select(
                     OntologyClass.iri, OntologyClass.label, OntologyClass.description
@@ -1809,7 +1829,8 @@ async def extract_entities(
                 out.append({
                     "iri": iri, "label": label or "", "description": descr or ""
                 })
-            return out, recovery_index, _rm
+            _idx, _meta = _recovery(out)
+            return out, _idx, _meta
 
     async def _validate_pass(
         txt: str,
