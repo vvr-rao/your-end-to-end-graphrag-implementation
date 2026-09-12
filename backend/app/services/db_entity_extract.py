@@ -30,6 +30,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
+from collections.abc import Mapping
 from typing import Any
 
 from sqlalchemy import func, select, text as sql_text
@@ -82,12 +83,64 @@ _DROPPING_VERDICTS = {
 }
 
 
+def _build_menu_index(
+    cand_iris: set[str], cand_labels: Mapping[str, str] | None
+) -> dict[str, str]:
+    """Lowercase key -> IRI, for recovering a class named by label.
+
+    Keys are each candidate's IRI local-name and, when the caller supplies
+    them, its label. A key claimed by two DIFFERENT classes is dropped rather
+    than resolved arbitrarily: `foaf#Person` and `org#Person` share a local
+    name, and picking between them by set-iteration order would make
+    extraction non-deterministic across runs.
+    """
+    idx: dict[str, str | None] = {}
+
+    def offer(key: str, iri: str) -> None:
+        key = key.strip().lower()
+        if not key:
+            return
+        if key in idx and idx[key] != iri:
+            idx[key] = None          # ambiguous -- never resolve it
+        else:
+            idx.setdefault(key, iri)
+
+    for iri in cand_iris:
+        offer(iri.rsplit("#", 1)[-1].rsplit("/", 1)[-1], iri)
+    for label, iri in (cand_labels or {}).items():
+        if iri in cand_iris:
+            offer(label, iri)
+    return {k: v for k, v in idx.items() if v is not None}
+
+
+def _resolve_menu_iri(raw: str, menu_index: dict[str, str]) -> str | None:
+    """Recover an off-menu `class_iri` that actually names a menu class.
+
+    MEASURED on the pharma corpus: of 11 off-menu values, 10 were the class
+    LABEL emitted into the IRI field -- "brandnamedrug", "lipaseinhibitor",
+    "semaglutide" -- each of them a class that was on the menu. The model
+    chose correctly and serialised wrongly, and the entity was dropped for it
+    (Ozempic, Wegovy and Orlistat among them). Only 1 of 11 was a genuine
+    invention.
+
+    This is why the rate differed so sharply between corpora: that ontology's
+    labels are lowercase single tokens that look like IRI fragments, while a
+    CamelCase taxonomy ("ContainerShip") does not invite the same slip.
+    """
+    hit = menu_index.get(raw.strip().lower())
+    if hit:
+        return hit
+    tail = raw.rsplit("#", 1)[-1].rsplit("/", 1)[-1]
+    return menu_index.get(tail.strip().lower())
+
+
 def _filter_entities(
     raw_entities: Any,
     cand_iris: set[str],
     ent_drops: dict[str, int],
     abstained: list[dict[str, Any]],
     abstain_cap: int = 200,
+    cand_labels: Mapping[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Validate one `entity_extract` response into the kept-entity list.
 
@@ -99,6 +152,7 @@ def _filter_entities(
     kept: list[dict[str, Any]] = []
     if not isinstance(raw_entities, list):
         return kept
+    menu_index = _build_menu_index(cand_iris, cand_labels)
     for e in raw_entities:
         if not isinstance(e, dict):
             continue
@@ -122,6 +176,17 @@ def _filter_entities(
                     "proposed_type": (e.get("proposed_type") or "").strip(),
                 })
             continue
+        if class_iri and class_iri not in cand_iris:
+            # Before counting this a loss, see whether the value NAMES a class
+            # that is on the menu -- the model routinely writes the label into
+            # the IRI field. Recovered separately from `off_menu_iri` so the
+            # slip stays visible instead of being papered over.
+            recovered = _resolve_menu_iri(class_iri, menu_index)
+            if recovered is not None:
+                class_iri = recovered
+                ent_drops["recovered_label_iri"] = (
+                    ent_drops.get("recovered_label_iri", 0) + 1
+                )
         if not class_iri or class_iri not in cand_iris:
             ent_drops["off_menu_iri"] += 1
             continue
@@ -1396,6 +1461,7 @@ async def extract_entities(
     ent_drops: dict[str, int] = {
         "off_menu_iri": 0, "no_name": 0, "abstained": 0,
         "reviewer_removed": 0, "no_candidates": 0,
+        "recovered_label_iri": 0,
     }
     val_stats: dict[str, int] = {
         "clean": 0, "revised": 0, "reclassified": 0, "removed": 0,
@@ -1651,6 +1717,7 @@ async def extract_entities(
                     c["iri"]: {"label": c["label"], "description": c["description"]}
                     for c in candidates
                 }
+                menu_labels = {c["label"]: c["iri"] for c in candidates}
 
                 async def _extract_pass(
                     feedback: dict[str, Any] | None,
@@ -1682,6 +1749,7 @@ async def extract_entities(
                         ent_drops,
                         abstained,
                         _abstain_sample_cap,
+                        cand_labels=menu_labels,
                     )
 
                 kept = await _extract_pass(None)
@@ -1772,6 +1840,7 @@ async def extract_entities(
                         _filter_entities(
                             c_parsed.get("entities"), c_iris, ent_drops,
                             abstained, _abstain_sample_cap,
+                            cand_labels={c["label"]: c["iri"] for c in c_menu},
                         )
                         if isinstance(c_parsed, dict)
                         else []
@@ -2555,7 +2624,18 @@ async def extract_entities(
     # output to show for it.
     summary.entity_drops = dict(ent_drops)
     summary.abstained_samples = abstained
-    _ent_dropped = sum(ent_drops.values())
+    # `recovered_label_iri` counts entities SAVED, not lost -- excluded from
+    # the drop total so a recovery is never reported as a loss.
+    _recovered = ent_drops.get("recovered_label_iri", 0)
+    _ent_dropped = sum(
+        v for k, v in ent_drops.items() if k != "recovered_label_iri"
+    )
+    if _recovered:
+        print(
+            f"[extract-entities] recovered {_recovered} entity assignment(s) "
+            f"where the model wrote the class LABEL into the class_iri field "
+            f"instead of the IRI. These would previously have been dropped."
+        )
     if _ent_dropped:
         print(
             f"[extract-entities] entity drops: {_ent_dropped} "

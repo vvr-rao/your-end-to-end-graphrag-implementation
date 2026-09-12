@@ -33,7 +33,11 @@ from __future__ import annotations
 import pytest
 import yaml
 
-from backend.app.services.db_entity_extract import _dedup_key, _filter_entities
+from backend.app.services.db_entity_extract import (
+    ABSTAIN_SENTINEL,
+    _dedup_key,
+    _filter_entities,
+)
 from backend.app.services.prompts import (
     PROMPTS,
     concept_extract,
@@ -217,3 +221,101 @@ def test_concept_extract_matches_the_entity_extractor(preset: str) -> None:
         f"{preset}: concept_extract ({tasks['concept_extract']['model']}) has "
         f"drifted from entity_extract ({tasks['entity_extract']['model']})"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Off-menu IRI recovery
+# --------------------------------------------------------------------------- #
+
+
+_MENU_IRIS = {
+    "https://x/merged#brandnamedrug",
+    "https://x/merged#lipaseinhibitor",
+    "http://xmlns.com/foaf/0.1/Person",
+}
+_MENU_LABELS = {
+    "brandnamedrug": "https://x/merged#brandnamedrug",
+    "lipaseinhibitor": "https://x/merged#lipaseinhibitor",
+    "Person": "http://xmlns.com/foaf/0.1/Person",
+}
+
+
+def _fe(entities, drops, **kw):
+    return _filter_entities(entities, _MENU_IRIS, drops, [], 200, **kw)
+
+
+def test_label_written_into_the_iri_field_is_recovered() -> None:
+    """Measured on the pharma corpus: 10 of 11 off-menu values were the class
+    LABEL, not an invented class -- "brandnamedrug", "lipaseinhibitor",
+    "semaglutide", each of them on the menu. Ozempic, Wegovy and Orlistat were
+    dropped over a serialisation slip."""
+    drops = _drops()
+    kept = _fe(
+        [{"canonical_name": "Ozempic", "class_iri": "brandnamedrug"},
+         {"canonical_name": "Orlistat", "class_iri": "lipaseinhibitor"}],
+        drops, cand_labels=_MENU_LABELS,
+    )
+    assert [e["canonical_name"] for e in kept] == ["Ozempic", "Orlistat"]
+    assert kept[0]["class_iri"] == "https://x/merged#brandnamedrug"
+    assert drops["off_menu_iri"] == 0
+    assert drops["recovered_label_iri"] == 2
+
+
+def test_a_genuinely_invented_class_is_still_dropped() -> None:
+    """The recovery must not become a way for hallucinated classes to land.
+    `prescriptiondrug` carries the right namespace and is not a class."""
+    drops = _drops()
+    kept = _fe(
+        [{"canonical_name": "topiramate",
+          "class_iri": "https://x/merged#prescriptiondrug"}],
+        drops, cand_labels=_MENU_LABELS,
+    )
+    assert kept == []
+    assert drops["off_menu_iri"] == 1
+    assert drops.get("recovered_label_iri", 0) == 0
+
+
+def test_recovery_works_from_the_iri_local_name_without_labels() -> None:
+    """Callers that pass no label map still recover, via the IRI local-name --
+    which is what the model usually echoes."""
+    drops = _drops()
+    kept = _fe([{"canonical_name": "Ozempic", "class_iri": "brandnamedrug"}], drops)
+    assert kept and kept[0]["class_iri"] == "https://x/merged#brandnamedrug"
+    assert drops["recovered_label_iri"] == 1
+
+
+def test_an_ambiguous_local_name_is_never_resolved() -> None:
+    """`foaf#Person` and `org#Person` share a local name. Resolving by set
+    iteration order would make extraction non-deterministic across runs, so an
+    ambiguous key resolves to nothing and the entity is dropped as before."""
+    iris = {"http://xmlns.com/foaf/0.1/Person", "http://www.w3.org/ns/org#Person"}
+    drops = _drops()
+    kept = _filter_entities(
+        [{"canonical_name": "Jane", "class_iri": "Person"}], iris, drops, [], 200,
+    )
+    assert kept == []
+    assert drops["off_menu_iri"] == 1
+
+
+def test_recovery_is_counted_apart_from_drops() -> None:
+    """A recovery is an entity SAVED. Folding it into the drop tally would
+    report the fix as damage."""
+    drops = _drops()
+    _fe([{"canonical_name": "Ozempic", "class_iri": "brandnamedrug"}],
+        drops, cand_labels=_MENU_LABELS)
+    assert "recovered_label_iri" in drops
+    assert drops["off_menu_iri"] == 0
+
+
+def test_abstain_still_wins_over_recovery() -> None:
+    """NONE_OF_THESE must never be coerced into a class by the resolver."""
+    drops = _drops()
+    abst: list = []
+    kept = _filter_entities(
+        [{"canonical_name": "Xyz", "class_iri": ABSTAIN_SENTINEL,
+          "proposed_type": "Enzyme"}],
+        _MENU_IRIS, drops, abst, 200, cand_labels=_MENU_LABELS,
+    )
+    assert kept == []
+    assert drops["abstained"] == 1
+    assert drops.get("recovered_label_iri", 0) == 0
