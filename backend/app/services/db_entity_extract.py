@@ -1648,7 +1648,7 @@ async def extract_entities(
     # discards silently, which is how losses stayed invisible. Count instead.
     rel_drops: dict[str, int] = {
         "unresolved": 0, "bad_predicate": 0, "domain_range": 0,
-        "self_loop": 0,
+        "self_loop": 0, "contradictory_direction": 0,
         "no_evidence": 0, "one_sided_evidence": 0,
         "unsupported": 0, "reversed": 0,
     }
@@ -2784,6 +2784,51 @@ async def extract_entities(
                 })
                 rel_by_sig[sig]["_chunks"] = [chunk_id]
 
+        # RECONCILE CONTRADICTIONS ACROSS CHUNKS.
+        #
+        # Each chunk is judged on its own, so nothing stops two passages
+        # asserting the same predicate in opposite directions. Measured on the
+        # finance build: `BHE U.S. Transmission --hasSubOrganization--> MATL
+        # LLP` and `MATL LLP --hasSubOrganization--> BHE U.S. Transmission`
+        # were both written. One of them is necessarily false -- these
+        # predicates are asymmetric -- and a graph asserting both is worse
+        # than one asserting neither, because BFS will happily traverse the
+        # wrong one.
+        #
+        # The tie-break is corroboration: `_chunks` already records how many
+        # independent passages asserted each triple. More passages wins. On a
+        # TIE both are dropped: with one passage each there is no ground to
+        # prefer either, and inventing a preference is how a confident false
+        # edge gets in.
+        #
+        # DIFFERENT predicates between the same pair are left alone. "A
+        # regulates B" and "B is subject to A" are not contradictory, and the
+        # observed case (`AUC --hasSubOrganization--> AltaLink` alongside
+        # `AltaLink --monitors--> AUC`) is two wrong PREDICATES rather than a
+        # direction conflict -- a problem for the menu, not for this pass.
+        _seen_dirs: dict[tuple[Any, str, Any], tuple[Any, str, Any]] = {}
+        _kill: set[tuple[Any, str, Any]] = set()
+        for sig in rel_by_sig:
+            sid, pred, oid = sig
+            mirror = (oid, pred, sid)
+            if mirror in rel_by_sig:
+                pair = (min(str(sid), str(oid)), pred, max(str(sid), str(oid)))
+                if pair in _seen_dirs:
+                    continue
+                _seen_dirs[pair] = sig
+                n_here = len(rel_by_sig[sig].get("_chunks") or [])
+                n_there = len(rel_by_sig[mirror].get("_chunks") or [])
+                if n_here > n_there:
+                    _kill.add(mirror)
+                elif n_there > n_here:
+                    _kill.add(sig)
+                else:
+                    _kill.add(sig)
+                    _kill.add(mirror)
+        for sig in _kill:
+            rel_by_sig.pop(sig, None)
+            rel_drops["contradictory_direction"] += 1
+
         # Fold the supporting-chunk list into extra_metadata. Capped so a
         # heavily-repeated triple cannot grow the JSONB without bound; the
         # count stays exact either way.
@@ -2993,6 +3038,7 @@ async def extract_entities(
             + (f", {_dropped} dropped "
                f"(unresolved={rel_drops['unresolved']}, "
                f"self_loop={rel_drops['self_loop']}, "
+               f"contradictory_direction={rel_drops['contradictory_direction']}, "
                f"bad_predicate={rel_drops['bad_predicate']}, "
                f"domain_range={rel_drops['domain_range']}, "
                f"no_evidence={rel_drops['no_evidence']}, "

@@ -961,3 +961,80 @@ def test_descendant_sql_carries_the_origin_class() -> None:
     sql = str(_DESCENDANT_SQL)
     assert "down(origin, id)" in sql
     assert "SELECT DISTINCT down.origin" in sql
+
+
+# --------------------------------------------------------------------------- #
+# Cross-chunk direction contradictions
+# --------------------------------------------------------------------------- #
+
+
+def _reconcile(by_sig):
+    """The reconciliation the driver performs, in isolation."""
+    seen, kill = {}, set()
+    for sig in by_sig:
+        sid, pred, oid = sig
+        mirror = (oid, pred, sid)
+        if mirror in by_sig:
+            pair = (min(str(sid), str(oid)), pred, max(str(sid), str(oid)))
+            if pair in seen:
+                continue
+            seen[pair] = sig
+            n_here = len(by_sig[sig].get("_chunks") or [])
+            n_there = len(by_sig[mirror].get("_chunks") or [])
+            if n_here > n_there:
+                kill.add(mirror)
+            elif n_there > n_here:
+                kill.add(sig)
+            else:
+                kill.add(sig)
+                kill.add(mirror)
+    return {k: v for k, v in by_sig.items() if k not in kill}, len(kill)
+
+
+def test_better_corroborated_direction_survives() -> None:
+    """Each chunk is judged alone, so nothing stops two passages asserting the
+    same asymmetric predicate both ways -- measured on the finance build with
+    `BHE U.S. Transmission --hasSubOrganization--> MATL LLP` and its mirror.
+    `_chunks` already records how many passages asserted each triple."""
+    by_sig = {
+        ("A", "p", "B"): {"_chunks": [1, 2]},
+        ("B", "p", "A"): {"_chunks": [3]},
+    }
+    kept, n = _reconcile(by_sig)
+    assert list(kept) == [("A", "p", "B")]
+    assert n == 1
+
+
+def test_a_tie_drops_both_rather_than_picking() -> None:
+    """One passage each gives no ground to prefer either. Inventing a
+    preference is how a confident false edge gets in, and a graph asserting
+    both directions is worse than one asserting neither -- BFS will traverse
+    the wrong one."""
+    by_sig = {
+        ("A", "p", "B"): {"_chunks": [1]},
+        ("B", "p", "A"): {"_chunks": [2]},
+    }
+    kept, n = _reconcile(by_sig)
+    assert kept == {}
+    assert n == 2
+
+
+def test_different_predicates_between_the_same_pair_are_left_alone() -> None:
+    """"A regulates B" and "B is subject to A" are not contradictory. The
+    observed `AUC --hasSubOrganization--> AltaLink` / `AltaLink --monitors-->
+    AUC` case is two wrong PREDICATES, a menu problem, not a direction one."""
+    by_sig = {
+        ("A", "p", "B"): {"_chunks": [1]},
+        ("B", "q", "A"): {"_chunks": [2]},
+    }
+    kept, n = _reconcile(by_sig)
+    assert len(kept) == 2 and n == 0
+
+
+def test_ordinary_edges_are_untouched() -> None:
+    by_sig = {
+        ("A", "p", "B"): {"_chunks": [1]},
+        ("C", "p", "D"): {"_chunks": [2]},
+    }
+    kept, n = _reconcile(by_sig)
+    assert len(kept) == 2 and n == 0
