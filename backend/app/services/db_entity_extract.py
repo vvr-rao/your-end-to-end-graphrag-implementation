@@ -2379,33 +2379,54 @@ async def extract_entities(
 
     _alias_map, _n_alias = _resolve_canonical_forms(results, _person_iris)
     if _alias_map:
-        _by_norm_canon: dict[str, str] = {}
+        # Display form for every normalised key: the longest RAW spelling seen
+        # anywhere in the run. Built over ALL entities, not just merge targets
+        # -- the old version registered only targets, so a target that no
+        # entity spelled out kept an empty string and the rewrite fell through
+        # to the NORMALISED key. That is how "Ozempic (semaglutide)" was stored
+        # as `ozempic semaglutide` and a bylined author as
+        # `phuoc anh anne nguyen pharmd ms bcps`: lowercased, punctuation
+        # stripped, and then unfindable, since entity seeding matches on
+        # similarity >= 0.4 and "wegovy" scores 0.163 against
+        # "wegovy semaglutide injection and oral pill".
+        _raw_of: dict[str, str] = {}
         for tup in results:
             if tup is None:
                 continue
             for e in (tup[3] or []):
-                nrm = _normalize_name(e.get("canonical_name") or "")
-                tgt = _alias_map.get(nrm)
-                if tgt and tgt != nrm:
-                    # Recover a display form for the target: prefer the
-                    # longest raw spelling seen for it anywhere in the run.
-                    _by_norm_canon.setdefault(tgt, "")
-        for tup in results:
-            if tup is None:
-                continue
-            for e in (tup[3] or []):
-                raw = e.get("canonical_name") or ""
+                raw = (e.get("canonical_name") or "").strip()
+                if not raw:
+                    continue
                 nrm = _normalize_name(raw)
-                if nrm in _by_norm_canon and len(raw) > len(_by_norm_canon[nrm]):
-                    _by_norm_canon[nrm] = raw
+                if len(raw) > len(_raw_of.get(nrm, "")):
+                    _raw_of[nrm] = raw
+        # A target may be a spelling no entity used as its canonical_name (it
+        # can come from a short_name or from the word-order/surname merges).
+        # Fall back to the best raw form among the variants that alias TO it.
+        _variants_of: dict[str, list[str]] = {}
+        for variant, target in _alias_map.items():
+            _variants_of.setdefault(target, []).append(variant)
+
+        def _display_for(target: str, own: str) -> str:
+            best = _raw_of.get(target, "")
+            for v in _variants_of.get(target, ()):
+                cand = _raw_of.get(v, "")
+                if len(cand) > len(best):
+                    best = cand
+            # Never store a normalised key as a display name: keeping the
+            # entity's OWN spelling is wrong-but-readable, which beats
+            # wrong-and-lowercased.
+            return best or own
+
         for tup in results:
             if tup is None:
                 continue
             for e in (tup[3] or []):
-                nrm = _normalize_name(e.get("canonical_name") or "")
+                own = (e.get("canonical_name") or "").strip()
+                nrm = _normalize_name(own)
                 tgt = _alias_map.get(nrm)
                 if tgt and tgt != nrm:
-                    e["canonical_name"] = _by_norm_canon.get(tgt) or tgt
+                    e["canonical_name"] = _display_for(tgt, own)
         print(
             f"[extract-entities] name collapse: {_n_alias} variant spelling(s) "
             f"merged into their fullest form (legal suffixes + the model's own "

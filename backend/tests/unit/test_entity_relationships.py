@@ -848,3 +848,83 @@ def test_self_loop_is_counted_not_silently_dropped() -> None:
     src = inspect.getsource(m.extract_entities)
     assert '"self_loop": 0' in src or "'self_loop': 0" in src
     assert 'rel_drops["self_loop"] += 1' in src
+
+
+# --------------------------------------------------------------------------- #
+# Display names must never be the normalised key
+# --------------------------------------------------------------------------- #
+
+
+def _name_collapse(results, person_iris=None):
+    """Re-run the name-collapse rewrite the driver performs, in isolation."""
+    from backend.app.services.db_entity_extract import (
+        _normalize_name,
+        _resolve_canonical_forms,
+    )
+
+    alias, _n = _resolve_canonical_forms(results, person_iris or set())
+    raw_of: dict[str, str] = {}
+    for tup in results:
+        for e in (tup[3] or []):
+            raw = (e.get("canonical_name") or "").strip()
+            if raw and len(raw) > len(raw_of.get(_normalize_name(raw), "")):
+                raw_of[_normalize_name(raw)] = raw
+    variants_of: dict[str, list[str]] = {}
+    for v, t in alias.items():
+        variants_of.setdefault(t, []).append(v)
+    out = []
+    for tup in results:
+        for e in (tup[3] or []):
+            own = (e.get("canonical_name") or "").strip()
+            tgt = alias.get(_normalize_name(own))
+            if tgt and tgt != _normalize_name(own):
+                best = raw_of.get(tgt, "")
+                for v in variants_of.get(tgt, ()):
+                    if len(raw_of.get(v, "")) > len(best):
+                        best = raw_of[v]
+                out.append(best or own)
+            else:
+                out.append(own)
+    return out
+
+
+def test_collapsed_name_is_never_the_normalised_key() -> None:
+    """Measured on the pharma build: 12 of 155 entity names were stored as
+    their own `normalized_name` -- lowercased, punctuation stripped:
+
+        "Ozempic (semaglutide)"                   -> ozempic semaglutide
+        "Phuoc Anh Anne Nguyen, PharmD, MS, BCPS" -> phuoc anh anne nguyen ...
+
+    Not cosmetic: entity seeding matches on similarity >= 0.4, and "wegovy"
+    scores 0.163 against "wegovy semaglutide injection and oral pill", so the
+    node exists and can never be found by name.
+    """
+    results = [(
+        None, None, None,
+        [{"canonical_name": "Ozempic (semaglutide)", "short_name": "Ozempic",
+          "class_iri": "#Drug"},
+         {"canonical_name": "Ozempic", "short_name": "Ozempic",
+          "class_iri": "#Drug"}],
+        None,
+    )]
+    for name in _name_collapse(results):
+        assert name != name.lower() or " " not in name, (
+            f"{name!r} looks like a normalised key, not a display name"
+        )
+        assert name in ("Ozempic (semaglutide)", "Ozempic"), name
+
+
+def test_merge_still_happens_it_is_only_the_spelling_that_changed() -> None:
+    """The fix must not stop the collapse -- a legal-suffix variant and its
+    short form still resolve to one node."""
+    from backend.app.services.db_entity_extract import _resolve_canonical_forms
+    results = [(
+        None, None, None,
+        [{"canonical_name": "CMA CGM SA", "short_name": "CMA CGM",
+          "class_iri": "#Org"},
+         {"canonical_name": "CMA CGM", "short_name": "CMA CGM",
+          "class_iri": "#Org"}],
+        None,
+    )]
+    alias, n = _resolve_canonical_forms(results, set())
+    assert n >= 1 and alias
