@@ -1491,6 +1491,7 @@ async def extract_entities(
     # Roots come from config and close over subclasses, so a corpus-specific
     # `AudioTechnology` under `TechnologyConcept` is included automatically.
     concept_class_iris: set[str] = set()
+    concept_root_iris: set[str] = set()
     if concept_pass:
         _roots = [r.strip().lower() for r in concept_class_roots if r and r.strip()]
         if _roots:
@@ -1499,6 +1500,20 @@ async def extract_entities(
                     _CONCEPT_CLOSURE_SQL, {"labels": _roots}
                 )
                 concept_class_iris = {r[0] for r in rows.all()}
+                # The roots themselves, kept apart from their descendants.
+                # A concept typed to a ROOT can never take part in a
+                # relationship: no object property declares `Process` or
+                # `PolicyConcept` as a domain or range, so "energy efficiency
+                # programs -> Process" ended the run with 0 edges while
+                # "rate change -> RateChange" got one. Rendering the roots
+                # LAST makes the specific classes the ones the model reads
+                # first.
+                rr = await session.execute(
+                    select(OntologyClass.iri).where(
+                        func.lower(OntologyClass.label).in_(_roots)
+                    )
+                )
+                concept_root_iris = set(rr.scalars().all())
         if not concept_class_iris:
             print(
                 "[extract-entities] concept pass ON but no class matched "
@@ -2019,8 +2034,15 @@ async def extract_entities(
             # Menu narrowed to the concept branch. A chunk whose candidates
             # contain no concept class costs NO call -- on a concept-free
             # corpus the pass is free, not merely harmless.
+            # Specific classes first, broad roots last -- see the note where
+            # `concept_root_iris` is resolved. Order only; nothing is withheld,
+            # because a genuinely generic concept ("inflation") may have no
+            # narrower class and must still be typeable.
             c_menu = (
-                [c for c in candidates if c["iri"] in concept_class_iris]
+                sorted(
+                    (c for c in candidates if c["iri"] in concept_class_iris),
+                    key=lambda c: c["iri"] in concept_root_iris,
+                )
                 if concept_pass else []
             )
             if concept_pass and not c_menu:

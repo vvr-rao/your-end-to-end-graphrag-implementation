@@ -405,3 +405,26 @@ def test_recovery_is_inert_without_an_index() -> None:
         {"https://x/merged#Person"}, drops, abst, 200,
     )
     assert kept == [] and drops["abstained"] == 1
+
+
+def test_concept_menu_ordering_not_prompt_wording_carries_specificity() -> None:
+    """A concept filed under a catch-all root can never be linked: no object
+    property declares `Process` or `PolicyConcept` as a domain or range.
+    Measured on the finance build -- "rate change" -> RateChange carried an
+    edge, "energy efficiency programs" -> Process carried none.
+
+    The fix is the MENU ORDER (specific classes first, roots last), applied in
+    `_candidate_classes`. A prompt rule was tried and REMOVED: naming the
+    catch-alls in order to discourage them primed the model to use them.
+    Four-arm A/B over 12 chunks, % of concepts on a specific class:
+
+        original order, no rule    55%
+        specific-first, no rule    60%   <- kept
+        original order, rule on    52%
+        specific-first, rule on    43%   <- worst
+
+    This test pins the removal so the rule does not get helpfully re-added.
+    """
+    c_sys, _ = concept_extract("text", _CANDIDATES)
+    assert "MOST SPECIFIC" not in c_sys
+    assert "last resort" not in c_sys.lower()
