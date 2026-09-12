@@ -1012,8 +1012,11 @@ async def _rescue_relationships(
     for rel in (parsed.get("relationships") or []):
         if not isinstance(rel, dict):
             continue
-        s_ent = ent_by_norm.get(_normalize_name(rel.get("subject") or ""))
-        o_ent = ent_by_norm.get(_normalize_name(rel.get("object") or ""))
+        # No type hint available here (the wide menu's constraints are not
+        # threaded in), so this resolves on name alone -- exact, else a single
+        # unambiguous word-boundary prefix candidate. It never guesses.
+        s_ent = _resolve_entity_ref(rel.get("subject") or "", ent_by_norm)
+        o_ent = _resolve_entity_ref(rel.get("object") or "", ent_by_norm)
         pred = (rel.get("predicate_iri") or "").strip()
         if s_ent is None or o_ent is None or pred not in known_iris:
             continue
@@ -1127,6 +1130,60 @@ async def _verify_relationships(
             continue
         rel_drops["unsupported"] += 1
     return out
+
+
+def _resolve_entity_ref(
+    raw: str,
+    by_norm: dict[str, dict[str, Any]],
+    *,
+    expect_class: str | None = None,
+    ancestors: dict[str, set[str]] | None = None,
+) -> dict[str, Any] | None:
+    """Match a name the model returned back to an extracted entity.
+
+    The relationship pass is handed each entity's `canonical_name` and asked to
+    echo it. It does not, reliably: measured on a utility 10-K it was given
+    "MidAmerican Energy Company" and answered "MidAmerican Energy", and the
+    exact-dict lookup dropped every claim about it as `unresolved` -- 13 of 150
+    drops on that run, 12 of 65 on a pharma run, including relationships that
+    were correct.
+
+    Exact (normalised) match first. On a miss, fall back to WORD-BOUNDARY
+    prefix candidates in either direction -- but only commit when exactly one
+    survives, because guessing here writes a wrong edge. "MidAmerican Energy"
+    prefix-matches three entities on that corpus (`...Company`, `...Services`,
+    `...wind facilities repowering`), so name alone is not enough.
+
+    `expect_class` is the predicate's declared domain (for a subject) or range
+    (for an object). Using it to filter candidates is what makes the ambiguous
+    case resolvable without guessing: `hasMember` declares domain Organization,
+    which picks `MidAmerican Energy Company` over the `Repowering` one. When
+    the filter leaves more than one candidate, the claim is still dropped.
+    """
+    n = _normalize_name(raw or "")
+    if not n:
+        return None
+    hit = by_norm.get(n)
+    if hit is not None:
+        return hit
+    seen_ids: set[int] = set()
+    cands: list[dict[str, Any]] = []
+    for key, ent in by_norm.items():
+        if key == n or not key:
+            continue
+        # Word-boundary containment only: "Craig" must not match "Craigslist".
+        if key.startswith(n + " ") or n.startswith(key + " "):
+            if id(ent) not in seen_ids:
+                seen_ids.add(id(ent))
+                cands.append(ent)
+    if len(cands) > 1 and expect_class and ancestors is not None:
+        typed = [
+            c for c in cands
+            if expect_class in ancestors.get(c["class_iri"], {c["class_iri"]})
+        ]
+        if typed:
+            cands = typed
+    return cands[0] if len(cands) == 1 else None
 
 
 async def _candidate_predicates(
@@ -1514,6 +1571,7 @@ async def extract_entities(
     # discards silently, which is how losses stayed invisible. Count instead.
     rel_drops: dict[str, int] = {
         "unresolved": 0, "bad_predicate": 0, "domain_range": 0,
+        "self_loop": 0,
         "no_evidence": 0, "one_sided_evidence": 0,
         "unsupported": 0, "reversed": 0,
     }
@@ -2048,22 +2106,31 @@ async def extract_entities(
                         for rel in (r_parsed.get("relationships") or []):
                             if not isinstance(rel, dict):
                                 continue
-                            s_ent = _by_norm.get(
-                                _normalize_name(rel.get("subject") or "")
-                            )
-                            o_ent = _by_norm.get(
-                                _normalize_name(rel.get("object") or "")
-                            )
+                            # Predicate FIRST: its declared domain/range is
+                            # what disambiguates an inexact entity reference,
+                            # so it has to be known before resolving the ends.
                             pred = (rel.get("predicate_iri") or "").strip()
-                            if s_ent is None or o_ent is None:
-                                rel_drops["unresolved"] += 1
-                                continue
-                            if s_ent["canonical_name"] == o_ent["canonical_name"]:
-                                continue
                             if pred not in pred_constraints:
                                 rel_drops["bad_predicate"] += 1
                                 continue
                             dom_iri, rng_iri = pred_constraints[pred]
+                            s_ent = _resolve_entity_ref(
+                                rel.get("subject") or "", _by_norm,
+                                expect_class=dom_iri, ancestors=pred_ancestors,
+                            )
+                            o_ent = _resolve_entity_ref(
+                                rel.get("object") or "", _by_norm,
+                                expect_class=rng_iri, ancestors=pred_ancestors,
+                            )
+                            if s_ent is None or o_ent is None:
+                                rel_drops["unresolved"] += 1
+                                continue
+                            if s_ent["canonical_name"] == o_ent["canonical_name"]:
+                                # A self-loop asserts nothing. Counted rather
+                                # than dropped silently -- a bare `continue`
+                                # here is how the entity path hid its losses.
+                                rel_drops["self_loop"] += 1
+                                continue
                             s_cls, o_cls = s_ent["class_iri"], o_ent["class_iri"]
                             _type_ok = (
                                 dom_iri in pred_ancestors.get(s_cls, {s_cls})
@@ -2820,6 +2887,7 @@ async def extract_entities(
             f"{len(rel_payloads)} written"
             + (f", {_dropped} dropped "
                f"(unresolved={rel_drops['unresolved']}, "
+               f"self_loop={rel_drops['self_loop']}, "
                f"bad_predicate={rel_drops['bad_predicate']}, "
                f"domain_range={rel_drops['domain_range']}, "
                f"no_evidence={rel_drops['no_evidence']}, "

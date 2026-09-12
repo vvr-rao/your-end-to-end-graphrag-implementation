@@ -16,7 +16,6 @@ import pytest
 
 from backend.app.services.prompts import entity_extract
 
-
 _CLASSES = [
     {"iri": "http://x#Org", "label": "Organization", "description": "a company"},
     {"iri": "http://x#Country", "label": "Country", "description": "a country"},
@@ -751,3 +750,101 @@ def test_relationship_prompt_asks_for_completeness_without_dropping_precision() 
     assert "do not use world knowledge" in low
     assert "it must name both" in low
     assert "read your own quote before emitting" in low
+
+
+# --------------------------------------------------------------------------- #
+# Entity-reference resolution in the relationship pass
+# --------------------------------------------------------------------------- #
+
+
+def _rel_ents():
+    from backend.app.services.db_entity_extract import _normalize_name
+    ents = [
+        {"canonical_name": "MidAmerican Energy Company", "class_iri": "#Org"},
+        {"canonical_name": "MidAmerican Energy Services", "class_iri": "#Org"},
+        {"canonical_name": "MidAmerican Energy wind facilities repowering",
+         "class_iri": "#Repowering"},
+        {"canonical_name": "PacifiCorp", "class_iri": "#Org"},
+    ]
+    return {_normalize_name(e["canonical_name"]): e for e in ents}
+
+
+_REL_ANC = {"#Org": {"#Org", "#Agent"}, "#Repowering": {"#Repowering", "#Process"}}
+
+
+def test_exact_name_still_resolves() -> None:
+    from backend.app.services.db_entity_extract import _resolve_entity_ref
+    hit = _resolve_entity_ref("PacifiCorp", _rel_ents())
+    assert hit and hit["canonical_name"] == "PacifiCorp"
+
+
+def test_shortened_name_resolves_when_unambiguous() -> None:
+    """The pass is handed `canonical_name` and asked to echo it; it does not.
+    Measured on a utility 10-K: given "MidAmerican Energy Company" it answered
+    "MidAmerican Energy", and every claim about it died as `unresolved`."""
+    from backend.app.services.db_entity_extract import (
+        _normalize_name,
+        _resolve_entity_ref,
+    )
+    by = {_normalize_name("Hapag-Lloyd AG"):
+          {"canonical_name": "Hapag-Lloyd AG", "class_iri": "#Org"}}
+    hit = _resolve_entity_ref("Hapag-Lloyd", by)
+    assert hit and hit["canonical_name"] == "Hapag-Lloyd AG"
+
+
+def test_ambiguous_name_refuses_rather_than_guessing() -> None:
+    """"MidAmerican Energy" prefix-matches three entities on the real corpus.
+    Picking one would write a WRONG edge, which is worse than dropping."""
+    from backend.app.services.db_entity_extract import _resolve_entity_ref
+    assert _resolve_entity_ref("MidAmerican Energy", _rel_ents()) is None
+
+
+def test_predicate_type_disambiguates_without_guessing() -> None:
+    """The predicate's declared domain/range is what makes the ambiguous case
+    resolvable: only one candidate is a Process."""
+    from backend.app.services.db_entity_extract import _resolve_entity_ref
+    hit = _resolve_entity_ref(
+        "MidAmerican Energy", _rel_ents(),
+        expect_class="#Process", ancestors=_REL_ANC,
+    )
+    assert hit["canonical_name"] == "MidAmerican Energy wind facilities repowering"
+
+
+def test_type_hint_that_leaves_two_candidates_still_refuses() -> None:
+    """Two of the three are Organizations, so an Organization-domain predicate
+    narrows nothing. The claim must still be dropped."""
+    from backend.app.services.db_entity_extract import _resolve_entity_ref
+    assert _resolve_entity_ref(
+        "MidAmerican Energy", _rel_ents(),
+        expect_class="#Org", ancestors=_REL_ANC,
+    ) is None
+
+
+def test_prefix_match_respects_word_boundaries() -> None:
+    """"Craig" must not match "Craigslist" -- substring matching here would
+    invent relationships between unrelated entities."""
+    from backend.app.services.db_entity_extract import (
+        _normalize_name,
+        _resolve_entity_ref,
+    )
+    by = {_normalize_name("Craigslist"):
+          {"canonical_name": "Craigslist", "class_iri": "#Org"}}
+    assert _resolve_entity_ref("Craig", by) is None
+
+
+def test_empty_reference_resolves_to_nothing() -> None:
+    from backend.app.services.db_entity_extract import _resolve_entity_ref
+    assert _resolve_entity_ref("", _rel_ents()) is None
+    assert _resolve_entity_ref("   ", _rel_ents()) is None
+
+
+def test_self_loop_is_counted_not_silently_dropped() -> None:
+    """A bare `continue` here is exactly how the entity path hid its losses
+    until `ent_drops` was added. `self_loop` must be a named counter."""
+    import inspect
+
+    from backend.app.services import db_entity_extract as m
+
+    src = inspect.getsource(m.extract_entities)
+    assert '"self_loop": 0' in src or "'self_loop': 0" in src
+    assert 'rel_drops["self_loop"] += 1' in src
