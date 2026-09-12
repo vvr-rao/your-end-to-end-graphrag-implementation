@@ -456,3 +456,28 @@ def test_recovery_index_is_built_after_the_menu_is_final() -> None:
     # and the menu must actually be folded in alongside the pool
     body = src[build:build + 2000]
     assert "list(_pool[:recovery_pool]) + list(menu)" in body
+
+
+def test_abstain_demands_a_proposed_type_imperatively() -> None:
+    """`proposed_type` is what abstention recovery resolves against, so an
+    abstention without one is unrecoverable by construction.
+
+    Three wordings A/B'd over 27 finance chunks, % of abstentions carrying a
+    type, and NET entities (directly kept + recoverable):
+
+        A  current, "put your own short type name ... so the gap can be seen"
+             43% typed,  73 typed,   9 recoverable,  NET 424
+        B  imperative, "MUST ... REQUIRED ... never be empty or omitted"
+            100% typed, 235 typed,  40 recoverable,  NET 443   <- shipped
+        C  reason-giving, "that name is used to look for a class you were
+           NOT shown ... one left empty is discarded"
+              0% typed  <- the model omitted the field entirely
+
+    C is the counter-intuitive one and was verified against raw responses
+    rather than assumed: explaining WHY buried the instruction and compliance
+    collapsed to zero. Blunt beats motivated here.
+    """
+    sys_p, _ = entity_extract("text", _CANDIDATES)
+    assert "MUST also fill in" in sys_p
+    assert "REQUIRED" in sys_p
+    assert "never be empty or omitted" in sys_p
