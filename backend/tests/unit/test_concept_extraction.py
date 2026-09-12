@@ -319,3 +319,89 @@ def test_abstain_still_wins_over_recovery() -> None:
     assert kept == []
     assert drops["abstained"] == 1
     assert drops.get("recovered_label_iri", 0) == 0
+
+
+# --------------------------------------------------------------------------- #
+# Abstention recovery via proposed_type
+# --------------------------------------------------------------------------- #
+
+
+_TYPE_INDEX = {
+    "coffeemaker": "https://x/merged#CoffeeMaker",
+    "vacuumcleaner": "https://x/merged#VacuumCleaner",
+}
+
+
+def test_abstention_recovered_when_the_proposed_class_exists() -> None:
+    """Measured on 20 news chunks: of 29 distinct `proposed_type` values, 15
+    (51%) named a class ALREADY in the ontology -- CoffeeMaker, VacuumCleaner,
+    MeshRouter, VideoGame -- which simply never reached that chunk's top-K
+    menu. The model could not pick what it was not shown, so it abstained and
+    a real entity was discarded over a ranking miss.
+    """
+    drops = _drops()
+    abst: list = []
+    kept = _filter_entities(
+        [{"canonical_name": "Keurig K-Express", "class_iri": ABSTAIN_SENTINEL,
+          "proposed_type": "coffee maker"}],
+        {"https://x/merged#Person"}, drops, abst, 200, type_index=_TYPE_INDEX,
+    )
+    assert [e["class_iri"] for e in kept] == ["https://x/merged#CoffeeMaker"]
+    assert drops["abstained"] == 0
+    assert drops["recovered_proposed_type"] == 1
+    assert abst == []
+
+
+def test_a_real_ontology_gap_still_abstains() -> None:
+    """The recovery must not mask the signal it is filtering. `Processor` and
+    `PoliticalParty` genuinely do not exist, and those abstentions are what a
+    prune-expand run should act on."""
+    drops = _drops()
+    abst: list = []
+    kept = _filter_entities(
+        [{"canonical_name": "AMD Ryzen 7", "class_iri": ABSTAIN_SENTINEL,
+          "proposed_type": "Processor"}],
+        {"https://x/merged#Person"}, drops, abst, 200, type_index=_TYPE_INDEX,
+    )
+    assert kept == []
+    assert drops["abstained"] == 1
+    assert drops.get("recovered_proposed_type", 0) == 0
+    assert abst[0]["proposed_type"] == "Processor"
+
+
+def test_abstention_with_no_proposed_type_is_untouched() -> None:
+    drops = _drops()
+    abst: list = []
+    kept = _filter_entities(
+        [{"canonical_name": "Thing", "class_iri": ABSTAIN_SENTINEL}],
+        {"https://x/merged#Person"}, drops, abst, 200, type_index=_TYPE_INDEX,
+    )
+    assert kept == [] and drops["abstained"] == 1
+
+
+def test_type_lookup_folds_spacing_and_case_but_is_not_fuzzy() -> None:
+    """"coffee maker" must reach CoffeeMaker; "coffee machine" must NOT reach
+    anything. A near-miss here recreates the wrong-class problem the abstain
+    path exists to prevent."""
+    for proposed, expect in (("Coffee Maker", True), ("coffee-maker", True),
+                             ("COFFEEMAKER", True), ("coffee machine", False),
+                             ("maker", False)):
+        drops = _drops()
+        kept = _filter_entities(
+            [{"canonical_name": "X", "class_iri": ABSTAIN_SENTINEL,
+              "proposed_type": proposed}],
+            {"https://x/merged#Person"}, drops, [], 200, type_index=_TYPE_INDEX,
+        )
+        assert bool(kept) is expect, f"{proposed!r} resolved={bool(kept)}"
+
+
+def test_recovery_is_inert_without_an_index() -> None:
+    """Callers that pass no index keep the old behaviour exactly."""
+    drops = _drops()
+    abst: list = []
+    kept = _filter_entities(
+        [{"canonical_name": "Keurig", "class_iri": ABSTAIN_SENTINEL,
+          "proposed_type": "coffee maker"}],
+        {"https://x/merged#Person"}, drops, abst, 200,
+    )
+    assert kept == [] and drops["abstained"] == 1

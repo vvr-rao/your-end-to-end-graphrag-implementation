@@ -911,6 +911,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_ext.add_argument(
+        "--recovery-pool", type=int, default=None,
+        help=(
+            "How far abstention recovery may reach, in classes, measured by "
+            "vector distance from the chunk (unset => extraction.recovery_pool, "
+            "default 400; 0 disables). When the model answers NONE_OF_THESE it "
+            "names the type it wanted, and ~half the time that class already "
+            "exists and merely missed the top-K menu -- the entity was lost to "
+            "a ranking miss, not an ontology gap. Bounded to the chunk's "
+            "neighbourhood so an exact name match cannot pull in a homonym."
+        ),
+    )
+    p_ext.add_argument(
         "--no-menu-filter", action="store_true",
         help=(
             "Do NOT withhold instance-shaped and disjunction-shaped class "
@@ -1870,6 +1882,8 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
             concept_pass=_concepts,
             concept_class_roots=tuple(
                 _extraction_cfg().get("concept_class_roots") or ()),
+            recovery_pool=int(_resolve_extraction_opt(
+                args, "recovery_pool", "recovery_pool", 400)),
             filter_candidate_menu=_menu_filter,
             max_candidate_l2=float(_l2) if _l2 is not None else None,
             menu_filter_allowlist=_allow or None,
