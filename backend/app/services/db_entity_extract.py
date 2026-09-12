@@ -878,6 +878,23 @@ _MAX_RESCUE_PREDICATES = 60
 # Supporting chunk ids kept per edge (the COUNT is always exact).
 _MAX_SUPPORTING_CHUNKS = 20
 
+_DESCENDANT_SQL = sql_text("""
+WITH RECURSIVE down(origin, id) AS (
+    SELECT oc.iri, oc.id FROM graphrag.ontology_classes oc
+     WHERE oc.iri = ANY(CAST(:iris AS text[]))
+  UNION
+    SELECT down.origin, gr.source_node_id
+      FROM down JOIN graphrag.graph_relationships gr
+        ON gr.target_node_id = down.id
+       AND gr.source_node_type = 'ontology_class'
+       AND gr.target_node_type = 'ontology_class'
+       AND gr.predicate_label  = 'rdfs:subClassOf'
+)
+SELECT DISTINCT down.origin, oc.iri
+  FROM down JOIN graphrag.ontology_classes oc ON oc.id = down.id
+""")
+
+
 _CONCEPT_CLOSURE_SQL = sql_text("""
 WITH RECURSIVE down(id) AS (
     SELECT oc.id FROM graphrag.ontology_classes oc
@@ -1225,6 +1242,34 @@ async def _candidate_predicates(
     ancestors: dict[str, set[str]] = {c: {c} for c in class_iris}
     for origin, anc in r.all():
         ancestors.setdefault(origin, {origin}).add(anc)
+
+    # DESCENDANTS TOO, and this is the difference between a usable menu and a
+    # starved one. Walking only UPWARD means a generically-typed entity can
+    # never use a specifically-declared predicate: an entity typed
+    # `Organization` fails every predicate whose domain is `pipelineoperator`,
+    # even though pipeline operators ARE organizations. Measured on the
+    # finance build, that left a MEDIAN OF 8 PREDICATES OUT OF 563 per chunk
+    # -- so the model, holding 8-15 entities, forced real relationships onto
+    # whatever it had been shown. One chunk put 10 proposals through
+    # `hasMember`, every one junk.
+    #
+    # This is also what OWL actually means. `rdfs:domain` is an INFERENCE rule,
+    # not a constraint: asserting `X hasPipeline Y` entails that X is a
+    # pipeline operator, it does not require X to have been typed one first.
+    # The old reading treated it as a precondition.
+    #
+    # It does NOT open the gate to unrelated pairs. The two classes must still
+    # share an IS-A line, so `PolicyConcept` still fails a predicate whose
+    # range is `Agent` -- which is what correctly rejected
+    # `PacifiCorp --hasMember--> renewable resource`. And every claim still has
+    # to quote text that names both ends and survive the direction auditor.
+    # Descendants are attributed PER CLASS, exactly as ancestors are, so the
+    # per-claim check keeps requiring domain/range to sit on the same IS-A line
+    # as that entity's own class. A shared pool would let any entity satisfy
+    # any other entity's subtree, which is a different and much looser rule.
+    r = await session.execute(_DESCENDANT_SQL, {"iris": list(class_iris)})
+    for origin, desc in r.all():
+        ancestors.setdefault(origin, {origin}).add(desc)
     expanded = {a for anc in ancestors.values() for a in anc} | set(class_iris)
 
     r = await session.execute(

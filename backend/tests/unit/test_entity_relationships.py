@@ -928,3 +928,36 @@ def test_merge_still_happens_it_is_only_the_spelling_that_changed() -> None:
     )]
     alias, n = _resolve_canonical_forms(results, set())
     assert n >= 1 and alias
+
+
+def test_predicate_matching_walks_the_isa_line_both_ways() -> None:
+    """Walking only UPWARD starves the menu: an entity typed `Organization`
+    fails every predicate whose domain is `pipelineoperator`, even though
+    pipeline operators ARE organizations. Measured on the finance build that
+    left a median of 8 predicates out of 563 per chunk, and the model forced
+    real relationships onto whatever it had -- one chunk put 10 proposals
+    through `hasMember`, all junk.
+
+    `rdfs:domain` is an INFERENCE rule in OWL, not a precondition. What must
+    NOT change is that unrelated classes stay rejected: the two must still
+    share an IS-A line.
+    """
+    import inspect
+
+    from backend.app.services import db_entity_extract as m
+
+    src = inspect.getsource(m._candidate_predicates)
+    assert "_DESCENDANT_SQL" in src, "descendants are not consulted"
+    # Per-class attribution, not a shared pool -- a shared pool would let any
+    # entity satisfy any OTHER entity's subtree.
+    assert "ancestors.setdefault(origin, {origin}).add(desc)" in src
+
+
+def test_descendant_sql_carries_the_origin_class() -> None:
+    """Without `origin` the query returns a union and descendants cannot be
+    attributed to the class they belong to."""
+    from backend.app.services.db_entity_extract import _DESCENDANT_SQL
+
+    sql = str(_DESCENDANT_SQL)
+    assert "down(origin, id)" in sql
+    assert "SELECT DISTINCT down.origin" in sql
