@@ -878,6 +878,23 @@ _MAX_RESCUE_PREDICATES = 60
 # Supporting chunk ids kept per edge (the COUNT is always exact).
 _MAX_SUPPORTING_CHUNKS = 20
 
+_DESCENDANT_SQL = sql_text("""
+WITH RECURSIVE down(origin, id) AS (
+    SELECT oc.iri, oc.id FROM graphrag.ontology_classes oc
+     WHERE oc.iri = ANY(CAST(:iris AS text[]))
+  UNION
+    SELECT down.origin, gr.source_node_id
+      FROM down JOIN graphrag.graph_relationships gr
+        ON gr.target_node_id = down.id
+       AND gr.source_node_type = 'ontology_class'
+       AND gr.target_node_type = 'ontology_class'
+       AND gr.predicate_label  = 'rdfs:subClassOf'
+)
+SELECT DISTINCT down.origin, oc.iri
+  FROM down JOIN graphrag.ontology_classes oc ON oc.id = down.id
+""")
+
+
 _CONCEPT_CLOSURE_SQL = sql_text("""
 WITH RECURSIVE down(id) AS (
     SELECT oc.id FROM graphrag.ontology_classes oc
@@ -1012,8 +1029,11 @@ async def _rescue_relationships(
     for rel in (parsed.get("relationships") or []):
         if not isinstance(rel, dict):
             continue
-        s_ent = ent_by_norm.get(_normalize_name(rel.get("subject") or ""))
-        o_ent = ent_by_norm.get(_normalize_name(rel.get("object") or ""))
+        # No type hint available here (the wide menu's constraints are not
+        # threaded in), so this resolves on name alone -- exact, else a single
+        # unambiguous word-boundary prefix candidate. It never guesses.
+        s_ent = _resolve_entity_ref(rel.get("subject") or "", ent_by_norm)
+        o_ent = _resolve_entity_ref(rel.get("object") or "", ent_by_norm)
         pred = (rel.get("predicate_iri") or "").strip()
         if s_ent is None or o_ent is None or pred not in known_iris:
             continue
@@ -1068,12 +1088,29 @@ async def _verify_relationships(
     though, so a model that skips a claim does not smuggle it through.
     """
     label_of = {p["iri"]: (p.get("label") or p["iri"]) for p in pred_list}
-    claims = [{
-        "subject": r["subject"],
-        "object": r["object"],
-        "predicate_label": label_of.get(r["predicate_iri"], r["predicate_iri"]),
-        "evidence": r["evidence"],
-    } for r in rels]
+    # The declared domain/range travel with each claim so the auditor can see
+    # what the predicate MEANS, not just its camelCase name. Measured: it
+    # affirmed "Northern Powergrid --monitors--> Gas and Electricity Markets
+    # Authority" against a quote reading "enforced BY the Authority", and
+    # "BHE GT&S --hasMember--> FERC" against "rate-regulated BY the Federal
+    # Energy...". Knowing hasMember runs <Organization> -> <Agent> makes a
+    # regulator in the object slot visibly wrong.
+    shape_of = {
+        p["iri"]: (p.get("domain_label") or "", p.get("range_label") or "")
+        for p in pred_list
+    }
+    claims = []
+    for r in rels:
+        dom_lbl, rng_lbl = shape_of.get(r["predicate_iri"], ("", ""))
+        claims.append({
+            "subject": r["subject"],
+            "object": r["object"],
+            "predicate_label": label_of.get(
+                r["predicate_iri"], r["predicate_iri"]),
+            "domain_label": dom_lbl,
+            "range_label": rng_lbl,
+            "evidence": r["evidence"],
+        })
 
     try:
         v_sys, v_user = PROMPTS["relationship_verify"](chunk_text, claims)
@@ -1129,6 +1166,60 @@ async def _verify_relationships(
     return out
 
 
+def _resolve_entity_ref(
+    raw: str,
+    by_norm: dict[str, dict[str, Any]],
+    *,
+    expect_class: str | None = None,
+    ancestors: dict[str, set[str]] | None = None,
+) -> dict[str, Any] | None:
+    """Match a name the model returned back to an extracted entity.
+
+    The relationship pass is handed each entity's `canonical_name` and asked to
+    echo it. It does not, reliably: measured on a utility 10-K it was given
+    "MidAmerican Energy Company" and answered "MidAmerican Energy", and the
+    exact-dict lookup dropped every claim about it as `unresolved` -- 13 of 150
+    drops on that run, 12 of 65 on a pharma run, including relationships that
+    were correct.
+
+    Exact (normalised) match first. On a miss, fall back to WORD-BOUNDARY
+    prefix candidates in either direction -- but only commit when exactly one
+    survives, because guessing here writes a wrong edge. "MidAmerican Energy"
+    prefix-matches three entities on that corpus (`...Company`, `...Services`,
+    `...wind facilities repowering`), so name alone is not enough.
+
+    `expect_class` is the predicate's declared domain (for a subject) or range
+    (for an object). Using it to filter candidates is what makes the ambiguous
+    case resolvable without guessing: `hasMember` declares domain Organization,
+    which picks `MidAmerican Energy Company` over the `Repowering` one. When
+    the filter leaves more than one candidate, the claim is still dropped.
+    """
+    n = _normalize_name(raw or "")
+    if not n:
+        return None
+    hit = by_norm.get(n)
+    if hit is not None:
+        return hit
+    seen_ids: set[int] = set()
+    cands: list[dict[str, Any]] = []
+    for key, ent in by_norm.items():
+        if key == n or not key:
+            continue
+        # Word-boundary containment only: "Craig" must not match "Craigslist".
+        if key.startswith(n + " ") or n.startswith(key + " "):
+            if id(ent) not in seen_ids:
+                seen_ids.add(id(ent))
+                cands.append(ent)
+    if len(cands) > 1 and expect_class and ancestors is not None:
+        typed = [
+            c for c in cands
+            if expect_class in ancestors.get(c["class_iri"], {c["class_iri"]})
+        ]
+        if typed:
+            cands = typed
+    return cands[0] if len(cands) == 1 else None
+
+
 async def _candidate_predicates(
     session: AsyncSession, class_iris: set[str]
 ) -> tuple[list[dict[str, str]], dict[str, tuple[str, str]], dict[str, set[str]]]:
@@ -1151,6 +1242,34 @@ async def _candidate_predicates(
     ancestors: dict[str, set[str]] = {c: {c} for c in class_iris}
     for origin, anc in r.all():
         ancestors.setdefault(origin, {origin}).add(anc)
+
+    # DESCENDANTS TOO, and this is the difference between a usable menu and a
+    # starved one. Walking only UPWARD means a generically-typed entity can
+    # never use a specifically-declared predicate: an entity typed
+    # `Organization` fails every predicate whose domain is `pipelineoperator`,
+    # even though pipeline operators ARE organizations. Measured on the
+    # finance build, that left a MEDIAN OF 8 PREDICATES OUT OF 563 per chunk
+    # -- so the model, holding 8-15 entities, forced real relationships onto
+    # whatever it had been shown. One chunk put 10 proposals through
+    # `hasMember`, every one junk.
+    #
+    # This is also what OWL actually means. `rdfs:domain` is an INFERENCE rule,
+    # not a constraint: asserting `X hasPipeline Y` entails that X is a
+    # pipeline operator, it does not require X to have been typed one first.
+    # The old reading treated it as a precondition.
+    #
+    # It does NOT open the gate to unrelated pairs. The two classes must still
+    # share an IS-A line, so `PolicyConcept` still fails a predicate whose
+    # range is `Agent` -- which is what correctly rejected
+    # `PacifiCorp --hasMember--> renewable resource`. And every claim still has
+    # to quote text that names both ends and survive the direction auditor.
+    # Descendants are attributed PER CLASS, exactly as ancestors are, so the
+    # per-claim check keeps requiring domain/range to sit on the same IS-A line
+    # as that entity's own class. A shared pool would let any entity satisfy
+    # any other entity's subtree, which is a different and much looser rule.
+    r = await session.execute(_DESCENDANT_SQL, {"iris": list(class_iris)})
+    for origin, desc in r.all():
+        ancestors.setdefault(origin, {origin}).add(desc)
     expanded = {a for anc in ancestors.values() for a in anc} | set(class_iris)
 
     r = await session.execute(
@@ -1417,6 +1536,7 @@ async def extract_entities(
     # Roots come from config and close over subclasses, so a corpus-specific
     # `AudioTechnology` under `TechnologyConcept` is included automatically.
     concept_class_iris: set[str] = set()
+    concept_root_iris: set[str] = set()
     if concept_pass:
         _roots = [r.strip().lower() for r in concept_class_roots if r and r.strip()]
         if _roots:
@@ -1425,6 +1545,20 @@ async def extract_entities(
                     _CONCEPT_CLOSURE_SQL, {"labels": _roots}
                 )
                 concept_class_iris = {r[0] for r in rows.all()}
+                # The roots themselves, kept apart from their descendants.
+                # A concept typed to a ROOT can never take part in a
+                # relationship: no object property declares `Process` or
+                # `PolicyConcept` as a domain or range, so "energy efficiency
+                # programs -> Process" ended the run with 0 edges while
+                # "rate change -> RateChange" got one. Rendering the roots
+                # LAST makes the specific classes the ones the model reads
+                # first.
+                rr = await session.execute(
+                    select(OntologyClass.iri).where(
+                        func.lower(OntologyClass.label).in_(_roots)
+                    )
+                )
+                concept_root_iris = set(rr.scalars().all())
         if not concept_class_iris:
             print(
                 "[extract-entities] concept pass ON but no class matched "
@@ -1514,6 +1648,7 @@ async def extract_entities(
     # discards silently, which is how losses stayed invisible. Count instead.
     rel_drops: dict[str, int] = {
         "unresolved": 0, "bad_predicate": 0, "domain_range": 0,
+        "self_loop": 0, "contradictory_direction": 0,
         "no_evidence": 0, "one_sided_evidence": 0,
         "unsupported": 0, "reversed": 0,
     }
@@ -1944,8 +2079,15 @@ async def extract_entities(
             # Menu narrowed to the concept branch. A chunk whose candidates
             # contain no concept class costs NO call -- on a concept-free
             # corpus the pass is free, not merely harmless.
+            # Specific classes first, broad roots last -- see the note where
+            # `concept_root_iris` is resolved. Order only; nothing is withheld,
+            # because a genuinely generic concept ("inflation") may have no
+            # narrower class and must still be typeable.
             c_menu = (
-                [c for c in candidates if c["iri"] in concept_class_iris]
+                sorted(
+                    (c for c in candidates if c["iri"] in concept_class_iris),
+                    key=lambda c: c["iri"] in concept_root_iris,
+                )
                 if concept_pass else []
             )
             if concept_pass and not c_menu:
@@ -2048,22 +2190,31 @@ async def extract_entities(
                         for rel in (r_parsed.get("relationships") or []):
                             if not isinstance(rel, dict):
                                 continue
-                            s_ent = _by_norm.get(
-                                _normalize_name(rel.get("subject") or "")
-                            )
-                            o_ent = _by_norm.get(
-                                _normalize_name(rel.get("object") or "")
-                            )
+                            # Predicate FIRST: its declared domain/range is
+                            # what disambiguates an inexact entity reference,
+                            # so it has to be known before resolving the ends.
                             pred = (rel.get("predicate_iri") or "").strip()
-                            if s_ent is None or o_ent is None:
-                                rel_drops["unresolved"] += 1
-                                continue
-                            if s_ent["canonical_name"] == o_ent["canonical_name"]:
-                                continue
                             if pred not in pred_constraints:
                                 rel_drops["bad_predicate"] += 1
                                 continue
                             dom_iri, rng_iri = pred_constraints[pred]
+                            s_ent = _resolve_entity_ref(
+                                rel.get("subject") or "", _by_norm,
+                                expect_class=dom_iri, ancestors=pred_ancestors,
+                            )
+                            o_ent = _resolve_entity_ref(
+                                rel.get("object") or "", _by_norm,
+                                expect_class=rng_iri, ancestors=pred_ancestors,
+                            )
+                            if s_ent is None or o_ent is None:
+                                rel_drops["unresolved"] += 1
+                                continue
+                            if s_ent["canonical_name"] == o_ent["canonical_name"]:
+                                # A self-loop asserts nothing. Counted rather
+                                # than dropped silently -- a bare `continue`
+                                # here is how the entity path hid its losses.
+                                rel_drops["self_loop"] += 1
+                                continue
                             s_cls, o_cls = s_ent["class_iri"], o_ent["class_iri"]
                             _type_ok = (
                                 dom_iri in pred_ancestors.get(s_cls, {s_cls})
@@ -2273,33 +2424,54 @@ async def extract_entities(
 
     _alias_map, _n_alias = _resolve_canonical_forms(results, _person_iris)
     if _alias_map:
-        _by_norm_canon: dict[str, str] = {}
+        # Display form for every normalised key: the longest RAW spelling seen
+        # anywhere in the run. Built over ALL entities, not just merge targets
+        # -- the old version registered only targets, so a target that no
+        # entity spelled out kept an empty string and the rewrite fell through
+        # to the NORMALISED key. That is how "Ozempic (semaglutide)" was stored
+        # as `ozempic semaglutide` and a bylined author as
+        # `phuoc anh anne nguyen pharmd ms bcps`: lowercased, punctuation
+        # stripped, and then unfindable, since entity seeding matches on
+        # similarity >= 0.4 and "wegovy" scores 0.163 against
+        # "wegovy semaglutide injection and oral pill".
+        _raw_of: dict[str, str] = {}
         for tup in results:
             if tup is None:
                 continue
             for e in (tup[3] or []):
-                nrm = _normalize_name(e.get("canonical_name") or "")
-                tgt = _alias_map.get(nrm)
-                if tgt and tgt != nrm:
-                    # Recover a display form for the target: prefer the
-                    # longest raw spelling seen for it anywhere in the run.
-                    _by_norm_canon.setdefault(tgt, "")
-        for tup in results:
-            if tup is None:
-                continue
-            for e in (tup[3] or []):
-                raw = e.get("canonical_name") or ""
+                raw = (e.get("canonical_name") or "").strip()
+                if not raw:
+                    continue
                 nrm = _normalize_name(raw)
-                if nrm in _by_norm_canon and len(raw) > len(_by_norm_canon[nrm]):
-                    _by_norm_canon[nrm] = raw
+                if len(raw) > len(_raw_of.get(nrm, "")):
+                    _raw_of[nrm] = raw
+        # A target may be a spelling no entity used as its canonical_name (it
+        # can come from a short_name or from the word-order/surname merges).
+        # Fall back to the best raw form among the variants that alias TO it.
+        _variants_of: dict[str, list[str]] = {}
+        for variant, target in _alias_map.items():
+            _variants_of.setdefault(target, []).append(variant)
+
+        def _display_for(target: str, own: str) -> str:
+            best = _raw_of.get(target, "")
+            for v in _variants_of.get(target, ()):
+                cand = _raw_of.get(v, "")
+                if len(cand) > len(best):
+                    best = cand
+            # Never store a normalised key as a display name: keeping the
+            # entity's OWN spelling is wrong-but-readable, which beats
+            # wrong-and-lowercased.
+            return best or own
+
         for tup in results:
             if tup is None:
                 continue
             for e in (tup[3] or []):
-                nrm = _normalize_name(e.get("canonical_name") or "")
+                own = (e.get("canonical_name") or "").strip()
+                nrm = _normalize_name(own)
                 tgt = _alias_map.get(nrm)
                 if tgt and tgt != nrm:
-                    e["canonical_name"] = _by_norm_canon.get(tgt) or tgt
+                    e["canonical_name"] = _display_for(tgt, own)
         print(
             f"[extract-entities] name collapse: {_n_alias} variant spelling(s) "
             f"merged into their fullest form (legal suffixes + the model's own "
@@ -2612,6 +2784,51 @@ async def extract_entities(
                 })
                 rel_by_sig[sig]["_chunks"] = [chunk_id]
 
+        # RECONCILE CONTRADICTIONS ACROSS CHUNKS.
+        #
+        # Each chunk is judged on its own, so nothing stops two passages
+        # asserting the same predicate in opposite directions. Measured on the
+        # finance build: `BHE U.S. Transmission --hasSubOrganization--> MATL
+        # LLP` and `MATL LLP --hasSubOrganization--> BHE U.S. Transmission`
+        # were both written. One of them is necessarily false -- these
+        # predicates are asymmetric -- and a graph asserting both is worse
+        # than one asserting neither, because BFS will happily traverse the
+        # wrong one.
+        #
+        # The tie-break is corroboration: `_chunks` already records how many
+        # independent passages asserted each triple. More passages wins. On a
+        # TIE both are dropped: with one passage each there is no ground to
+        # prefer either, and inventing a preference is how a confident false
+        # edge gets in.
+        #
+        # DIFFERENT predicates between the same pair are left alone. "A
+        # regulates B" and "B is subject to A" are not contradictory, and the
+        # observed case (`AUC --hasSubOrganization--> AltaLink` alongside
+        # `AltaLink --monitors--> AUC`) is two wrong PREDICATES rather than a
+        # direction conflict -- a problem for the menu, not for this pass.
+        _seen_dirs: dict[tuple[Any, str, Any], tuple[Any, str, Any]] = {}
+        _kill: set[tuple[Any, str, Any]] = set()
+        for sig in rel_by_sig:
+            sid, pred, oid = sig
+            mirror = (oid, pred, sid)
+            if mirror in rel_by_sig:
+                pair = (min(str(sid), str(oid)), pred, max(str(sid), str(oid)))
+                if pair in _seen_dirs:
+                    continue
+                _seen_dirs[pair] = sig
+                n_here = len(rel_by_sig[sig].get("_chunks") or [])
+                n_there = len(rel_by_sig[mirror].get("_chunks") or [])
+                if n_here > n_there:
+                    _kill.add(mirror)
+                elif n_there > n_here:
+                    _kill.add(sig)
+                else:
+                    _kill.add(sig)
+                    _kill.add(mirror)
+        for sig in _kill:
+            rel_by_sig.pop(sig, None)
+            rel_drops["contradictory_direction"] += 1
+
         # Fold the supporting-chunk list into extra_metadata. Capped so a
         # heavily-repeated triple cannot grow the JSONB without bound; the
         # count stays exact either way.
@@ -2820,6 +3037,8 @@ async def extract_entities(
             f"{len(rel_payloads)} written"
             + (f", {_dropped} dropped "
                f"(unresolved={rel_drops['unresolved']}, "
+               f"self_loop={rel_drops['self_loop']}, "
+               f"contradictory_direction={rel_drops['contradictory_direction']}, "
                f"bad_predicate={rel_drops['bad_predicate']}, "
                f"domain_range={rel_drops['domain_range']}, "
                f"no_evidence={rel_drops['no_evidence']}, "

@@ -1811,11 +1811,20 @@ def relationship_verify(
       "reversed"   -- the quote states it with subject and object swapped
       "unsupported"-- the quote does not state this claim at all
     """
-    claim_lines = "\n".join(
-        f'  [{i}] {c["subject"]} --{c["predicate_label"]}--> {c["object"]}\n'
-        f'      quote: "{c["evidence"]}"'
-        for i, c in enumerate(claims)
-    )
+    def _claim_line(i: int, c: dict[str, Any]) -> str:
+        # The declared domain/range are rendered when the caller supplies them.
+        # Without it the auditor sees only a camelCase label and has to guess
+        # the predicate's semantics -- which is how "Northern Powergrid
+        # --monitors--> Gas and Electricity Markets Authority" was affirmed
+        # against a quote reading "enforced BY the Authority".
+        shape = ""
+        if c.get("domain_label") and c.get("range_label"):
+            shape = (f'\n      means: <{c["domain_label"]}> '
+                     f'{c["predicate_label"]} <{c["range_label"]}>')
+        return (f'  [{i}] {c["subject"]} --{c["predicate_label"]}--> '
+                f'{c["object"]}{shape}\n      quote: "{c["evidence"]}"')
+
+    claim_lines = "\n".join(_claim_line(i, c) for i, c in enumerate(claims))
     system = (
         "You audit extracted relationship claims against the quote offered as "
         "proof. Return ONE JSON object and nothing else -- no prose, no "
@@ -1836,6 +1845,20 @@ def relationship_verify(
         "them related.\n"
         '  - Direction is the point. "lawsuits filed against A by B" means B '
         "sued A.\n"
+        "  - PASSIVE VOICE INVERTS THE DIRECTION, and it is the single most "
+        "common way these claims go wrong. \"A's licenses are enforced by B\" "
+        "means B enforces A. \"A is regulated by B\", \"A is owned by B\", "
+        "\"A is a subsidiary of B\", \"A was acquired by B\" all put B in the "
+        "SUBJECT position. Before answering \"supported\", find the actor in "
+        "the quote and check it is on the left of the arrow.\n"
+        "  - A LIST IS NOT AN ASSERTION. A quote that just enumerates names -- "
+        "separated by commas, semicolons or parentheses, as in \"B Transmission "
+        "(B Canada/AltaLink); B Renewables; HomeServices\" -- states that these "
+        "things exist, not how they relate. Answer \"unsupported\".\n"
+        "  - Check the claim against the \"means:\" line when one is given. If "
+        "the subject is not the kind of thing the predicate takes on the left, "
+        "the claim is at best reversed, and more likely unsupported: a "
+        "REGULATOR is not a MEMBER of the company it regulates.\n"
         "  - Be strict. When in doubt, answer \"unsupported\" -- a dropped "
         "true edge costs far less than a confident false one.\n"
         "  - Return a verdict for EVERY index, exactly once."

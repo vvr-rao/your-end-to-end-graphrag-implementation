@@ -16,7 +16,6 @@ import pytest
 
 from backend.app.services.prompts import entity_extract
 
-
 _CLASSES = [
     {"iri": "http://x#Org", "label": "Organization", "description": "a company"},
     {"iri": "http://x#Country", "label": "Country", "description": "a country"},
@@ -751,3 +750,291 @@ def test_relationship_prompt_asks_for_completeness_without_dropping_precision() 
     assert "do not use world knowledge" in low
     assert "it must name both" in low
     assert "read your own quote before emitting" in low
+
+
+# --------------------------------------------------------------------------- #
+# Entity-reference resolution in the relationship pass
+# --------------------------------------------------------------------------- #
+
+
+def _rel_ents():
+    from backend.app.services.db_entity_extract import _normalize_name
+    ents = [
+        {"canonical_name": "MidAmerican Energy Company", "class_iri": "#Org"},
+        {"canonical_name": "MidAmerican Energy Services", "class_iri": "#Org"},
+        {"canonical_name": "MidAmerican Energy wind facilities repowering",
+         "class_iri": "#Repowering"},
+        {"canonical_name": "PacifiCorp", "class_iri": "#Org"},
+    ]
+    return {_normalize_name(e["canonical_name"]): e for e in ents}
+
+
+_REL_ANC = {"#Org": {"#Org", "#Agent"}, "#Repowering": {"#Repowering", "#Process"}}
+
+
+def test_exact_name_still_resolves() -> None:
+    from backend.app.services.db_entity_extract import _resolve_entity_ref
+    hit = _resolve_entity_ref("PacifiCorp", _rel_ents())
+    assert hit and hit["canonical_name"] == "PacifiCorp"
+
+
+def test_shortened_name_resolves_when_unambiguous() -> None:
+    """The pass is handed `canonical_name` and asked to echo it; it does not.
+    Measured on a utility 10-K: given "MidAmerican Energy Company" it answered
+    "MidAmerican Energy", and every claim about it died as `unresolved`."""
+    from backend.app.services.db_entity_extract import (
+        _normalize_name,
+        _resolve_entity_ref,
+    )
+    by = {_normalize_name("Hapag-Lloyd AG"):
+          {"canonical_name": "Hapag-Lloyd AG", "class_iri": "#Org"}}
+    hit = _resolve_entity_ref("Hapag-Lloyd", by)
+    assert hit and hit["canonical_name"] == "Hapag-Lloyd AG"
+
+
+def test_ambiguous_name_refuses_rather_than_guessing() -> None:
+    """"MidAmerican Energy" prefix-matches three entities on the real corpus.
+    Picking one would write a WRONG edge, which is worse than dropping."""
+    from backend.app.services.db_entity_extract import _resolve_entity_ref
+    assert _resolve_entity_ref("MidAmerican Energy", _rel_ents()) is None
+
+
+def test_predicate_type_disambiguates_without_guessing() -> None:
+    """The predicate's declared domain/range is what makes the ambiguous case
+    resolvable: only one candidate is a Process."""
+    from backend.app.services.db_entity_extract import _resolve_entity_ref
+    hit = _resolve_entity_ref(
+        "MidAmerican Energy", _rel_ents(),
+        expect_class="#Process", ancestors=_REL_ANC,
+    )
+    assert hit["canonical_name"] == "MidAmerican Energy wind facilities repowering"
+
+
+def test_type_hint_that_leaves_two_candidates_still_refuses() -> None:
+    """Two of the three are Organizations, so an Organization-domain predicate
+    narrows nothing. The claim must still be dropped."""
+    from backend.app.services.db_entity_extract import _resolve_entity_ref
+    assert _resolve_entity_ref(
+        "MidAmerican Energy", _rel_ents(),
+        expect_class="#Org", ancestors=_REL_ANC,
+    ) is None
+
+
+def test_prefix_match_respects_word_boundaries() -> None:
+    """"Craig" must not match "Craigslist" -- substring matching here would
+    invent relationships between unrelated entities."""
+    from backend.app.services.db_entity_extract import (
+        _normalize_name,
+        _resolve_entity_ref,
+    )
+    by = {_normalize_name("Craigslist"):
+          {"canonical_name": "Craigslist", "class_iri": "#Org"}}
+    assert _resolve_entity_ref("Craig", by) is None
+
+
+def test_empty_reference_resolves_to_nothing() -> None:
+    from backend.app.services.db_entity_extract import _resolve_entity_ref
+    assert _resolve_entity_ref("", _rel_ents()) is None
+    assert _resolve_entity_ref("   ", _rel_ents()) is None
+
+
+def test_self_loop_is_counted_not_silently_dropped() -> None:
+    """A bare `continue` here is exactly how the entity path hid its losses
+    until `ent_drops` was added. `self_loop` must be a named counter."""
+    import inspect
+
+    from backend.app.services import db_entity_extract as m
+
+    src = inspect.getsource(m.extract_entities)
+    assert '"self_loop": 0' in src or "'self_loop': 0" in src
+    assert 'rel_drops["self_loop"] += 1' in src
+
+
+# --------------------------------------------------------------------------- #
+# Display names must never be the normalised key
+# --------------------------------------------------------------------------- #
+
+
+def _name_collapse(results, person_iris=None):
+    """Re-run the name-collapse rewrite the driver performs, in isolation."""
+    from backend.app.services.db_entity_extract import (
+        _normalize_name,
+        _resolve_canonical_forms,
+    )
+
+    alias, _n = _resolve_canonical_forms(results, person_iris or set())
+    raw_of: dict[str, str] = {}
+    for tup in results:
+        for e in (tup[3] or []):
+            raw = (e.get("canonical_name") or "").strip()
+            if raw and len(raw) > len(raw_of.get(_normalize_name(raw), "")):
+                raw_of[_normalize_name(raw)] = raw
+    variants_of: dict[str, list[str]] = {}
+    for v, t in alias.items():
+        variants_of.setdefault(t, []).append(v)
+    out = []
+    for tup in results:
+        for e in (tup[3] or []):
+            own = (e.get("canonical_name") or "").strip()
+            tgt = alias.get(_normalize_name(own))
+            if tgt and tgt != _normalize_name(own):
+                best = raw_of.get(tgt, "")
+                for v in variants_of.get(tgt, ()):
+                    if len(raw_of.get(v, "")) > len(best):
+                        best = raw_of[v]
+                out.append(best or own)
+            else:
+                out.append(own)
+    return out
+
+
+def test_collapsed_name_is_never_the_normalised_key() -> None:
+    """Measured on the pharma build: 12 of 155 entity names were stored as
+    their own `normalized_name` -- lowercased, punctuation stripped:
+
+        "Ozempic (semaglutide)"                   -> ozempic semaglutide
+        "Phuoc Anh Anne Nguyen, PharmD, MS, BCPS" -> phuoc anh anne nguyen ...
+
+    Not cosmetic: entity seeding matches on similarity >= 0.4, and "wegovy"
+    scores 0.163 against "wegovy semaglutide injection and oral pill", so the
+    node exists and can never be found by name.
+    """
+    results = [(
+        None, None, None,
+        [{"canonical_name": "Ozempic (semaglutide)", "short_name": "Ozempic",
+          "class_iri": "#Drug"},
+         {"canonical_name": "Ozempic", "short_name": "Ozempic",
+          "class_iri": "#Drug"}],
+        None,
+    )]
+    for name in _name_collapse(results):
+        assert name != name.lower() or " " not in name, (
+            f"{name!r} looks like a normalised key, not a display name"
+        )
+        assert name in ("Ozempic (semaglutide)", "Ozempic"), name
+
+
+def test_merge_still_happens_it_is_only_the_spelling_that_changed() -> None:
+    """The fix must not stop the collapse -- a legal-suffix variant and its
+    short form still resolve to one node."""
+    from backend.app.services.db_entity_extract import _resolve_canonical_forms
+    results = [(
+        None, None, None,
+        [{"canonical_name": "CMA CGM SA", "short_name": "CMA CGM",
+          "class_iri": "#Org"},
+         {"canonical_name": "CMA CGM", "short_name": "CMA CGM",
+          "class_iri": "#Org"}],
+        None,
+    )]
+    alias, n = _resolve_canonical_forms(results, set())
+    assert n >= 1 and alias
+
+
+def test_predicate_matching_walks_the_isa_line_both_ways() -> None:
+    """Walking only UPWARD starves the menu: an entity typed `Organization`
+    fails every predicate whose domain is `pipelineoperator`, even though
+    pipeline operators ARE organizations. Measured on the finance build that
+    left a median of 8 predicates out of 563 per chunk, and the model forced
+    real relationships onto whatever it had -- one chunk put 10 proposals
+    through `hasMember`, all junk.
+
+    `rdfs:domain` is an INFERENCE rule in OWL, not a precondition. What must
+    NOT change is that unrelated classes stay rejected: the two must still
+    share an IS-A line.
+    """
+    import inspect
+
+    from backend.app.services import db_entity_extract as m
+
+    src = inspect.getsource(m._candidate_predicates)
+    assert "_DESCENDANT_SQL" in src, "descendants are not consulted"
+    # Per-class attribution, not a shared pool -- a shared pool would let any
+    # entity satisfy any OTHER entity's subtree.
+    assert "ancestors.setdefault(origin, {origin}).add(desc)" in src
+
+
+def test_descendant_sql_carries_the_origin_class() -> None:
+    """Without `origin` the query returns a union and descendants cannot be
+    attributed to the class they belong to."""
+    from backend.app.services.db_entity_extract import _DESCENDANT_SQL
+
+    sql = str(_DESCENDANT_SQL)
+    assert "down(origin, id)" in sql
+    assert "SELECT DISTINCT down.origin" in sql
+
+
+# --------------------------------------------------------------------------- #
+# Cross-chunk direction contradictions
+# --------------------------------------------------------------------------- #
+
+
+def _reconcile(by_sig):
+    """The reconciliation the driver performs, in isolation."""
+    seen, kill = {}, set()
+    for sig in by_sig:
+        sid, pred, oid = sig
+        mirror = (oid, pred, sid)
+        if mirror in by_sig:
+            pair = (min(str(sid), str(oid)), pred, max(str(sid), str(oid)))
+            if pair in seen:
+                continue
+            seen[pair] = sig
+            n_here = len(by_sig[sig].get("_chunks") or [])
+            n_there = len(by_sig[mirror].get("_chunks") or [])
+            if n_here > n_there:
+                kill.add(mirror)
+            elif n_there > n_here:
+                kill.add(sig)
+            else:
+                kill.add(sig)
+                kill.add(mirror)
+    return {k: v for k, v in by_sig.items() if k not in kill}, len(kill)
+
+
+def test_better_corroborated_direction_survives() -> None:
+    """Each chunk is judged alone, so nothing stops two passages asserting the
+    same asymmetric predicate both ways -- measured on the finance build with
+    `BHE U.S. Transmission --hasSubOrganization--> MATL LLP` and its mirror.
+    `_chunks` already records how many passages asserted each triple."""
+    by_sig = {
+        ("A", "p", "B"): {"_chunks": [1, 2]},
+        ("B", "p", "A"): {"_chunks": [3]},
+    }
+    kept, n = _reconcile(by_sig)
+    assert list(kept) == [("A", "p", "B")]
+    assert n == 1
+
+
+def test_a_tie_drops_both_rather_than_picking() -> None:
+    """One passage each gives no ground to prefer either. Inventing a
+    preference is how a confident false edge gets in, and a graph asserting
+    both directions is worse than one asserting neither -- BFS will traverse
+    the wrong one."""
+    by_sig = {
+        ("A", "p", "B"): {"_chunks": [1]},
+        ("B", "p", "A"): {"_chunks": [2]},
+    }
+    kept, n = _reconcile(by_sig)
+    assert kept == {}
+    assert n == 2
+
+
+def test_different_predicates_between_the_same_pair_are_left_alone() -> None:
+    """"A regulates B" and "B is subject to A" are not contradictory. The
+    observed `AUC --hasSubOrganization--> AltaLink` / `AltaLink --monitors-->
+    AUC` case is two wrong PREDICATES, a menu problem, not a direction one."""
+    by_sig = {
+        ("A", "p", "B"): {"_chunks": [1]},
+        ("B", "q", "A"): {"_chunks": [2]},
+    }
+    kept, n = _reconcile(by_sig)
+    assert len(kept) == 2 and n == 0
+
+
+def test_ordinary_edges_are_untouched() -> None:
+    by_sig = {
+        ("A", "p", "B"): {"_chunks": [1]},
+        ("C", "p", "D"): {"_chunks": [2]},
+    }
+    kept, n = _reconcile(by_sig)
+    assert len(kept) == 2 and n == 0
