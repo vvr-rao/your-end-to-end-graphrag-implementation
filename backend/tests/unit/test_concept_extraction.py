@@ -196,9 +196,24 @@ def test_concept_extract_task_exists_in_every_preset(preset: str) -> None:
     "config/models.openai.example.yaml",
     "config/models.anthropic.example.yaml",
 ])
-def test_concept_extract_stays_on_the_cheap_tier(preset: str) -> None:
-    """This is menu-constrained selection, not synthesis. Escalating it would
-    multiply the cost of every chunk for no measured gain -- the narrowed
-    one-job prompt is what carried the quality, not a bigger model."""
+def test_concept_extract_matches_the_entity_extractor(preset: str) -> None:
+    """The concept pass reads the same chunk against the same kind of menu as
+    `entity_extract`, so the two are kept on one model rather than split
+    across tiers.
+
+    This started as "stays on the cheap tier", asserted as equality with
+    entity_extract. Both halves were wrong for their own reasons. The equality
+    was over-coupled -- it broke the moment entity_extract moved for reasons
+    unrelated to concepts. And "cheap tier" assumed gpt-4o-mini was adequate
+    here; its measured instability on the entity pass (2/5 on Ramon Fernandez,
+    0 clean validation rounds across 3 runs) is a property of the model, not
+    of that one prompt.
+
+    What is worth pinning is that the two do not silently DIVERGE, leaving the
+    concept pass on a model nobody chose for it.
+    """
     tasks = yaml.safe_load(open(preset))["tasks"]
-    assert tasks["concept_extract"]["model"] == tasks["entity_extract"]["model"]
+    assert tasks["concept_extract"]["model"] == tasks["entity_extract"]["model"], (
+        f"{preset}: concept_extract ({tasks['concept_extract']['model']}) has "
+        f"drifted from entity_extract ({tasks['entity_extract']['model']})"
+    )

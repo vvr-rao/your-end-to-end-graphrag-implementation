@@ -106,25 +106,64 @@ def test_planner_stays_on_a_cheap_model() -> None:
         assert not model.startswith(expensive), f"{path.name}: planner on {model}"
 
 
-def test_entity_validate_is_not_the_same_model_as_entity_extract() -> None:
-    """A model reviewing its OWN output rubber-stamps it.
+# Rough capability ordering, cheapest first. Only used to compare the
+# extractor against its reviewer -- not a general quality claim.
+_TIER = {
+    "claude-haiku-4-5": 1, "gpt-4o-mini": 1,
+    "gpt-4.1-mini": 2, "gpt-5.4-mini": 2,
+    "claude-sonnet-4-6": 3, "gpt-4.1": 3,
+    "claude-opus-4-8": 4, "gpt-5.4": 4,
+}
 
-    The whole value of the review pass is that a different, stronger model
-    reads the same menu. The errors it hunts are systematic, not random: the
-    extractor picked `ChollaUnit4` because the menu offered it and the prompt
-    said "pick ONE", so re-asking the same weights over the same menu
-    reproduces the same reasoning and the pass becomes an expensive no-op.
 
-    This is asserted here rather than left as a comment because the failure
-    mode is silent -- a later config tidy-up that "simplifies" both tasks onto
-    gpt-4o-mini would still run, still cost money, and still report verdicts.
+def test_entity_reviewer_is_not_weaker_than_the_extractor() -> None:
+    """The reviewer must never be the CHEAPER of the pair.
+
+    This replaces an earlier assertion that the two models must DIFFER, on the
+    theory that a model reviewing its own output rubber-stamps it. Measured on
+    mhrag_doc_023 (fulltext, 3 rounds, n=3 per model) that turned out to be
+    the wrong guard. With both tasks on gpt-4.1-mini the loop performed BEST:
+    17/18 on the six named people versus 22/30 with a gpt-4o-mini extractor,
+    1-2 clean rounds instead of 0, and 0-1 class rewrites instead of 5-10.
+
+    What actually matters is the extractor's own competence. gpt-4o-mini did
+    not fail because nobody caught its mistakes -- the reviewer caught them
+    fine -- it failed because it would not honour "return the COMPLETE list,
+    not a diff" under repeated feedback, so each round traded one recovered
+    entity for another lost one.
+
+    The real silent-failure risk the old test was reaching for survives here:
+    a config tidy-up that drops the REVIEWER to the cheap tier while the
+    extractor stays above it would still run, still cost money, and still
+    report verdicts -- while having nothing to add.
     """
     for path in _PRESETS:
         t = _tasks(path)
         assert "entity_validate" in t, f"{path.name}: entity_validate missing"
-        assert t["entity_validate"]["model"] != t["entity_extract"]["model"], (
-            f"{path.name}: the entity reviewer must not be the same model as "
-            f"the extractor it reviews"
+        ex, val = t["entity_extract"]["model"], t["entity_validate"]["model"]
+        assert ex in _TIER, f"{path.name}: untiered entity_extract model {ex}"
+        assert val in _TIER, f"{path.name}: untiered entity_validate model {val}"
+        assert _TIER[val] >= _TIER[ex], (
+            f"{path.name}: entity_validate ({val}) is a weaker tier than "
+            f"entity_extract ({ex}) -- the reviewer cannot improve on output "
+            f"it is less capable than"
+        )
+
+
+def test_entity_extract_is_off_the_cheapest_tier_in_openai_presets() -> None:
+    """Pins the measured switch away from gpt-4o-mini.
+
+    Its failure was not random noise: across 5 runs it missed Ramon Fernandez
+    3 times, Rodolphe Saade twice and Karen Reddington once, and it never
+    produced a single clean validation round. Reverting this would reopen the
+    exact recall complaint that prompted the change.
+    """
+    for path in _PRESETS:
+        t = _tasks(path)
+        if t["entity_extract"]["provider"] != "openai":
+            continue
+        assert t["entity_extract"]["model"] != "gpt-4o-mini", (
+            f"{path.name}: entity_extract back on gpt-4o-mini"
         )
 
 
