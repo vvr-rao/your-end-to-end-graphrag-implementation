@@ -248,12 +248,44 @@ tasks:
 
   # Milestone C: per-chunk named-entity extraction. JSON mode for
   # reliability; bounded output since each chunk yields <= 15 entities.
+  # gpt-4.1-mini, NOT gpt-4o-mini. Measured on mhrag_doc_023 (fulltext,
+  # 3 validation rounds, n=3 per model): gpt-4o-mini hit 22/30 on the six
+  # people the passage names, gpt-4.1-mini 17/18. Ramon Fernandez -- the CFO
+  # who speaks the article's central quote -- went 2/5 to 3/3.
+  #
+  # The reason is convergence, and it is what makes the switch pay for itself.
+  # With gpt-4o-mini the review loop NEVER settled: 0 clean rounds across
+  # three runs, all 6 rounds re-extracting, 5-10 class rewrites per run.
+  # With gpt-4.1-mini: 1-2 clean rounds, 1-3 re-extractions, 0-1 rewrites --
+  # it gets the class right the first time. So despite 2.7x the token price,
+  # measured cost per document FELL ($0.0197 -> $0.0146) because the loop
+  # stops instead of thrashing.
+  #
+  # Caveat: that cost win needs --validate-entities ON. Without the loop this
+  # task is a straight 2.7x (~$0.17 -> $0.47 over a 245-chunk summary run;
+  # scale accordingly for --from-fulltext).
   entity_extract:
     provider: openai
-    model: gpt-4o-mini
+    model: gpt-4.1-mini
     timeout: 600
     temperature: 0.0
     max_tokens: 8192          # dense chunks w/ many entities (50 candidate classes) exceed 2048 -> truncation
+    response_format: json_object
+  # Second extraction pass over the SAME chunk, asking only for the CONCEPTS
+  # the passage develops (freight rates, consolidation, overcapacity) rather
+  # than the named things it mentions. Runs only with --concept-pass.
+  # Same model as entity_extract and entity_validate. This is
+  # menu-constrained selection, not synthesis, so the cheap tier was the
+  # starting point -- but gpt-4o-mini's instability on the entity pass
+  # (see the entity_extract note) is a property of the model, not of that
+  # prompt, and the concept pass reads the same chunk against the same
+  # kind of menu. Kept aligned rather than split across tiers.
+  concept_extract:
+    provider: openai
+    model: gpt-4.1-mini
+    timeout: 600
+    temperature: 0.0
+    max_tokens: 4096          # <=5 concepts per chunk; far smaller than entity_extract
     response_format: json_object
   # Review pass over what entity_extract just produced: is each entity real,
   # and is its class the right KIND of thing? Only runs with

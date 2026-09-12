@@ -892,6 +892,37 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_ext.add_argument(
+        # default=None (not False) so an absent flag falls through to
+        # extraction.concept_pass in config.yaml; store_true's usual False
+        # default would satisfy _resolve_extraction_opt and make the config
+        # key dead.
+        "--concept-pass", action="store_true", default=None,
+        help=(
+            "Run a SECOND extraction call per chunk asking only for the "
+            "CONCEPTS the passage develops -- freight rates, consolidation, "
+            "overcapacity -- rather than the named things it mentions (OFF by "
+            "default; unset => extraction.concept_pass in config.yaml). "
+            "Concept classes (EconomicConcept, Metric, Process, Industry) are "
+            "reachable by the main pass too, but one call holding both jobs "
+            "spends its attention on the named entities: on a measured "
+            "shipping chunk it found 1 concept where the passage developed at "
+            "least 5. Costs one extra call per chunk (`concept_extract`, same "
+            "cheap tier as entity_extract, ~half the output size)."
+        ),
+    )
+    p_ext.add_argument(
+        "--recovery-pool", type=int, default=None,
+        help=(
+            "How far abstention recovery may reach, in classes, measured by "
+            "vector distance from the chunk (unset => extraction.recovery_pool, "
+            "default 400; 0 disables). When the model answers NONE_OF_THESE it "
+            "names the type it wanted, and ~half the time that class already "
+            "exists and merely missed the top-K menu -- the entity was lost to "
+            "a ranking miss, not an ontology gap. Bounded to the chunk's "
+            "neighbourhood so an exact name match cannot pull in a homonym."
+        ),
+    )
+    p_ext.add_argument(
         "--no-menu-filter", action="store_true",
         help=(
             "Do NOT withhold instance-shaped and disjunction-shaped class "
@@ -1813,6 +1844,8 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
     _rounds = int(_resolve_extraction_opt(
         args, "validation_rounds", "validation_rounds", 2))
     _validate = getattr(args, "validate_entities", False)
+    _concepts = bool(_resolve_extraction_opt(
+        args, "concept_pass", "concept_pass", False))
     _l2 = _resolve_extraction_opt(
         args, "max_candidate_l2", "max_candidate_l2", None)
     _menu_filter = not getattr(args, "no_menu_filter", False) and bool(
@@ -1826,6 +1859,8 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
     print(f"[extract-entities] concurrency = {_conc}")
     if _validate:
         print(f"[extract-entities] entity review ON, up to {_rounds} round(s)")
+    if _concepts:
+        print("[extract-entities] concept pass ON (one extra call per chunk)")
     from backend.app.services.db_entity_extract import extract_entities
 
     asyncio.run(
@@ -1844,6 +1879,11 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
             entity_identity=getattr(args, "entity_identity", "name"),
             validate_entities=_validate,
             validation_rounds=_rounds,
+            concept_pass=_concepts,
+            concept_class_roots=tuple(
+                _extraction_cfg().get("concept_class_roots") or ()),
+            recovery_pool=int(_resolve_extraction_opt(
+                args, "recovery_pool", "recovery_pool", 400)),
             filter_candidate_menu=_menu_filter,
             max_candidate_l2=float(_l2) if _l2 is not None else None,
             menu_filter_allowlist=_allow or None,

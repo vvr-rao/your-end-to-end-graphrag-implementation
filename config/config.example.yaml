@@ -368,6 +368,62 @@ extraction:
   # costs ONE extra call (the review) and stops; only chunks with a real
   # problem pay for a re-extraction. 0 disables.
   validation_rounds: 2
+  # Second extraction call per chunk asking ONLY for the concepts the passage
+  # develops (freight rates, consolidation, overcapacity), as distinct from
+  # the named things it mentions. `entity_extract` can reach concept classes
+  # on its own since the proper-noun-only rule was lifted, but one call
+  # holding both jobs spends its attention on the named entities -- measured
+  # on a shipping chunk, the widened single call found 1 concept where the
+  # passage developed at least 5. Costs one extra `concept_extract` call per
+  # chunk (same cheap tier as entity_extract, ~half the output size).
+  # false = behaviour-preserving default; --concept-pass overrides.
+  concept_pass: false
+  # How far the abstention recovery may reach. When the model abstains
+  # (NONE_OF_THESE) it names the type it wanted; ~half the time that class
+  # ALREADY EXISTS and simply did not rank into the chunk's top-K menu, so the
+  # entity was discarded over a ranking miss rather than a real ontology gap.
+  # Recovery resolves that `proposed_type` against the chunk's nearest N
+  # classes by vector distance -- the same query that builds the menu, so it
+  # costs no extra round-trip.
+  #
+  # Bounded to the chunk's neighbourhood rather than the whole ontology on
+  # purpose: an exact name match against ALL classes would let a homonym
+  # through (a tennis "Court" resolving to a legal one). Measured on 20 news
+  # chunks the bound is nearly free -- 24 recoveries versus 25 unbounded,
+  # while excluding ~40% of the ontology.
+  #
+  # 0 disables recovery entirely; abstentions are then dropped as before.
+  recovery_pool: 400
+  # Which ontology branches the concept pass may assign to. Resolved to IRIs
+  # at run start and closed over subclasses, so `AudioTechnology` under
+  # `TechnologyConcept` is included without being listed. These are the
+  # concept-bearing roots of the shipped core ontology
+  # `source_ontologies/core_ontologies/domain_concepts.owl`; replace them if
+  # you swap that ontology out.
+  #
+  # WHY THE MENU IS RESTRICTED AT ALL. The prompt tells the model to pick only
+  # classes denoting an abstract kind, and on a concept-POOR document it
+  # ignores that: on a WIRED product-deals article it typed "laptop" ->
+  # Laptop, "speaker" -> SpeakerDevice, "battery life" -> FitnessDevice --
+  # bare category nouns under concrete product classes, exactly the noise the
+  # old proper-noun-only rule prevented. Restricting the menu makes those
+  # picks impossible rather than merely discouraged.
+  #
+  # Deliberately EXCLUDED: Event (holds named events like "Super Bowl" -- the
+  # entity pass's job), TimePeriod (the temporal pass), FinancialTable (the
+  # StructuredTable pass). Empty list disables the concept pass entirely.
+  concept_class_roots:
+    - EconomicConcept
+    - TechnologyConcept
+    - PolicyConcept
+    - Process
+    - Industry
+    - Metric
+    - Measure
+    - FinancialObservation
+    - Infrastructure
+    - SupplyChainConcept
+    - MediaConcept
   # Candidate-menu quality filter. Withholds instance-shaped class labels
   # ("Cholla Unit 4") and disjunction labels ("SegmentOperatingExpense or
   # SegmentAsset") from the top-K menu handed to the extractor. Neither is a

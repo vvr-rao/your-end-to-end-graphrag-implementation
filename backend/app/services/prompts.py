@@ -1013,7 +1013,15 @@ def entity_extract(
     *,
     feedback: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
-    """Phase 2 Milestone C: extract named entities from a chunk.
+    """Phase 2 Milestone C: extract entities from a chunk.
+
+    Extracts proper-noun entities AND -- when the candidate menu offers a
+    class denoting an abstract kind -- the common-noun CONCEPTS the passage
+    develops. Concept classes (EconomicConcept, Metric, Process, Industry)
+    were previously unreachable: they sat on the menu on most chunks, via
+    vector rank and ancestor closure, while the rules said "Only PROPER NOUN
+    entities", so 995 of 1,008 entities in a measured news build were proper
+    nouns and 248 of 328 minted classes held nothing at all.
 
     `candidate_classes` is a list of {iri, label, description} dicts
     -- the top-K classes the chunk's vector matched against
@@ -1060,8 +1068,18 @@ def entity_extract(
         "named plant, one document code) rather than a category, never "
         "assign an entity to it -- answer \"NONE_OF_THESE\".\n\n"
         "RULES:\n"
-        "  - Only PROPER NOUN entities: organizations, people, places, "
-        "products, named events, programs. Skip generic terms like "
+        "  - PROPER NOUN entities: organizations, people, places, products, "
+        "named events, programs.\n"
+        "  - CONCEPTS, but ONLY when some CANDIDATE CLASS denotes an abstract "
+        "kind -- a concept, metric, measure, process, industry, policy or "
+        "observation. A concept is a common-noun idea the passage is "
+        "substantively ABOUT: \"freight rates\", \"price war\", "
+        "\"consolidation\", \"quantitative easing\". Take the passage's own "
+        "wording. Extract a concept only if the passage DEVELOPS it -- states "
+        "something about it, not merely uses the word in passing -- and at "
+        "most 5 per chunk. If no candidate class denotes an abstract kind, "
+        "extract no concepts at all.\n"
+        "  - Skip empty referring phrases that name nothing of their own: "
         "\"the manufacturer\", \"the report\", \"the country\".\n"
         "  - Do extract named PEOPLE when the passage names them. Named "
         "people are systematically under-extracted, so check explicitly "
@@ -1178,6 +1196,88 @@ def _render_review_feedback(feedback: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def concept_extract(
+    chunk_text: str,
+    candidate_classes: list[dict[str, str]],
+) -> tuple[str, str]:
+    """Second pass: the CONCEPTS a chunk develops, as opposed to the named
+    things it mentions.
+
+    Why a separate call rather than only widening `entity_extract`. Measured
+    on a container-shipping news chunk, relaxing the proper-noun rule inside
+    the single call moved concept yield from 0 to 1 while the passage
+    developed at least five (freight rates, overcapacity, consolidation, the
+    boom-bust cycle, the orderbook). One call holding both jobs spends its
+    attention on the named entities, which are easier to see and score
+    higher-confidence. This pass has one job and a menu narrowed to the
+    classes that can actually hold its output.
+
+    Returns the same JSON shape as `entity_extract`, so the caller can run
+    both through `_filter_entities` unchanged.
+    """
+    candidates_block = _render_candidate_block(candidate_classes)
+
+    system = (
+        "You identify the CONCEPTS a passage develops -- the ideas, "
+        "mechanisms, measures and processes it is ABOUT -- as distinct from "
+        "the named people, organizations and places it mentions.\n\n"
+        "Someone else has already extracted the proper nouns. Do NOT repeat "
+        "that work: no people, no companies, no places, no product names, no "
+        "named events. Only concepts.\n\n"
+        "WHAT COUNTS AS A CONCEPT HERE:\n"
+        "  - A common-noun idea the passage makes a CLAIM about: \"freight "
+        "rates\", \"price war\", \"overcapacity\", \"consolidation\", "
+        "\"quantitative easing\", \"supply chain disruption\".\n"
+        "  - It must be DEVELOPED, not merely mentioned. The passage says "
+        "something about it -- that it rose, collapsed, caused something, is "
+        "contested. A word appearing once in a list is not a concept.\n"
+        "  - Use the passage's OWN wording, normalised to its most natural "
+        "form (prefer the singular unless the plural is how the domain says "
+        "it: \"freight rates\", not \"freight rate\").\n\n"
+        "WHAT DOES NOT COUNT:\n"
+        "  - Empty referring phrases: \"the industry\", \"the report\", "
+        "\"the situation\", \"the company\".\n"
+        "  - Whole academic fields or topics so broad they describe the "
+        "corpus rather than the passage: \"business\", \"economics\", "
+        "\"technology\".\n"
+        "  - Anything a proper noun names. \"the Panama Canal\" is a place; "
+        "\"canal congestion\" is a concept.\n"
+        "  - Years, dates, quantities.\n\n"
+        "PICKING THE CLASS:\n"
+        "  - class_iri MUST come from the CANDIDATE CLASSES list, verbatim, "
+        "and MUST be a class denoting an ABSTRACT KIND -- a concept, metric, "
+        "measure, process, industry, policy, observation or similar.\n"
+        "  - Classes denoting concrete named things (a company kind, a "
+        "person kind, a place kind, a product kind) are NOT valid here even "
+        "though they appear on the list. If the only fitting class is one of "
+        "those, the thing is not a concept -- leave it out.\n"
+        "  - If no candidate class denotes an abstract kind, return an EMPTY "
+        "list. That is the correct answer, not a failure.\n"
+        "  - \"NONE_OF_THESE\" is available when the passage clearly develops "
+        "a concept but no abstract class on the menu denotes its kind; put "
+        "your own short type name in \"proposed_type\".\n\n"
+        "RULES:\n"
+        "  - 0 to 5 concepts. Fewer, well-developed concepts beat a long "
+        "list. An empty list is a normal answer for a passage that is pure "
+        "narrative or pure names.\n"
+        "  - canonical_name and short_name are both the concept phrase.\n"
+        "  - confidence in [0,1]: how clearly the passage develops it AND how "
+        "clearly it instantiates that class.\n"
+        "  - Return ONLY JSON, no preamble, no markdown."
+    )
+    user = (
+        "CANDIDATE CLASSES (pick class_iri from this list ONLY, and only "
+        "where the class denotes an abstract kind):\n"
+        + candidates_block
+        + "\n\nTEXT CHUNK:\n```\n"
+        + chunk_text
+        + "\n```\n\n"
+        "Return JSON: {\"entities\": [{\"canonical_name\": ..., "
+        "\"short_name\": ..., \"class_iri\": ..., \"confidence\": ...}]}"
+    )
+    return system, user
+
+
 def entity_validate(
     chunk_text: str,
     candidate_classes: list[dict[str, str]],
@@ -1241,8 +1341,11 @@ def entity_validate(
         "VERDICTS (exactly one per entity):\n"
         "  correct        -- real entity, and the class is a reasonable KIND for it\n"
         "  wrong_class    -- real entity, but a better class exists IN THE MENU\n"
-        "  not_an_entity  -- not a proper-noun named entity (a generic phrase, "
-        "a bare year, a section heading)\n"
+        "  not_an_entity  -- neither a named entity nor a concept the passage "
+        "develops (an empty referring phrase like \"the report\", a bare "
+        "year, a section heading). A common-noun CONCEPT assigned to a class "
+        "denoting an abstract kind is a legitimate entity here -- judge it on "
+        "whether the passage develops it, not on whether it is capitalised.\n"
         "  no_class_fits  -- real entity, but NOTHING in the menu denotes its kind\n"
         "  not_in_text    -- this entity does not appear in the passage at all\n\n"
         "RULES:\n"
@@ -1266,10 +1369,13 @@ def entity_validate(
         "Ramon Fernandez\"). A person who speaks the passage's central claim "
         "being absent from the extraction is a serious miss, not a minor "
         "one;\n"
-        "      * named ORGANIZATIONS and PLACES the extraction passed over.\n"
-        "    List each as a missing entity. Only PROPER NOUNS actually "
-        "written in the passage -- do not invent. Years and dates are handled "
-        "by a separate pass, so never list them.\n"
+        "      * named ORGANIZATIONS and PLACES the extraction passed over;\n"
+        "      * where a candidate class denotes an ABSTRACT KIND (concept, "
+        "metric, process, industry, policy), the significant CONCEPTS the "
+        "passage develops.\n"
+        "    List each as a missing entity, in the passage's own wording -- "
+        "do not invent. Years and dates are handled by a separate pass, so "
+        "never list them.\n"
         "    canonical_name is the entity's OWN name and nothing else. Strip "
         "any title or affiliation the passage attaches to it: from \"CMA CGM "
         "Chief Financial Officer Ramon Fernandez\" the entity is \"Ramon "
@@ -3432,6 +3538,7 @@ PROMPTS = {
     "summary_revise": summary_revise,
     "entity_extract": entity_extract,
     "entity_validate": entity_validate,
+    "concept_extract": concept_extract,
     "relationship_extract": relationship_extract,
     "relationship_verify": relationship_verify,
     "relationship_repair": relationship_repair,

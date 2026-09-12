@@ -30,6 +30,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
+from collections.abc import Mapping
 from typing import Any
 
 from sqlalchemy import func, select, text as sql_text
@@ -82,12 +83,105 @@ _DROPPING_VERDICTS = {
 }
 
 
+def _confidence_of(e: dict[str, Any]) -> float | None:
+    try:
+        return float(e["confidence"]) if e.get("confidence") is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalise_type_label(text: str) -> str:
+    """Fold a type name to a comparison key: lowercase, alphanumerics only.
+
+    So the model's "coffee maker" reaches the class `CoffeeMaker`, and
+    "Credit Scoring Model" reaches `CreditScoringModel`. Deliberately NOT
+    fuzzy -- this resolves an abstention into a real class, and a near-miss
+    here recreates exactly the wrong-class problem the abstain path exists to
+    prevent.
+    """
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+def _resolve_proposed_type(
+    proposed: str, type_index: Mapping[str, str] | None
+) -> str | None:
+    """An abstention recovered when the model's own `proposed_type` names a
+    class that exists but never reached this chunk's menu.
+
+    MEASURED on 20 news chunks: of 29 distinct `proposed_type` values the
+    model asked for, 15 (51%) ALREADY EXISTED in the ontology -- CoffeeMaker,
+    VacuumCleaner, MeshRouter, VideoGame, KitchenAppliance among them, and the
+    most frequently requested ones at that. They simply did not rank into the
+    chunk's top-K candidates, so the model could not pick what it was never
+    shown and abstained, correctly, on its own terms.
+
+    That is a menu-coverage failure, not an ontology gap, and no amount of
+    re-running prune-expand fixes it -- the class is already there.
+    """
+    if not proposed or not type_index:
+        return None
+    return type_index.get(_normalise_type_label(proposed))
+
+
+def _build_menu_index(
+    cand_iris: set[str], cand_labels: Mapping[str, str] | None
+) -> dict[str, str]:
+    """Lowercase key -> IRI, for recovering a class named by label.
+
+    Keys are each candidate's IRI local-name and, when the caller supplies
+    them, its label. A key claimed by two DIFFERENT classes is dropped rather
+    than resolved arbitrarily: `foaf#Person` and `org#Person` share a local
+    name, and picking between them by set-iteration order would make
+    extraction non-deterministic across runs.
+    """
+    idx: dict[str, str | None] = {}
+
+    def offer(key: str, iri: str) -> None:
+        key = key.strip().lower()
+        if not key:
+            return
+        if key in idx and idx[key] != iri:
+            idx[key] = None          # ambiguous -- never resolve it
+        else:
+            idx.setdefault(key, iri)
+
+    for iri in cand_iris:
+        offer(iri.rsplit("#", 1)[-1].rsplit("/", 1)[-1], iri)
+    for label, iri in (cand_labels or {}).items():
+        if iri in cand_iris:
+            offer(label, iri)
+    return {k: v for k, v in idx.items() if v is not None}
+
+
+def _resolve_menu_iri(raw: str, menu_index: dict[str, str]) -> str | None:
+    """Recover an off-menu `class_iri` that actually names a menu class.
+
+    MEASURED on the pharma corpus: of 11 off-menu values, 10 were the class
+    LABEL emitted into the IRI field -- "brandnamedrug", "lipaseinhibitor",
+    "semaglutide" -- each of them a class that was on the menu. The model
+    chose correctly and serialised wrongly, and the entity was dropped for it
+    (Ozempic, Wegovy and Orlistat among them). Only 1 of 11 was a genuine
+    invention.
+
+    This is why the rate differed so sharply between corpora: that ontology's
+    labels are lowercase single tokens that look like IRI fragments, while a
+    CamelCase taxonomy ("ContainerShip") does not invite the same slip.
+    """
+    hit = menu_index.get(raw.strip().lower())
+    if hit:
+        return hit
+    tail = raw.rsplit("#", 1)[-1].rsplit("/", 1)[-1]
+    return menu_index.get(tail.strip().lower())
+
+
 def _filter_entities(
     raw_entities: Any,
     cand_iris: set[str],
     ent_drops: dict[str, int],
     abstained: list[dict[str, Any]],
     abstain_cap: int = 200,
+    cand_labels: Mapping[str, str] | None = None,
+    type_index: Mapping[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Validate one `entity_extract` response into the kept-entity list.
 
@@ -99,6 +193,7 @@ def _filter_entities(
     kept: list[dict[str, Any]] = []
     if not isinstance(raw_entities, list):
         return kept
+    menu_index = _build_menu_index(cand_iris, cand_labels)
     for e in raw_entities:
         if not isinstance(e, dict):
             continue
@@ -109,6 +204,23 @@ def _filter_entities(
             ent_drops["no_name"] += 1
             continue
         if class_iri == ABSTAIN_SENTINEL:
+            # Before recording a loss: the model names the type it wanted, and
+            # half the time that class EXISTS -- it just never reached this
+            # chunk's top-K menu. Recover those rather than discarding a real
+            # entity over a ranking miss.
+            proposed = (e.get("proposed_type") or "").strip()
+            recovered_type = _resolve_proposed_type(proposed, type_index)
+            if recovered_type is not None:
+                ent_drops["recovered_proposed_type"] = (
+                    ent_drops.get("recovered_proposed_type", 0) + 1
+                )
+                kept.append({
+                    "canonical_name": name,
+                    "short_name": short,
+                    "class_iri": recovered_type,
+                    "confidence": _confidence_of(e),
+                })
+                continue
             # The model found a real entity and honestly reported that no
             # candidate class denotes its kind. `entities.class_id` is NOT
             # NULL, so this cannot be persisted without a migration -- record
@@ -122,13 +234,21 @@ def _filter_entities(
                     "proposed_type": (e.get("proposed_type") or "").strip(),
                 })
             continue
+        if class_iri and class_iri not in cand_iris:
+            # Before counting this a loss, see whether the value NAMES a class
+            # that is on the menu -- the model routinely writes the label into
+            # the IRI field. Recovered separately from `off_menu_iri` so the
+            # slip stays visible instead of being papered over.
+            recovered = _resolve_menu_iri(class_iri, menu_index)
+            if recovered is not None:
+                class_iri = recovered
+                ent_drops["recovered_label_iri"] = (
+                    ent_drops.get("recovered_label_iri", 0) + 1
+                )
         if not class_iri or class_iri not in cand_iris:
             ent_drops["off_menu_iri"] += 1
             continue
-        try:
-            conf = float(e.get("confidence")) if e.get("confidence") is not None else None
-        except (TypeError, ValueError):
-            conf = None
+        conf = _confidence_of(e)
         kept.append({
             "canonical_name": name,
             "short_name": short,
@@ -323,6 +443,7 @@ class EntityExtractSummary:
     # relationship path already had `rel_drops`; this is the entity mirror.
     entity_drops: dict[str, int] = field(default_factory=dict)
     entity_validation: dict[str, int] = field(default_factory=dict)
+    concept_extraction: dict[str, int] = field(default_factory=dict)
     # Names the model declined to type because no candidate class denoted
     # their KIND. A rising count here is the honest signal that the ontology
     # is missing a branch -- act on it with a prune-expand run.
@@ -757,6 +878,23 @@ _MAX_RESCUE_PREDICATES = 60
 # Supporting chunk ids kept per edge (the COUNT is always exact).
 _MAX_SUPPORTING_CHUNKS = 20
 
+_CONCEPT_CLOSURE_SQL = sql_text("""
+WITH RECURSIVE down(id) AS (
+    SELECT oc.id FROM graphrag.ontology_classes oc
+     WHERE lower(oc.label) = ANY(CAST(:labels AS text[]))
+  UNION
+    SELECT gr.source_node_id
+      FROM down
+      JOIN graphrag.graph_relationships gr
+        ON gr.target_node_id = down.id
+       AND gr.source_node_type = 'ontology_class'
+       AND gr.target_node_type = 'ontology_class'
+       AND gr.predicate_label = 'rdfs:subClassOf'
+)
+SELECT oc.iri FROM down JOIN graphrag.ontology_classes oc ON oc.id = down.id
+""")
+
+
 _ANCESTOR_SQL = sql_text("""
 WITH RECURSIVE up(origin, id) AS (
     SELECT oc.iri, oc.id FROM graphrag.ontology_classes oc
@@ -1132,6 +1270,9 @@ async def extract_entities(
     entity_identity: str = "name",
     validate_entities: bool = False,
     validation_rounds: int = 2,
+    concept_pass: bool = False,
+    concept_class_roots: tuple[str, ...] = (),
+    recovery_pool: int = 400,
     filter_candidate_menu: bool = True,
     max_candidate_l2: float | None = None,
     menu_filter_allowlist: frozenset[str] | None = None,
@@ -1251,6 +1392,53 @@ async def extract_entities(
             validate_entities = False
     if validate_entities and validation_rounds < 1:
         validate_entities = False
+    # Same degradation for the concept pass.
+    if concept_pass:
+        try:
+            router.task_spec("concept_extract")
+        except KeyError:
+            print(
+                "[extract-entities] models.yaml has no 'concept_extract' task "
+                "-- running WITHOUT the concept pass. Add it (see "
+                "config/models.example.yaml) to enable --concept-pass."
+            )
+            concept_pass = False
+    # Which classes the concept pass is allowed to assign to, resolved ONCE.
+    #
+    # The prompt tells the model to use only classes denoting an abstract
+    # kind, and on a concept-POOR document it ignores that: measured on a
+    # WIRED product-deals article it typed "laptop" -> Laptop, "speaker" ->
+    # SpeakerDevice, "battery life" -> FitnessDevice -- bare category nouns
+    # forced under concrete product classes, which is precisely the noise the
+    # old proper-noun-only rule existed to prevent. Restricting the MENU makes
+    # those picks impossible instead of merely discouraged; the model's only
+    # remaining options are a real concept class or abstaining.
+    #
+    # Roots come from config and close over subclasses, so a corpus-specific
+    # `AudioTechnology` under `TechnologyConcept` is included automatically.
+    concept_class_iris: set[str] = set()
+    if concept_pass:
+        _roots = [r.strip().lower() for r in concept_class_roots if r and r.strip()]
+        if _roots:
+            async with session_scope() as session:
+                rows = await session.execute(
+                    _CONCEPT_CLOSURE_SQL, {"labels": _roots}
+                )
+                concept_class_iris = {r[0] for r in rows.all()}
+        if not concept_class_iris:
+            print(
+                "[extract-entities] concept pass ON but no class matched "
+                f"extraction.concept_class_roots ({list(concept_class_roots)}) "
+                "-- the ontology has no concept branch, so the pass is "
+                "disabled rather than left to pick from concrete classes."
+            )
+            concept_pass = False
+        else:
+            print(
+                f"[extract-entities] concept pass menu: "
+                f"{len(concept_class_iris)} class(es) under "
+                f"{len(_roots)} configured root(s)"
+            )
 
     # Candidate-menu quality filter, computed ONCE per run: one query over
     # labels + descriptions, no vectors. Withholding a class here is cheaper
@@ -1286,6 +1474,12 @@ async def extract_entities(
                 f"[extract-entities] candidate-menu filter: "
                 f"{len(menu_excluded)} class(es) withheld ({_detail})"
             )
+
+    if recovery_pool:
+        print(
+            f"[extract-entities] abstention recovery ON: a proposed_type may "
+            f"resolve to any class in this chunk's nearest {recovery_pool}"
+        )
 
     # Resolve the pinned universal classes once. Matched on LABEL (case- and
     # space-insensitive) rather than IRI so the same config works whichever
@@ -1329,10 +1523,15 @@ async def extract_entities(
     ent_drops: dict[str, int] = {
         "off_menu_iri": 0, "no_name": 0, "abstained": 0,
         "reviewer_removed": 0, "no_candidates": 0,
+        "recovered_label_iri": 0, "recovered_proposed_type": 0,
     }
     val_stats: dict[str, int] = {
         "clean": 0, "revised": 0, "reclassified": 0, "removed": 0,
         "added": 0, "empty_reextract_rejected": 0, "validator_failed": 0,
+    }
+    concept_stats: dict[str, int] = {
+        "chunks_run": 0, "added": 0, "duplicate_of_entity": 0, "failed": 0,
+        "no_concept_classes": 0,
     }
     abstained: list[dict[str, Any]] = []
     _abstain_sample_cap = 200
@@ -1364,7 +1563,9 @@ async def extract_entities(
             f"cost=${cost:.4f}, rate={rate:.1f}/s, ETA={eta/60:.1f} min"
         )
 
-    async def _candidate_classes(chunk_embedding: list[float]) -> list[dict[str, str]]:
+    async def _candidate_classes(
+        chunk_embedding: list[float],
+    ) -> tuple[list[dict[str, str]], dict[str, str], dict[str, dict[str, str]]]:
         """The candidate menu: vector top-K, plus a general-class backstop.
 
         Guards beyond the plain ANN query:
@@ -1398,10 +1599,19 @@ async def extract_entities(
            Needed on top of (1) because a chunk whose top-K contains no
            person-ish class at all has no person ancestor to close over.
         """
-        over_fetch = (
+        # One query serves two purposes. The first `candidate_classes_per_chunk`
+        # survivors become the MENU; the whole ranked pool becomes the recovery
+        # index, so an abstention whose `proposed_type` names a class can only
+        # reach a class that was at least in this chunk's semantic
+        # neighbourhood. Measured, that bound costs ~nothing: 24 recoveries
+        # against 25 for an index over the entire ontology, while excluding
+        # ~40% of classes -- which is what keeps a homonym (a tennis "Court"
+        # resolving to a legal one) out of the graph.
+        over_fetch = max(
             candidate_classes_per_chunk * 3
             if menu_excluded
-            else candidate_classes_per_chunk
+            else candidate_classes_per_chunk,
+            recovery_pool,
         )
         async with session_scope() as session:
             stmt = select(
@@ -1418,11 +1628,29 @@ async def extract_entities(
                 stmt.order_by(OntologyClass.embedding.l2_distance(chunk_embedding))
                 .limit(over_fetch)
             )
-            out = [
+            _pool = [
                 {"iri": iri, "label": label or "", "description": descr or ""}
                 for iri, label, descr in r.all()
                 if iri not in menu_excluded
-            ][:candidate_classes_per_chunk]
+            ]
+            out = _pool[:candidate_classes_per_chunk]
+            # Ambiguous keys resolve to nothing rather than an arbitrary
+            # winner -- same rule as the menu index, same reason.
+            _ri: dict[str, str | None] = {}
+            _rm: dict[str, dict[str, str]] = {}
+            if recovery_pool:
+                for c in _pool[:recovery_pool]:
+                    key = _normalise_type_label(c["label"])
+                    if not key:
+                        continue
+                    if key in _ri and _ri[key] != c["iri"]:
+                        _ri[key] = None
+                    else:
+                        _ri.setdefault(key, c["iri"])
+                    _rm[c["iri"]] = {
+                        "label": c["label"], "description": c["description"]
+                    }
+            recovery_index = {k: v for k, v in _ri.items() if v is not None}
 
             have = {c["iri"] for c in out}
             extra_iris: set[str] = set()
@@ -1436,7 +1664,7 @@ async def extract_entities(
                 }
             extra_iris |= {i for i in pinned_iris if i not in have}
             if not extra_iris:
-                return out
+                return out, recovery_index, _rm
             rows = await session.execute(
                 select(
                     OntologyClass.iri, OntologyClass.label, OntologyClass.description
@@ -1446,7 +1674,7 @@ async def extract_entities(
                 out.append({
                     "iri": iri, "label": label or "", "description": descr or ""
                 })
-            return out
+            return out, recovery_index, _rm
 
     async def _validate_pass(
         txt: str,
@@ -1455,6 +1683,7 @@ async def extract_entities(
         cand_iris: set[str],
         class_meta: dict[str, dict[str, str]],
         chunk_iri: str,
+        review_meta: dict[str, dict[str, str]] | None = None,
     ) -> dict[str, Any] | None:
         """One `entity_validate` call, sanitised. None => fail open.
 
@@ -1475,9 +1704,28 @@ async def extract_entities(
             }
             for i, e in enumerate(kept)
         ]
+        # The reviewer's own rules define `no_class_fits` as "nothing IN THE
+        # MENU denotes its kind", so a class that is not on the menu cannot be
+        # endorsed -- and a recovered class is off-menu by definition. Measured
+        # before this fix: the reviewer returned `no_class_fits` on 68% of
+        # recovered entities while returning `correct` on 96% of everything
+        # else, rejecting assignments that were plainly right --
+        # "Netherlands -> Country", "Dyson V12 Detect Slim -> VacuumCleaner".
+        # It was obeying its instructions; the menu was wrong.
+        review_meta = review_meta or {}
+        review_menu = list(candidates)
+        _have = {c["iri"] for c in candidates}
+        for _iri in {e["class_iri"] for e in kept} - _have:
+            _m = review_meta.get(_iri)
+            if _m:
+                review_menu.append({
+                    "iri": _iri,
+                    "label": _m["label"],
+                    "description": _m["description"],
+                })
         try:
             v_sys, v_user = PROMPTS["entity_validate"](
-                txt, candidates, entities_for_review
+                txt, review_menu, entities_for_review
             )
             out = await router.chat("entity_validate", system=v_sys, user=v_user)
             parsed = _extract_json(out.text)
@@ -1489,8 +1737,16 @@ async def extract_entities(
             val_stats["validator_failed"] += 1
             return None
 
+        # Sanitise against the WIDENED set, or a verdict naming the recovered
+        # class is discarded as off-menu -- the same mismatch one level down.
+        _review_iris = cand_iris | {c["iri"] for c in review_menu}
+        _review_meta_all = {
+            **class_meta,
+            **{c["iri"]: {"label": c["label"], "description": c["description"]}
+               for c in review_menu},
+        }
         feedback = _sanitise_verdicts(
-            parsed, kept, cand_iris, class_meta, menu_filter_allowlist
+            parsed, kept, _review_iris, _review_meta_all, menu_filter_allowlist
         )
         # Count what the reviewer actually asked for, so the run summary can
         # show whether the pass is earning its cost.
@@ -1560,7 +1816,9 @@ async def extract_entities(
             if cost_limit_hit.is_set():
                 return
             try:
-                candidates = await _candidate_classes(chunk_emb)
+                candidates, recovery_index, recovery_meta = (
+                    await _candidate_classes(chunk_emb)
+                )
                 if not candidates:
                     # Not a failure. With an L2 ceiling set, a chunk whose
                     # subject matter the ontology simply does not cover
@@ -1580,6 +1838,7 @@ async def extract_entities(
                     c["iri"]: {"label": c["label"], "description": c["description"]}
                     for c in candidates
                 }
+                menu_labels = {c["label"]: c["iri"] for c in candidates}
 
                 async def _extract_pass(
                     feedback: dict[str, Any] | None,
@@ -1611,6 +1870,8 @@ async def extract_entities(
                         ent_drops,
                         abstained,
                         _abstain_sample_cap,
+                        cand_labels=menu_labels,
+                        type_index=recovery_index,
                     )
 
                 kept = await _extract_pass(None)
@@ -1642,6 +1903,7 @@ async def extract_entities(
                 for _round in range(validation_rounds):
                     feedback = await _validate_pass(
                         txt, candidates, kept, cand_iris, class_meta, chunk_iri,
+                        review_meta=recovery_meta,
                     )
                     if feedback is None:
                         break
@@ -1667,6 +1929,66 @@ async def extract_entities(
                         break
                     val_stats["revised"] += 1
                     kept = revised
+
+            # ---- Concept pass ----
+            #
+            # A separate call asking ONLY for the concepts the passage
+            # develops. `entity_extract` now permits concepts too, but one
+            # call holding both jobs spends its attention on the named
+            # entities: measured on a shipping chunk, widening that prompt
+            # alone moved concept yield 0 -> 1 while the passage developed at
+            # least five. This pass has one job.
+            #
+            # Fails SOFT, like the reviewer: a concept-pass error must not
+            # cost the chunk its named entities, which are already in `kept`.
+            # Menu narrowed to the concept branch. A chunk whose candidates
+            # contain no concept class costs NO call -- on a concept-free
+            # corpus the pass is free, not merely harmless.
+            c_menu = (
+                [c for c in candidates if c["iri"] in concept_class_iris]
+                if concept_pass else []
+            )
+            if concept_pass and not c_menu:
+                concept_stats["no_concept_classes"] += 1
+            if c_menu:
+                concept_stats["chunks_run"] += 1
+                try:
+                    c_sys, c_user = PROMPTS["concept_extract"](txt, c_menu)
+                    c_out = await router.chat(
+                        "concept_extract", system=c_sys, user=c_user
+                    )
+                    c_parsed = _extract_json(c_out.text)
+                    c_iris = {c["iri"] for c in c_menu}
+                    c_kept = (
+                        _filter_entities(
+                            c_parsed.get("entities"), c_iris, ent_drops,
+                            abstained, _abstain_sample_cap,
+                            cand_labels={c["label"]: c["iri"] for c in c_menu},
+                            type_index=recovery_index,
+                        )
+                        if isinstance(c_parsed, dict)
+                        else []
+                    )
+                    # entity_extract sees the concept classes too (they are
+                    # in the full menu), so it may already have found what
+                    # this pass returns. Dedup on the same normalised key the
+                    # DB upsert uses, so a duplicate is dropped here rather
+                    # than counted twice in the stats.
+                    seen = {_dedup_key(e["canonical_name"]) for e in kept}
+                    for c in c_kept:
+                        key = _dedup_key(c["canonical_name"])
+                        if key in seen:
+                            concept_stats["duplicate_of_entity"] += 1
+                            continue
+                        seen.add(key)
+                        kept.append(c)
+                        concept_stats["added"] += 1
+                except Exception as exc:
+                    concept_stats["failed"] += 1
+                    print(
+                        f"[extract-entities] chunk {chunk_iri} concept pass "
+                        f"failed: {exc}"
+                    )
 
             # ---- Second pass: relationships ----
             #
@@ -2426,7 +2748,28 @@ async def extract_entities(
     # output to show for it.
     summary.entity_drops = dict(ent_drops)
     summary.abstained_samples = abstained
-    _ent_dropped = sum(ent_drops.values())
+    # `recovered_label_iri` counts entities SAVED, not lost -- excluded from
+    # the drop total so a recovery is never reported as a loss.
+    _recovery_keys = ("recovered_label_iri", "recovered_proposed_type")
+    _recovered = ent_drops.get("recovered_label_iri", 0)
+    _recovered_type = ent_drops.get("recovered_proposed_type", 0)
+    _ent_dropped = sum(
+        v for k, v in ent_drops.items() if k not in _recovery_keys
+    )
+    if _recovered_type:
+        print(
+            f"[extract-entities] recovered {_recovered_type} abstention(s) "
+            f"whose proposed_type named a class that EXISTS but had not "
+            f"reached that chunk's candidate menu. A high number here means "
+            f"the menu is too narrow, NOT that the ontology is missing a "
+            f"branch -- a prune-expand run would not change it."
+        )
+    if _recovered:
+        print(
+            f"[extract-entities] recovered {_recovered} entity assignment(s) "
+            f"where the model wrote the class LABEL into the class_iri field "
+            f"instead of the IRI. These would previously have been dropped."
+        )
     if _ent_dropped:
         print(
             f"[extract-entities] entity drops: {_ent_dropped} "
@@ -2457,6 +2800,17 @@ async def extract_entities(
             f"{val_stats['empty_reextract_rejected']} empty re-extract(s) "
             f"rejected; {val_stats['validator_failed']} validator call(s) "
             f"failed (kept the unreviewed result)"
+        )
+
+    if concept_pass:
+        summary.concept_extraction = dict(concept_stats)
+        print(
+            f"[extract-entities] concept pass: {concept_stats['added']} "
+            f"concept(s) added over {concept_stats['chunks_run']} chunk(s) "
+            f"({concept_stats['duplicate_of_entity']} already found by the "
+            f"entity pass, {concept_stats['no_concept_classes']} chunk(s) had "
+            f"no concept class on the menu and cost no call, "
+            f"{concept_stats['failed']} call(s) failed)"
         )
 
     if extract_relationships:
