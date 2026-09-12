@@ -1071,12 +1071,29 @@ async def _verify_relationships(
     though, so a model that skips a claim does not smuggle it through.
     """
     label_of = {p["iri"]: (p.get("label") or p["iri"]) for p in pred_list}
-    claims = [{
-        "subject": r["subject"],
-        "object": r["object"],
-        "predicate_label": label_of.get(r["predicate_iri"], r["predicate_iri"]),
-        "evidence": r["evidence"],
-    } for r in rels]
+    # The declared domain/range travel with each claim so the auditor can see
+    # what the predicate MEANS, not just its camelCase name. Measured: it
+    # affirmed "Northern Powergrid --monitors--> Gas and Electricity Markets
+    # Authority" against a quote reading "enforced BY the Authority", and
+    # "BHE GT&S --hasMember--> FERC" against "rate-regulated BY the Federal
+    # Energy...". Knowing hasMember runs <Organization> -> <Agent> makes a
+    # regulator in the object slot visibly wrong.
+    shape_of = {
+        p["iri"]: (p.get("domain_label") or "", p.get("range_label") or "")
+        for p in pred_list
+    }
+    claims = []
+    for r in rels:
+        dom_lbl, rng_lbl = shape_of.get(r["predicate_iri"], ("", ""))
+        claims.append({
+            "subject": r["subject"],
+            "object": r["object"],
+            "predicate_label": label_of.get(
+                r["predicate_iri"], r["predicate_iri"]),
+            "domain_label": dom_lbl,
+            "range_label": rng_lbl,
+            "evidence": r["evidence"],
+        })
 
     try:
         v_sys, v_user = PROMPTS["relationship_verify"](chunk_text, claims)

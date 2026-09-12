@@ -419,3 +419,67 @@ def test_trim_falls_back_to_the_original_when_an_endpoint_is_unlocatable() -> No
 
     q = "The parties entered into an agreement in 2024."
     assert _trim_quote_to_claim(q, "Acme", "Beta") == q
+
+
+# --------------------------------------------------------------------------- #
+# Direction auditing: the two shapes measured on the finance corpus
+# --------------------------------------------------------------------------- #
+
+
+def test_verify_prompt_names_passive_voice_as_the_inversion_trap() -> None:
+    """Measured on a utility 10-K: the auditor affirmed
+    `Northern Powergrid --monitors--> Gas and Electricity Markets Authority`
+    against a quote reading "Northern Powergrid's licenses are ENFORCED BY the
+    Gas and Electricity Markets Authority", and
+    `BHE GT&S --hasMember--> FERC` against "RATE-REGULATED BY the Federal
+    Energy...". 4 of 5 wrong edges in that run were this shape, with
+    `reversed=0` reported.
+
+    The generic "direction is the point" rule was already present and did not
+    fire, so the specific pattern is named.
+    """
+    from backend.app.services.prompts import relationship_verify
+    sys_p, _ = relationship_verify("passage", [
+        {"subject": "A", "object": "B", "predicate_label": "monitors",
+         "evidence": "A's licenses are enforced by B"},
+    ])
+    low = sys_p.lower()
+    assert "passive voice" in low
+    for cue in ("regulated by", "owned by", "subsidiary of"):
+        assert cue in low, cue
+
+
+def test_verify_prompt_rejects_bare_enumerations() -> None:
+    """`BHE Transmission --hasMember--> Berkshire Hathaway Energy` was affirmed
+    on a quote that is purely a list: "BHE Transmission (BHE Canada/AltaLink,
+    BHE U.S. Transmission); BHE Renewables; HomeServices". A list says these
+    things exist, not how they relate."""
+    from backend.app.services.prompts import relationship_verify
+    sys_p, _ = relationship_verify("passage", [
+        {"subject": "A", "object": "B", "predicate_label": "hasMember",
+         "evidence": "A (X, Y); B; C"},
+    ])
+    assert "A LIST IS NOT AN ASSERTION" in sys_p
+
+
+def test_verify_claim_shows_the_predicates_declared_shape() -> None:
+    """Without it the auditor sees only a camelCase label and must guess the
+    semantics -- knowing hasMember runs <Organization> -> <Agent> is what makes
+    a regulator in the object slot visibly wrong."""
+    from backend.app.services.prompts import relationship_verify
+    _s, user = relationship_verify("passage", [
+        {"subject": "BHE GT&S", "object": "FERC", "predicate_label": "hasMember",
+         "domain_label": "Organization", "range_label": "Agent",
+         "evidence": "rate-regulated by FERC"},
+    ])
+    assert "means: <Organization> hasMember <Agent>" in user
+
+
+def test_verify_claim_without_domain_range_still_renders() -> None:
+    """Callers that pass no shape must not break -- the line is simply omitted."""
+    from backend.app.services.prompts import relationship_verify
+    _s, user = relationship_verify("passage", [
+        {"subject": "A", "object": "B", "predicate_label": "p", "evidence": "q"},
+    ])
+    assert "[0] A --p--> B" in user
+    assert "means:" not in user
