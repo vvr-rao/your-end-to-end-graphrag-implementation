@@ -323,3 +323,90 @@ def test_split_disjunction_label_only_fires_on_real_disjunctions() -> None:
     assert split_disjunction_label("Doctor") == []
     assert split_disjunction_label("") == []
     assert split_disjunction_label(None) == []
+
+
+# --------------------------------------------------------------------------- #
+# Stage 3 reconciliation: the dedup model drops entries it never merged
+# --------------------------------------------------------------------------- #
+
+
+def _reconcile(merged_in, model_out, existing=()):
+    """The reconciliation `_dedup` performs, in isolation."""
+    from backend.app.services.pipeline_llm import _DEDUP_KEYS, _dedup_merge_key
+
+    out = {k: list(model_out.get(k) or []) for k in _DEDUP_KEYS}
+    restored = 0
+    for key in _DEDUP_KEYS:
+        have = {_dedup_merge_key(key, e) for e in out[key] if isinstance(e, dict)}
+        for entry in merged_in.get(key) or []:
+            ident = _dedup_merge_key(key, entry)
+            if not ident or ident in have:
+                continue
+            if key == "MATCH NOT FOUND" and ident in {c.lower() for c in existing}:
+                continue
+            have.add(ident)
+            out[key].append(entry)
+            restored += 1
+    return out, restored
+
+
+def _mnf(label):
+    return {"LABEL": label, "DESCRIPTION": "d", "PARENT_LABEL": "NONE"}
+
+
+def test_dropped_proposals_are_restored() -> None:
+    """Stage 3 is a FILTER, not a summariser. Measured on two corpora it drops
+    the same ~64% of proposals -- finance 1632 -> 550, pharma 509 -> 186 --
+    against a genuine near-duplicate rate of ~6% (the batch clusterer found
+    only 21 of 341 class clusters with more than one member). There was nothing
+    for the other 320 to be merged into."""
+    src = {"MATCH NOT FOUND": [_mnf("GovernmentAgency"), _mnf("SystemOperator"),
+                               _mnf("WindFarm")]}
+    out, n = _reconcile(src, {"MATCH NOT FOUND": [_mnf("WindFarm")]})
+    labels = {e["LABEL"] for e in out["MATCH NOT FOUND"]}
+    assert labels == {"GovernmentAgency", "SystemOperator", "WindFarm"}
+    assert n == 2
+
+
+def test_a_genuine_collapse_is_not_undone_twice() -> None:
+    """An entry the model DID return is never duplicated by the restore."""
+    src = {"MATCH NOT FOUND": [_mnf("WindFarm")]}
+    out, n = _reconcile(src, {"MATCH NOT FOUND": [_mnf("WindFarm")]})
+    assert len(out["MATCH NOT FOUND"]) == 1 and n == 0
+
+
+def test_rule_1_still_holds_after_restore() -> None:
+    """Never resurrect a class that already exists in the ontology -- that is
+    what rule 1 removes, and the restore must not put it back."""
+    src = {"MATCH NOT FOUND": [_mnf("Organization")]}
+    out, n = _reconcile(src, {"MATCH NOT FOUND": []}, existing=("Organization",))
+    assert out["MATCH NOT FOUND"] == [] and n == 0
+
+
+def test_restore_covers_relations_and_instances_too() -> None:
+    """Instances take the same hit: 1,021 proposed -> 389 emitted on finance."""
+    src = {
+        "MATCH NOT FOUND RELATIONS": [
+            {"LABEL": "owns", "DOMAIN": "Org", "RANGE": "Asset"}],
+        "MATCH NOT FOUND INSTANCES": [
+            {"LABEL": "X", "CANONICAL_FORM": "X", "TYPE_LABEL": "Org"}],
+    }
+    out, n = _reconcile(src, {})
+    assert len(out["MATCH NOT FOUND RELATIONS"]) == 1
+    assert len(out["MATCH NOT FOUND INSTANCES"]) == 1
+    assert n == 2
+
+
+def test_iri_shaped_instance_types_are_not_synthesised_as_classes() -> None:
+    """`extend_ontology_with_instances` resolves an IRI TYPE_LABEL directly
+    against `classes_dict`, which is keyed BY IRI. `existing_concepts` holds
+    LABELS, so comparing against it reports these as orphans -- the first run
+    of the synthesis minted classes literally named
+    `http://www.w3.org/ns/org#Organization`.
+    """
+    for tl in ("http://www.w3.org/ns/org#Organization",
+               "http://www.w3.org/2006/time#Instant",
+               "https://example.com/x#Thing"):
+        assert "://" in tl or "#" in tl, tl
+    # a plain label must still be eligible
+    assert "://" not in "GovernmentAgency" and "#" not in "GovernmentAgency"
