@@ -897,7 +897,14 @@ def _entity_iri(canonical_name: str, class_iri: str) -> str:
 # a `PublicCompany` entity, so the entity's classes are walked UP the
 # subClassOf chain (source=child -> target=parent, as the importer writes it).
 
-_MAX_CANDIDATE_PREDICATES = 40
+# Predicates shown per chunk, AFTER ranking by fit (see `_rank_predicates`).
+# The pool used to be cut at 40 in ALPHABETICAL order: on multihop-rag-subset
+# 84 of 89 chunks had a larger pool (median 102), the menu typically ended at
+# "h", and only 11 of 516 proposals used a predicate past it -- memberOf,
+# ownedBy, partOf, worksFor were effectively never offered.
+_MAX_CANDIDATE_PREDICATES = 60
+# Upper bound on the unranked pool fetched from the DB before ranking.
+_CANDIDATE_POOL_LIMIT = 2000
 # Rescue menu is wider (either-end match), so it needs a higher ceiling; the
 # measured either-end pool is a median of 52 per chunk.
 _MAX_RESCUE_PREDICATES = 60
@@ -976,12 +983,18 @@ SELECT DISTINCT up.origin, oc.iri
   FROM up JOIN graphrag.ontology_classes oc ON oc.id = up.id
 """)
 
+# Returns EVERY in-scope declared domain and range, not the first one: 173 of
+# 434 predicates on the news build declare several (`created` has domain
+# [Organization, Agent]), and checking only the first rejected
+# `Sam Bankman-Fried --created--> FTT token`.
 _CANDIDATE_PREDICATE_SQL = sql_text("""
 SELECT op.iri, op.label,
-       (SELECT d->>'iri' FROM jsonb_array_elements(op.extra_metadata->'domain') d
-         WHERE d->>'iri' = ANY(CAST(:iris AS text[])) LIMIT 1) AS dom_iri,
-       (SELECT r->>'iri' FROM jsonb_array_elements(op.extra_metadata->'range') r
-         WHERE r->>'iri' = ANY(CAST(:iris AS text[])) LIMIT 1) AS rng_iri
+       ARRAY(SELECT DISTINCT d->>'iri'
+               FROM jsonb_array_elements(op.extra_metadata->'domain') d
+              WHERE d->>'iri' = ANY(CAST(:iris AS text[]))) AS dom_iris,
+       ARRAY(SELECT DISTINCT r->>'iri'
+               FROM jsonb_array_elements(op.extra_metadata->'range') r
+              WHERE r->>'iri' = ANY(CAST(:iris AS text[]))) AS rng_iris
   FROM graphrag.ontology_object_properties op
  WHERE jsonb_typeof(op.extra_metadata->'domain') = 'array'
    AND jsonb_typeof(op.extra_metadata->'range')  = 'array'
@@ -1203,12 +1216,11 @@ async def _verify_relationships(
             # than direction.
             s_ent = ent_by_norm.get(_normalize_name(rel["object"]))
             o_ent = ent_by_norm.get(_normalize_name(rel["subject"]))
-            dom_rng = pred_constraints.get(rel["predicate_iri"])
-            if s_ent and o_ent and dom_rng:
-                dom_iri, rng_iri = dom_rng
+            menu_pred = next((p for p in pred_list
+                              if p["iri"] == rel["predicate_iri"]), None)
+            if s_ent and o_ent and menu_pred:
                 s_cls, o_cls = s_ent["class_iri"], o_ent["class_iri"]
-                if (dom_iri in pred_ancestors.get(s_cls, {s_cls})
-                        and rng_iri in pred_ancestors.get(o_cls, {o_cls})):
+                if _types_fit(menu_pred, s_cls, o_cls, pred_ancestors):
                     out.append({**rel,
                                 "subject": s_ent["canonical_name"],
                                 "object": o_ent["canonical_name"]})
@@ -1321,6 +1333,7 @@ async def _candidate_predicates(
     # per-claim check keeps requiring domain/range to sit on the same IS-A line
     # as that entity's own class. A shared pool would let any entity satisfy
     # any other entity's subtree, which is a different and much looser rule.
+    up_only = {c: set(a) for c, a in ancestors.items()}
     r = await session.execute(_DESCENDANT_SQL, {"iris": list(class_iris)})
     for origin, desc in r.all():
         ancestors.setdefault(origin, {origin}).add(desc)
@@ -1328,22 +1341,105 @@ async def _candidate_predicates(
 
     r = await session.execute(
         _CANDIDATE_PREDICATE_SQL,
-        {"iris": list(expanded), "limit": _MAX_CANDIDATE_PREDICATES},
+        {"iris": list(expanded), "limit": _CANDIDATE_POOL_LIMIT},
     )
-    labels: dict[str, str] = {}
-    out: list[dict[str, str]] = []
+    pool = [(iri, label, list(doms or []), list(rngs or []))
+            for iri, label, doms, rngs in r.all()]
+    # Depth of each declared domain/range (its ancestor count) -- a deeper
+    # class is a more specific predicate. One query per chunk.
+    typ_iris = {t for _, _, d, g in pool for t in (*d, *g)}
+    depth: dict[str, int] = {}
+    if typ_iris:
+        r = await session.execute(_ANCESTOR_SQL, {"iris": list(typ_iris)})
+        for origin, _anc in r.all():
+            depth[origin] = depth.get(origin, 0) + 1
+    ranked = _rank_predicates(pool, set(class_iris), up_only, ancestors, depth)
+
+    out: list[dict[str, Any]] = []
     constraints: dict[str, tuple[str, str]] = {}
-    for iri, label, dom_iri, rng_iri in r.all():
-        if not dom_iri or not rng_iri:
-            continue
+    for iri, label, doms, rngs, dom_iri, rng_iri in (
+            ranked[:_MAX_CANDIDATE_PREDICATES]):
         constraints[iri] = (dom_iri, rng_iri)
         out.append({
             "iri": iri,
             "label": label or iri.rsplit("#", 1)[-1],
-            "domain_label": labels.get(dom_iri) or dom_iri.rsplit("#", 1)[-1],
-            "range_label": labels.get(rng_iri) or rng_iri.rsplit("#", 1)[-1],
+            "domain_label": dom_iri.rsplit("#", 1)[-1].rsplit("/", 1)[-1],
+            "range_label": rng_iri.rsplit("#", 1)[-1].rsplit("/", 1)[-1],
+            # Every in-scope declared type, for `_types_fit`. The labels above
+            # show the best-fitting pair only.
+            "domain_iris": doms,
+            "range_iris": rngs,
         })
     return out, constraints, ancestors
+
+
+def _rank_predicates(
+    pool: list[tuple[str, str | None, list[str], list[str]]],
+    class_iris: set[str],
+    up_only: dict[str, set[str]],
+    lines: dict[str, set[str]],
+    depth: dict[str, int],
+) -> list[tuple[str, str | None, list[str], list[str], str, str]]:
+    """Keep predicates that fit SOME ordered pair of this chunk's classes, and
+    order them by how well they fit.
+
+    A predicate is offered only if one class's IS-A line meets a declared
+    domain and one class's line meets a declared range -- the pooled SQL alone
+    also admits predicates whose domain fits entity A and range fits only A,
+    which no pair can use. Ranking, best first:
+
+      tier 0  both ends are the entity's own class
+      tier 1  worst end is an ANCESTOR (`Organization` for a `PublicCompany`)
+      tier 2  some end matches only a DESCENDANT (`pipelineoperator` for an
+              entity typed `Organization`) -- valid inference, weakest fit
+
+    then deeper (more specific) domain+range first, then label. Returns each
+    predicate with the best-fitting (domain, range) pair appended.
+    """
+    def tier(t: str, cls: str) -> int:
+        if t == cls:
+            return 0
+        return 1 if t in up_only.get(cls, {cls}) else 2
+
+    ranked = []
+    for iri, label, doms, rngs in pool:
+        best: tuple[int, int, str, str] | None = None
+        for s_cls in class_iris:
+            s_line = lines.get(s_cls, {s_cls})
+            ds = [d for d in doms if d in s_line]
+            if not ds:
+                continue
+            for o_cls in class_iris:
+                o_line = lines.get(o_cls, {o_cls})
+                for g in (g for g in rngs if g in o_line):
+                    for d in ds:
+                        key = (max(tier(d, s_cls), tier(g, o_cls)),
+                               -(depth.get(d, 1) + depth.get(g, 1)), d, g)
+                        if best is None or key[:2] < best[:2]:
+                            best = key
+        if best is not None:
+            ranked.append((best[0], best[1], (label or iri).lower(),
+                           (iri, label, doms, rngs, best[2], best[3])))
+    ranked.sort(key=lambda x: x[:3])
+    return [x[3] for x in ranked]
+
+
+def _types_fit(
+    pred: dict[str, Any] | None,
+    s_cls: str,
+    o_cls: str,
+    ancestors: dict[str, set[str]],
+) -> bool:
+    """Does (s_cls, o_cls) satisfy ANY declared domain and ANY declared range
+    of this menu predicate? Uses the same per-class IS-A lines that offered it.
+    """
+    if not pred:
+        return False
+    doms = pred.get("domain_iris") or []
+    rngs = pred.get("range_iris") or []
+    s_line = ancestors.get(s_cls, {s_cls})
+    o_line = ancestors.get(o_cls, {o_cls})
+    return any(d in s_line for d in doms) and any(g in o_line for g in rngs)
 
 
 async def report_candidate_distances(
@@ -1729,7 +1825,7 @@ async def extract_entities(
     # than discarded, since the model found a real assertion and only mis-read
     # its direction.
     rel_repairs = {"direction_swapped": 0, "rescued": 0,
-                   "predicate_recovered": 0}
+                   "predicate_recovered": 0, "type_swapped": 0}
     cost_limit_hit = asyncio.Event()
 
     # Progress reporting -- mirrors generate-artifacts pattern.
@@ -2264,6 +2360,7 @@ async def extract_entities(
                         _pred_label = {p["iri"]: (p.get("label") or p["iri"])
                                        for p in pred_list}
                         _pred_index = _predicate_menu_index(pred_list)
+                        _pred_by_iri = {p["iri"]: p for p in pred_list}
                         for rel in (r_parsed.get("relationships") or []):
                             if not isinstance(rel, dict):
                                 continue
@@ -2297,10 +2394,9 @@ async def extract_entities(
                                 rel_drops["self_loop"] += 1
                                 continue
                             s_cls, o_cls = s_ent["class_iri"], o_ent["class_iri"]
-                            _type_ok = (
-                                dom_iri in pred_ancestors.get(s_cls, {s_cls})
-                                and rng_iri in pred_ancestors.get(
-                                    o_cls, {o_cls}))
+                            _type_ok = _types_fit(
+                                _pred_by_iri.get(pred), s_cls, o_cls,
+                                pred_ancestors)
                             # Narrowing the menu makes the type check weaker
                             # (offer and check now share a basis), so the
                             # model must QUOTE the text that asserts this.
@@ -2328,6 +2424,21 @@ async def extract_entities(
                             # type-check is held for the rescue pass rather
                             # than thrown away. It has already proved it is
                             # not a hallucination.
+                            if not _type_ok and _types_fit(
+                                    _pred_by_iri.get(pred), o_cls, s_cls,
+                                    pred_ancestors):
+                                # The types fit the OTHER way round: the model
+                                # read the direction backwards ("Pochettino
+                                # coachedBy Chelsea"). 26 of 123 type drops on
+                                # multihop-rag-subset were this shape. Swap and
+                                # let the verifier, which reads the quote,
+                                # confirm the direction -- if the original
+                                # reading was right it answers "reversed", the
+                                # flipped pair fails the type check there, and
+                                # the claim is dropped.
+                                s_ent, o_ent = o_ent, s_ent
+                                rel_repairs["type_swapped"] += 1
+                                _type_ok = True
                             if not _type_ok:
                                 rel_drops["domain_range"] += 1
                                 rejects.append({
@@ -3134,6 +3245,8 @@ async def extract_entities(
                f"predicate" if rel_repairs["rescued"] else "")
             + (f", {rel_repairs['direction_swapped']} direction(s) repaired"
                if rel_repairs["direction_swapped"] else "")
+            + (f", {rel_repairs['type_swapped']} claim(s) swapped to fit the "
+               f"predicate's types" if rel_repairs["type_swapped"] else "")
             + (f", {rel_repairs['predicate_recovered']} predicate IRI(s) "
                f"recovered from label/case" if rel_repairs["predicate_recovered"]
                else "")
