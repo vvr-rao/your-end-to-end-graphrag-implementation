@@ -149,11 +149,25 @@ def _convert_ttl_to_rdfxml_bytes(ttl_path: Path) -> bytes:
         if isinstance(o, BNode):
             g.remove((s, p, o))
             stripped += 1
+    from backend.app.helpers.ontology_parsing import (
+        GRAPHRAG_NAMED_EQUIVALENT_CLASS,
+    )
+
+    _equiv_ann = rdflib.URIRef(GRAPHRAG_NAMED_EQUIVALENT_CLASS)
+    g.add((_equiv_ann, rdflib.RDF.type, OWL.AnnotationProperty))
     for s, p, o in list(g.triples((None, OWL.equivalentClass, None))):
-        # Drop ALL equivalentClass triples -- blank-node ones break owlready2
-        # outright, and named-class ones pointing to external vocabularies
-        # (e.g. foaf:Organization) also break it because the placeholder
-        # isn't a class.
+        # Still removed from the graph owlready2 reads: blank-node equivalences
+        # break it outright, and named ones pointing at external vocabularies
+        # (foaf:Organization) break it because the placeholder isn't a class.
+        #
+        # But a NAMED equivalence is kept as a plain-literal annotation, which
+        # owlready2 loads harmlessly, so `extract_class` can restore it. Deleting
+        # it outright is what severed org:Organization from foaf:Organization and
+        # left relationship type-checking rejecting most person-organization
+        # edges. Anonymous (blank-node) equivalences carry no class identity to
+        # preserve and are still simply dropped.
+        if not isinstance(s, BNode) and not isinstance(o, BNode):
+            g.add((s, _equiv_ann, rdflib.Literal(str(o))))
         g.remove((s, p, o))
         stripped += 1
     for s, p, o in list(g.triples((None, RDFS.domain, None))):

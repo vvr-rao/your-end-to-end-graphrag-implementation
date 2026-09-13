@@ -883,12 +883,19 @@ WITH RECURSIVE down(origin, id) AS (
     SELECT oc.iri, oc.id FROM graphrag.ontology_classes oc
      WHERE oc.iri = ANY(CAST(:iris AS text[]))
   UNION
-    SELECT down.origin, gr.source_node_id
+    SELECT down.origin,
+           CASE WHEN gr.predicate_label = 'rdfs:subClassOf' THEN gr.source_node_id
+                WHEN gr.source_node_id = down.id THEN gr.target_node_id
+                ELSE gr.source_node_id END
       FROM down JOIN graphrag.graph_relationships gr
-        ON gr.target_node_id = down.id
-       AND gr.source_node_type = 'ontology_class'
+        ON gr.source_node_type = 'ontology_class'
        AND gr.target_node_type = 'ontology_class'
-       AND gr.predicate_label  = 'rdfs:subClassOf'
+       AND (
+             (gr.predicate_label = 'rdfs:subClassOf'
+              AND gr.target_node_id = down.id)
+          OR (gr.predicate_label = 'owl:equivalentClass'
+              AND (gr.source_node_id = down.id OR gr.target_node_id = down.id))
+       )
 )
 SELECT DISTINCT down.origin, oc.iri
   FROM down JOIN graphrag.ontology_classes oc ON oc.id = down.id
@@ -912,17 +919,32 @@ SELECT oc.iri FROM down JOIN graphrag.ontology_classes oc ON oc.id = down.id
 """)
 
 
+# Both closures cross owl:equivalentClass in EITHER direction, in addition to
+# walking rdfs:subClassOf. An equivalent class IS the same class, so it is an
+# ancestor and a descendant at once. Without this, `org:Organization` and
+# `foaf:Organization` -- declared equivalent in the W3C ORG ontology -- are
+# unrelated siblings under `foaf:Agent`, and every predicate declared on one
+# rejects entities typed with the other: `Caroline Ellison --controls-->
+# Alameda Research LLC` failed the type check on a news build although
+# `controls` is declared Person -> Organization. UNION (not UNION ALL) stops the
+# symmetric edge from looping.
 _ANCESTOR_SQL = sql_text("""
 WITH RECURSIVE up(origin, id) AS (
     SELECT oc.iri, oc.id FROM graphrag.ontology_classes oc
      WHERE oc.iri = ANY(CAST(:iris AS text[]))
   UNION
-    SELECT up.origin, gr.target_node_id
+    SELECT up.origin,
+           CASE WHEN gr.source_node_id = up.id THEN gr.target_node_id
+                ELSE gr.source_node_id END
       FROM up JOIN graphrag.graph_relationships gr
-        ON gr.source_node_id = up.id
-       AND gr.source_node_type = 'ontology_class'
+        ON gr.source_node_type = 'ontology_class'
        AND gr.target_node_type = 'ontology_class'
-       AND gr.predicate_label  = 'rdfs:subClassOf'
+       AND (
+             (gr.predicate_label = 'rdfs:subClassOf'
+              AND gr.source_node_id = up.id)
+          OR (gr.predicate_label = 'owl:equivalentClass'
+              AND (gr.source_node_id = up.id OR gr.target_node_id = up.id))
+       )
 )
 SELECT DISTINCT up.origin, oc.iri
   FROM up JOIN graphrag.ontology_classes oc ON oc.id = up.id
