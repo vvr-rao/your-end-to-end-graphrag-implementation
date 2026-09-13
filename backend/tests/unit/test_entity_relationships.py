@@ -847,7 +847,9 @@ def test_self_loop_is_counted_not_silently_dropped() -> None:
 
     src = inspect.getsource(m.extract_entities)
     assert '"self_loop": 0' in src or "'self_loop': 0" in src
-    assert 'rel_drops["self_loop"] += 1' in src
+    # The per-chunk gates live in the shared `_relationships_for_chunk`.
+    assert 'rel_drops["self_loop"] += 1' in inspect.getsource(
+        m._relationships_for_chunk)
 
 
 # --------------------------------------------------------------------------- #

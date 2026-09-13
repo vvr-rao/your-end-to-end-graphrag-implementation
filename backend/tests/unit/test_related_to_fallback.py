@@ -34,12 +34,11 @@ def test_relation_phrase_is_required_and_short() -> None:
     assert _clean_relation("a b c d e f g h i") is None  # a sentence, not a relation
 
 
-def test_relationship_cap_scales_with_entities() -> None:
-    assert _relationship_cap(4) == 10
-    assert _relationship_cap(19) == 10
-    assert _relationship_cap(40) == 20
-    assert _relationship_cap(80) == 40
-    assert _relationship_cap(500) == 40
+def test_relationship_cap_is_one_per_entity() -> None:
+    assert _relationship_cap(4) == 10      # floor
+    assert _relationship_cap(19) == 19
+    assert _relationship_cap(80) == 80     # a full lineup chunk
+    assert _relationship_cap(500) == 100   # token-safety ceiling
 
 
 def test_extract_prompt_offers_relation_field_and_the_cap() -> None:
@@ -78,3 +77,27 @@ def test_retrieval_shows_and_ranks_the_phrase_preferring_specific_on_ties() -> N
     ranked = _rank_relationships(rels, "where was he born?")
     # Both "born" edges beat the unrelated one; the typed edge wins the tie.
     assert [r["subject"] for r in ranked] == ["C", "A", "E"]
+
+
+def test_merged_names_rename_relationship_endpoints_too() -> None:
+    """The rename bug: entities were renamed by name collapse but the chunk's
+    relationships kept the old spelling and were dropped as unresolved."""
+    from backend.app.services.db_entity_extract import _apply_merged_names
+
+    merges = {"Alameda Research": "Alameda Research LLC", "FTX": "FTX Trading Ltd."}
+    kept = [{"canonical_name": "Alameda Research"}, {"canonical_name": "FTX"},
+            {"canonical_name": "Caroline Ellison"}]
+    rels = [{"subject": "Caroline Ellison", "object": "Alameda Research"},
+            {"subject": "Alameda Research", "object": "FTX"}]
+    results = [("chunk", "iri", "doc", kept, rels), None]
+
+    renamed, endpoints = _apply_merged_names(results, merges.get)
+
+    assert [e["canonical_name"] for e in kept] == [
+        "Alameda Research LLC", "FTX Trading Ltd.", "Caroline Ellison"]
+    assert rels == [
+        {"subject": "Caroline Ellison", "object": "Alameda Research LLC"},
+        {"subject": "Alameda Research LLC", "object": "FTX Trading Ltd."}]
+    assert endpoints == 3
+    assert renamed == {"Alameda Research LLC": {"Alameda Research"},
+                       "FTX Trading Ltd.": {"FTX"}}
