@@ -825,6 +825,26 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_ext.add_argument(
+        "--no-relationship-gap-pass", action="store_true",
+        help=(
+            "Skip the SECOND relationship pass, which shows the model the "
+            "first pass's accepted relationships and asks only for what it "
+            "missed. One pass finds a different ~70%% of a chunk's "
+            "relationships on each run. Costs one extra call per chunk."
+        ),
+    )
+    p_ext.add_argument(
+        "--no-relationship-orphan-check", action="store_true",
+        help=(
+            "Skip the orphan check: entities still without a relationship "
+            "after both passes are listed, and the model (task "
+            "relationship_orphan_check) either returns a relationship the "
+            "passage states for each or flags why there is none. Its "
+            "relationships face the same gates and the verifier. Costs one "
+            "call per chunk that has orphans."
+        ),
+    )
+    p_ext.add_argument(
         "--no-verify-relationships", action="store_true",
         help=(
             "Skip the THIRD pass that checks each relationship's quoted "
@@ -1086,6 +1106,19 @@ def build_parser() -> argparse.ArgumentParser:
              "except StructuredTable. Clustering is homogeneous within each type.",
     )
     p_art.set_defaults(func=_cmd_generate_artifacts)
+
+    p_relink = sub.add_parser(
+        "relink-artifact-entities",
+        help=(
+            "Add artifact -> assertsAbout -> entity edges using entity aliases "
+            "as well as full names (e.g. an artifact saying 'FTX' links to "
+            "FTX Trading Ltd.). For builds made before alias-aware linking. "
+            "No LLM calls; additive."
+        ),
+    )
+    p_relink.add_argument("--dry-run", action="store_true",
+                          help="Report how many edges would be added; write nothing.")
+    p_relink.set_defaults(func=_cmd_relink_artifact_entities)
 
     p_regen = sub.add_parser(
         "regenerate-stale-artifacts",
@@ -1876,6 +1909,10 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
                 args, "no_verify_relationships", False),
             rescue_relationships=getattr(
                 args, "rescue_relationships", False),
+            relationship_gap_pass=not getattr(
+                args, "no_relationship_gap_pass", False),
+            relationship_orphan_check=not getattr(
+                args, "no_relationship_orphan_check", False),
             entity_identity=getattr(args, "entity_identity", "name"),
             validate_entities=_validate,
             validation_rounds=_rounds,
@@ -1892,6 +1929,12 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
                 _extraction_cfg().get("pinned_class_labels") or ()),
         )
     )
+    return 0
+
+
+def _cmd_relink_artifact_entities(args: argparse.Namespace) -> int:
+    from backend.app.services.db_artifact_gen import relink_artifact_entities
+    asyncio.run(relink_artifact_entities(dry_run=args.dry_run))
     return 0
 
 

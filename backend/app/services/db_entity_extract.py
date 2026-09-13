@@ -24,6 +24,7 @@ Generic: no corpus-specific assumptions; works on any ingested corpus.
 from __future__ import annotations
 
 import asyncio
+import collections
 import hashlib
 import json
 import re
@@ -56,10 +57,11 @@ from backend.app.services.pipeline_llm import (
     _split_camel,
 )
 from backend.app.services.predicates import (
+    GRAPHRAG_RELATED_TO,
     RDF_TYPE,
     VIAO_ASSERTS_ABOUT,
 )
-from backend.app.services.prompts import PROMPTS
+from backend.app.services.prompts import ORPHAN_REASONS, PROMPTS
 
 _ENTITIES_NS = "https://veerla-ramrao.ai/ontology/entities"
 
@@ -172,6 +174,23 @@ def _resolve_menu_iri(raw: str, menu_index: dict[str, str]) -> str | None:
         return hit
     tail = raw.rsplit("#", 1)[-1].rsplit("/", 1)[-1]
     return menu_index.get(tail.strip().lower())
+
+
+def _predicate_menu_index(preds: list[dict[str, str]]) -> dict[str, str]:
+    """`_build_menu_index` for a predicate menu, so a mis-serialised
+    `predicate_iri` resolves to the predicate that was actually offered.
+
+    MEASURED on multihop-rag-subset: the merged ontology stores predicate IRIs
+    lowercased (`merged#employedby`) under camelCase labels (`employedBy`).
+    gpt-4.1-mini "corrected" the IRI to match the label in 127 of 590
+    proposals -- `merged#collaboratesWith`, even `foaf/0.1/employedBy` -- and
+    every one was dropped as bad_predicate. Resolution only ever lands on a
+    menu predicate, and a key two menu predicates share is not resolved.
+    """
+    return _build_menu_index(
+        {p["iri"] for p in preds},
+        {p["label"]: p["iri"] for p in preds if p.get("label")},
+    )
 
 
 def _filter_entities(
@@ -449,6 +468,19 @@ class EntityExtractSummary:
     # is missing a branch -- act on it with a prune-expand run.
     abstained_samples: list[dict[str, Any]] = field(default_factory=list)
     menu_classes_withheld: int = 0
+    # Name collapse audit: every spelling merged into another entity's name
+    # ({"from": "Alameda Research", "to": "Alameda Research LLC"}), and how many
+    # relationship endpoints were rewritten to follow. Before the endpoints
+    # were rewritten, a relationship naming a merged spelling could not find
+    # its entity and was dropped as "unresolved" -- 90 of 668 claims on
+    # multihop-rag-subset, concentrated on FTX, Alameda Research, Epic Games.
+    renamed_entities: list[dict[str, str]] = field(default_factory=list)
+    relationship_endpoints_renamed: int = 0
+    # Per-step relationship accounting (pass1 / gap / orphan_check): claims
+    # kept, duplicates discarded, orphans flagged and why, and how many of each
+    # step's claims the verifier kept. See `_relationships_for_chunk`.
+    relationship_pass_stats: dict[str, int] = field(default_factory=dict)
+    orphan_flags: list[dict[str, str]] = field(default_factory=list)
 
 
 def _normalize_name(name: str) -> str:
@@ -658,6 +690,15 @@ _CORPORATE_SUFFIX_TOKENS: tuple[str, ...] = (
 )
 
 
+# Longest evidence quote accepted, and stored. The relationship prompt lets a
+# quote reach back up to 3 sentences to include the name a pronoun refers to
+# ("Alameda is a hedge fund. Bankman-Fried founded it."); the ceiling makes
+# that cap real in code, since a long quote can otherwise bridge unrelated
+# sentences that happen to name both ends. The old 400-char storage cut would
+# also have dropped the naming sentence from citations.
+_MAX_EVIDENCE_CHARS = 700
+
+
 # Name tokens too generic to prove an entity is named in a quote. Without
 # this, "Ray-Ban Meta smart glasses" would count as named by any sentence
 # containing the word "smart".
@@ -688,7 +729,8 @@ def _evidence_names(evidence: str, ent: dict[str, Any]) -> bool:
     hay = _normalize_name(evidence)
     if not hay:
         return False
-    for form in (ent.get("canonical_name") or "", ent.get("short_name") or ""):
+    for form in (ent.get("canonical_name") or "", ent.get("short_name") or "",
+                 *(ent.get("aliases") or ())):
         norm = _normalize_name(form)
         if not norm:
             continue
@@ -871,7 +913,24 @@ def _entity_iri(canonical_name: str, class_iri: str) -> str:
 # a `PublicCompany` entity, so the entity's classes are walked UP the
 # subClassOf chain (source=child -> target=parent, as the importer writes it).
 
-_MAX_CANDIDATE_PREDICATES = 40
+# Predicates shown per chunk, AFTER ranking by fit (see `_rank_predicates`).
+# The pool used to be cut at 40 in ALPHABETICAL order: on multihop-rag-subset
+# 84 of 89 chunks had a larger pool (median 102), the menu typically ended at
+# "h", and only 11 of 516 proposals used a predicate past it -- memberOf,
+# ownedBy, partOf, worksFor were effectively never offered.
+_MAX_CANDIDATE_PREDICATES = 60
+# Upper bound on the unranked pool fetched from the DB before ranking.
+_CANDIDATE_POOL_LIMIT = 2000
+# Relationships the model may return per chunk: one per entity in the chunk,
+# within these bounds. A flat 10 could link at most 20 of a chunk's entities,
+# while summary chunks hold a median of 19 and up to 80 (full team lineups,
+# product round-ups) -- so rosters were cut off by construction. Half the
+# entity count still left a connected roster short; the ceiling exists only to
+# keep one response inside relationship_extract's max_tokens.
+_MIN_RELATIONSHIPS_PER_CHUNK = 10
+_MAX_RELATIONSHIPS_PER_CHUNK = 100
+# Longest free-text `relation` phrase accepted on a graphrag#relatedTo edge.
+_MAX_RELATION_WORDS = 8
 # Rescue menu is wider (either-end match), so it needs a higher ceiling; the
 # measured either-end pool is a median of 52 per chunk.
 _MAX_RESCUE_PREDICATES = 60
@@ -883,12 +942,19 @@ WITH RECURSIVE down(origin, id) AS (
     SELECT oc.iri, oc.id FROM graphrag.ontology_classes oc
      WHERE oc.iri = ANY(CAST(:iris AS text[]))
   UNION
-    SELECT down.origin, gr.source_node_id
+    SELECT down.origin,
+           CASE WHEN gr.predicate_label = 'rdfs:subClassOf' THEN gr.source_node_id
+                WHEN gr.source_node_id = down.id THEN gr.target_node_id
+                ELSE gr.source_node_id END
       FROM down JOIN graphrag.graph_relationships gr
-        ON gr.target_node_id = down.id
-       AND gr.source_node_type = 'ontology_class'
+        ON gr.source_node_type = 'ontology_class'
        AND gr.target_node_type = 'ontology_class'
-       AND gr.predicate_label  = 'rdfs:subClassOf'
+       AND (
+             (gr.predicate_label = 'rdfs:subClassOf'
+              AND gr.target_node_id = down.id)
+          OR (gr.predicate_label = 'owl:equivalentClass'
+              AND (gr.source_node_id = down.id OR gr.target_node_id = down.id))
+       )
 )
 SELECT DISTINCT down.origin, oc.iri
   FROM down JOIN graphrag.ontology_classes oc ON oc.id = down.id
@@ -912,28 +978,49 @@ SELECT oc.iri FROM down JOIN graphrag.ontology_classes oc ON oc.id = down.id
 """)
 
 
+# Both closures cross owl:equivalentClass in EITHER direction, in addition to
+# walking rdfs:subClassOf. An equivalent class IS the same class, so it is an
+# ancestor and a descendant at once. Without this, `org:Organization` and
+# `foaf:Organization` -- declared equivalent in the W3C ORG ontology -- are
+# unrelated siblings under `foaf:Agent`, and every predicate declared on one
+# rejects entities typed with the other: `Caroline Ellison --controls-->
+# Alameda Research LLC` failed the type check on a news build although
+# `controls` is declared Person -> Organization. UNION (not UNION ALL) stops the
+# symmetric edge from looping.
 _ANCESTOR_SQL = sql_text("""
 WITH RECURSIVE up(origin, id) AS (
     SELECT oc.iri, oc.id FROM graphrag.ontology_classes oc
      WHERE oc.iri = ANY(CAST(:iris AS text[]))
   UNION
-    SELECT up.origin, gr.target_node_id
+    SELECT up.origin,
+           CASE WHEN gr.source_node_id = up.id THEN gr.target_node_id
+                ELSE gr.source_node_id END
       FROM up JOIN graphrag.graph_relationships gr
-        ON gr.source_node_id = up.id
-       AND gr.source_node_type = 'ontology_class'
+        ON gr.source_node_type = 'ontology_class'
        AND gr.target_node_type = 'ontology_class'
-       AND gr.predicate_label  = 'rdfs:subClassOf'
+       AND (
+             (gr.predicate_label = 'rdfs:subClassOf'
+              AND gr.source_node_id = up.id)
+          OR (gr.predicate_label = 'owl:equivalentClass'
+              AND (gr.source_node_id = up.id OR gr.target_node_id = up.id))
+       )
 )
 SELECT DISTINCT up.origin, oc.iri
   FROM up JOIN graphrag.ontology_classes oc ON oc.id = up.id
 """)
 
+# Returns EVERY in-scope declared domain and range, not the first one: 173 of
+# 434 predicates on the news build declare several (`created` has domain
+# [Organization, Agent]), and checking only the first rejected
+# `Sam Bankman-Fried --created--> FTT token`.
 _CANDIDATE_PREDICATE_SQL = sql_text("""
 SELECT op.iri, op.label,
-       (SELECT d->>'iri' FROM jsonb_array_elements(op.extra_metadata->'domain') d
-         WHERE d->>'iri' = ANY(CAST(:iris AS text[])) LIMIT 1) AS dom_iri,
-       (SELECT r->>'iri' FROM jsonb_array_elements(op.extra_metadata->'range') r
-         WHERE r->>'iri' = ANY(CAST(:iris AS text[])) LIMIT 1) AS rng_iri
+       ARRAY(SELECT DISTINCT d->>'iri'
+               FROM jsonb_array_elements(op.extra_metadata->'domain') d
+              WHERE d->>'iri' = ANY(CAST(:iris AS text[]))) AS dom_iris,
+       ARRAY(SELECT DISTINCT r->>'iri'
+               FROM jsonb_array_elements(op.extra_metadata->'range') r
+              WHERE r->>'iri' = ANY(CAST(:iris AS text[]))) AS rng_iris
   FROM graphrag.ontology_object_properties op
  WHERE jsonb_typeof(op.extra_metadata->'domain') = 'array'
    AND jsonb_typeof(op.extra_metadata->'range')  = 'array'
@@ -1025,6 +1112,7 @@ async def _rescue_relationships(
         return []
 
     hay = " ".join(chunk_text.split()).lower()
+    wide_index = _predicate_menu_index(wide_preds)
     rescued: list[dict[str, Any]] = []
     for rel in (parsed.get("relationships") or []):
         if not isinstance(rel, dict):
@@ -1035,6 +1123,11 @@ async def _rescue_relationships(
         s_ent = _resolve_entity_ref(rel.get("subject") or "", ent_by_norm)
         o_ent = _resolve_entity_ref(rel.get("object") or "", ent_by_norm)
         pred = (rel.get("predicate_iri") or "").strip()
+        if pred and pred not in known_iris:
+            recovered = _resolve_menu_iri(pred, wide_index)
+            if recovered in known_iris:
+                pred = recovered
+                rel_repairs["predicate_recovered"] += 1
         if s_ent is None or o_ent is None or pred not in known_iris:
             continue
         if s_ent["canonical_name"] == o_ent["canonical_name"]:
@@ -1042,7 +1135,7 @@ async def _rescue_relationships(
         ev = " ".join((rel.get("evidence") or "").split())
         # Same evidence bar as the strict path -- widening WHICH predicate may
         # be used never widens what counts as proof.
-        if len(ev) < 12 or ev.lower() not in hay:
+        if len(ev) < 12 or len(ev) > _MAX_EVIDENCE_CHARS or ev.lower() not in hay:
             continue
         if not (_evidence_names(ev, s_ent) and _evidence_names(ev, o_ent)):
             continue
@@ -1051,7 +1144,7 @@ async def _rescue_relationships(
             "object": o_ent["canonical_name"],
             "predicate_iri": pred,
             "confidence": None,
-            "evidence": ev[:400],
+            "evidence": ev[:_MAX_EVIDENCE_CHARS],
             "type_check": "relaxed",
         })
     rel_repairs["rescued"] += len(rescued)
@@ -1102,13 +1195,16 @@ async def _verify_relationships(
     claims = []
     for r in rels:
         dom_lbl, rng_lbl = shape_of.get(r["predicate_iri"], ("", ""))
+        generic = r["predicate_iri"] == GRAPHRAG_RELATED_TO
         claims.append({
             "subject": r["subject"],
             "object": r["object"],
-            "predicate_label": label_of.get(
-                r["predicate_iri"], r["predicate_iri"]),
-            "domain_label": dom_lbl,
-            "range_label": rng_lbl,
+            # A relatedTo claim is judged on its phrase ("was born in"); the
+            # bare word "relatedTo" would let almost any co-mention pass.
+            "predicate_label": (r.get("relation") or "related to") if generic
+            else label_of.get(r["predicate_iri"], r["predicate_iri"]),
+            "domain_label": "" if generic else dom_lbl,
+            "range_label": "" if generic else rng_lbl,
             "evidence": r["evidence"],
         })
 
@@ -1142,6 +1238,12 @@ async def _verify_relationships(
         if verdict == "supported":
             out.append(rel)
             continue
+        if verdict == "reversed" and rel["predicate_iri"] == GRAPHRAG_RELATED_TO:
+            # Flipping the ends would leave the phrase backwards ("Failsworth
+            # was born in Ratcliffe"), and there is no reliable way to invert
+            # free text -- so drop it rather than write a garbled edge.
+            rel_drops["reversed"] += 1
+            continue
         if verdict == "reversed":
             # The assertion is real; only the direction was mis-read. Keep it
             # ONLY if the flipped pair still type-checks -- a swap that
@@ -1149,12 +1251,11 @@ async def _verify_relationships(
             # than direction.
             s_ent = ent_by_norm.get(_normalize_name(rel["object"]))
             o_ent = ent_by_norm.get(_normalize_name(rel["subject"]))
-            dom_rng = pred_constraints.get(rel["predicate_iri"])
-            if s_ent and o_ent and dom_rng:
-                dom_iri, rng_iri = dom_rng
+            menu_pred = next((p for p in pred_list
+                              if p["iri"] == rel["predicate_iri"]), None)
+            if s_ent and o_ent and menu_pred:
                 s_cls, o_cls = s_ent["class_iri"], o_ent["class_iri"]
-                if (dom_iri in pred_ancestors.get(s_cls, {s_cls})
-                        and rng_iri in pred_ancestors.get(o_cls, {o_cls})):
+                if _types_fit(menu_pred, s_cls, o_cls, pred_ancestors):
                     out.append({**rel,
                                 "subject": s_ent["canonical_name"],
                                 "object": o_ent["canonical_name"]})
@@ -1267,6 +1368,7 @@ async def _candidate_predicates(
     # per-claim check keeps requiring domain/range to sit on the same IS-A line
     # as that entity's own class. A shared pool would let any entity satisfy
     # any other entity's subtree, which is a different and much looser rule.
+    up_only = {c: set(a) for c, a in ancestors.items()}
     r = await session.execute(_DESCENDANT_SQL, {"iris": list(class_iris)})
     for origin, desc in r.all():
         ancestors.setdefault(origin, {origin}).add(desc)
@@ -1274,22 +1376,175 @@ async def _candidate_predicates(
 
     r = await session.execute(
         _CANDIDATE_PREDICATE_SQL,
-        {"iris": list(expanded), "limit": _MAX_CANDIDATE_PREDICATES},
+        {"iris": list(expanded), "limit": _CANDIDATE_POOL_LIMIT},
     )
-    labels: dict[str, str] = {}
-    out: list[dict[str, str]] = []
+    pool = [(iri, label, list(doms or []), list(rngs or []))
+            for iri, label, doms, rngs in r.all()]
+    # Depth of each declared domain/range (its ancestor count) -- a deeper
+    # class is a more specific predicate. One query per chunk.
+    typ_iris = {t for _, _, d, g in pool for t in (*d, *g)}
+    depth: dict[str, int] = {}
+    if typ_iris:
+        r = await session.execute(_ANCESTOR_SQL, {"iris": list(typ_iris)})
+        for origin, _anc in r.all():
+            depth[origin] = depth.get(origin, 0) + 1
+    ranked = _rank_predicates(pool, set(class_iris), up_only, ancestors, depth)
+
+    out: list[dict[str, Any]] = []
     constraints: dict[str, tuple[str, str]] = {}
-    for iri, label, dom_iri, rng_iri in r.all():
-        if not dom_iri or not rng_iri:
-            continue
+    for iri, label, doms, rngs, dom_iri, rng_iri in (
+            ranked[:_MAX_CANDIDATE_PREDICATES]):
         constraints[iri] = (dom_iri, rng_iri)
         out.append({
             "iri": iri,
             "label": label or iri.rsplit("#", 1)[-1],
-            "domain_label": labels.get(dom_iri) or dom_iri.rsplit("#", 1)[-1],
-            "range_label": labels.get(rng_iri) or rng_iri.rsplit("#", 1)[-1],
+            "domain_label": dom_iri.rsplit("#", 1)[-1].rsplit("/", 1)[-1],
+            "range_label": rng_iri.rsplit("#", 1)[-1].rsplit("/", 1)[-1],
+            # Every in-scope declared type, for `_types_fit`. The labels above
+            # show the best-fitting pair only.
+            "domain_iris": doms,
+            "range_iris": rngs,
         })
+    # The reserved fallback is always on the menu (outside the cap), so a
+    # stated relationship the ontology has no predicate for is recorded with
+    # its phrase rather than discarded. The prompt lists it last-resort.
+    constraints[GRAPHRAG_RELATED_TO] = ("", "")
+    out.append({
+        "iri": GRAPHRAG_RELATED_TO,
+        "label": "relatedTo",
+        "domain_label": "Thing",
+        "range_label": "Thing",
+        "domain_iris": [],
+        "range_iris": [],
+    })
     return out, constraints, ancestors
+
+
+def _rank_predicates(
+    pool: list[tuple[str, str | None, list[str], list[str]]],
+    class_iris: set[str],
+    up_only: dict[str, set[str]],
+    lines: dict[str, set[str]],
+    depth: dict[str, int],
+) -> list[tuple[str, str | None, list[str], list[str], str, str]]:
+    """Keep predicates that fit SOME ordered pair of this chunk's classes, and
+    order them by how well they fit.
+
+    A predicate is offered only if one class's IS-A line meets a declared
+    domain and one class's line meets a declared range -- the pooled SQL alone
+    also admits predicates whose domain fits entity A and range fits only A,
+    which no pair can use. Ranking, best first:
+
+      tier 0  both ends are the entity's own class
+      tier 1  worst end is an ANCESTOR (`Organization` for a `PublicCompany`)
+      tier 2  some end matches only a DESCENDANT (`pipelineoperator` for an
+              entity typed `Organization`) -- valid inference, weakest fit
+
+    then deeper (more specific) domain+range first, then label. Returns each
+    predicate with the best-fitting (domain, range) pair appended.
+    """
+    def tier(t: str, cls: str) -> int:
+        if t == cls:
+            return 0
+        return 1 if t in up_only.get(cls, {cls}) else 2
+
+    ranked = []
+    for iri, label, doms, rngs in pool:
+        best: tuple[int, int, str, str] | None = None
+        for s_cls in class_iris:
+            s_line = lines.get(s_cls, {s_cls})
+            ds = [d for d in doms if d in s_line]
+            if not ds:
+                continue
+            for o_cls in class_iris:
+                o_line = lines.get(o_cls, {o_cls})
+                for g in (g for g in rngs if g in o_line):
+                    for d in ds:
+                        key = (max(tier(d, s_cls), tier(g, o_cls)),
+                               -(depth.get(d, 1) + depth.get(g, 1)), d, g)
+                        if best is None or key[:2] < best[:2]:
+                            best = key
+        if best is not None:
+            ranked.append((best[0], best[1], (label or iri).lower(),
+                           (iri, label, doms, rngs, best[2], best[3])))
+    ranked.sort(key=lambda x: x[:3])
+    return [x[3] for x in ranked]
+
+
+def _apply_merged_names(
+    results: list[Any],
+    merged_name: Any,
+) -> tuple[dict[str, set[str]], int]:
+    """Rename entities to their merged spelling, and the relationship
+    endpoints that name them, with ONE function so the two cannot diverge.
+
+    `results` holds per-chunk tuples whose [3] is the kept entities and [4] the
+    relationships; both are rewritten in place. `merged_name(own)` returns the
+    new spelling or None. Returns ({new_name: {old spellings}}, number of
+    relationship endpoints rewritten).
+    """
+    renamed_from: dict[str, set[str]] = {}
+    endpoints = 0
+    for tup in results:
+        if tup is None:
+            continue
+        for e in (tup[3] or []):
+            own = (e.get("canonical_name") or "").strip()
+            new = merged_name(own)
+            if new:
+                e["canonical_name"] = new
+                renamed_from.setdefault(new, set()).add(own)
+        # A chunk's relationships name their ends by the spelling THAT chunk
+        # used, copied before the merge. Left alone, the write step looks up a
+        # name that no longer exists and drops the edge as "unresolved".
+        for rel in (tup[4] or []):
+            for side in ("subject", "object"):
+                new = merged_name((rel.get(side) or "").strip())
+                if new:
+                    rel[side] = new
+                    endpoints += 1
+    return renamed_from, endpoints
+
+
+def _relationship_cap(n_entities: int) -> int:
+    """Relationships to ask for in a chunk holding `n_entities` entities."""
+    return max(_MIN_RELATIONSHIPS_PER_CHUNK,
+               min(_MAX_RELATIONSHIPS_PER_CHUNK, n_entities))
+
+
+def _clean_relation(raw: Any) -> str | None:
+    """The `relation` phrase of a relatedTo claim, or None if unusable.
+
+    Required: an edge saying only "related to" is exactly the co-mention link
+    the evidence rules exist to keep out, and it gives retrieval nothing to
+    rank on or show.
+    """
+    phrase = " ".join(str(raw or "").split()).strip(" .;:,")
+    if not phrase or phrase.lower() in {"related to", "relatedto", "related"}:
+        return None
+    if len(phrase.split()) > _MAX_RELATION_WORDS:
+        return None
+    return phrase
+
+
+def _types_fit(
+    pred: dict[str, Any] | None,
+    s_cls: str,
+    o_cls: str,
+    ancestors: dict[str, set[str]],
+) -> bool:
+    """Does (s_cls, o_cls) satisfy ANY declared domain and ANY declared range
+    of this menu predicate? Uses the same per-class IS-A lines that offered it.
+    """
+    if not pred:
+        return False
+    if pred.get("iri") == GRAPHRAG_RELATED_TO:
+        return True       # untyped by design; the evidence checks still apply
+    doms = pred.get("domain_iris") or []
+    rngs = pred.get("range_iris") or []
+    s_line = ancestors.get(s_cls, {s_cls})
+    o_line = ancestors.get(o_cls, {o_cls})
+    return any(d in s_line for d in doms) and any(g in o_line for g in rngs)
 
 
 async def report_candidate_distances(
@@ -1375,6 +1630,412 @@ async def report_candidate_distances(
         print("\n[candidate-distances] no existing assignments to calibrate against")
 
 
+def _build_relationship_payloads(
+    resolved: list[tuple[Any, Any, Any, Any, dict[str, Any]]],
+    *,
+    gv: int,
+    rel_drops: dict[str, int],
+) -> list[dict[str, Any]]:
+    """Turn checked claims into edge rows: one edge per (subject, predicate,
+    object) with every supporting chunk counted, direction contradictions
+    reconciled, and relatedTo dropped where a specific edge links the pair.
+
+    `resolved` is [(chunk_id, doc_id, subject_id, object_id, claim)], the ids
+    already looked up. No DB access.
+    """
+    _pred_label: dict[str, str] = {}
+    rel_by_sig: dict[tuple[Any, str, Any], dict[str, Any]] = {}
+    for chunk_id, doc_id, sid, oid, rel in resolved:
+        sig = (sid, rel["predicate_iri"], oid)
+        if sig in rel_by_sig:
+            # Same triple asserted by another chunk. ONE edge, but
+            # record the extra chunk: how many independent passages
+            # support an edge separates a corroborated claim from a
+            # one-off mention, and keeping only the first chunk id
+            # threw that away.
+            rel_by_sig[sig]["_chunks"].append(chunk_id)
+            continue
+        rel_by_sig[sig] = ({
+            "source_node_type": "entity",
+            "source_node_id": sid,
+            "target_node_type": "entity",
+            "target_node_id": oid,
+            "predicate_iri": rel["predicate_iri"],
+            "predicate_label": _pred_label.get(
+                rel["predicate_iri"],
+                rel["predicate_iri"].rsplit("#", 1)[-1],
+            ),
+            "relationship_type": rel["predicate_iri"].rsplit("#", 1)[-1],
+            "relationship_source": "DOCUMENT_EXTRACTION",
+            "is_authoritative": False,
+            # Traceability: which chunk asserted it.
+            "source_chunk_id": chunk_id,
+            "source_document_id": doc_id,
+            "source_artifact_id": None,
+            "graph_version": gv,
+            "extra_metadata": {
+                **({"confidence": rel["confidence"]}
+                   if rel.get("confidence") is not None else {}),
+                # The verbatim span that asserted it -- makes an edge
+                # auditable without re-reading the whole chunk.
+                **({"evidence": rel["evidence"]}
+                   if rel.get("evidence") else {}),
+                # Marks an edge the strict domain/range check rejected
+                # and the rescue pass re-homed, so a later audit can
+                # tell the two populations apart.
+                **({"type_check": rel["type_check"]}
+                   if rel.get("type_check") else {}),
+                # How a graphrag#relatedTo edge relates its ends, in
+                # the passage's words -- what retrieval shows.
+                **({"relation": rel["relation"]}
+                   if rel.get("relation") else {}),
+                # Which relationship step found it: pass1, gap, orphan_check.
+                **({"found_by": rel["found_by"]}
+                   if rel.get("found_by") else {}),
+            },
+        })
+        rel_by_sig[sig]["_chunks"] = [chunk_id]
+
+    # RECONCILE CONTRADICTIONS ACROSS CHUNKS.
+    #
+    # Each chunk is judged on its own, so nothing stops two passages
+    # asserting the same predicate in opposite directions. Measured on the
+    # finance build: `BHE U.S. Transmission --hasSubOrganization--> MATL
+    # LLP` and `MATL LLP --hasSubOrganization--> BHE U.S. Transmission`
+    # were both written. One of them is necessarily false -- these
+    # predicates are asymmetric -- and a graph asserting both is worse
+    # than one asserting neither, because BFS will happily traverse the
+    # wrong one.
+    #
+    # The tie-break is corroboration: `_chunks` already records how many
+    # independent passages asserted each triple. More passages wins. On a
+    # TIE both are dropped: with one passage each there is no ground to
+    # prefer either, and inventing a preference is how a confident false
+    # edge gets in.
+    #
+    # DIFFERENT predicates between the same pair are left alone. "A
+    # regulates B" and "B is subject to A" are not contradictory, and the
+    # observed case (`AUC --hasSubOrganization--> AltaLink` alongside
+    # `AltaLink --monitors--> AUC`) is two wrong PREDICATES rather than a
+    # direction conflict -- a problem for the menu, not for this pass.
+    _seen_dirs: dict[tuple[Any, str, Any], tuple[Any, str, Any]] = {}
+    _kill: set[tuple[Any, str, Any]] = set()
+    for sig in rel_by_sig:
+        sid, pred, oid = sig
+        mirror = (oid, pred, sid)
+        # relatedTo is not one relation but many ("was born in" one way,
+        # "is the birthplace of" the other), so a mirror is no conflict.
+        if pred == GRAPHRAG_RELATED_TO:
+            continue
+        if mirror in rel_by_sig:
+            pair = (min(str(sid), str(oid)), pred, max(str(sid), str(oid)))
+            if pair in _seen_dirs:
+                continue
+            _seen_dirs[pair] = sig
+            n_here = len(rel_by_sig[sig].get("_chunks") or [])
+            n_there = len(rel_by_sig[mirror].get("_chunks") or [])
+            if n_here > n_there:
+                _kill.add(mirror)
+            elif n_there > n_here:
+                _kill.add(sig)
+            else:
+                _kill.add(sig)
+                _kill.add(mirror)
+    for sig in _kill:
+        rel_by_sig.pop(sig, None)
+        rel_drops["contradictory_direction"] += 1
+
+    # A pair the corpus links with a SPECIFIC predicate anywhere does not
+    # also need the fallback: same BFS reach, and the specific edge says
+    # more. Keeps relatedTo to what the ontology genuinely cannot express.
+    _specific_pairs = {
+        frozenset((str(sid), str(oid)))
+        for sid, pred, oid in rel_by_sig if pred != GRAPHRAG_RELATED_TO
+    }
+    for sig in [g for g in rel_by_sig if g[1] == GRAPHRAG_RELATED_TO]:
+        if frozenset((str(sig[0]), str(sig[2]))) in _specific_pairs:
+            rel_by_sig.pop(sig)
+            rel_drops["generic_superseded"] += 1
+
+    # Fold the supporting-chunk list into extra_metadata. Capped so a
+    # heavily-repeated triple cannot grow the JSONB without bound; the
+    # count stays exact either way.
+    for payload in rel_by_sig.values():
+        chunks = payload.pop("_chunks", [])
+        payload["extra_metadata"] = {
+            **payload["extra_metadata"],
+            "support_count": len(chunks),
+            "supporting_chunks": [str(c) for c in chunks[:_MAX_SUPPORTING_CHUNKS]],
+        }
+    return list(rel_by_sig.values())
+
+
+async def _relationships_for_chunk(
+    router: Any,
+    txt: str,
+    kept: list[dict[str, Any]],
+    class_label_of: dict[str, str],
+    chunk_iri: str,
+    *,
+    rel_drops: dict[str, int],
+    rel_repairs: dict[str, int],
+    rescue: bool = False,
+    verify: bool = True,
+    gap_pass: bool = False,
+    orphan_check: bool = False,
+    pass_stats: dict[str, int] | None = None,
+    orphan_flags: list[dict[str, str]] | None = None,
+) -> list[dict[str, Any]]:
+    """Extract, check and verify the relationships ONE chunk states among its
+    entities.
+
+    Steps, each claim tagged with the step that found it (`found_by`):
+      pass1         relationship_extract over the chunk
+      gap           (gap_pass) the same call shown pass 1's accepted claims and
+                    asked only for what it missed -- one pass finds a different
+                    ~70% of a chunk's relationships on each run
+      orphan_check  (orphan_check) entities still without a relationship are
+                    listed; the model returns a stated relationship for each or
+                    flags it with a reason (prompts.ORPHAN_REASONS)
+      verify        relationship_verify over ALL of the above
+    Every claim from every step passes the same gates. Duplicates of an
+    earlier claim (either direction) are discarded and counted.
+
+    Each entity is {canonical_name, short_name?, aliases?, class_iri}.
+    Returns claims naming their ends by `canonical_name`.
+    """
+    stats = pass_stats if pass_stats is not None else {}
+    rels: list[dict[str, Any]] = []
+    if len(kept) < 2:
+        return rels
+    ent_class_iris = {e["class_iri"] for e in kept}
+    async with session_scope() as session:
+        pred_list, pred_constraints, pred_ancestors = (
+            await _candidate_predicates(session, ent_class_iris)
+        )
+    if not pred_list:
+        return rels
+    ents_for_prompt = [
+        {"canonical_name": e["canonical_name"],
+         "class_label": class_label_of.get(e["class_iri"], "")}
+        for e in kept
+    ]
+    cap = _relationship_cap(len(kept))
+    try:
+        r_sys, r_user = PROMPTS["relationship_extract"](
+            txt, ents_for_prompt, pred_list, max_relationships=cap,
+        )
+        r_out = await router.chat(
+            "relationship_extract", system=r_sys, user=r_user
+        )
+        r_parsed = _extract_json(r_out.text)
+    except Exception as exc:
+        print(f"[extract-entities] relationship call failed "
+              f"on {chunk_iri}: {exc}")
+        r_parsed = None
+    if not isinstance(r_parsed, dict):
+        return rels
+
+    _by_norm = {_normalize_name(e["canonical_name"]): e for e in kept}
+    for e in kept:
+        for form in (e.get("short_name"), *(e.get("aliases") or ())):
+            if form:
+                _by_norm.setdefault(_normalize_name(form), e)
+    hay = " ".join(txt.split()).lower()
+    rejects: list[dict[str, Any]] = []
+    _pred_label = {p["iri"]: (p.get("label") or p["iri"]) for p in pred_list}
+    _pred_index = _predicate_menu_index(pred_list)
+    _pred_by_iri = {p["iri"]: p for p in pred_list}
+
+    def _bump(key: str, n: int = 1) -> None:
+        stats[key] = stats.get(key, 0) + n
+
+    def _gate(raw: Any, found_by: str) -> list[dict[str, Any]]:
+        """The evidence and type gates, identical for every step."""
+        out: list[dict[str, Any]] = []
+        for rel in (raw or []):
+            if not isinstance(rel, dict):
+                continue
+            # Predicate FIRST: its declared domain/range is what disambiguates
+            # an inexact entity reference.
+            pred = (rel.get("predicate_iri") or "").strip()
+            if pred not in pred_constraints:
+                recovered = _resolve_menu_iri(pred, _pred_index)
+                if recovered not in pred_constraints:
+                    rel_drops["bad_predicate"] += 1
+                    continue
+                pred = recovered
+                rel_repairs["predicate_recovered"] += 1
+            dom_iri, rng_iri = pred_constraints[pred]
+            relation = None
+            if pred == GRAPHRAG_RELATED_TO:
+                relation = _clean_relation(rel.get("relation"))
+                if relation is None:
+                    rel_drops["no_relation_phrase"] += 1
+                    continue
+            s_ent = _resolve_entity_ref(
+                rel.get("subject") or "", _by_norm,
+                expect_class=dom_iri, ancestors=pred_ancestors,
+            )
+            o_ent = _resolve_entity_ref(
+                rel.get("object") or "", _by_norm,
+                expect_class=rng_iri, ancestors=pred_ancestors,
+            )
+            if s_ent is None or o_ent is None:
+                rel_drops["unresolved"] += 1
+                continue
+            if s_ent["canonical_name"] == o_ent["canonical_name"]:
+                rel_drops["self_loop"] += 1
+                continue
+            s_cls, o_cls = s_ent["class_iri"], o_ent["class_iri"]
+            _type_ok = _types_fit(
+                _pred_by_iri.get(pred), s_cls, o_cls, pred_ancestors)
+            # The model must QUOTE the text that asserts the claim...
+            ev = " ".join((rel.get("evidence") or "").split())
+            if len(ev) < 12 or ev.lower() not in hay:
+                rel_drops["no_evidence"] += 1
+                continue
+            if len(ev) > _MAX_EVIDENCE_CHARS:
+                rel_drops["overlong_evidence"] += 1
+                continue
+            # ...and the quote must NAME BOTH ends.
+            if not (_evidence_names(ev, s_ent) and _evidence_names(ev, o_ent)):
+                rel_drops["one_sided_evidence"] += 1
+                continue
+            # Types fit the other way round: swap, and let the verifier
+            # confirm the direction from the quote.
+            if not _type_ok and _types_fit(
+                    _pred_by_iri.get(pred), o_cls, s_cls, pred_ancestors):
+                s_ent, o_ent = o_ent, s_ent
+                rel_repairs["type_swapped"] += 1
+                _type_ok = True
+            if not _type_ok:
+                rel_drops["domain_range"] += 1
+                rejects.append({
+                    "subject": s_ent["canonical_name"],
+                    "object": o_ent["canonical_name"],
+                    "predicate_label": _pred_label.get(pred, pred),
+                    "evidence": ev[:_MAX_EVIDENCE_CHARS],
+                })
+                continue
+            try:
+                rconf = (float(rel["confidence"])
+                         if rel.get("confidence") is not None else None)
+            except (TypeError, ValueError):
+                rconf = None
+            out.append({
+                "subject": s_ent["canonical_name"],
+                "object": o_ent["canonical_name"],
+                "predicate_iri": pred,
+                "confidence": rconf,
+                "evidence": ev[:_MAX_EVIDENCE_CHARS],
+                "found_by": found_by,
+                **({"relation": relation} if relation else {}),
+            })
+        return out
+
+    def _add(new: list[dict[str, Any]], tag: str) -> None:
+        have = set()
+        for c in rels:
+            have.add((c["subject"], c["predicate_iri"], c["object"]))
+            have.add((c["object"], c["predicate_iri"], c["subject"]))
+        for c in new:
+            key = (c["subject"], c["predicate_iri"], c["object"])
+            if key in have:
+                _bump(f"{tag}_duplicates")
+                continue
+            have.add(key)
+            have.add((c["object"], c["predicate_iri"], c["subject"]))
+            rels.append(c)
+            _bump(f"{tag}_kept")
+
+    def _show(c: dict[str, Any]) -> str:
+        label = (c.get("relation") if c["predicate_iri"] == GRAPHRAG_RELATED_TO
+                 else _pred_label.get(c["predicate_iri"], c["predicate_iri"]))
+        return f"{c['subject']} --{label}--> {c['object']}"
+
+    _add(_gate(r_parsed.get("relationships"), "pass1"), "pass1")
+
+    if gap_pass:
+        try:
+            g_sys, g_user = PROMPTS["relationship_extract"](
+                txt, ents_for_prompt, pred_list, max_relationships=cap,
+                already_found=[_show(c) for c in rels],
+            )
+            g_out = await router.chat(
+                "relationship_extract", system=g_sys, user=g_user
+            )
+            g_parsed = _extract_json(g_out.text)
+        except Exception as exc:
+            print(f"[extract-entities] gap relationship pass failed "
+                  f"on {chunk_iri}: {exc}")
+            g_parsed = None
+        _bump("gap_calls")
+        if isinstance(g_parsed, dict):
+            _add(_gate(g_parsed.get("relationships"), "gap"), "gap")
+
+    if orphan_check:
+        linked = {c["subject"] for c in rels} | {c["object"] for c in rels}
+        orphans = [e["canonical_name"] for e in kept
+                   if e["canonical_name"] not in linked]
+        if orphans:
+            _bump("orphans_flagged", len(orphans))
+            try:
+                o_sys, o_user = PROMPTS["relationship_orphan_check"](
+                    txt, ents_for_prompt, pred_list,
+                    orphans=orphans, found=[_show(c) for c in rels],
+                    max_relationships=max(_MIN_RELATIONSHIPS_PER_CHUNK,
+                                          len(orphans)),
+                )
+                o_out = await router.chat(
+                    "relationship_orphan_check", system=o_sys, user=o_user
+                )
+                o_parsed = _extract_json(o_out.text)
+            except Exception as exc:
+                print(f"[extract-entities] orphan check failed "
+                      f"on {chunk_iri}: {exc}")
+                o_parsed = None
+            _bump("orphan_calls")
+            if isinstance(o_parsed, dict):
+                _add(_gate(o_parsed.get("relationships"), "orphan_check"),
+                     "orphan")
+                valid = set(ORPHAN_REASONS)
+                for f in (o_parsed.get("no_relationship") or []):
+                    if not isinstance(f, dict):
+                        continue
+                    reason = str(f.get("reason") or "").strip().lower()
+                    reason = reason if reason in valid else "unspecified"
+                    _bump(f"orphan_reason_{reason}")
+                    if orphan_flags is not None and len(orphan_flags) < 300:
+                        orphan_flags.append({
+                            "entity": str(f.get("entity") or ""),
+                            "reason": reason, "chunk": chunk_iri})
+            linked = {c["subject"] for c in rels} | {c["object"] for c in rels}
+            _bump("orphans_still_unlinked",
+                  sum(1 for o in orphans if o not in linked))
+
+    if rejects and rescue:
+        async with session_scope() as session:
+            wide = await _wide_predicates(session, ent_class_iris, pred_ancestors)
+        _known = {p["iri"] for p in wide}
+        rescued = await _rescue_relationships(
+            router, txt, rejects, wide, _known, _by_norm, rel_repairs, chunk_iri,
+        )
+        for c in rescued:
+            c.setdefault("found_by", "rescue")
+        rels.extend(rescued)
+
+    if rels and verify:
+        rels = await _verify_relationships(
+            router, txt, rels, pred_list,
+            rel_drops, rel_repairs, pred_constraints,
+            pred_ancestors, _by_norm, chunk_iri,
+        )
+    for c in rels:
+        _bump(f"verified_{c.get('found_by') or 'pass1'}")
+    return rels
+
+
 async def extract_entities(
     *,
     scope_document_iri: str | None = None,
@@ -1386,6 +2047,8 @@ async def extract_entities(
     extract_relationships: bool = True,
     verify_relationships: bool = True,
     rescue_relationships: bool = False,
+    relationship_gap_pass: bool = True,
+    relationship_orphan_check: bool = True,
     entity_identity: str = "name",
     validate_entities: bool = False,
     validation_rounds: int = 2,
@@ -1496,6 +2159,17 @@ async def extract_entities(
                 "config/models.example.yaml) for higher precision."
             )
             verify_relationships = False
+    # And for the orphan check: without its task the step is skipped, not fatal.
+    if extract_relationships and relationship_orphan_check:
+        try:
+            router.task_spec("relationship_orphan_check")
+        except KeyError:
+            print(
+                "[extract-entities] models.yaml has no "
+                "'relationship_orphan_check' task -- skipping the orphan "
+                "check. Add it (see config/models.example.yaml)."
+            )
+            relationship_orphan_check = False
     # Same degradation for the entity reviewer: an older models.yaml should
     # lose the review pass, not raise once per chunk.
     if validate_entities:
@@ -1649,8 +2323,9 @@ async def extract_entities(
     rel_drops: dict[str, int] = {
         "unresolved": 0, "bad_predicate": 0, "domain_range": 0,
         "self_loop": 0, "contradictory_direction": 0,
-        "no_evidence": 0, "one_sided_evidence": 0,
+        "no_evidence": 0, "overlong_evidence": 0, "one_sided_evidence": 0,
         "unsupported": 0, "reversed": 0,
+        "no_relation_phrase": 0, "generic_superseded": 0,
     }
     # The entity mirror of `rel_drops`. Line-for-line, the old code did a bare
     # `continue` for every one of these -- so the corpus could lose entities
@@ -1674,7 +2349,10 @@ async def extract_entities(
     # the relationship backwards is re-emitted with the ends swapped rather
     # than discarded, since the model found a real assertion and only mis-read
     # its direction.
-    rel_repairs = {"direction_swapped": 0, "rescued": 0}
+    rel_pass_stats: dict[str, int] = {}
+    orphan_flags: list[dict[str, str]] = []
+    rel_repairs = {"direction_swapped": 0, "rescued": 0,
+                   "predicate_recovered": 0, "type_swapped": 0}
     cost_limit_hit = asyncio.Event()
 
     # Progress reporting -- mirrors generate-artifacts pattern.
@@ -2166,162 +2844,15 @@ async def extract_entities(
             # chunk with nothing assertable costs no second call.
             rels: list[dict[str, Any]] = []
             if extract_relationships and len(kept) >= 2:
-                ent_class_iris = {e["class_iri"] for e in kept}
-                async with session_scope() as session:
-                    pred_list, pred_constraints, pred_ancestors = (
-                        await _candidate_predicates(session, ent_class_iris)
-                    )
-                if pred_list:
-                    _lbl = {c["iri"]: c["label"] for c in candidates}
-                    ents_for_prompt = [
-                        {"canonical_name": e["canonical_name"],
-                         "class_label": _lbl.get(e["class_iri"], "")}
-                        for e in kept
-                    ]
-                    try:
-                        r_sys, r_user = PROMPTS["relationship_extract"](
-                            txt, ents_for_prompt, pred_list
-                        )
-                        r_out = await router.chat(
-                            "relationship_extract", system=r_sys, user=r_user
-                        )
-                        r_parsed = _extract_json(r_out.text)
-                    except Exception as exc:
-                        print(f"[extract-entities] relationship call failed "
-                              f"on {chunk_iri}: {exc}")
-                        r_parsed = None
-
-                    if isinstance(r_parsed, dict):
-                        _by_norm = {
-                            _normalize_name(e["canonical_name"]): e for e in kept
-                        }
-                        for e in kept:
-                            _by_norm.setdefault(
-                                _normalize_name(e["short_name"]), e
-                            )
-                        # Evidence is matched against the chunk with whitespace
-                        # collapsed, so a quote that differs only in wrapping
-                        # still counts.
-                        hay = " ".join(txt.split()).lower()
-                        # Claims with sound evidence but an ill-fitting
-                        # predicate; re-homed by the rescue pass below.
-                        rejects: list[dict[str, Any]] = []
-                        _pred_label = {p["iri"]: (p.get("label") or p["iri"])
-                                       for p in pred_list}
-                        for rel in (r_parsed.get("relationships") or []):
-                            if not isinstance(rel, dict):
-                                continue
-                            # Predicate FIRST: its declared domain/range is
-                            # what disambiguates an inexact entity reference,
-                            # so it has to be known before resolving the ends.
-                            pred = (rel.get("predicate_iri") or "").strip()
-                            if pred not in pred_constraints:
-                                rel_drops["bad_predicate"] += 1
-                                continue
-                            dom_iri, rng_iri = pred_constraints[pred]
-                            s_ent = _resolve_entity_ref(
-                                rel.get("subject") or "", _by_norm,
-                                expect_class=dom_iri, ancestors=pred_ancestors,
-                            )
-                            o_ent = _resolve_entity_ref(
-                                rel.get("object") or "", _by_norm,
-                                expect_class=rng_iri, ancestors=pred_ancestors,
-                            )
-                            if s_ent is None or o_ent is None:
-                                rel_drops["unresolved"] += 1
-                                continue
-                            if s_ent["canonical_name"] == o_ent["canonical_name"]:
-                                # A self-loop asserts nothing. Counted rather
-                                # than dropped silently -- a bare `continue`
-                                # here is how the entity path hid its losses.
-                                rel_drops["self_loop"] += 1
-                                continue
-                            s_cls, o_cls = s_ent["class_iri"], o_ent["class_iri"]
-                            _type_ok = (
-                                dom_iri in pred_ancestors.get(s_cls, {s_cls})
-                                and rng_iri in pred_ancestors.get(
-                                    o_cls, {o_cls}))
-                            # Narrowing the menu makes the type check weaker
-                            # (offer and check now share a basis), so the
-                            # model must QUOTE the text that asserts this.
-                            # An unquotable claim is world knowledge, not
-                            # something this passage said.
-                            ev = " ".join((rel.get("evidence") or "").split())
-                            if len(ev) < 12 or ev.lower() not in hay:
-                                rel_drops["no_evidence"] += 1
-                                continue
-                            # ...and it must NAME BOTH ends. A quote that
-                            # mentions only one is about something else: the
-                            # news run asserted `Anthropic hasMember Mustafa
-                            # Suleyman` on a real sentence that never says
-                            # "Suleyman", and `Datadog linkedTo Valor VC` on
-                            # one that never says "Valor".
-                            if not (_evidence_names(ev, s_ent)
-                                    and _evidence_names(ev, o_ent)):
-                                rel_drops["one_sided_evidence"] += 1
-                                continue
-                            # The type check runs LAST now, so a claim whose
-                            # evidence is sound but whose predicate does not
-                            # type-check is held for the rescue pass rather
-                            # than thrown away. It has already proved it is
-                            # not a hallucination.
-                            if not _type_ok:
-                                rel_drops["domain_range"] += 1
-                                rejects.append({
-                                    "subject": s_ent["canonical_name"],
-                                    "object": o_ent["canonical_name"],
-                                    "predicate_label": _pred_label.get(
-                                        pred, pred),
-                                    "evidence": ev[:400],
-                                })
-                                continue
-                            try:
-                                rconf = (float(rel["confidence"])
-                                         if rel.get("confidence") is not None
-                                         else None)
-                            except (TypeError, ValueError):
-                                rconf = None
-                            rels.append({
-                                "subject": s_ent["canonical_name"],
-                                "object": o_ent["canonical_name"],
-                                "predicate_iri": pred,
-                                "confidence": rconf,
-                                "evidence": ev[:400],
-                            })
-
-                        # ---- Rescue: re-home the type-check rejects --------
-                        #
-                        # Answers "are the dropped edges added back?" -- yes,
-                        # when the drop was a vocabulary problem rather than a
-                        # truth problem. Each reject already proved its quote
-                        # is real and names both ends; only the predicate did
-                        # not fit. The wide menu usually holds the right one.
-                        if rejects and rescue_relationships:
-                            async with session_scope() as session:
-                                wide = await _wide_predicates(
-                                    session, ent_class_iris, pred_ancestors)
-                            _known = {p["iri"] for p in wide}
-                            rels.extend(await _rescue_relationships(
-                                router, txt, rejects, wide, _known,
-                                _by_norm, rel_repairs, chunk_iri,
-                            ))
-
-                        # ---- Third pass: does the quote SUPPORT the claim? --
-                        #
-                        # Everything above verifies form, not meaning: the
-                        # quote is real, both ends are named, the types line
-                        # up. None of that catches `OpenAI
-                        # --filesLawsuitAgainst--> Sara Silverman` quoting
-                        # "lawsuits filed against OpenAI BY Sara Silverman" --
-                        # a quote that passes every structural check while
-                        # asserting the opposite. One batched call per chunk
-                        # judges all surviving claims at once.
-                        if rels and verify_relationships:
-                            rels = await _verify_relationships(
-                                router, txt, rels, pred_list,
-                                rel_drops, rel_repairs, pred_constraints,
-                                pred_ancestors, _by_norm, chunk_iri,
-                            )
+                rels = await _relationships_for_chunk(
+                    router, txt, kept,
+                    {c["iri"]: c["label"] for c in candidates}, chunk_iri,
+                    rel_drops=rel_drops, rel_repairs=rel_repairs,
+                    rescue=rescue_relationships, verify=verify_relationships,
+                    gap_pass=relationship_gap_pass,
+                    orphan_check=relationship_orphan_check,
+                    pass_stats=rel_pass_stats, orphan_flags=orphan_flags,
+                )
 
             results[idx] = (chunk_id, chunk_iri, doc_id, kept, rels)
 
@@ -2444,6 +2975,7 @@ async def extract_entities(
             _person_iris |= _rootset
 
     _alias_map, _n_alias = _resolve_canonical_forms(results, _person_iris)
+    _renamed_from: dict[str, set[str]] = {}
     if _alias_map:
         # Display form for every normalised key: the longest RAW spelling seen
         # anywhere in the run. Built over ALL entities, not just merge targets
@@ -2484,20 +3016,48 @@ async def extract_entities(
             # wrong-and-lowercased.
             return best or own
 
-        for tup in results:
-            if tup is None:
-                continue
-            for e in (tup[3] or []):
-                own = (e.get("canonical_name") or "").strip()
-                nrm = _normalize_name(own)
-                tgt = _alias_map.get(nrm)
-                if tgt and tgt != nrm:
-                    e["canonical_name"] = _display_for(tgt, own)
+        def _merged_name(own: str) -> str | None:
+            """The merged display name for `own`, or None if it is unchanged.
+            Entities and relationship endpoints both go through here, so the
+            two can never disagree about what a name became."""
+            nrm = _normalize_name(own)
+            tgt = _alias_map.get(nrm)
+            if not tgt or tgt == nrm:
+                return None
+            new = _display_for(tgt, own)
+            return new if new != own else None
+
+        _renamed_from, summary.relationship_endpoints_renamed = (
+            _apply_merged_names(results, _merged_name))
+        summary.renamed_entities = [
+            {"from": old, "to": new}
+            for new, olds in sorted(_renamed_from.items()) for old in sorted(olds)
+        ][:500]
         print(
             f"[extract-entities] name collapse: {_n_alias} variant spelling(s) "
             f"merged into their fullest form (legal suffixes + the model's own "
-            f"short_name pairing)"
+            f"short_name pairing); {len(summary.renamed_entities)} rename(s) "
+            f"applied, {summary.relationship_endpoints_renamed} relationship "
+            f"endpoint(s) rewritten to follow. e.g. "
+            + "; ".join(f"{r['from']} -> {r['to']}"
+                        for r in summary.renamed_entities[:8])
         )
+
+    # Every surface form each final name was written as: the spellings merged
+    # into it plus the chunks' own short forms ("FTX" for "FTX Trading Ltd.").
+    # Stored on the entity so later passes that start from STORED entities can
+    # still recognise the name in text.
+    _aliases_by_norm: dict[str, set[str]] = {}
+    for new, olds in _renamed_from.items():
+        _aliases_by_norm.setdefault(_normalize_name(new), set()).update(olds)
+    for tup in results:
+        if tup is None:
+            continue
+        for e in (tup[3] or []):
+            short = (e.get("short_name") or "").strip()
+            name = (e.get("canonical_name") or "").strip()
+            if short and short != name:
+                _aliases_by_norm.setdefault(_normalize_name(name), set()).add(short)
 
     # Preload existing (normalized_name, class_id) -> id for O(1) exact match.
     # Cheap: strings + ids (~250 bytes/entity), NOT embeddings.
@@ -2619,6 +3179,9 @@ async def extract_entities(
                 "extra_metadata": {
                     "first_seen_in_chunk": chunk_iri,
                     "first_confidence": e["confidence"],
+                    **({"aliases": sorted(
+                        _aliases_by_norm[normalized] - {e["canonical_name"]})[:25]}
+                       if _aliases_by_norm.get(normalized) else {}),
                 },
             })
             fresh_to_embed.append(
@@ -2730,8 +3293,7 @@ async def extract_entities(
     # against what the DB already holds.
     rel_payloads: list[dict[str, Any]] = []
     if extract_relationships:
-        _pred_label: dict[str, str] = {}
-        rel_by_sig: dict[tuple[Any, str, Any], dict[str, Any]] = {}
+        resolved_claims: list[tuple[Any, Any, Any, Any, dict[str, Any]]] = []
         for tup in results:
             if tup is None:
                 continue
@@ -2762,105 +3324,10 @@ async def extract_entities(
                 if sid is None or oid is None or sid == oid:
                     rel_drops["unresolved"] += 1
                     continue
-                sig = (sid, rel["predicate_iri"], oid)
-                if sig in rel_by_sig:
-                    # Same triple asserted by another chunk. ONE edge, but
-                    # record the extra chunk: how many independent passages
-                    # support an edge separates a corroborated claim from a
-                    # one-off mention, and keeping only the first chunk id
-                    # threw that away.
-                    rel_by_sig[sig]["_chunks"].append(chunk_id)
-                    continue
-                rel_by_sig[sig] = ({
-                    "source_node_type": "entity",
-                    "source_node_id": sid,
-                    "target_node_type": "entity",
-                    "target_node_id": oid,
-                    "predicate_iri": rel["predicate_iri"],
-                    "predicate_label": _pred_label.get(
-                        rel["predicate_iri"],
-                        rel["predicate_iri"].rsplit("#", 1)[-1],
-                    ),
-                    "relationship_type": rel["predicate_iri"].rsplit("#", 1)[-1],
-                    "relationship_source": "DOCUMENT_EXTRACTION",
-                    "is_authoritative": False,
-                    # Traceability: which chunk asserted it.
-                    "source_chunk_id": chunk_id,
-                    "source_document_id": doc_id,
-                    "source_artifact_id": None,
-                    "graph_version": gv,
-                    "extra_metadata": {
-                        **({"confidence": rel["confidence"]}
-                           if rel.get("confidence") is not None else {}),
-                        # The verbatim span that asserted it -- makes an edge
-                        # auditable without re-reading the whole chunk.
-                        **({"evidence": rel["evidence"]}
-                           if rel.get("evidence") else {}),
-                        # Marks an edge the strict domain/range check rejected
-                        # and the rescue pass re-homed, so a later audit can
-                        # tell the two populations apart.
-                        **({"type_check": rel["type_check"]}
-                           if rel.get("type_check") else {}),
-                    },
-                })
-                rel_by_sig[sig]["_chunks"] = [chunk_id]
+                resolved_claims.append((chunk_id, doc_id, sid, oid, rel))
 
-        # RECONCILE CONTRADICTIONS ACROSS CHUNKS.
-        #
-        # Each chunk is judged on its own, so nothing stops two passages
-        # asserting the same predicate in opposite directions. Measured on the
-        # finance build: `BHE U.S. Transmission --hasSubOrganization--> MATL
-        # LLP` and `MATL LLP --hasSubOrganization--> BHE U.S. Transmission`
-        # were both written. One of them is necessarily false -- these
-        # predicates are asymmetric -- and a graph asserting both is worse
-        # than one asserting neither, because BFS will happily traverse the
-        # wrong one.
-        #
-        # The tie-break is corroboration: `_chunks` already records how many
-        # independent passages asserted each triple. More passages wins. On a
-        # TIE both are dropped: with one passage each there is no ground to
-        # prefer either, and inventing a preference is how a confident false
-        # edge gets in.
-        #
-        # DIFFERENT predicates between the same pair are left alone. "A
-        # regulates B" and "B is subject to A" are not contradictory, and the
-        # observed case (`AUC --hasSubOrganization--> AltaLink` alongside
-        # `AltaLink --monitors--> AUC`) is two wrong PREDICATES rather than a
-        # direction conflict -- a problem for the menu, not for this pass.
-        _seen_dirs: dict[tuple[Any, str, Any], tuple[Any, str, Any]] = {}
-        _kill: set[tuple[Any, str, Any]] = set()
-        for sig in rel_by_sig:
-            sid, pred, oid = sig
-            mirror = (oid, pred, sid)
-            if mirror in rel_by_sig:
-                pair = (min(str(sid), str(oid)), pred, max(str(sid), str(oid)))
-                if pair in _seen_dirs:
-                    continue
-                _seen_dirs[pair] = sig
-                n_here = len(rel_by_sig[sig].get("_chunks") or [])
-                n_there = len(rel_by_sig[mirror].get("_chunks") or [])
-                if n_here > n_there:
-                    _kill.add(mirror)
-                elif n_there > n_here:
-                    _kill.add(sig)
-                else:
-                    _kill.add(sig)
-                    _kill.add(mirror)
-        for sig in _kill:
-            rel_by_sig.pop(sig, None)
-            rel_drops["contradictory_direction"] += 1
-
-        # Fold the supporting-chunk list into extra_metadata. Capped so a
-        # heavily-repeated triple cannot grow the JSONB without bound; the
-        # count stays exact either way.
-        for payload in rel_by_sig.values():
-            chunks = payload.pop("_chunks", [])
-            payload["extra_metadata"] = {
-                **payload["extra_metadata"],
-                "support_count": len(chunks),
-                "supporting_chunks": [str(c) for c in chunks[:_MAX_SUPPORTING_CHUNKS]],
-            }
-        rel_payloads = list(rel_by_sig.values())
+        rel_payloads = _build_relationship_payloads(
+            resolved_claims, gv=gv, rel_drops=rel_drops)
 
         # Drop anything the DB already has (idempotent re-runs).
         if rel_payloads:
@@ -3063,14 +3530,59 @@ async def extract_entities(
                f"bad_predicate={rel_drops['bad_predicate']}, "
                f"domain_range={rel_drops['domain_range']}, "
                f"no_evidence={rel_drops['no_evidence']}, "
+               f"overlong_evidence={rel_drops['overlong_evidence']}, "
                f"one_sided_evidence={rel_drops['one_sided_evidence']}, "
                f"unsupported={rel_drops['unsupported']}, "
-               f"reversed={rel_drops['reversed']})" if _dropped else "")
+               f"reversed={rel_drops['reversed']}, "
+               f"no_relation_phrase={rel_drops['no_relation_phrase']}, "
+               f"generic_superseded={rel_drops['generic_superseded']})"
+               if _dropped else "")
             + (f", {rel_repairs['rescued']} rescued by re-homing to a better "
                f"predicate" if rel_repairs["rescued"] else "")
             + (f", {rel_repairs['direction_swapped']} direction(s) repaired"
                if rel_repairs["direction_swapped"] else "")
+            + (f", {rel_repairs['type_swapped']} claim(s) swapped to fit the "
+               f"predicate's types" if rel_repairs["type_swapped"] else "")
+            + (f", {rel_repairs['predicate_recovered']} predicate IRI(s) "
+               f"recovered from label/case" if rel_repairs["predicate_recovered"]
+               else "")
         )
+        _generic = [p for p in rel_payloads
+                    if p["predicate_iri"] == GRAPHRAG_RELATED_TO]
+        if _generic:
+            _phrases = collections.Counter(
+                (p["extra_metadata"].get("relation") or "").lower()
+                for p in _generic)
+            print(
+                f"[extract-entities] relatedTo (no ontology predicate fitted): "
+                f"{len(_generic)} of {len(rel_payloads)} edges. Most common "
+                f"relations -- candidates for new predicates: "
+                + ", ".join(f'"{k}" x{v}' for k, v in _phrases.most_common(12))
+            )
+        summary.relationship_pass_stats = dict(rel_pass_stats)
+        summary.orphan_flags = orphan_flags
+        if rel_pass_stats:
+            _st = rel_pass_stats
+            _written_by = collections.Counter(
+                (p["extra_metadata"].get("found_by") or "pass1")
+                for p in rel_payloads)
+            _reasons = {k[len("orphan_reason_"):]: v for k, v in _st.items()
+                        if k.startswith("orphan_reason_")}
+            print(
+                f"[extract-entities] relationship steps: "
+                f"pass1 kept {_st.get('pass1_kept', 0)}; "
+                f"gap pass ({_st.get('gap_calls', 0)} calls) added "
+                f"{_st.get('gap_kept', 0)} (+{_st.get('gap_duplicates', 0)} "
+                f"duplicates); orphan check ({_st.get('orphan_calls', 0)} calls) "
+                f"flagged {_st.get('orphans_flagged', 0)} entities, added "
+                f"{_st.get('orphan_kept', 0)} (+{_st.get('orphan_duplicates', 0)} "
+                f"duplicates), {_st.get('orphans_still_unlinked', 0)} still "
+                f"unlinked -- reasons {_reasons}; verifier kept "
+                f"pass1={_st.get('verified_pass1', 0)} "
+                f"gap={_st.get('verified_gap', 0)} "
+                f"orphan_check={_st.get('verified_orphan_check', 0)}; "
+                f"edges written by step {dict(_written_by)}"
+            )
         if not rel_payloads and summary.chunks_scanned:
             print(
                 "[extract-entities] NOTE: no relationships written. Either the "

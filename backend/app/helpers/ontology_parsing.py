@@ -289,6 +289,53 @@ def serialize_named_vs_constructs(items: List[Any]) -> Dict[str, List[Any]]:
 # Extractors
 # -----------------------------
 
+# Carries a NAMED owl:equivalentClass across owlready2, which cannot load one.
+#
+# The W3C ORG ontology declares `org:Organization owl:equivalentClass
+# foaf:Organization`. owlready2 raises `TypeError: issubclass() arg 1 must be a
+# class` on a cross-ontology named equivalence, so the Turtle loader strips every
+# owl:equivalentClass triple before owlready2 sees the file. That was a sound
+# trade-off while only the prune-expand LLM read the ontology. It stopped being
+# one when relationship type-checking began depending on class identity: with the
+# equivalence gone, `org:Organization` and `foaf:Organization` became unrelated
+# siblings, and a predicate declared on one rejected every entity typed with the
+# other. Measured on a 40-document news build, 81% of person-organization
+# co-mentions involved `org:Organization`, while 140 of 170 organization
+# predicates declare `foaf:Organization`.
+#
+# So the loader re-encodes each named equivalence as a plain-literal annotation --
+# which owlready2 loads without touching its class machinery -- and
+# `extract_class` turns it back into an `equivalent_to` entry. Everything
+# downstream already handles `equivalent_to`: merge, prune-expand, and the import
+# that writes owl:equivalentClass edges.
+GRAPHRAG_NAMED_EQUIVALENT_CLASS = (
+    "https://veerla-ramrao.ai/ontology/graphrag#namedEquivalentClass"
+)
+
+
+def _with_preserved_equivalences(
+    named: list[Any], cls: Any, rdf_graph
+) -> list[Any]:
+    """`equivalent_to` plus any named equivalence the Turtle loader had to hide
+    from owlready2. See GRAPHRAG_NAMED_EQUIVALENT_CLASS."""
+    out = list(named)
+    iri = safe_iri(cls)
+    if not iri or rdf_graph is None:
+        return out
+    have = {e.get("iri") for e in out if isinstance(e, dict)}
+    for obj in rdf_graph.objects(URIRef(iri), URIRef(GRAPHRAG_NAMED_EQUIVALENT_CLASS)):
+        target = str(obj).strip()
+        if not target or target in have or target == iri:
+            continue
+        have.add(target)
+        out.append({
+            "kind": "class",
+            "iri": target,
+            "name": target.rsplit("#", 1)[-1].rsplit("/", 1)[-1],
+        })
+    return out
+
+
 def extract_class(cls: Any, rdf_graph) -> Dict[str, Any]:
     isa_split = serialize_named_vs_constructs(list(getattr(cls, "is_a", [])))
     eq_split = serialize_named_vs_constructs(list(getattr(cls, "equivalent_to", [])))
@@ -311,7 +358,9 @@ def extract_class(cls: Any, rdf_graph) -> Dict[str, Any]:
         "superclasses": isa_split["named"],
         "restrictions_and_class_constructs": isa_split["constructs"],
 
-        "equivalent_to": eq_split["named"],
+        "equivalent_to": _with_preserved_equivalences(
+            eq_split["named"], cls, rdf_graph
+        ),
         "equivalent_constructs": eq_split["constructs"],
 
         "disjoints": serialize_disjoints(cls),

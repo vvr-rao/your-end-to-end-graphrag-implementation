@@ -659,6 +659,34 @@ qa:
   # holding 14 `defeated` edges still answered "which teams defeated which
   # other teams" with "no information". 0 disables.
   max_relationship_evidence: 25
+  # ---- Graph seeding / traversal (measured 2026-09-13, 182 MultiHop-RAG
+  # questions on multihop-rag-subset). Defaults reproduce the original design.
+  #
+  # graph_seeding: "legacy" seeds from the 30 nearest classes + named classes +
+  #   entities matched by name. "cascade" seeds ENTITIES from the first tier
+  #   that finds any: (1) entities the question names, by name or alias,
+  #   publications excluded; (2) the closest specific classes to its class
+  #   terms -> top chunks mentioning their members -> those entities;
+  #   (3) the closest artifacts -> the entities they are about.
+  graph_seeding: legacy
+  # graph_traversal: "all_edges" walks class membership and chunk mentions too
+  #   (reached 40/40 documents on every question, 7% precision).
+  #   "entity_relationships" walks entity -> entity relationships only.
+  graph_traversal: all_edges
+  # Hops for the entity_relationships traversal (overrides qa.hops for it).
+  entity_relationship_hops: 3
+  # Class tier: nearest classes per term, member-count cap (keeps hubs like
+  # Person out), and how many ranked chunks supply the seeds.
+  class_seed_classes_per_term: 5
+  class_seed_max_members: 50
+  class_seed_top_chunks: 3
+  # Artifact tier: how many nearest artifacts supply the seeds.
+  artifact_seed_top_artifacts: 5
+  # Search ALL artifacts by vector on every query (not only artifact_only mode)
+  # and add them as candidates alongside the entity-linked ones. Candidates
+  # only -- never graph seeds; they share the existing artifact evidence slots.
+  global_artifact_search: false
+  global_artifact_top_k: 40
   # How strictly a triple must sit inside the BFS neighbourhood: "either"
   # (one endpoint reached) or "both". Measured on "which players signed with
   # or transferred to new teams": "both" admitted 44 of 132 edges and excluded

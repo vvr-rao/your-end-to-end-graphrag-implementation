@@ -69,12 +69,30 @@ SELECT node_id, node_type, max(score) AS best_score, min(hop) AS min_hop
 """)
 
 
+# The same walk restricted to entity -> entity relationships. Class membership
+# (rdf:type / subClassOf) and chunk mentions are not traversed, so a seed
+# reaches only what it is RELATED to, not everything sharing a class with it.
+# Measured on 182 MultiHop-RAG questions (multihop-rag-subset, 515
+# relationships): walking every edge reached 40/40 documents on every question
+# (7% precision); entity relationships only reached ~7-9 with 98-100% recall
+# on questions that name their subjects.
+_ENTITY_BFS_SQL = sql_text(
+    _BFS_SQL.text.replace(
+        "WHERE b.hop < CAST(:max_hops AS int)",
+        "WHERE b.hop < CAST(:max_hops AS int)\n"
+        "       AND gr.source_node_type = 'entity'\n"
+        "       AND gr.target_node_type = 'entity'",
+    )
+)
+
+
 async def bfs_expand(
     session: AsyncSession,
     seeds: list[tuple[uuid.UUID, str]],
     *,
     max_hops: int = 2,
     decay: float = 0.7,
+    entity_relationships_only: bool = False,
 ) -> dict[tuple[uuid.UUID, str], dict[str, Any]]:
     """Walk `graph_relationships` outward from seeds. Returns a map of
     `(node_id, node_type) -> {score, hop}`.
@@ -87,7 +105,7 @@ async def bfs_expand(
     seed_ids = [str(sid) for sid, _ in seeds]
     seed_types = [stype for _, stype in seeds]
     result = await session.execute(
-        _BFS_SQL,
+        _ENTITY_BFS_SQL if entity_relationships_only else _BFS_SQL,
         {
             "seed_ids": seed_ids,
             "seed_types": seed_types,
@@ -153,7 +171,10 @@ async def fetch_relationships_among_entities(
     result = await session.execute(
         sql_text("""
         SELECT s.name AS subject,
-               coalesce(p.label, split_part(gr.predicate_iri, '#', 2)) AS predicate,
+               -- A graphrag#relatedTo edge carries its relation as a phrase
+               -- ("was born in"); show and rank on that, not on "relatedTo".
+               coalesce(gr.extra_metadata ->> 'relation', p.label,
+                        split_part(gr.predicate_iri, '#', 2)) AS predicate,
                o.name AS object,
                gr.extra_metadata ->> 'evidence' AS evidence,
                coalesce((gr.extra_metadata ->> 'support_count')::int, 1) AS support,
@@ -445,6 +466,164 @@ async def vector_rerank_chunks(
         },
     )
     return [(cid, float(dist)) for cid, dist in result.all()]
+
+
+async def document_sources(session: AsyncSession) -> list[str]:
+    """Publication names from each document's header line ("Source: TechCrunch").
+
+    Used to keep publications out of graph seeding: "as reported by
+    TechCrunch" names a source to filter on, not an entity to start from --
+    and a publication entity, if extracted at all, would link to every one of
+    its articles.
+    """
+    result = await session.execute(sql_text("""
+        SELECT DISTINCT btrim(substring(text FROM
+               'Source:[ \\t]*([^\\r\\n]+)'))
+          FROM graphrag.chunks
+         WHERE chunk_index = 0 AND status = 'ACTIVE'
+    """))
+    return [r[0] for r in result.all() if r[0]]
+
+
+async def match_entities_by_name_or_alias(
+    session: AsyncSession, term: str, *, min_similarity: float = 0.4, limit: int = 10,
+) -> list[uuid.UUID]:
+    """Entities named `term`: trigram on the normalised name, OR an exact
+    (case-insensitive) stored alias. The alias arm is what lets "FTX" reach
+    `FTX Trading Ltd.`, whose name similarity (0.25) is under the threshold."""
+    result = await session.execute(sql_text("""
+        SELECT id FROM (
+          SELECT e.id,
+                 GREATEST(similarity(e.normalized_name, lower(:t)),
+                          CASE WHEN jsonb_typeof(e.extra_metadata -> 'aliases') = 'array'
+                                AND EXISTS (SELECT 1 FROM jsonb_array_elements_text(
+                                               e.extra_metadata -> 'aliases') a
+                                             WHERE lower(a) = lower(:t))
+                               THEN 1.0 ELSE 0.0 END) AS score
+            FROM graphrag.entities e
+        ) x
+         WHERE score >= :min
+         ORDER BY score DESC
+         LIMIT :limit
+    """), {"t": term, "min": min_similarity, "limit": limit})
+    return [r[0] for r in result.all()]
+
+
+async def entities_in_chunks(
+    session: AsyncSession, chunk_ids: list[uuid.UUID]
+) -> list[uuid.UUID]:
+    if not chunk_ids:
+        return []
+    result = await session.execute(sql_text("""
+        SELECT DISTINCT target_node_id FROM graphrag.graph_relationships
+         WHERE predicate_label = 'viao:assertsAbout' AND source_node_type = 'chunk'
+           AND target_node_type = 'entity'
+           AND source_node_id = ANY(CAST(:c AS uuid[]))
+    """), {"c": [str(c) for c in chunk_ids]})
+    return [r[0] for r in result.all()]
+
+
+async def class_seed_entities(
+    session: AsyncSession,
+    terms: list[str],
+    term_embeddings: list[list[float]],
+    question_embedding: list[float],
+    *,
+    classes_per_term: int = 5,
+    max_members: int = 50,
+    top_chunks: int = 3,
+) -> tuple[list[uuid.UUID], int]:
+    """Seed entities from the classes closest to the question's class terms.
+
+    Per term: the nearest classes by embedding plus an exact label match, and
+    their subclasses. Classes with more than `max_members` entities are
+    skipped -- "individual" would otherwise pick `Person` and reintroduce the
+    hub this traversal avoids. The chunks mentioning the remaining classes'
+    members are ranked against the QUESTION and the top few supply the seeds.
+    Returns (entity ids, number of classes kept).
+    """
+    class_ids: set[uuid.UUID] = set()
+    for term, vec in zip(terms, term_embeddings, strict=False):
+        r = await session.execute(sql_text("""
+            SELECT id FROM graphrag.ontology_classes
+             WHERE embedding IS NOT NULL
+             ORDER BY embedding <-> CAST(:v AS vector) LIMIT :k
+        """), {"v": _vec_str(vec), "k": classes_per_term})
+        class_ids |= {row[0] for row in r.all()}
+        r = await session.execute(sql_text("""
+            SELECT id FROM graphrag.ontology_classes
+             WHERE label IS NOT NULL
+               AND (lower(label) = lower(:t)
+                    OR lower(replace(label, ' ', '')) = lower(replace(:t, ' ', '')))
+        """), {"t": term})
+        class_ids |= {row[0] for row in r.all()}
+    if not class_ids:
+        return [], 0
+    r = await session.execute(sql_text("""
+        WITH RECURSIVE down(id, depth) AS (
+            SELECT id, 0 FROM graphrag.ontology_classes WHERE id = ANY(CAST(:ids AS uuid[]))
+          UNION
+            SELECT gr.source_node_id, down.depth + 1
+              FROM down JOIN graphrag.graph_relationships gr
+                ON gr.target_node_id = down.id
+               AND gr.source_node_type = 'ontology_class'
+               AND gr.target_node_type = 'ontology_class'
+               AND gr.predicate_label = 'rdfs:subClassOf'
+             WHERE down.depth < 3
+        )
+        SELECT e.class_id, count(*) FROM graphrag.entities e
+         WHERE e.class_id IN (SELECT id FROM down)
+         GROUP BY e.class_id
+    """), {"ids": [str(c) for c in class_ids]})
+    keep = [cid for cid, n in r.all() if 1 <= n <= max_members]
+    if not keep:
+        return [], 0
+    r = await session.execute(sql_text("""
+        SELECT c.id FROM graphrag.chunks c
+         WHERE c.embedding IS NOT NULL AND c.status = 'ACTIVE'
+           AND c.id IN (
+             SELECT gr.source_node_id FROM graphrag.graph_relationships gr
+               JOIN graphrag.entities e ON e.id = gr.target_node_id
+              WHERE gr.predicate_label = 'viao:assertsAbout'
+                AND gr.source_node_type = 'chunk'
+                AND e.class_id = ANY(CAST(:k AS uuid[])))
+         ORDER BY c.embedding <-> CAST(:q AS vector)
+         LIMIT :n
+    """), {"k": [str(c) for c in keep], "q": _vec_str(question_embedding), "n": top_chunks})
+    chunk_ids = [row[0] for row in r.all()]
+    return await entities_in_chunks(session, chunk_ids), len(keep)
+
+
+async def artifact_seed_entities(
+    session: AsyncSession,
+    question_embedding: list[float],
+    *,
+    top_artifacts: int = 5,
+    top_chunks: int = 3,
+) -> list[uuid.UUID]:
+    """Seed entities from the artifacts closest to the question -- the
+    entities those claims/findings/summaries are about. Falls back to the
+    closest chunks' entities when no artifact is linked to any entity."""
+    r = await session.execute(sql_text("""
+        SELECT DISTINCT gr.target_node_id
+          FROM (SELECT id FROM graphrag.intelligence_artifacts
+                 WHERE embedding IS NOT NULL AND status = 'ACTIVE'
+                 ORDER BY embedding <-> CAST(:q AS vector) LIMIT :n) a
+          JOIN graphrag.graph_relationships gr
+            ON gr.source_node_id = a.id
+           AND gr.source_node_type = 'intelligence_artifact'
+           AND gr.predicate_label = 'viao:assertsAbout'
+           AND gr.target_node_type = 'entity'
+    """), {"q": _vec_str(question_embedding), "n": top_artifacts})
+    ids = [row[0] for row in r.all()]
+    if ids:
+        return ids
+    r = await session.execute(sql_text("""
+        SELECT id FROM graphrag.chunks
+         WHERE embedding IS NOT NULL AND status = 'ACTIVE'
+         ORDER BY embedding <-> CAST(:q AS vector) LIMIT :n
+    """), {"q": _vec_str(question_embedding), "n": top_chunks})
+    return await entities_in_chunks(session, [row[0] for row in r.all()])
 
 
 async def vector_search_all_artifacts(

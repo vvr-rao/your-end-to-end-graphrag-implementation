@@ -1706,6 +1706,10 @@ def document_type_consolidate(labels: list[str]) -> tuple[str, str]:
 # for them when nothing specific fits -- they are demoted in the prompt rather
 # than removed, because occasionally they are the honest answer.
 GENERIC_PREDICATE_IRIS: frozenset[str] = frozenset({
+    # The reserved fallback (predicates.GRAPHRAG_RELATED_TO), listed last-resort
+    # like every other catch-all. Spelled out rather than imported so this
+    # module stays import-free.
+    "https://veerla-ramrao.ai/ontology/graphrag#relatedTo",
     "http://xmlns.com/foaf/0.1/topic",
     "http://xmlns.com/foaf/0.1/knows",
     "http://xmlns.com/foaf/0.1/interest",
@@ -1841,6 +1845,13 @@ def relationship_verify(
         "RULES THAT MATTER:\n"
         "  - Judge ONLY the quote. Do NOT use world knowledge, and do not use "
         "the rest of the passage to rescue a quote that does not say it.\n"
+        "  - A quote may be several sentences so that it contains a name and a "
+        "later pronoun or role phrase for it (\"Bankman-Fried ... the exchange "
+        "he founded\"). Resolve such a reference ONLY to a name that appears "
+        "EARLIER IN THE SAME QUOTE, and only when it unambiguously points to "
+        "it. Then judge the sentence that makes the claim. A quote whose "
+        "sentences merely sit next to each other -- one names A, another names "
+        "B, and no sentence states how A and B relate -- is \"unsupported\".\n"
         "  - Co-occurrence is NOT a relationship. 'A demonstrated X to B' does "
         "not make B a member of A. 'A and B were both listed' does not make "
         "them related.\n"
@@ -1852,6 +1863,9 @@ def relationship_verify(
         "\"A is a subsidiary of B\", \"A was acquired by B\" all put B in the "
         "SUBJECT position. Before answering \"supported\", find the actor in "
         "the quote and check it is on the left of the arrow.\n"
+        "  - A claim whose predicate is a plain phrase (\"was born in\") is "
+        "judged the same way: supported only if the quote states THAT "
+        "relation between them, in that direction.\n"
         "  - A LIST IS NOT AN ASSERTION. A quote that just enumerates names -- "
         "separated by commas, semicolons or parentheses, as in \"B Transmission "
         "(B Canada/AltaLink); B Renewables; HomeServices\" -- states that these "
@@ -1877,6 +1891,9 @@ def relationship_extract(
     chunk_text: str,
     entities: list[dict[str, str]],
     candidate_predicates: list[dict[str, str]],
+    *,
+    max_relationships: int = 10,
+    already_found: list[str] | None = None,
 ) -> tuple[str, str]:
     """Phase 2 Milestone C, second pass: relationships between entities ALREADY
     extracted from this chunk.
@@ -1926,7 +1943,19 @@ def relationship_extract(
         pred_lines += ("\n\nLAST-RESORT PREDICATES (vague -- use ONLY if no "
                        "predicate above fits):\n"
                        + "\n".join(_fmt(p) for p in generic))
+    # already_found: the SECOND pass. The first pass's accepted relationships
+    # are shown and only the ones it missed are asked for -- a single pass
+    # finds a different ~70% of a chunk's relationships on each run.
+    _gap = (
+        "A FIRST PASS has already extracted the relationships listed under "
+        "ALREADY FOUND. Your job now is to find what it MISSED: relationships "
+        "the passage states that are NOT already listed (the same pair with "
+        "subject and object swapped counts as listed). Return ONLY new "
+        "relationships -- an empty list is the correct answer when nothing was "
+        "missed. Every rule below still applies.\n\n"
+    ) if already_found is not None else ""
     system = (
+        _gap +
         "You identify RELATIONSHIPS that a passage explicitly asserts between "
         "entities that have ALREADY been extracted from it. Return ONE JSON "
         "object and nothing else -- no prose, no markdown fences.\n\n"
@@ -1940,8 +1969,27 @@ def relationship_extract(
         "character. Do not paraphrase. It MUST NAME BOTH the subject and the "
         "object -- a sentence mentioning only one of them does not state a "
         "relationship between them.\n"
+        "  - WHEN THE STATING SENTENCE USES A PRONOUN OR ROLE for one of them "
+        "(\"he\", \"the company\", \"her father\", \"the Gangs of New York "
+        "director\"), extend the quote BACKWARDS to begin at the words that "
+        "NAME that entity, and copy everything in between unchanged. Example: "
+        "for \"Alameda Research is a hedge fund. Bankman-Fried founded it in "
+        "2017.\" quote exactly that, not just \"Bankman-Fried founded it in "
+        "2017.\" The quote must stay ONE continuous span of at most 3 "
+        "sentences -- never skip text, never join separate passages. If the "
+        "name is further back than that, do not emit the relationship.\n"
+        "  - relation: ONLY when predicate_iri is "
+        "https://veerla-ramrao.ai/ontology/graphrag#relatedTo -- a short verb "
+        "phrase (2-6 words) taken from the quote, read subject -> object, "
+        "saying HOW they relate: \"was born in\", \"alleges fraud "
+        "against\", \"signed for\". Omit it for every other predicate.\n"
         "  - confidence: float in [0,1].\n\n"
         "RULES THAT MATTER:\n"
+        "  - graphrag#relatedTo is the LAST resort. Use it ONLY when the "
+        "passage explicitly states a relationship between the two AND no "
+        "other listed predicate expresses it. It is never for two entities "
+        "that merely appear together, sit in the same list, or share a "
+        "topic -- the quote must still state how they relate.\n"
         "  - Assert ONLY what the passage states. Do NOT use world knowledge. "
         "Two entities appearing near each other is NOT a relationship.\n"
         "  - If you cannot quote a span that states it, do not emit it.\n"
@@ -1957,7 +2005,7 @@ def relationship_extract(
         "  - RETURNING AN EMPTY LIST IS THE CORRECT ANSWER when the passage "
         "asserts none of these relationships. Do not force a match merely "
         "because a predicate is offered.\n"
-        "  - At most 10 relationships.\n\n"
+        f"  - At most {max_relationships} relationships.\n\n"
         "BEFORE YOU FINISH -- completeness check:\n"
         "  Every rule above tells you when NOT to emit a relationship, and "
         "they all still hold. But leaving out a relationship the passage "
@@ -1978,9 +2026,81 @@ def relationship_extract(
     user = (
         "ENTITIES (subject/object must come from here):\n" + ent_lines
         + "\n\nPREDICATES (predicate_iri must come from here):\n" + pred_lines
+        + ("\n\nALREADY FOUND (do NOT repeat these):\n"
+           + ("\n".join(f"  - {f}" for f in already_found) or "  (none)")
+           if already_found is not None else "")
         + "\n\nPASSAGE:\n```\n" + chunk_text + "\n```\n\n"
         'Return JSON: {"relationships": [{"subject": ..., "predicate_iri": ..., '
-        '"object": ..., "evidence": ..., "confidence": ...}]}'
+        '"object": ..., "evidence": ..., "confidence": ..., '
+        '"relation": ... (graphrag#relatedTo only)}]}'
+    )
+    return system, user
+
+
+ORPHAN_REASONS: tuple[str, ...] = (
+    "only_listed", "no_partner", "implied_only", "not_an_entity",
+)
+
+
+def relationship_orphan_check(
+    chunk_text: str,
+    entities: list[dict[str, str]],
+    candidate_predicates: list[dict[str, str]],
+    *,
+    orphans: list[str],
+    found: list[str],
+    max_relationships: int = 10,
+) -> tuple[str, str]:
+    """Look again at the entities in a chunk that still have NO relationship.
+
+    Runs after both relationship passes and before verification. For each
+    orphan the model must either return a relationship the passage states, or
+    flag it with a reason -- so every orphan is accounted for, and what comes
+    back as a relationship still faces every evidence gate and the verifier.
+
+    Returns JSON: {relationships: [...same shape as relationship_extract...],
+                   no_relationship: [{entity, reason}]}
+    with reason one of ORPHAN_REASONS.
+    """
+    system, user = relationship_extract(
+        chunk_text, entities, candidate_predicates,
+        max_relationships=max_relationships,
+    )
+    system = (
+        "Some entities extracted from this passage have NO relationship yet. "
+        "Look again at EACH entity listed under NO RELATIONSHIP YET and decide "
+        "one of:\n"
+        "  (a) the passage states a relationship between it and another listed "
+        "entity -> return it under relationships, following every rule below;\n"
+        "  (b) it does not -> list it under no_relationship with ONE reason:\n"
+        "      only_listed   -- named only in a list, lineup, table or header, "
+        "with nothing said about how it relates to another entity\n"
+        "      no_partner    -- what the passage says about it involves no "
+        "other listed entity\n"
+        "      implied_only  -- a relationship is implied or known, but the "
+        "passage does not state it\n"
+        "      not_an_entity -- an abstract concept, metric or phrase rather "
+        "than a thing that can stand in a relationship\n"
+        "Every entity under NO RELATIONSHIP YET must appear exactly once: as the "
+        "subject or object of a returned relationship, or under no_relationship. "
+        "Flagging is a normal answer -- never force a relationship to avoid it. "
+        "Do not repeat relationships listed under ALREADY FOUND.\n\n"
+        + system
+    )
+    head, _, _ = user.rpartition("Return JSON:")
+    head = head.replace(
+        "\n\nPASSAGE:\n",
+        "\n\nALREADY FOUND (context only -- do not repeat):\n"
+        + ("\n".join(f"  - {f}" for f in found) or "  (none)")
+        + "\n\nNO RELATIONSHIP YET (check each):\n"
+        + "\n".join(f"  - {o}" for o in orphans)
+        + "\n\nPASSAGE:\n", 1)
+    user = head + (
+        'Return JSON: {"relationships": [{"subject": ..., "predicate_iri": ..., '
+        '"object": ..., "evidence": ..., "confidence": ..., '
+        '"relation": ... (graphrag#relatedTo only)}], "no_relationship": '
+        '[{"entity": ..., "reason": "only_listed"|"no_partner"|"implied_only"|'
+        '"not_an_entity"}]}'
     )
     return system, user
 
@@ -3565,6 +3685,7 @@ PROMPTS = {
     "concept_extract": concept_extract,
     "relationship_extract": relationship_extract,
     "relationship_verify": relationship_verify,
+    "relationship_orphan_check": relationship_orphan_check,
     "relationship_repair": relationship_repair,
     # Phase 2a — table extraction (vision)
     "table_extract_vision": table_extract_vision,

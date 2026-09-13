@@ -59,12 +59,25 @@ TIME_MONTH_OF_YEAR: Final = f"{TIME_NS}#monthOfYear"
 TIME_BEFORE: Final = f"{TIME_NS}#before"
 TIME_AFTER: Final = f"{TIME_NS}#after"
 
+# ---------- GraphRAG reserved fallback ----------
+# The ONE predicate that exists independently of the ontology. When a passage
+# states a relationship no ontology predicate expresses ("Failsworth, where
+# Ratcliffe was born" -- no bornIn), extraction records it as
+# `relatedTo` plus the free-text `relation` phrase in extra_metadata, instead
+# of discarding it. BFS ignores predicates, so the edge connects the two
+# entities; retrieval renders it with the phrase ("Ratcliffe was born in
+# Failsworth"). It is fixed and reserved, not coined per ingestion, and every
+# evidence check still applies -- only the domain/range check is skipped.
+GRAPHRAG_NS = "https://veerla-ramrao.ai/ontology/graphrag"
+GRAPHRAG_RELATED_TO: Final = f"{GRAPHRAG_NS}#relatedTo"
+
 # Built-ins that don't appear in `ontology_object_properties`.
 _BUILTIN_ALLOWLIST: Final = frozenset({
     RDFS_SUBCLASS_OF,
     OWL_EQUIVALENT_CLASS,
     OWL_DISJOINT_WITH,
     RDF_TYPE,
+    GRAPHRAG_RELATED_TO,
 })
 
 

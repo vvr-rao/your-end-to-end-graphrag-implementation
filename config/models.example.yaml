@@ -308,33 +308,51 @@ tasks:
   # Second pass of Milestone C: relationships between entities already
   # extracted from a chunk. Separate from entity_extract so the predicate menu
   # can be narrowed to the entities' ACTUAL classes -- see
-  # db_entity_extract._candidate_predicates. Cheap model: the menu is short and
-  # the output is a small JSON list.
+  # db_entity_extract._candidate_predicates. gpt-4.1-mini, not gpt-4o-mini:
+  # measured 2026-09-13 on multihop-rag-subset, 4o-mini broke the "quote must
+  # NAME BOTH ends" rule on 182 of 515 claims, ~63% of them outright false
+  # ("iPad Pro --awarded--> Brenda Stolyar"). Same model as entity_extract.
   relationship_extract:
     provider: openai
-    model: gpt-4o-mini
-    timeout: 120
+    model: gpt-4.1-mini
+    timeout: 900
     temperature: 0.0
-    max_tokens: 2048
+    max_tokens: 16384   # up to one relationship per entity (ceiling 100) per chunk, each with a quote
   # Third pass: does each relationship's quoted evidence actually SUPPORT the
   # claim, in the stated direction? The structural checks verify a quote occurs
   # in the chunk and names both ends; they cannot tell that "lawsuits filed
   # against A by B" does not mean A sued B. Judgement over a short quote, so
-  # the cheap model is the right one -- but it decides what enters the graph,
-  # so give it room to answer for every claim in a chunk.
+  # a mini model is the right tier -- but it decides what enters the graph,
+  # so give it room to answer for every claim in a chunk. gpt-4.1-mini to
+  # match relationship_extract: a weaker model must not judge a stronger one.
   relationship_verify:
     provider: openai
-    model: gpt-4o-mini
-    timeout: 120
+    model: gpt-4.1-mini
+    timeout: 420
     temperature: 0.0
-    max_tokens: 2048
+    max_tokens: 8192   # a verdict per claim; up to ~100 claims per dense chunk
+  # Orphan check: after both relationship passes, the chunk's entities that
+  # still have no relationship are listed and the model either returns a
+  # relationship the passage states for each or flags why there is none
+  # (only_listed / no_partner / implied_only / not_an_entity). Its claims face
+  # the same evidence gates and the verifier. gpt-4.1: measured 2026-09-13 with
+  # everything else replayed from one recording, it wrote 515 edges vs 480 on
+  # gpt-4.1-mini and its unique edges were ~84% correct vs ~75%. The VERIFIER
+  # stays on gpt-4.1-mini -- on gpt-4.1 it removed ~80 correct edges (team
+  # lineups, accessories) to catch ~12 wrong ones.
+  relationship_orphan_check:
+    provider: openai
+    model: gpt-4.1
+    timeout: 420
+    temperature: 0.0
+    max_tokens: 8192   # relationships for up to ~100 orphans, plus a flag per unlinked one
   # Rescue pass: re-home relationship claims whose evidence is sound but whose
   # predicate failed the domain/range check, using a WIDER predicate menu. The
   # strict menu offered a median of 8 of 620 predicates on the news corpus, so
   # real relationships were being forced onto wrong predicates and dropped.
   relationship_repair:
     provider: openai
-    model: gpt-4o-mini
+    model: gpt-4.1-mini       # emits claims too; same evidence bar as relationship_extract
     timeout: 120
     temperature: 0.0
     max_tokens: 2048
