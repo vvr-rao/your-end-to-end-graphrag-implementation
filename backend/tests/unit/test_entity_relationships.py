@@ -1038,3 +1038,33 @@ def test_ordinary_edges_are_untouched() -> None:
     }
     kept, n = _reconcile(by_sig)
     assert len(kept) == 2 and n == 0
+
+
+def test_extract_prompt_extends_quote_back_to_the_named_antecedent() -> None:
+    """A claim stated through a pronoun ("the exchange he founded") used to be
+    dropped as one_sided_evidence: 18 true edges on multihop-rag-subset. The
+    quote may now reach back to the name -- one continuous span, capped."""
+    from backend.app.services.prompts import relationship_extract
+
+    system, _ = relationship_extract("text", _ENTS, _PREDS)
+    assert "PRONOUN OR ROLE" in system
+    assert "extend the quote BACKWARDS" in system
+    assert "ONE continuous span of at most 3" in system
+    assert "never skip text" in system
+    # The both-ends rule still holds; extension is how it is met, not waived.
+    assert "MUST NAME BOTH" in system
+
+
+def test_verify_prompt_resolves_references_only_within_the_quote() -> None:
+    from backend.app.services.prompts import relationship_verify
+
+    system, _ = relationship_verify("passage", [])
+    assert "EARLIER IN THE SAME QUOTE" in system
+    assert "merely sit next to each other" in system
+    assert "do not use the rest of the passage" in system
+
+
+def test_evidence_ceiling_admits_three_sentences_not_whole_passages() -> None:
+    from backend.app.services.db_entity_extract import _MAX_EVIDENCE_CHARS
+
+    assert 400 < _MAX_EVIDENCE_CHARS <= 1000

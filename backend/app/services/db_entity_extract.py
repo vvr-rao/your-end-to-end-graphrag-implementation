@@ -675,6 +675,15 @@ _CORPORATE_SUFFIX_TOKENS: tuple[str, ...] = (
 )
 
 
+# Longest evidence quote accepted, and stored. The relationship prompt lets a
+# quote reach back up to 3 sentences to include the name a pronoun refers to
+# ("Alameda is a hedge fund. Bankman-Fried founded it."); the ceiling makes
+# that cap real in code, since a long quote can otherwise bridge unrelated
+# sentences that happen to name both ends. The old 400-char storage cut would
+# also have dropped the naming sentence from citations.
+_MAX_EVIDENCE_CHARS = 700
+
+
 # Name tokens too generic to prove an entity is named in a quote. Without
 # this, "Ray-Ban Meta smart glasses" would count as named by any sentence
 # containing the word "smart".
@@ -1087,7 +1096,7 @@ async def _rescue_relationships(
         ev = " ".join((rel.get("evidence") or "").split())
         # Same evidence bar as the strict path -- widening WHICH predicate may
         # be used never widens what counts as proof.
-        if len(ev) < 12 or ev.lower() not in hay:
+        if len(ev) < 12 or len(ev) > _MAX_EVIDENCE_CHARS or ev.lower() not in hay:
             continue
         if not (_evidence_names(ev, s_ent) and _evidence_names(ev, o_ent)):
             continue
@@ -1096,7 +1105,7 @@ async def _rescue_relationships(
             "object": o_ent["canonical_name"],
             "predicate_iri": pred,
             "confidence": None,
-            "evidence": ev[:400],
+            "evidence": ev[:_MAX_EVIDENCE_CHARS],
             "type_check": "relaxed",
         })
     rel_repairs["rescued"] += len(rescued)
@@ -1694,7 +1703,7 @@ async def extract_entities(
     rel_drops: dict[str, int] = {
         "unresolved": 0, "bad_predicate": 0, "domain_range": 0,
         "self_loop": 0, "contradictory_direction": 0,
-        "no_evidence": 0, "one_sided_evidence": 0,
+        "no_evidence": 0, "overlong_evidence": 0, "one_sided_evidence": 0,
         "unsupported": 0, "reversed": 0,
     }
     # The entity mirror of `rel_drops`. Line-for-line, the old code did a bare
@@ -2301,6 +2310,9 @@ async def extract_entities(
                             if len(ev) < 12 or ev.lower() not in hay:
                                 rel_drops["no_evidence"] += 1
                                 continue
+                            if len(ev) > _MAX_EVIDENCE_CHARS:
+                                rel_drops["overlong_evidence"] += 1
+                                continue
                             # ...and it must NAME BOTH ends. A quote that
                             # mentions only one is about something else: the
                             # news run asserted `Anthropic hasMember Mustafa
@@ -2323,7 +2335,7 @@ async def extract_entities(
                                     "object": o_ent["canonical_name"],
                                     "predicate_label": _pred_label.get(
                                         pred, pred),
-                                    "evidence": ev[:400],
+                                    "evidence": ev[:_MAX_EVIDENCE_CHARS],
                                 })
                                 continue
                             try:
@@ -2337,7 +2349,7 @@ async def extract_entities(
                                 "object": o_ent["canonical_name"],
                                 "predicate_iri": pred,
                                 "confidence": rconf,
-                                "evidence": ev[:400],
+                                "evidence": ev[:_MAX_EVIDENCE_CHARS],
                             })
 
                         # ---- Rescue: re-home the type-check rejects --------
@@ -3114,6 +3126,7 @@ async def extract_entities(
                f"bad_predicate={rel_drops['bad_predicate']}, "
                f"domain_range={rel_drops['domain_range']}, "
                f"no_evidence={rel_drops['no_evidence']}, "
+               f"overlong_evidence={rel_drops['overlong_evidence']}, "
                f"one_sided_evidence={rel_drops['one_sided_evidence']}, "
                f"unsupported={rel_drops['unsupported']}, "
                f"reversed={rel_drops['reversed']})" if _dropped else "")
