@@ -174,6 +174,23 @@ def _resolve_menu_iri(raw: str, menu_index: dict[str, str]) -> str | None:
     return menu_index.get(tail.strip().lower())
 
 
+def _predicate_menu_index(preds: list[dict[str, str]]) -> dict[str, str]:
+    """`_build_menu_index` for a predicate menu, so a mis-serialised
+    `predicate_iri` resolves to the predicate that was actually offered.
+
+    MEASURED on multihop-rag-subset: the merged ontology stores predicate IRIs
+    lowercased (`merged#employedby`) under camelCase labels (`employedBy`).
+    gpt-4.1-mini "corrected" the IRI to match the label in 127 of 590
+    proposals -- `merged#collaboratesWith`, even `foaf/0.1/employedBy` -- and
+    every one was dropped as bad_predicate. Resolution only ever lands on a
+    menu predicate, and a key two menu predicates share is not resolved.
+    """
+    return _build_menu_index(
+        {p["iri"] for p in preds},
+        {p["label"]: p["iri"] for p in preds if p.get("label")},
+    )
+
+
 def _filter_entities(
     raw_entities: Any,
     cand_iris: set[str],
@@ -1047,6 +1064,7 @@ async def _rescue_relationships(
         return []
 
     hay = " ".join(chunk_text.split()).lower()
+    wide_index = _predicate_menu_index(wide_preds)
     rescued: list[dict[str, Any]] = []
     for rel in (parsed.get("relationships") or []):
         if not isinstance(rel, dict):
@@ -1057,6 +1075,11 @@ async def _rescue_relationships(
         s_ent = _resolve_entity_ref(rel.get("subject") or "", ent_by_norm)
         o_ent = _resolve_entity_ref(rel.get("object") or "", ent_by_norm)
         pred = (rel.get("predicate_iri") or "").strip()
+        if pred and pred not in known_iris:
+            recovered = _resolve_menu_iri(pred, wide_index)
+            if recovered in known_iris:
+                pred = recovered
+                rel_repairs["predicate_recovered"] += 1
         if s_ent is None or o_ent is None or pred not in known_iris:
             continue
         if s_ent["canonical_name"] == o_ent["canonical_name"]:
@@ -1696,7 +1719,8 @@ async def extract_entities(
     # the relationship backwards is re-emitted with the ends swapped rather
     # than discarded, since the model found a real assertion and only mis-read
     # its direction.
-    rel_repairs = {"direction_swapped": 0, "rescued": 0}
+    rel_repairs = {"direction_swapped": 0, "rescued": 0,
+                   "predicate_recovered": 0}
     cost_limit_hit = asyncio.Event()
 
     # Progress reporting -- mirrors generate-artifacts pattern.
@@ -2230,6 +2254,7 @@ async def extract_entities(
                         rejects: list[dict[str, Any]] = []
                         _pred_label = {p["iri"]: (p.get("label") or p["iri"])
                                        for p in pred_list}
+                        _pred_index = _predicate_menu_index(pred_list)
                         for rel in (r_parsed.get("relationships") or []):
                             if not isinstance(rel, dict):
                                 continue
@@ -2238,8 +2263,12 @@ async def extract_entities(
                             # so it has to be known before resolving the ends.
                             pred = (rel.get("predicate_iri") or "").strip()
                             if pred not in pred_constraints:
-                                rel_drops["bad_predicate"] += 1
-                                continue
+                                recovered = _resolve_menu_iri(pred, _pred_index)
+                                if recovered not in pred_constraints:
+                                    rel_drops["bad_predicate"] += 1
+                                    continue
+                                pred = recovered
+                                rel_repairs["predicate_recovered"] += 1
                             dom_iri, rng_iri = pred_constraints[pred]
                             s_ent = _resolve_entity_ref(
                                 rel.get("subject") or "", _by_norm,
@@ -3092,6 +3121,9 @@ async def extract_entities(
                f"predicate" if rel_repairs["rescued"] else "")
             + (f", {rel_repairs['direction_swapped']} direction(s) repaired"
                if rel_repairs["direction_swapped"] else "")
+            + (f", {rel_repairs['predicate_recovered']} predicate IRI(s) "
+               f"recovered from label/case" if rel_repairs["predicate_recovered"]
+               else "")
         )
         if not rel_payloads and summary.chunks_scanned:
             print(

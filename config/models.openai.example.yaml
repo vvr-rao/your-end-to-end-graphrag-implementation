@@ -241,11 +241,13 @@ tasks:
   # Second pass of Milestone C: relationships between entities already
   # extracted from a chunk. Separate from entity_extract so the predicate menu
   # can be narrowed to the entities' ACTUAL classes -- see
-  # db_entity_extract._candidate_predicates. Cheap model: the menu is short and
-  # the output is a small JSON list.
+  # db_entity_extract._candidate_predicates. gpt-4.1-mini, not gpt-4o-mini:
+  # measured 2026-09-13 on multihop-rag-subset, 4o-mini broke the "quote must
+  # NAME BOTH ends" rule on 182 of 515 claims, ~63% of them outright false
+  # ("iPad Pro --awarded--> Brenda Stolyar"). Same model as entity_extract.
   relationship_extract:
     provider: openai
-    model: gpt-4o-mini
+    model: gpt-4.1-mini
     timeout: 120
     temperature: 0.0
     max_tokens: 2048
@@ -253,11 +255,12 @@ tasks:
   # claim, in the stated direction? The structural checks verify a quote occurs
   # in the chunk and names both ends; they cannot tell that "lawsuits filed
   # against A by B" does not mean A sued B. Judgement over a short quote, so
-  # the cheap model is the right one -- but it decides what enters the graph,
-  # so give it room to answer for every claim in a chunk.
+  # a mini model is the right tier -- but it decides what enters the graph,
+  # so give it room to answer for every claim in a chunk. gpt-4.1-mini to
+  # match relationship_extract: a weaker model must not judge a stronger one.
   relationship_verify:
     provider: openai
-    model: gpt-4o-mini
+    model: gpt-4.1-mini
     timeout: 120
     temperature: 0.0
     max_tokens: 2048
@@ -267,7 +270,7 @@ tasks:
   # real relationships were being forced onto wrong predicates and dropped.
   relationship_repair:
     provider: openai
-    model: gpt-4o-mini
+    model: gpt-4.1-mini       # emits claims too; same evidence bar as relationship_extract
     timeout: 120
     temperature: 0.0
     max_tokens: 2048
