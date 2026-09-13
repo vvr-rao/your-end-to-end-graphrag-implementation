@@ -428,3 +428,56 @@ def test_concept_menu_ordering_not_prompt_wording_carries_specificity() -> None:
     c_sys, _ = concept_extract("text", _CANDIDATES)
     assert "MOST SPECIFIC" not in c_sys
     assert "last resort" not in c_sys.lower()
+
+
+def test_recovery_index_is_built_after_the_menu_is_final() -> None:
+    """Pinned and ancestor-closure classes join the menu WITHOUT ranking well,
+    so an index built from the vector pool alone misses them.
+
+    Measured on the finance build: `Organization` -- pinned, offered on every
+    chunk -- sits at MEDIAN RANK 687 of 1524 and is inside the top-400 pool for
+    only 3 of 27 chunks. An abstention proposing "Organization" therefore found
+    nothing to resolve against and the entity was dropped, though that exact
+    class was on the menu the model had been shown.
+
+    Pinned to the build ORDER because the bug was ordering: the index used to
+    be computed before pins and ancestors were appended to `out`.
+    """
+    import inspect
+
+    from backend.app.services import db_entity_extract as m
+
+    src = inspect.getsource(m.extract_entities)
+    build = src.index("def _recovery(")
+    # both return paths must build the index from the completed menu
+    assert src.count("_recovery(out)") == 2, "index not built at every return"
+    for call in [i for i in range(len(src)) if src.startswith("_recovery(out)", i)]:
+        assert call > build, "index built before the menu is final"
+    # and the menu must actually be folded in alongside the pool
+    body = src[build:build + 2000]
+    assert "list(_pool[:recovery_pool]) + list(menu)" in body
+
+
+def test_abstain_demands_a_proposed_type_imperatively() -> None:
+    """`proposed_type` is what abstention recovery resolves against, so an
+    abstention without one is unrecoverable by construction.
+
+    Three wordings A/B'd over 27 finance chunks, % of abstentions carrying a
+    type, and NET entities (directly kept + recoverable):
+
+        A  current, "put your own short type name ... so the gap can be seen"
+             43% typed,  73 typed,   9 recoverable,  NET 424
+        B  imperative, "MUST ... REQUIRED ... never be empty or omitted"
+            100% typed, 235 typed,  40 recoverable,  NET 443   <- shipped
+        C  reason-giving, "that name is used to look for a class you were
+           NOT shown ... one left empty is discarded"
+              0% typed  <- the model omitted the field entirely
+
+    C is the counter-intuitive one and was verified against raw responses
+    rather than assumed: explaining WHY buried the instruction and compliance
+    collapsed to zero. Blunt beats motivated here.
+    """
+    sys_p, _ = entity_extract("text", _CANDIDATES)
+    assert "MUST also fill in" in sys_p
+    assert "REQUIRED" in sys_p
+    assert "never be empty or omitted" in sys_p

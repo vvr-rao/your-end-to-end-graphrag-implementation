@@ -1484,6 +1484,118 @@ async def _dedup(
     merged = _merge_dedup_batches(
         [r for r in results if r], {c.lower() for c in existing_concepts}
     )
+
+    # ---- RECONCILE: restore entries the model silently dropped ----
+    #
+    # Stage 3 is a FILTER, not a summariser: rules 1/2/5 say what to remove or
+    # merge, and everything else is supposed to come back unchanged. It does
+    # not. Measured on two corpora, the same ~64% of proposals vanish:
+    #
+    #     finance  1632 -> 550      pharma  509 -> 186
+    #
+    # against a genuine near-duplicate rate of ~6% -- the batch clusterer
+    # reports only 21 of 341 class clusters with more than one member, so
+    # there is nothing for the other 320 to have been merged INTO. The
+    # survivors confirm it: `WindFacility` AND `WindFarm`, `PowerPurchaseContract`
+    # AND `PowerPurchaseAgreement` both came back, while 259 unique classes did
+    # not. It keeps duplicates and drops singletons -- the inverse of its job.
+    #
+    # This is not a keying bug: `_dedup_merge_key` returns a non-empty key for
+    # all 1,717 proposals in that run, so nothing is lost in the merge above.
+    # The model is simply returning short lists.
+    #
+    # So the input is treated as the source of truth. Anything the model did
+    # not return is put back. The cost of being wrong here is a surviving
+    # near-duplicate; the cost of trusting the model is a class that no entity
+    # can ever be typed as, which is what drove a 25% extraction abstention
+    # rate downstream. Duplicates are visible and mergeable later; missing
+    # classes are silent.
+    restored: dict[str, int] = {}
+    for key in _DEDUP_KEYS:
+        have = {
+            _dedup_merge_key(key, e)
+            for e in merged.get(key) or []
+            if isinstance(e, dict)
+        }
+        for entry in merged_results.get(key) or []:
+            if not isinstance(entry, dict):
+                continue
+            ident = _dedup_merge_key(key, entry)
+            if not ident or ident in have:
+                continue
+            # Rule 1 still applies: never resurrect an already-existing class.
+            if key == "MATCH NOT FOUND" and ident in {
+                c.lower() for c in existing_concepts
+            }:
+                continue
+            have.add(ident)
+            merged[key].append(entry)
+            restored[key] = restored.get(key, 0) + 1
+    if restored:
+        _detail = ", ".join(f"{k}={v}" for k, v in sorted(restored.items()))
+        print(
+            f"[stage3] reconciled: restored {sum(restored.values())} proposal(s) "
+            f"the dedup model dropped without merging them ({_detail}). A large "
+            f"number here means Stage 3 is discarding rather than deduplicating."
+        )
+
+    # ---- ORPHANED INSTANCE TYPES: an instance typed to a class that does
+    # not exist ----
+    #
+    # Stage 3 emits instances carrying a TYPE_LABEL, and nothing guarantees a
+    # class of that name survives. Measured on the finance build, 110 distinct
+    # TYPE_LABELs had no surviving class. The reconciliation above restores the
+    # 52 that WERE proposed and dropped; the rest were never proposed at all --
+    # the model named a type while deduplicating without adding the class.
+    #
+    # Stage 4 does not mint one either: `extend_ontology_with_instances`
+    # resolves TYPE_LABEL against the class index and silently falls back to a
+    # generic type when it misses, so the instance survives with its type
+    # discarded. Downstream that is a class extraction can never assign, which
+    # is how "Department of Energy" ends up abstained.
+    #
+    # Synthesising the class here keeps Stage 3's own output internally
+    # consistent. The instance-shaped guard still applies: a TYPE_LABEL that
+    # names one specific thing rather than a kind is NOT promoted to a class --
+    # that is the `ChollaUnit4` failure, and it is not worth reintroducing to
+    # save a type label.
+    _class_keys = {
+        _dedup_merge_key("MATCH NOT FOUND", e)
+        for e in merged.get("MATCH NOT FOUND") or []
+        if isinstance(e, dict)
+    } | {c.lower() for c in existing_concepts}
+    _synth: list[str] = []
+    for inst in merged.get("MATCH NOT FOUND INSTANCES") or []:
+        if not isinstance(inst, dict):
+            continue
+        tl = " ".join(str(inst.get("TYPE_LABEL") or "").split()).strip()
+        if not tl or tl.upper() == "NONE" or tl.lower() in _class_keys:
+            continue
+        # An IRI-shaped TYPE_LABEL already names a class directly --
+        # `extend_ontology_with_instances` looks it up in `classes_dict`, which
+        # is keyed BY IRI, so it resolves without help. `existing_concepts`
+        # holds labels, not IRIs, so comparing against it wrongly reports these
+        # as orphans: the first run of this code minted classes literally named
+        # `http://www.w3.org/ns/org#Organization`.
+        if "://" in tl or "#" in tl:
+            continue
+        unfit, _reason = _looks_like_entity_not_class(tl)
+        if unfit:
+            continue
+        _class_keys.add(tl.lower())
+        _synth.append(tl)
+        merged["MATCH NOT FOUND"].append({
+            "LABEL": tl,
+            "DESCRIPTION": f"A kind of thing; inferred from instances typed {tl}.",
+            "PARENT_LABEL": "NONE",
+        })
+    if _synth:
+        print(
+            f"[stage3] synthesised {len(_synth)} class(es) for instance types "
+            f"that had no class (e.g. {', '.join(sorted(_synth)[:4])}). Without "
+            f"these the instances keep their type only as a dangling label."
+        )
+
     merged["MATCHES FOUND"] = matches_found  # never sent, never modified
     spent = router.total_cost_usd - cost_before
     before = sum(len(merged_results.get(k) or []) for k in _DEDUP_KEYS)
