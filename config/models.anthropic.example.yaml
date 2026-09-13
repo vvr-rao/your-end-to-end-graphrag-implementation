@@ -232,6 +232,18 @@ tasks:
     timeout: 420
     temperature: 0.0
     max_tokens: 8192   # a verdict per claim; up to ~100 claims per dense chunk
+  # Orphan check: after both relationship passes, the chunk's entities that
+  # still have no relationship are listed and the model either returns a
+  # relationship the passage states for each or flags why there is none
+  # (only_listed / no_partner / implied_only / not_an_entity). Its claims face
+  # the same evidence gates and the verifier. At least gpt-4.1-mini: it is a
+  # targeted re-read, and a weaker model mostly repeats pass 1's misses.
+  relationship_orphan_check:
+    provider: anthropic
+    model: claude-haiku-4-5
+    timeout: 420
+    temperature: 0.0
+    max_tokens: 8192   # relationships for up to ~100 orphans, plus a flag per unlinked one
   # Rescue pass: re-home relationship claims whose evidence is sound but whose
   # predicate failed the domain/range check, using a WIDER predicate menu. The
   # strict menu offered a median of 8 of 620 predicates on the news corpus, so

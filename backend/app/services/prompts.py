@@ -1893,6 +1893,7 @@ def relationship_extract(
     candidate_predicates: list[dict[str, str]],
     *,
     max_relationships: int = 10,
+    already_found: list[str] | None = None,
 ) -> tuple[str, str]:
     """Phase 2 Milestone C, second pass: relationships between entities ALREADY
     extracted from this chunk.
@@ -1942,7 +1943,19 @@ def relationship_extract(
         pred_lines += ("\n\nLAST-RESORT PREDICATES (vague -- use ONLY if no "
                        "predicate above fits):\n"
                        + "\n".join(_fmt(p) for p in generic))
+    # already_found: the SECOND pass. The first pass's accepted relationships
+    # are shown and only the ones it missed are asked for -- a single pass
+    # finds a different ~70% of a chunk's relationships on each run.
+    _gap = (
+        "A FIRST PASS has already extracted the relationships listed under "
+        "ALREADY FOUND. Your job now is to find what it MISSED: relationships "
+        "the passage states that are NOT already listed (the same pair with "
+        "subject and object swapped counts as listed). Return ONLY new "
+        "relationships -- an empty list is the correct answer when nothing was "
+        "missed. Every rule below still applies.\n\n"
+    ) if already_found is not None else ""
     system = (
+        _gap +
         "You identify RELATIONSHIPS that a passage explicitly asserts between "
         "entities that have ALREADY been extracted from it. Return ONE JSON "
         "object and nothing else -- no prose, no markdown fences.\n\n"
@@ -2013,10 +2026,81 @@ def relationship_extract(
     user = (
         "ENTITIES (subject/object must come from here):\n" + ent_lines
         + "\n\nPREDICATES (predicate_iri must come from here):\n" + pred_lines
+        + ("\n\nALREADY FOUND (do NOT repeat these):\n"
+           + ("\n".join(f"  - {f}" for f in already_found) or "  (none)")
+           if already_found is not None else "")
         + "\n\nPASSAGE:\n```\n" + chunk_text + "\n```\n\n"
         'Return JSON: {"relationships": [{"subject": ..., "predicate_iri": ..., '
         '"object": ..., "evidence": ..., "confidence": ..., '
         '"relation": ... (graphrag#relatedTo only)}]}'
+    )
+    return system, user
+
+
+ORPHAN_REASONS: tuple[str, ...] = (
+    "only_listed", "no_partner", "implied_only", "not_an_entity",
+)
+
+
+def relationship_orphan_check(
+    chunk_text: str,
+    entities: list[dict[str, str]],
+    candidate_predicates: list[dict[str, str]],
+    *,
+    orphans: list[str],
+    found: list[str],
+    max_relationships: int = 10,
+) -> tuple[str, str]:
+    """Look again at the entities in a chunk that still have NO relationship.
+
+    Runs after both relationship passes and before verification. For each
+    orphan the model must either return a relationship the passage states, or
+    flag it with a reason -- so every orphan is accounted for, and what comes
+    back as a relationship still faces every evidence gate and the verifier.
+
+    Returns JSON: {relationships: [...same shape as relationship_extract...],
+                   no_relationship: [{entity, reason}]}
+    with reason one of ORPHAN_REASONS.
+    """
+    system, user = relationship_extract(
+        chunk_text, entities, candidate_predicates,
+        max_relationships=max_relationships,
+    )
+    system = (
+        "Some entities extracted from this passage have NO relationship yet. "
+        "Look again at EACH entity listed under NO RELATIONSHIP YET and decide "
+        "one of:\n"
+        "  (a) the passage states a relationship between it and another listed "
+        "entity -> return it under relationships, following every rule below;\n"
+        "  (b) it does not -> list it under no_relationship with ONE reason:\n"
+        "      only_listed   -- named only in a list, lineup, table or header, "
+        "with nothing said about how it relates to another entity\n"
+        "      no_partner    -- what the passage says about it involves no "
+        "other listed entity\n"
+        "      implied_only  -- a relationship is implied or known, but the "
+        "passage does not state it\n"
+        "      not_an_entity -- an abstract concept, metric or phrase rather "
+        "than a thing that can stand in a relationship\n"
+        "Every entity under NO RELATIONSHIP YET must appear exactly once: as the "
+        "subject or object of a returned relationship, or under no_relationship. "
+        "Flagging is a normal answer -- never force a relationship to avoid it. "
+        "Do not repeat relationships listed under ALREADY FOUND.\n\n"
+        + system
+    )
+    head, _, _ = user.rpartition("Return JSON:")
+    head = head.replace(
+        "\n\nPASSAGE:\n",
+        "\n\nALREADY FOUND (context only -- do not repeat):\n"
+        + ("\n".join(f"  - {f}" for f in found) or "  (none)")
+        + "\n\nNO RELATIONSHIP YET (check each):\n"
+        + "\n".join(f"  - {o}" for o in orphans)
+        + "\n\nPASSAGE:\n", 1)
+    user = head + (
+        'Return JSON: {"relationships": [{"subject": ..., "predicate_iri": ..., '
+        '"object": ..., "evidence": ..., "confidence": ..., '
+        '"relation": ... (graphrag#relatedTo only)}], "no_relationship": '
+        '[{"entity": ..., "reason": "only_listed"|"no_partner"|"implied_only"|'
+        '"not_an_entity"}]}'
     )
     return system, user
 
@@ -3601,6 +3685,7 @@ PROMPTS = {
     "concept_extract": concept_extract,
     "relationship_extract": relationship_extract,
     "relationship_verify": relationship_verify,
+    "relationship_orphan_check": relationship_orphan_check,
     "relationship_repair": relationship_repair,
     # Phase 2a — table extraction (vision)
     "table_extract_vision": table_extract_vision,
