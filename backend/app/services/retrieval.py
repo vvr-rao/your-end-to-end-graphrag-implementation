@@ -542,17 +542,38 @@ async def retrieve_and_answer(
             f"seeds={len(seeds)}"
         )
 
+    # Graph seeding and traversal. Both default to the original behaviour;
+    # see config qa.graph_seeding / qa.graph_traversal.
+    _cascade = str(_qa_cfg("graph_seeding", "legacy")).lower() == "cascade"
+    _entity_walk = (str(_qa_cfg("graph_traversal", "all_edges")).lower()
+                    == "entity_relationships")
+    if _cascade:
+        _ent_seeds, _tier = await _cascade_entity_seeds(
+            parsed, qvec, aliases, embedder, verbose=verbose)
+        # Time seeds still come from the ontology match; class seeds do not.
+        seeds = ([(nid, t) for nid, t in seeds if t == "time_instance"]
+                 + [(eid, "entity") for eid in _ent_seeds])
+        if verbose:
+            print(f"[query] cascade seeding: tier={_tier}, "
+                  f"{len(_ent_seeds)} entity seed(s)")
+
     # -------- step 5: concept expansion --------
-    expanded_class_ids = await _concept_expansion(
-        router, resolved_query, matched_classes
-    )
-    seeds.extend((cid, "ontology_class") for cid in expanded_class_ids)
+    # Only produces CLASS seeds, so it is skipped when the cascade has replaced
+    # them or the traversal cannot walk through classes.
+    if not (_cascade or _entity_walk):
+        expanded_class_ids = await _concept_expansion(
+            router, resolved_query, matched_classes
+        )
+        seeds.extend((cid, "ontology_class") for cid in expanded_class_ids)
     seeds = list(set(seeds))   # dedupe
 
     # -------- step 6+7: BFS --------
+    if _entity_walk:
+        hops = int(_qa_cfg("entity_relationship_hops", hops))
     async with session_scope() as session:
         bfs_nodes = await retrieval_sql.bfs_expand(
-            session, seeds, max_hops=hops, decay=0.7
+            session, seeds, max_hops=hops, decay=0.7,
+            entity_relationships_only=_entity_walk,
         )
     expanded_entity_ids = [
         nid for (nid, ntype), _ in bfs_nodes.items() if ntype == "entity"
@@ -585,6 +606,15 @@ async def retrieve_and_answer(
         artifact_candidates = await retrieval_sql.fetch_candidate_artifacts_for_entities(
             session, expanded_entity_ids, limit=200,
         )
+        # Artifacts surfaced IN PARALLEL with graph seeding: a vector search over
+        # every artifact, independent of which entities were reached. Adds
+        # candidates only -- never seeds -- and they compete for the same
+        # artifact slots in the evidence packet.
+        global_artifact_ids: list[uuid.UUID] = []
+        if mode != "artifact_only" and bool(_qa_cfg("global_artifact_search", False)):
+            global_artifact_ids = await retrieval_sql.vector_search_all_artifacts(
+                session, qvec, top_k=int(_qa_cfg("global_artifact_top_k", 40)),
+            )
 
     # Document-level recall arm. `documents.embedding` has been written and
     # HNSW-indexed since 0001 but nothing ever read it. A document that is
@@ -616,6 +646,12 @@ async def retrieve_and_answer(
         {cid for cid, _ in ent_chunks + time_chunks + doc_chunks}
     )
     candidate_artifact_ids = [aid for aid, _ in artifact_candidates]
+    for _gid in global_artifact_ids:
+        if _gid not in candidate_artifact_ids:
+            candidate_artifact_ids.append(_gid)
+    if verbose and global_artifact_ids:
+        print(f"[query] global artifact search: {len(global_artifact_ids)} "
+              f"artifact(s); {len(candidate_artifact_ids)} artifact candidates total")
 
     # Document-mediated table inclusion: pull every StructuredTable
     # artifact derived from a document that owns at least one of our
@@ -1326,6 +1362,82 @@ async def _expand_aliases_from_question(question: str) -> dict[str, list[str]]:
         if alias not in bucket and len(bucket) < max_aliases:
             bucket.append(alias)
     return out
+
+
+async def _cascade_entity_seeds(
+    parsed: dict[str, Any],
+    qvec: list[float],
+    aliases: dict[str, list[str]],
+    embedder: Embedder,
+    *,
+    verbose: bool = False,
+) -> tuple[list[uuid.UUID], str]:
+    """Entity seeds for the graph walk, from the first tier that finds any:
+
+      1 named     entities the question names (publications excluded), by
+                  name or stored alias
+      2 classes   the closest specific classes to the question's class terms
+                  -> the top chunks mentioning their members -> those chunks'
+                  entities (retrieval_sql.class_seed_entities)
+      3 artifacts the closest intelligence artifacts -> the entities they are
+                  about (retrieval_sql.artifact_seed_entities)
+
+    Measured on 182 MultiHop-RAG questions with entity-relationship-only
+    traversal: named entities alone reached 51% of inference questions'
+    evidence (the only proper nouns are often publications); tiers 1->2
+    reached 96%, and 98% across all question types.
+    """
+    async with session_scope() as session:
+        sources = [normalize_term(x) for x in await retrieval_sql.document_sources(session)]
+
+    def _is_publication(term: str) -> bool:
+        n = normalize_term(term)
+        if not n:
+            return False
+        return any(n == src or (len(n) >= 3 and (n in src or src in n))
+                   for src in sources if src)
+
+    names = [t for t in (parsed.get("entities") or [])[:10] if t and t.strip()]
+    pubs = [t for t in names if _is_publication(t)]
+    terms: list[str] = []
+    for t in names:
+        if t in pubs:
+            continue
+        terms.append(t)
+        terms.extend(a for a in (aliases or {}).get(t, []) if not _is_publication(a))
+    seeds: list[uuid.UUID] = []
+    async with session_scope() as session:
+        for term in dict.fromkeys(terms):
+            for eid in await retrieval_sql.match_entities_by_name_or_alias(session, term):
+                if eid not in seeds:
+                    seeds.append(eid)
+    if verbose and pubs:
+        print(f"[query] publications kept out of seeding: {pubs}")
+    if seeds:
+        return seeds, "named"
+
+    class_terms = [t for t in (parsed.get("classes") or [])[:8] if t and len(t.strip()) >= 3]
+    if class_terms:
+        term_vecs = await embedder.embed(class_terms)
+        async with session_scope() as session:
+            seeds, n_classes = await retrieval_sql.class_seed_entities(
+                session, class_terms, term_vecs, qvec,
+                classes_per_term=int(_qa_cfg("class_seed_classes_per_term", 5)),
+                max_members=int(_qa_cfg("class_seed_max_members", 50)),
+                top_chunks=int(_qa_cfg("class_seed_top_chunks", 3)),
+            )
+        if verbose:
+            print(f"[query] class seeding: {n_classes} class(es) within the size cap")
+        if seeds:
+            return seeds, "classes"
+
+    async with session_scope() as session:
+        seeds = await retrieval_sql.artifact_seed_entities(
+            session, qvec,
+            top_artifacts=int(_qa_cfg("artifact_seed_top_artifacts", 5)),
+            top_chunks=int(_qa_cfg("class_seed_top_chunks", 3)),
+        )
+    return seeds, "artifacts" if seeds else "none"
 
 
 async def _ontology_match(
