@@ -90,9 +90,18 @@ def test_entity_walk_sql_only_follows_entity_relationships():
     assert "gr.source_node_type = 'entity'" not in rsql._BFS_SQL.text
 
 
-def test_defaults_keep_the_original_design():
+def test_defaults_are_the_new_design():
     import yaml
     qa = yaml.safe_load(open("config/config.example.yaml"))["qa"]
-    assert qa["graph_seeding"] == "legacy"
-    assert qa["graph_traversal"] == "all_edges"
-    assert qa["global_artifact_search"] is False
+    assert qa["graph_seeding"] == "cascade"
+    assert qa["graph_traversal"] == "entity_relationships"
+    assert qa["global_artifact_search"] is True
+
+
+def test_code_fallbacks_match_the_example_config():
+    # A config.yaml missing these keys must not silently keep the old design.
+    import inspect
+    src = inspect.getsource(rt.retrieve_and_answer)
+    assert '_qa_cfg("graph_seeding", "cascade")' in src
+    assert '_qa_cfg("graph_traversal", "entity_relationships")' in src
+    assert '_qa_cfg("global_artifact_search", True)' in src

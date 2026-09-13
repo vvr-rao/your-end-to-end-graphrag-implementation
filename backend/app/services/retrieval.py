@@ -542,10 +542,11 @@ async def retrieve_and_answer(
             f"seeds={len(seeds)}"
         )
 
-    # Graph seeding and traversal. Both default to the original behaviour;
-    # see config qa.graph_seeding / qa.graph_traversal.
-    _cascade = str(_qa_cfg("graph_seeding", "legacy")).lower() == "cascade"
-    _entity_walk = (str(_qa_cfg("graph_traversal", "all_edges")).lower()
+    # Graph seeding and traversal. Default: cascade seeding + entity-relationship
+    # walk; qa.graph_seeding: legacy / qa.graph_traversal: all_edges restore the
+    # original design.
+    _cascade = str(_qa_cfg("graph_seeding", "cascade")).lower() == "cascade"
+    _entity_walk = (str(_qa_cfg("graph_traversal", "entity_relationships")).lower()
                     == "entity_relationships")
     if _cascade:
         _ent_seeds, _tier = await _cascade_entity_seeds(
@@ -611,7 +612,7 @@ async def retrieve_and_answer(
         # candidates only -- never seeds -- and they compete for the same
         # artifact slots in the evidence packet.
         global_artifact_ids: list[uuid.UUID] = []
-        if mode != "artifact_only" and bool(_qa_cfg("global_artifact_search", False)):
+        if mode != "artifact_only" and bool(_qa_cfg("global_artifact_search", True)):
             global_artifact_ids = await retrieval_sql.vector_search_all_artifacts(
                 session, qvec, top_k=int(_qa_cfg("global_artifact_top_k", 40)),
             )
