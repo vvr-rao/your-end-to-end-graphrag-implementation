@@ -153,7 +153,10 @@ async def fetch_relationships_among_entities(
     result = await session.execute(
         sql_text("""
         SELECT s.name AS subject,
-               coalesce(p.label, split_part(gr.predicate_iri, '#', 2)) AS predicate,
+               -- A graphrag#relatedTo edge carries its relation as a phrase
+               -- ("was born in"); show and rank on that, not on "relatedTo".
+               coalesce(gr.extra_metadata ->> 'relation', p.label,
+                        split_part(gr.predicate_iri, '#', 2)) AS predicate,
                o.name AS object,
                gr.extra_metadata ->> 'evidence' AS evidence,
                coalesce((gr.extra_metadata ->> 'support_count')::int, 1) AS support,

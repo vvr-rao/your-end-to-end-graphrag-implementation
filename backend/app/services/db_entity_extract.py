@@ -24,6 +24,7 @@ Generic: no corpus-specific assumptions; works on any ingested corpus.
 from __future__ import annotations
 
 import asyncio
+import collections
 import hashlib
 import json
 import re
@@ -56,6 +57,7 @@ from backend.app.services.pipeline_llm import (
     _split_camel,
 )
 from backend.app.services.predicates import (
+    GRAPHRAG_RELATED_TO,
     RDF_TYPE,
     VIAO_ASSERTS_ABOUT,
 )
@@ -905,6 +907,14 @@ def _entity_iri(canonical_name: str, class_iri: str) -> str:
 _MAX_CANDIDATE_PREDICATES = 60
 # Upper bound on the unranked pool fetched from the DB before ranking.
 _CANDIDATE_POOL_LIMIT = 2000
+# Relationships the model may return per chunk: half the chunk's entities,
+# within these bounds. A flat 10 could link at most 20 of a chunk's entities,
+# while summary chunks hold a median of 19 and up to 80 (full team lineups,
+# product round-ups) -- so rosters were cut off by construction.
+_MIN_RELATIONSHIPS_PER_CHUNK = 10
+_MAX_RELATIONSHIPS_PER_CHUNK = 40
+# Longest free-text `relation` phrase accepted on a graphrag#relatedTo edge.
+_MAX_RELATION_WORDS = 8
 # Rescue menu is wider (either-end match), so it needs a higher ceiling; the
 # measured either-end pool is a median of 52 per chunk.
 _MAX_RESCUE_PREDICATES = 60
@@ -1169,13 +1179,16 @@ async def _verify_relationships(
     claims = []
     for r in rels:
         dom_lbl, rng_lbl = shape_of.get(r["predicate_iri"], ("", ""))
+        generic = r["predicate_iri"] == GRAPHRAG_RELATED_TO
         claims.append({
             "subject": r["subject"],
             "object": r["object"],
-            "predicate_label": label_of.get(
-                r["predicate_iri"], r["predicate_iri"]),
-            "domain_label": dom_lbl,
-            "range_label": rng_lbl,
+            # A relatedTo claim is judged on its phrase ("was born in"); the
+            # bare word "relatedTo" would let almost any co-mention pass.
+            "predicate_label": (r.get("relation") or "related to") if generic
+            else label_of.get(r["predicate_iri"], r["predicate_iri"]),
+            "domain_label": "" if generic else dom_lbl,
+            "range_label": "" if generic else rng_lbl,
             "evidence": r["evidence"],
         })
 
@@ -1208,6 +1221,12 @@ async def _verify_relationships(
         verdict = verdicts.get(i, "unsupported")
         if verdict == "supported":
             out.append(rel)
+            continue
+        if verdict == "reversed" and rel["predicate_iri"] == GRAPHRAG_RELATED_TO:
+            # Flipping the ends would leave the phrase backwards ("Failsworth
+            # was born in Ratcliffe"), and there is no reliable way to invert
+            # free text -- so drop it rather than write a garbled edge.
+            rel_drops["reversed"] += 1
             continue
         if verdict == "reversed":
             # The assertion is real; only the direction was mis-read. Keep it
@@ -1370,6 +1389,18 @@ async def _candidate_predicates(
             "domain_iris": doms,
             "range_iris": rngs,
         })
+    # The reserved fallback is always on the menu (outside the cap), so a
+    # stated relationship the ontology has no predicate for is recorded with
+    # its phrase rather than discarded. The prompt lists it last-resort.
+    constraints[GRAPHRAG_RELATED_TO] = ("", "")
+    out.append({
+        "iri": GRAPHRAG_RELATED_TO,
+        "label": "relatedTo",
+        "domain_label": "Thing",
+        "range_label": "Thing",
+        "domain_iris": [],
+        "range_iris": [],
+    })
     return out, constraints, ancestors
 
 
@@ -1424,6 +1455,27 @@ def _rank_predicates(
     return [x[3] for x in ranked]
 
 
+def _relationship_cap(n_entities: int) -> int:
+    """Relationships to ask for in a chunk holding `n_entities` entities."""
+    return max(_MIN_RELATIONSHIPS_PER_CHUNK,
+               min(_MAX_RELATIONSHIPS_PER_CHUNK, n_entities // 2))
+
+
+def _clean_relation(raw: Any) -> str | None:
+    """The `relation` phrase of a relatedTo claim, or None if unusable.
+
+    Required: an edge saying only "related to" is exactly the co-mention link
+    the evidence rules exist to keep out, and it gives retrieval nothing to
+    rank on or show.
+    """
+    phrase = " ".join(str(raw or "").split()).strip(" .;:,")
+    if not phrase or phrase.lower() in {"related to", "relatedto", "related"}:
+        return None
+    if len(phrase.split()) > _MAX_RELATION_WORDS:
+        return None
+    return phrase
+
+
 def _types_fit(
     pred: dict[str, Any] | None,
     s_cls: str,
@@ -1435,6 +1487,8 @@ def _types_fit(
     """
     if not pred:
         return False
+    if pred.get("iri") == GRAPHRAG_RELATED_TO:
+        return True       # untyped by design; the evidence checks still apply
     doms = pred.get("domain_iris") or []
     rngs = pred.get("range_iris") or []
     s_line = ancestors.get(s_cls, {s_cls})
@@ -1801,6 +1855,7 @@ async def extract_entities(
         "self_loop": 0, "contradictory_direction": 0,
         "no_evidence": 0, "overlong_evidence": 0, "one_sided_evidence": 0,
         "unsupported": 0, "reversed": 0,
+        "no_relation_phrase": 0, "generic_superseded": 0,
     }
     # The entity mirror of `rel_drops`. Line-for-line, the old code did a bare
     # `continue` for every one of these -- so the corpus could lose entities
@@ -2331,7 +2386,8 @@ async def extract_entities(
                     ]
                     try:
                         r_sys, r_user = PROMPTS["relationship_extract"](
-                            txt, ents_for_prompt, pred_list
+                            txt, ents_for_prompt, pred_list,
+                            max_relationships=_relationship_cap(len(kept)),
                         )
                         r_out = await router.chat(
                             "relationship_extract", system=r_sys, user=r_user
@@ -2376,6 +2432,12 @@ async def extract_entities(
                                 pred = recovered
                                 rel_repairs["predicate_recovered"] += 1
                             dom_iri, rng_iri = pred_constraints[pred]
+                            relation = None
+                            if pred == GRAPHRAG_RELATED_TO:
+                                relation = _clean_relation(rel.get("relation"))
+                                if relation is None:
+                                    rel_drops["no_relation_phrase"] += 1
+                                    continue
                             s_ent = _resolve_entity_ref(
                                 rel.get("subject") or "", _by_norm,
                                 expect_class=dom_iri, ancestors=pred_ancestors,
@@ -2461,6 +2523,7 @@ async def extract_entities(
                                 "predicate_iri": pred,
                                 "confidence": rconf,
                                 "evidence": ev[:_MAX_EVIDENCE_CHARS],
+                                **({"relation": relation} if relation else {}),
                             })
 
                         # ---- Rescue: re-home the type-check rejects --------
@@ -2975,6 +3038,10 @@ async def extract_entities(
                         # tell the two populations apart.
                         **({"type_check": rel["type_check"]}
                            if rel.get("type_check") else {}),
+                        # How a graphrag#relatedTo edge relates its ends, in
+                        # the passage's words -- what retrieval shows.
+                        **({"relation": rel["relation"]}
+                           if rel.get("relation") else {}),
                     },
                 })
                 rel_by_sig[sig]["_chunks"] = [chunk_id]
@@ -3006,6 +3073,10 @@ async def extract_entities(
         for sig in rel_by_sig:
             sid, pred, oid = sig
             mirror = (oid, pred, sid)
+            # relatedTo is not one relation but many ("was born in" one way,
+            # "is the birthplace of" the other), so a mirror is no conflict.
+            if pred == GRAPHRAG_RELATED_TO:
+                continue
             if mirror in rel_by_sig:
                 pair = (min(str(sid), str(oid)), pred, max(str(sid), str(oid)))
                 if pair in _seen_dirs:
@@ -3023,6 +3094,18 @@ async def extract_entities(
         for sig in _kill:
             rel_by_sig.pop(sig, None)
             rel_drops["contradictory_direction"] += 1
+
+        # A pair the corpus links with a SPECIFIC predicate anywhere does not
+        # also need the fallback: same BFS reach, and the specific edge says
+        # more. Keeps relatedTo to what the ontology genuinely cannot express.
+        _specific_pairs = {
+            frozenset((str(sid), str(oid)))
+            for sid, pred, oid in rel_by_sig if pred != GRAPHRAG_RELATED_TO
+        }
+        for sig in [g for g in rel_by_sig if g[1] == GRAPHRAG_RELATED_TO]:
+            if frozenset((str(sig[0]), str(sig[2]))) in _specific_pairs:
+                rel_by_sig.pop(sig)
+                rel_drops["generic_superseded"] += 1
 
         # Fold the supporting-chunk list into extra_metadata. Capped so a
         # heavily-repeated triple cannot grow the JSONB without bound; the
@@ -3240,7 +3323,10 @@ async def extract_entities(
                f"overlong_evidence={rel_drops['overlong_evidence']}, "
                f"one_sided_evidence={rel_drops['one_sided_evidence']}, "
                f"unsupported={rel_drops['unsupported']}, "
-               f"reversed={rel_drops['reversed']})" if _dropped else "")
+               f"reversed={rel_drops['reversed']}, "
+               f"no_relation_phrase={rel_drops['no_relation_phrase']}, "
+               f"generic_superseded={rel_drops['generic_superseded']})"
+               if _dropped else "")
             + (f", {rel_repairs['rescued']} rescued by re-homing to a better "
                f"predicate" if rel_repairs["rescued"] else "")
             + (f", {rel_repairs['direction_swapped']} direction(s) repaired"
@@ -3251,6 +3337,18 @@ async def extract_entities(
                f"recovered from label/case" if rel_repairs["predicate_recovered"]
                else "")
         )
+        _generic = [p for p in rel_payloads
+                    if p["predicate_iri"] == GRAPHRAG_RELATED_TO]
+        if _generic:
+            _phrases = collections.Counter(
+                (p["extra_metadata"].get("relation") or "").lower()
+                for p in _generic)
+            print(
+                f"[extract-entities] relatedTo (no ontology predicate fitted): "
+                f"{len(_generic)} of {len(rel_payloads)} edges. Most common "
+                f"relations -- candidates for new predicates: "
+                + ", ".join(f'"{k}" x{v}' for k, v in _phrases.most_common(12))
+            )
         if not rel_payloads and summary.chunks_scanned:
             print(
                 "[extract-entities] NOTE: no relationships written. Either the "

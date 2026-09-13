@@ -59,6 +59,7 @@ from backend.app.services.alias_mining import is_acronym, normalize_term
 from backend.app.services.db_artifact_gen import _extract_json
 from backend.app.services.embeddings import Embedder
 from backend.app.services.llm_router import LLMRouter
+from backend.app.services.predicates import GRAPHRAG_RELATED_TO
 from backend.app.services.prompts import PROMPTS
 from backend.app.services import retrieval_sql
 from backend.app.services.retrieval_ranking import cap_per_source, rrf_fuse
@@ -1720,13 +1721,16 @@ def _rank_relationships(
     # `acquires`. Cheap, dependency-free, and enough for verb-phrase labels.
     q_stem = {_stem(t) for t in q}
 
-    def _score(rel: dict[str, Any]) -> tuple[float, int]:
+    def _score(rel: dict[str, Any]) -> tuple[float, int, int]:
         pred_s = {_stem(t) for t in _toks(rel.get("predicate") or "")}
         ends_t = _toks(rel.get("subject") or "") | _toks(rel.get("object") or "")
         # The predicate is what the question is ASKING FOR, so it counts far
         # more than an incidental name collision in the endpoints.
         s = 3.0 * len(pred_s & q_stem) + 1.0 * len(ends_t & q)
-        return (s, int(rel.get("support") or 1))
+        # At equal relevance an ontology predicate outranks the relatedTo
+        # fallback: it was chosen from a typed menu and says more.
+        specific = int(rel.get("predicate_iri") != GRAPHRAG_RELATED_TO)
+        return (s, specific, int(rel.get("support") or 1))
 
     return sorted(rels, key=_score, reverse=True)
 

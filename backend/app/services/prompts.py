@@ -1706,6 +1706,10 @@ def document_type_consolidate(labels: list[str]) -> tuple[str, str]:
 # for them when nothing specific fits -- they are demoted in the prompt rather
 # than removed, because occasionally they are the honest answer.
 GENERIC_PREDICATE_IRIS: frozenset[str] = frozenset({
+    # The reserved fallback (predicates.GRAPHRAG_RELATED_TO), listed last-resort
+    # like every other catch-all. Spelled out rather than imported so this
+    # module stays import-free.
+    "https://veerla-ramrao.ai/ontology/graphrag#relatedTo",
     "http://xmlns.com/foaf/0.1/topic",
     "http://xmlns.com/foaf/0.1/knows",
     "http://xmlns.com/foaf/0.1/interest",
@@ -1859,6 +1863,9 @@ def relationship_verify(
         "\"A is a subsidiary of B\", \"A was acquired by B\" all put B in the "
         "SUBJECT position. Before answering \"supported\", find the actor in "
         "the quote and check it is on the left of the arrow.\n"
+        "  - A claim whose predicate is a plain phrase (\"was born in\") is "
+        "judged the same way: supported only if the quote states THAT "
+        "relation between them, in that direction.\n"
         "  - A LIST IS NOT AN ASSERTION. A quote that just enumerates names -- "
         "separated by commas, semicolons or parentheses, as in \"B Transmission "
         "(B Canada/AltaLink); B Renewables; HomeServices\" -- states that these "
@@ -1884,6 +1891,8 @@ def relationship_extract(
     chunk_text: str,
     entities: list[dict[str, str]],
     candidate_predicates: list[dict[str, str]],
+    *,
+    max_relationships: int = 10,
 ) -> tuple[str, str]:
     """Phase 2 Milestone C, second pass: relationships between entities ALREADY
     extracted from this chunk.
@@ -1956,8 +1965,18 @@ def relationship_extract(
         "2017.\" The quote must stay ONE continuous span of at most 3 "
         "sentences -- never skip text, never join separate passages. If the "
         "name is further back than that, do not emit the relationship.\n"
+        "  - relation: ONLY when predicate_iri is "
+        "https://veerla-ramrao.ai/ontology/graphrag#relatedTo -- a short verb "
+        "phrase (2-6 words) taken from the quote, read subject -> object, "
+        "saying HOW they relate: \"was born in\", \"alleges fraud "
+        "against\", \"signed for\". Omit it for every other predicate.\n"
         "  - confidence: float in [0,1].\n\n"
         "RULES THAT MATTER:\n"
+        "  - graphrag#relatedTo is the LAST resort. Use it ONLY when the "
+        "passage explicitly states a relationship between the two AND no "
+        "other listed predicate expresses it. It is never for two entities "
+        "that merely appear together, sit in the same list, or share a "
+        "topic -- the quote must still state how they relate.\n"
         "  - Assert ONLY what the passage states. Do NOT use world knowledge. "
         "Two entities appearing near each other is NOT a relationship.\n"
         "  - If you cannot quote a span that states it, do not emit it.\n"
@@ -1973,7 +1992,7 @@ def relationship_extract(
         "  - RETURNING AN EMPTY LIST IS THE CORRECT ANSWER when the passage "
         "asserts none of these relationships. Do not force a match merely "
         "because a predicate is offered.\n"
-        "  - At most 10 relationships.\n\n"
+        f"  - At most {max_relationships} relationships.\n\n"
         "BEFORE YOU FINISH -- completeness check:\n"
         "  Every rule above tells you when NOT to emit a relationship, and "
         "they all still hold. But leaving out a relationship the passage "
@@ -1996,7 +2015,8 @@ def relationship_extract(
         + "\n\nPREDICATES (predicate_iri must come from here):\n" + pred_lines
         + "\n\nPASSAGE:\n```\n" + chunk_text + "\n```\n\n"
         'Return JSON: {"relationships": [{"subject": ..., "predicate_iri": ..., '
-        '"object": ..., "evidence": ..., "confidence": ...}]}'
+        '"object": ..., "evidence": ..., "confidence": ..., '
+        '"relation": ... (graphrag#relatedTo only)}]}'
     )
     return system, user
 
