@@ -78,6 +78,61 @@ class ArtifactGenSummary:
     samples: list[dict[str, Any]] = field(default_factory=list)
 
 
+# Short forms at or below this length (acronyms: "FTX", "SEC", "X") match
+# case-sensitively, so "sec" in running text does not link the SEC.
+_CASE_SENSITIVE_MAX_LEN = 3
+
+
+def match_artifact_entities(
+    text: str, entities: list[dict[str, Any]]
+) -> set[Any]:
+    """Entity ids an artifact's text NAMES, by full name OR a stored alias.
+
+    `entities` are the candidates in scope -- the artifact's source chunk's
+    entities, or a summary's document's -- each {entity_id, canonical_name,
+    aliases}. Matching the full canonical name alone linked 3 of the 59
+    artifacts that say "FTX" to `FTX Trading Ltd.`, and none that say
+    "Bankman-Fried" to `Sam Bankman-Fried`; the aliases recorded by name
+    collapse ("FTX", "Bankman-Fried") close that gap.
+
+    Guards: whole-word matches only ("Apple" is not in "pineapple"); forms of
+    3 characters or fewer match case-sensitively; and a form shared by two
+    candidates ("Kelce" for Travis and Jason) links neither -- an ambiguous
+    short form is skipped rather than guessed.
+    """
+    if not text:
+        return set()
+    owners: dict[str, set[Any]] = {}
+    original: dict[str, str] = {}
+    for e in entities:
+        eid = e.get("entity_id")
+        if eid is None:
+            continue
+        forms = [e.get("canonical_name") or "", *(e.get("aliases") or [])]
+        for form in forms:
+            form = " ".join(str(form).split())
+            if len(form) < 2:
+                continue
+            key = form.lower()
+            owners.setdefault(key, set()).add(eid)
+            original.setdefault(key, form)
+    matched: set[Any] = set()
+    for key, ids in owners.items():
+        if len(ids) != 1:
+            continue
+        form = original[key]
+        flags = 0 if len(form) <= _CASE_SENSITIVE_MAX_LEN else re.IGNORECASE
+        if re.search(r"(?<!\w)" + re.escape(form) + r"(?!\w)", text, flags):
+            matched |= ids
+    return matched
+
+
+def _aliases_of(extra_metadata: Any) -> list[str]:
+    if isinstance(extra_metadata, dict):
+        return [a for a in (extra_metadata.get("aliases") or []) if isinstance(a, str)]
+    return []
+
+
 def _artifact_iri(artifact_type: str) -> str:
     return f"{_VIAO_NS}#{artifact_type}_{uuid.uuid4().hex[:16]}"
 
@@ -214,6 +269,7 @@ async def generate_per_chunk_artifacts(
                     Entity.id,
                     Entity.name,
                     OntologyClass.label,
+                    Entity.extra_metadata,
                 )
                 .join(Entity, Entity.id == GraphRelationship.target_node_id)
                 .join(OntologyClass, OntologyClass.id == Entity.class_id)
@@ -223,12 +279,13 @@ async def generate_per_chunk_artifacts(
                     GraphRelationship.source_chunk_id.in_(chunk_ids),
                 )
             )
-            for cid, eid, name, label in r.all():
+            for cid, eid, name, label, emeta in r.all():
                 chunks_to_entities.setdefault(cid, []).append({
                     "entity_id": eid,
                     "canonical_name": name,
                     "short_name": name,
                     "class_label": label or "",
+                    "aliases": _aliases_of(emeta),
                 })
 
     chunks_with_ents = sum(1 for cid, _, _, _ in chunks if chunks_to_entities.get(cid))
@@ -497,22 +554,13 @@ async def generate_per_chunk_artifacts(
             "extra_metadata": {},
         })
 
-        # Artifact -> viao:assertsAbout -> Entity edges
-        # For each entity attached to this artifact's source chunk,
-        # check whether the entity's canonical name appears in the
-        # artifact's text (case-insensitive substring). If so, edge.
-        # Idempotent within this run via asserts_about_seen.
+        # Artifact -> viao:assertsAbout -> Entity edges, for the source
+        # chunk's entities the artifact's text names by full name or alias
+        # (match_artifact_entities). Idempotent within this run via
+        # asserts_about_seen.
         if use_entities:
-            art_text_lower = art_text.lower()
-            for ent in chunks_to_entities.get(chunk_id, []):
-                name = (ent.get("canonical_name") or "").strip()
-                if not name:
-                    continue
-                if name.lower() not in art_text_lower:
-                    continue
-                ent_id = ent.get("entity_id")
-                if ent_id is None:
-                    continue
+            for ent_id in match_artifact_entities(
+                    art_text, chunks_to_entities.get(chunk_id, [])):
                 key = (aid, ent_id)
                 if key in asserts_about_seen:
                     continue
@@ -810,7 +858,7 @@ async def generate_document_summaries(
             # The doc's entities (linked to its chunks via chunk->assertsAbout->entity).
             er = await session.execute(
                 sql_text("""
-                SELECT DISTINCT e.id, e.normalized_name
+                SELECT DISTINCT e.id, e.name, e.extra_metadata
                   FROM graphrag.entities e
                   JOIN graphrag.graph_relationships gr ON gr.target_node_id = e.id
                    AND gr.predicate_label = 'viao:assertsAbout'
@@ -843,12 +891,12 @@ async def generate_document_summaries(
         # summary text. Makes Summaries (and their rollups, via inheritance) reachable
         # through the entity graph -> they now surface in deep_research, not just
         # artifact_only. Mirrors the per-chunk entity linker.
-        summary_lc = iri_to_text.get(airi, "").lower()
         seen_ent: set[Any] = set()
-        for ent_id, nname in doc_entities:
-            if not nname or ent_id in seen_ent:
-                continue
-            if nname.lower() in summary_lc:
+        for ent_id in match_artifact_entities(
+                iri_to_text.get(airi, ""),
+                [{"entity_id": eid, "canonical_name": nm,
+                  "aliases": _aliases_of(em)} for eid, nm, em in doc_entities]):
+            if ent_id not in seen_ent:
                 seen_ent.add(ent_id)
                 edge_payloads.append({
                     "source_node_type": "intelligence_artifact",
@@ -906,6 +954,85 @@ async def generate_document_summaries(
     summary.total_cost_usd += await _auto_summary_rollup(max_cost_usd)
 
     return summary
+
+
+async def relink_artifact_entities(*, dry_run: bool = False) -> dict[str, int]:
+    """Add the artifact -> viao:assertsAbout -> entity edges the alias-aware
+    matcher finds on an EXISTING build. No LLM calls, no cost.
+
+    Scope mirrors generation: a per-chunk artifact is matched against its
+    source chunk's entities; a Summary against its document's entities.
+    Additive only -- existing edges are kept, and rollups (which inherit their
+    children's edges) are not touched.
+    """
+    async with session_scope() as session:
+        ent_rows = (await session.execute(sql_text("""
+            SELECT g.source_chunk_id, c.document_id, e.id, e.name, e.extra_metadata
+              FROM graphrag.graph_relationships g
+              JOIN graphrag.entities e ON e.id = g.target_node_id
+              JOIN graphrag.chunks c ON c.id = g.source_chunk_id
+             WHERE g.predicate_label = 'viao:assertsAbout'
+               AND g.source_node_type = 'chunk' AND g.target_node_type = 'entity'
+        """))).all()
+        chunk_arts = (await session.execute(sql_text("""
+            SELECT a.id, a.text, g.target_node_id, c.document_id
+              FROM graphrag.intelligence_artifacts a
+              JOIN graphrag.graph_relationships g
+                ON g.source_node_id = a.id AND g.predicate_label = 'viao:derivedFromChunk'
+              JOIN graphrag.chunks c ON c.id = g.target_node_id
+        """))).all()
+        doc_arts = (await session.execute(sql_text("""
+            SELECT a.id, a.text, g.target_node_id
+              FROM graphrag.intelligence_artifacts a
+              JOIN graphrag.graph_relationships g
+                ON g.source_node_id = a.id AND g.predicate_label = 'viao:summarizes'
+        """))).all()
+        have = {(a, e) for a, e in (await session.execute(sql_text("""
+            SELECT source_node_id, target_node_id FROM graphrag.graph_relationships
+             WHERE source_node_type = 'intelligence_artifact'
+               AND predicate_label = 'viao:assertsAbout' AND target_node_type = 'entity'
+        """))).all()}
+        gv = await current_version(session)
+
+    by_chunk: dict[Any, dict[Any, dict[str, Any]]] = {}
+    by_doc: dict[Any, dict[Any, dict[str, Any]]] = {}
+    for chunk_id, doc_id, eid, name, emeta in ent_rows:
+        ent = {"entity_id": eid, "canonical_name": name, "aliases": _aliases_of(emeta)}
+        by_chunk.setdefault(chunk_id, {})[eid] = ent
+        by_doc.setdefault(doc_id, {})[eid] = ent
+
+    new_edges: list[dict[str, Any]] = []
+    def _edge(aid: Any, eid: Any, chunk_id: Any, doc_id: Any) -> None:
+        if (aid, eid) in have:
+            return
+        have.add((aid, eid))
+        new_edges.append({
+            "source_node_type": "intelligence_artifact", "source_node_id": aid,
+            "target_node_type": "entity", "target_node_id": eid,
+            "predicate_iri": VIAO_ASSERTS_ABOUT,
+            "predicate_label": "viao:assertsAbout",
+            "relationship_type": "assertsAbout",
+            "relationship_source": "LLM_INFERENCE", "is_authoritative": True,
+            "source_chunk_id": chunk_id, "source_document_id": doc_id,
+            "source_artifact_id": aid, "graph_version": gv, "extra_metadata": {},
+        })
+    for aid, text, chunk_id, doc_id in chunk_arts:
+        for eid in match_artifact_entities(text or "", list(by_chunk.get(chunk_id, {}).values())):
+            _edge(aid, eid, chunk_id, doc_id)
+    for aid, text, doc_id in doc_arts:
+        for eid in match_artifact_entities(text or "", list(by_doc.get(doc_id, {}).values())):
+            _edge(aid, eid, None, doc_id)
+
+    if new_edges and not dry_run:
+        async with session_scope() as session:
+            for i in range(0, len(new_edges), 500):
+                await session.execute(
+                    pg_insert(GraphRelationship).values(new_edges[i: i + 500]))
+    out = {"artifacts_checked": len(chunk_arts) + len(doc_arts),
+           "edges_added": len(new_edges), "dry_run": int(dry_run)}
+    print(f"[relink-artifact-entities] checked {out['artifacts_checked']} artifact(s); "
+          f"{'would add' if dry_run else 'added'} {len(new_edges)} artifact->entity edge(s)")
+    return out
 
 
 async def regenerate_stale_artifacts(

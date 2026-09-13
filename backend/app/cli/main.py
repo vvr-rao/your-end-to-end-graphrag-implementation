@@ -1107,6 +1107,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_art.set_defaults(func=_cmd_generate_artifacts)
 
+    p_relink = sub.add_parser(
+        "relink-artifact-entities",
+        help=(
+            "Add artifact -> assertsAbout -> entity edges using entity aliases "
+            "as well as full names (e.g. an artifact saying 'FTX' links to "
+            "FTX Trading Ltd.). For builds made before alias-aware linking. "
+            "No LLM calls; additive."
+        ),
+    )
+    p_relink.add_argument("--dry-run", action="store_true",
+                          help="Report how many edges would be added; write nothing.")
+    p_relink.set_defaults(func=_cmd_relink_artifact_entities)
+
     p_regen = sub.add_parser(
         "regenerate-stale-artifacts",
         help=(
@@ -1916,6 +1929,12 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
                 _extraction_cfg().get("pinned_class_labels") or ()),
         )
     )
+    return 0
+
+
+def _cmd_relink_artifact_entities(args: argparse.Namespace) -> int:
+    from backend.app.services.db_artifact_gen import relink_artifact_entities
+    asyncio.run(relink_artifact_entities(dry_run=args.dry_run))
     return 0
 
 
