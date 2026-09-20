@@ -116,10 +116,25 @@ def containment_is_plausible(child_label: str | None,
 
 
 # Contained places per call, on top of the container list.
-_BATCH = 40
+#
+# Small, for the reason measured twice on 2026-09-20. A single call covering
+# many items loses recall badly -- the model labels or omits rather than
+# searching, because that is the cheap path once attention is divided. The
+# orphan check showed it first (31 orphans in one call -> 2 rescues; the same
+# chunk, model and prompt found the edge when asked about ONE), and enrich-geo
+# had the identical shape: 5 batches over 299 places, ~109 per call, left 85 of
+# 146 cities and states (58%) with no containment edge at all -- including
+# Bangalore and Mumbai, which the model resolves correctly to
+# "Republic of India" when shown three places.
+#
+# That missing edge is not cosmetic: it is why "Which cities are in India?"
+# fell back to a broad walk and then failed to rank its answer.
+_BATCH = 15
 # Ceiling on containers carried into every batch, so a corpus with hundreds of
-# countries cannot blow the prompt up.
-_MAX_CONTAINERS = 80
+# countries cannot blow the prompt up. Containers ride along in EVERY batch, so
+# this is the dominant term in prompt size -- and in how much the model has to
+# hold in mind at once.
+_MAX_CONTAINERS = 60
 
 
 @dataclass
@@ -246,9 +261,55 @@ async def _place_entities(
     return [(r[0], r[1], r[2], r[3]) for r in rows.all()]
 
 
+_RELEVANT_CONTAINERS_SQL = sql_text("""
+SELECT c.id, c.name, min(c.embedding <=> p.embedding) AS d
+  FROM graphrag.entities c, graphrag.entities p
+ WHERE c.id = ANY(CAST(:containers AS uuid[]))
+   AND p.id = ANY(CAST(:batch AS uuid[]))
+   AND c.embedding IS NOT NULL
+   AND p.embedding IS NOT NULL
+ GROUP BY c.id, c.name
+ ORDER BY d ASC
+ LIMIT :k
+""")
+
+
+async def _relevant_containers(
+    session: Any,
+    batch_ids: list[Any],
+    container_ids: list[Any],
+    k: int,
+) -> set[Any]:
+    """The `k` containers closest in embedding space to any place in `batch`.
+
+    Containers ride along in every batch, so they cannot all be included once a
+    corpus has more than a few dozen. The previous rule took a fixed
+    ALPHABETICAL prefix, which silently withheld everything after the cut from
+    every batch: with 153 container-level places and a cap of 80, `Republic of
+    India` sat at position 109 and was never shown to the model at all. Indian
+    cities were therefore linked to `Asia` -- the best container they were
+    offered -- and "Which cities are in India?" had no edge to walk.
+
+    Selecting per batch instead means a batch of Indian cities is offered
+    India, and a batch of European ones is offered European containers. It uses
+    the entity embeddings already stored by extraction, so it costs no API
+    call.
+    """
+    if not batch_ids or not container_ids:
+        return set()
+    rows = await session.execute(_RELEVANT_CONTAINERS_SQL, {
+        "containers": [str(c) for c in container_ids],
+        "batch": [str(b) for b in batch_ids],
+        "k": int(k),
+    })
+    return {r[0] for r in rows.all()}
+
+
 async def enrich_geography(
     *,
     class_labels: tuple[str, ...] = DEFAULT_GEO_CLASS_LABELS,
+    batch_size: int = _BATCH,
+    max_containers: int = _MAX_CONTAINERS,
     dry_run: bool = False,
     limit: int | None = None,
     verbose: bool = False,
@@ -282,18 +343,20 @@ async def enrich_geography(
                for eid, name, label, cid in places}
     # A place is a CONTAINER by its resolved level (>= country), not by its
     # literal class label -- the label may be "Uzbekistan".
-    containers = [
-        {"name": n, "type": lbl} for _e, n, lbl, cid in places
+    all_containers = [
+        (eid, {"name": n, "type": lbl}) for eid, n, lbl, cid in places
         if levels.get(cid, _level(lbl)) >= 3
-    ][:_MAX_CONTAINERS]
-    contained = [
-        {"name": n, "type": lbl} for _e, n, lbl, cid in places
+    ]
+    contained_full = [
+        (eid, {"name": n, "type": lbl}) for eid, n, lbl, cid in places
         if levels.get(cid, _level(lbl)) < 3
     ]
+    contained = [d for _e, d in contained_full]
     # (container names are already in `by_name`; no separate index needed)
     if verbose:
-        print(f"[enrich-geo] {len(containers)} container place(s), "
-              f"{len(contained)} contained place(s)")
+        print(f"[enrich-geo] {len(all_containers)} container place(s), "
+              f"{len(contained)} contained place(s); "
+              f"<= {max_containers} offered per batch, by relevance")
     # Containers ride along in every batch AND get one batch to themselves, so
     # both Frankfurt -> Germany and Hesse -> Germany can be stated.
     # Each batch is sorted by name, which interleaves containers with the
@@ -305,11 +368,29 @@ async def enrich_geography(
     def _sorted(items: list[dict[str, str]]) -> list[dict[str, str]]:
         return sorted(items, key=lambda d: d["name"])
 
-    batches = [_sorted(containers)] if len(containers) > 1 else []
-    batches += [
-        _sorted(containers + contained[i : i + _BATCH])
-        for i in range(0, len(contained), _BATCH)
-    ]
+    # Containers are chosen PER BATCH by embedding proximity to that batch's
+    # places, not by an alphabetical prefix of the whole list. See
+    # `_relevant_containers`: the fixed prefix silently withheld every
+    # container after the cut, so Indian cities were only ever offered `Asia`.
+    cont_ids = [eid for eid, _d in all_containers]
+    cont_by_id = {eid: d for eid, d in all_containers}
+    batches: list[list[dict[str, str]]] = []
+    if len(all_containers) > 1:
+        # Container-to-container containment (Hesse -> Germany) still needs a
+        # pass of its own, chunked so it is never one huge list either.
+        conts_sorted = _sorted([d for _e, d in all_containers])
+        batches += [conts_sorted[i : i + max_containers]
+                    for i in range(0, len(conts_sorted), max_containers)]
+    async with session_scope() as session:
+        for i in range(0, len(contained_full), batch_size):
+            slice_ = contained_full[i : i + batch_size]
+            picked = await _relevant_containers(
+                session, [eid for eid, _d in slice_], cont_ids, max_containers,
+            )
+            batches.append(_sorted(
+                [cont_by_id[c] for c in picked if c in cont_by_id]
+                + [d for _e, d in slice_]
+            ))
 
     pairs: list[tuple[Any, Any, str]] = []
     for batch in batches:

@@ -2051,9 +2051,12 @@ def _cmd_enrich_geo(args: argparse.Namespace) -> int:
             "class_labels")
         or DEFAULT_GEO_CLASS_LABELS
     )
+    _geo_cfg = (get_settings().app_config.get("geo_enrichment", {}) or {})
     summary = asyncio.run(
         enrich_geography(
             class_labels=labels,
+            batch_size=int(_geo_cfg.get("batch_size") or 15),
+            max_containers=int(_geo_cfg.get("max_containers") or 60),
             dry_run=args.dry_run,
             limit=args.limit,
             verbose=True,

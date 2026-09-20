@@ -184,7 +184,8 @@ async def fetch_relationships_among_entities(
                o.name AS object,
                gr.extra_metadata ->> 'evidence' AS evidence,
                coalesce((gr.extra_metadata ->> 'support_count')::int, 1) AS support,
-               gr.predicate_iri
+               gr.predicate_iri,
+               coalesce(gr.extra_metadata ->> 'evidence_kind', '') AS evidence_kind
           FROM graphrag.graph_relationships gr
           JOIN graphrag.entities s ON s.id = gr.source_node_id
           JOIN graphrag.entities o ON o.id = gr.target_node_id
@@ -192,12 +193,19 @@ async def fetch_relationships_among_entities(
                  ON p.iri = gr.predicate_iri
          WHERE gr.source_node_type = 'entity'
            AND gr.target_node_type = 'entity'
-           -- World-knowledge edges (enrich-geo's "Frankfurt is in Germany")
-           -- exist to be WALKED, never cited: no document states them, so
-           -- presenting them as evidence would put a sentence the corpus
-           -- never wrote inside a grounded answer.
-           AND coalesce(gr.extra_metadata ->> 'evidence_kind', '')
-               <> 'world_knowledge'
+           -- World-knowledge edges (enrich-geo's "Bangalore is in India")
+           -- are admitted but MARKED, never silently mixed in with
+           -- document-sourced claims.
+           --
+           -- They were excluded outright at first, reasoning that no answer
+           -- should rest on a sentence no document wrote. That is right for
+           -- most questions and wrong for the one kind where the containment
+           -- IS the answer: measured 2026-09-20, "Which cities are in India?"
+           -- walked Bangalore -> Republic of India, reached both cities, and
+           -- then answered "the retrieved evidence contains no specific
+           -- cities in India" because the only edge that said so was filtered
+           -- out. A system that holds the answer and declines to give it is
+           -- the worse failure; provenance is preserved by labelling instead.
            AND __MATCH__
          ORDER BY support DESC, s.name
          LIMIT :limit
@@ -205,7 +213,7 @@ async def fetch_relationships_among_entities(
         {"ids": [str(e) for e in entity_ids], "limit": limit},
     )
     out: list[dict[str, Any]] = []
-    for subj, pred, obj, ev, support, pred_iri in result.all():
+    for subj, pred, obj, ev, support, pred_iri, ev_kind in result.all():
         if not subj or not obj:
             continue
         out.append({
@@ -215,6 +223,10 @@ async def fetch_relationships_among_entities(
             "evidence": (ev or "").strip(),
             "support": support,
             "predicate_iri": pred_iri,
+            # True where no document states this -- enrich-geo containment.
+            # The caller labels it so an answer can use it without presenting
+            # it as a corpus claim.
+            "world_knowledge": ev_kind == "world_knowledge",
         })
     return out
 

@@ -716,6 +716,23 @@ qa:
   class_seed_top_chunks: 3
   # Artifact tier: how many nearest artifacts supply the seeds.
   artifact_seed_top_artifacts: 5
+  # The full-text bridge swaps a document's verbatim chunks into the candidate
+  # pool when it has them. It used to DROP the summary chunks at the same time,
+  # keeping them only for documents with no full-text version -- which, on a
+  # corpus ingested wholesale with --full-text-chunks, is none. Measured on the
+  # 66-doc build: 127 graph-selected chunks became 413 verbatim ones and two
+  # enumeration questions the 30-doc build answered correctly began returning
+  # "the retrieved evidence contains no specific list"; both answers lived in a
+  # summary chunk the graph had already picked. Default now AUGMENTS: keep the
+  # summary chunks, add the full text, let RRF fusion decide -- as the table and
+  # artifact bridges already do. true restores the pre-2026-09-20 replacement.
+  fulltext_bridge_replaces_summary: false
+  # How many documents the full-text bridge may expand, ranked by how many
+  # candidate chunks each owns. Unbounded it pulled 464 verbatim chunks from 62
+  # of 66 documents -- the whole corpus -- and a question whose answer ranked
+  # fine among 186 candidates could not be found among 650. 0 = unbounded.
+  fulltext_bridge_max_documents: 10
+  fulltext_bridge_limit: 500
   # ---- Artifact -> chunk bridge. `artifact_sources` records which chunk each
   # artifact was distilled from (1,277 of 1,278 artifacts on the
   # websearch-geo-time build), but nothing in retrieval read it: the
@@ -822,3 +839,11 @@ jobs:
 storage:
   backend: local   # local | s3 (Phase 3+)
   # Override via STORAGE_DIR env var.
+
+# ---- enrich-geo. Contained places per LLM call, and how many containers
+# ride along in every call. Small on purpose: at ~109 places per call the
+# pass left 58% of cities with no containment edge, the same
+# recall-under-load failure measured in the orphan check.
+geo_enrichment:
+  batch_size: 15
+  max_containers: 60

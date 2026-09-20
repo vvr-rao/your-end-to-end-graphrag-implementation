@@ -891,35 +891,85 @@ async def retrieve_and_answer(
         chunk_doc_map: dict[uuid.UUID, uuid.UUID] = {}
         async with session_scope() as session:
             ft_rows = await retrieval_sql.fetch_fulltext_chunks_for_chunks(
-                session, candidate_chunk_ids, limit=500,
+                session, candidate_chunk_ids,
+                limit=int(_qa_cfg("fulltext_bridge_limit", 500)),
                 per_document_limit=int(
                     _qa_cfg("max_fulltext_chunks_per_document", 50)
                 ),
             )
+            # Expand only the documents the graph ranked HIGHEST, not every
+            # document it touched. On the 66-doc build the bridge was pulling
+            # 464 verbatim chunks from 62 of 66 documents -- effectively the
+            # whole corpus -- and "which cities are in India" then failed to
+            # rank its answer among 650 candidates, where 186 had found it.
+            # `hits` is the number of candidate chunks the document owns, so
+            # this follows the graph's own document ranking.
+            _max_ft_docs = int(_qa_cfg("fulltext_bridge_max_documents", 10))
+            if _max_ft_docs > 0 and ft_rows:
+                _by_doc: dict[uuid.UUID, float] = {}
+                for _c, _h, _d in ft_rows:
+                    _by_doc[_d] = max(_by_doc.get(_d, 0.0), float(_h))
+                _keep_docs = {
+                    d for d, _ in sorted(
+                        _by_doc.items(), key=lambda kv: kv[1], reverse=True
+                    )[:_max_ft_docs]
+                }
+                ft_rows = [r for r in ft_rows if r[2] in _keep_docs]
             if ft_rows:
                 chunk_doc_map = await retrieval_sql.fetch_chunk_document_ids(
                     session, candidate_chunk_ids,
                 )
         if ft_rows:
             ft_doc_ids = {did for _, _, did in ft_rows}
-            # Keep summary chunks only for docs that have NO full-text chunks.
-            summary_keep = [
-                cid for cid in candidate_chunk_ids
-                if chunk_doc_map.get(cid) not in ft_doc_ids
-            ]
             ft_ids = [cid for cid, _, _ in ft_rows]
-            candidate_chunk_ids = summary_keep + ft_ids
+            # ADD full text, do not REPLACE the summary chunks.
+            #
+            # This used to keep summary chunks only for documents with no
+            # full-text version -- which, on a corpus ingested wholesale with
+            # `--full-text-chunks`, is no documents at all. The entire
+            # graph-selected pool was discarded and replaced by every
+            # full-text chunk of the same documents: measured on the 66-doc
+            # build, 127 curated chunks became 413 verbatim ones and two
+            # enumeration questions that the 30-doc build answered correctly
+            # started returning "the retrieved evidence contains no specific
+            # list". Both answers lived in a summary chunk the graph had
+            # already picked, and both came back when the bridge was disabled.
+            #
+            # The summary chunks are what the entity graph was built from and
+            # what the graph arm actually chose; their document's full-text
+            # chunks inherit a document-level score, not that specific match.
+            # Keeping both and letting RRF fusion decide is how the table and
+            # artifact bridges already work -- this one was the odd one out.
+            #
+            # `qa.fulltext_bridge_replaces_summary: true` restores the old
+            # behaviour.
+            _replace = bool(_qa_cfg("fulltext_bridge_replaces_summary", False))
+            if _replace:
+                kept_summary = [
+                    cid for cid in candidate_chunk_ids
+                    if chunk_doc_map.get(cid) not in ft_doc_ids
+                ]
+            else:
+                kept_summary = list(candidate_chunk_ids)
+            _have = set(kept_summary)
+            candidate_chunk_ids = kept_summary + [
+                cid for cid in ft_ids if cid not in _have
+            ]
             # Propagate graph scores: fulltext chunks inherit their document's
-            # candidate-chunk count; kept summary chunks keep their entity score.
+            # candidate-chunk count; summary chunks keep their entity score.
             ent_score = {cid: sc for cid, sc in ent_chunks}
-            scored = [(cid, ent_score.get(cid, 0.0)) for cid in summary_keep]
-            scored += [(cid, hits) for cid, hits, _ in ft_rows]
+            scored = [(cid, ent_score.get(cid, 0.0)) for cid in kept_summary]
+            scored += [(cid, hits) for cid, hits, _ in ft_rows
+                       if cid not in _have]
             scored.sort(key=lambda t: t[1], reverse=True)
             graph_chunk_ranking = [cid for cid, _ in scored]
             if verbose:
                 print(
-                    f"[query] full-text bridge: {len(ft_ids)} fulltext chunk(s) "
-                    f"across {len(ft_doc_ids)} doc(s); candidate pool now "
+                    f"[query] full-text bridge ("
+                    f"{'replace' if _replace else 'augment'}): "
+                    f"{len(ft_ids)} fulltext chunk(s) across "
+                    f"{len(ft_doc_ids)} doc(s); kept {len(kept_summary)} "
+                    f"summary chunk(s); candidate pool now "
                     f"{len(candidate_chunk_ids)}"
                 )
 
@@ -1234,9 +1284,18 @@ async def retrieve_and_answer(
         # produced a confidently wrong, cited answer, because the quote carries
         # detail about one endpoint only.
         _stmt = f"{rel['subject']} {rel['predicate']} {rel['object']}."
+        if rel.get("world_knowledge"):
+            # Admitted so a containment question can be answered at all, but
+            # never passed off as something a document said. The synthesis
+            # prompt sees the label, so an answer can rely on the fact while
+            # a reader can tell it apart from a corpus claim.
+            _stmt += (" [This geographic fact is VERIFIED and you SHOULD use "
+                      "it to answer. It was derived during ingestion rather "
+                      "than quoted from a document, so it carries no passage "
+                      "-- that is expected, not a reason to withhold it.]")
         _ev = _trim_quote_to_claim(
             rel.get("evidence") or "", rel["subject"], rel["object"])
-        if _ev:
+        if _ev and not rel.get("world_knowledge"):
             _stmt += (f" [supporting quote for THAT relationship only; any "
                       f"other detail in it belongs to whichever one it names, "
                       f"not to both: \"{_ev}\"]")
