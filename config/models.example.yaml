@@ -366,6 +366,34 @@ tasks:
     max_tokens: 1024
     response_format: json_object
 
+  # Parses the RELATIONSHIPS a question implies, for relationship-aware
+  # graph traversal ("which company in Germany" -> company is in a place,
+  # that place is in Germany). gpt-4.1-mini rather than gpt-4o-mini: the
+  # multi-step decomposition is where mini-class models collapse two hops
+  # into one, and one bad parse costs the whole walk. One call per query.
+  question_relations:
+    provider: openai
+    model: gpt-4.1-mini
+    timeout: 90
+    temperature: 0.0
+    max_tokens: 1024
+    response_format: json_object
+
+  # enrich-geo: which named places contain which other named places. Closed
+  # list, one call per 40 places -- but gpt-4o-mini got it wrong in both
+  # directions on a 46-place list: it returned NOTHING when the list was
+  # grouped by class, and when it did answer it produced "Canada is in United
+  # States". These edges are world knowledge with no document behind them, so
+  # a wrong one is unfalsifiable from the corpus. A level guard rejects the
+  # impossible ones; gpt-4.1-mini is what makes the rest trustworthy.
+  geographic_containment:
+    provider: openai
+    model: gpt-4.1-mini
+    timeout: 240
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+
   concept_expansion:
     provider: openai
     model: gpt-4o-mini

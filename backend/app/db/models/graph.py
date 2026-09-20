@@ -19,6 +19,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import Boolean, CheckConstraint, ForeignKey, Integer, Numeric, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -74,4 +75,8 @@ class GraphRelationship(Base):
     generation_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     graph_version: Mapped[int] = mapped_column(Integer, nullable=False)
     extra_metadata: Mapped[dict[str, Any]] = metadata_jsonb_column()
+    # `<source> <relation> <target>. <evidence>`, written by
+    # `embed-relationships`. NULL on edges that were never embedded
+    # (ontology TBox rows, and any graph built before 0008).
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(1024))
     created_at: Mapped[datetime] = timestamp_column()

@@ -684,6 +684,54 @@ qa:
   class_seed_top_chunks: 3
   # Artifact tier: how many nearest artifacts supply the seeds.
   artifact_seed_top_artifacts: 5
+  # ---- Relationship-aware traversal (0008 graph_relationships.embedding).
+  # Every extracted edge carries the sentence that supports it; embed-relationships
+  # vectorizes it. When a question names a RELATION ("who was accused of fraud",
+  # "which company in Germany makes chips"), the walk follows only the edges whose
+  # text matches that relation, re-scored at EVERY hop -- which is what carries a
+  # multi-step question: hop 1 matches "Frankfurt is a city in Germany", hop 2
+  # matches "Company X is headquartered in Frankfurt". Each hop scores against ALL
+  # parsed relations and keeps the best, so a chain whose rungs differ ("who
+  # founded the company that acquired X") matches a different one per hop.
+  #
+  # Falls back to the broad walk whenever nothing matches -- a question stating no
+  # relationship, or a graph whose edges were never embedded. false = never use it.
+  relationship_traversal: true
+  # Cosine floor for an edge to count as matching a parsed relation. Measured on
+  # 182 MultiHop-RAG questions: 0.45 fired the anchored hop on 18% of questions
+  # (6.9 documents, 95% recall, 41% precision); 0.55 on 10% (6.3 documents, 90%
+  # recall, 40% precision) and sends the other 32% to the broad walk instead of
+  # following a weak match. Also the floor for relation-filtered class seeding.
+  relationship_similarity: 0.55
+  # Edges admitted per hop, and the per-hop score decay.
+  relationship_hop_limit: 50
+  relationship_hop_decay: 0.7
+  # Vague-entity seeding: "who was accused of fraud" names nobody, so the named
+  # tier finds nothing and the chunk-mediated class tier skips Person/Organization
+  # for exceeding class_seed_max_members. This tier takes the same classes with NO
+  # member cap and ranks their members by how well their edges match the parsed
+  # relation -- the class supplies the type, the relation does the narrowing.
+  # Floor for the vague-entity tier, deliberately BELOW
+  # relationship_similarity: the hop is precision-critical (a wrong edge
+  # at hop 1 propagates), while this tier only ORDERS members of a class
+  # the question already constrained. At 0.55 it never fires -- the best
+  # edge for "who was accused of fraud" scores 0.536.
+  relation_class_seed_similarity: 0.40
+  relation_class_seed_limit: 25
+  # ---- Document arm. "conditional" (default) runs it only where the graph
+  # cannot answer: a seed entity with no relationships at all, or a graph arm
+  # returning fewer than document_arm_min_chunks_factor x k_chunks candidates.
+  # Measured: running it on every query cost precision (41% vs 46%) and bought
+  # no gold documents or fact-bearing chunks. "always" = pre-2026-09-20
+  # behaviour; "off" = disabled, same as k_documents: 0.
+  document_arm: conditional
+  document_arm_min_chunks_factor: 3
+  # ---- Temporal. Question time terms are parsed with the same function
+  # ingestion used on chunk text, so Q3 2023 / October 2023 / 2023-10-15 all
+  # match the rows enrich-time minted (the old query path matched bare years
+  # only). A matched period expands DOWN its hierarchy at full weight and one
+  # level UP at half weight; depth caps the descent.
+  time_expansion_depth: 3
   # Search ALL artifacts by vector on every query (not only artifact_only mode)
   # and add them as candidates alongside the entity-linked ones. Candidates
   # only -- never graph seeds; they share the existing artifact evidence slots.

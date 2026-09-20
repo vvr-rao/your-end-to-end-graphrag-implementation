@@ -447,6 +447,8 @@ class EntityExtractSummary:
     entities_reused: int = 0
     chunk_entity_edges: int = 0
     entity_relationship_edges: int = 0
+    # Edges given a vector by the post-insert embedding pass (0008).
+    relationship_embeddings: int = 0
     type_edges: int = 0
     tables_scanned: int = 0
     table_entity_edges: int = 0
@@ -2060,6 +2062,7 @@ async def extract_entities(
     menu_filter_allowlist: frozenset[str] | None = None,
     menu_ancestor_closure: bool = True,
     pinned_class_labels: tuple[str, ...] = (),
+    embed_relationships: bool = True,
 ) -> EntityExtractSummary:
     """Drive entity extraction over chunks that haven't been processed.
 
@@ -3446,6 +3449,31 @@ async def extract_entities(
         for i in range(0, len(rel_payloads), EDGE_BATCH):
             await session.execute(
                 pg_insert(GraphRelationship).values(rel_payloads[i : i + EDGE_BATCH])
+            )
+
+    # Vectorize the new entity->entity edges so retrieval can match a
+    # question against what an edge SAYS, not just who it touches. Embeddings
+    # only (no chat model), pennies per 100k edges, and idempotent -- edges
+    # that already carry a vector are skipped. `embed-relationships` does the
+    # same thing standalone for a graph built before 0008.
+    if embed_relationships and rel_payloads:
+        from backend.app.services.db_relationship_embed import (
+            embed_relationships as _embed_rels,
+        )
+        try:
+            _rel_emb = await _embed_rels(only_missing=True)
+            summary.relationship_embeddings = _rel_emb.embedded
+            print(
+                f"[extract-entities] embedded {_rel_emb.embedded} "
+                f"relationship(s) (${_rel_emb.cost_usd:.4f})"
+            )
+        except Exception as exc:                      # pragma: no cover
+            # Never fail a completed extraction over the vector pass: the
+            # edges are already written and `embed-relationships` can
+            # backfill. Retrieval falls back to the broad walk meanwhile.
+            print(
+                f"[extract-entities] WARNING relationship embedding failed "
+                f"({exc}); run `embed-relationships` to backfill"
             )
 
     # Entity-side accounting. Previously every one of these was a silent

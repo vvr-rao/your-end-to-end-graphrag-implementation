@@ -69,13 +69,19 @@ SELECT node_id, node_type, max(score) AS best_score, min(hop) AS min_hop
 """)
 
 
-# The same walk restricted to entity -> entity relationships. Class membership
+# The same walk restricted to the edges that carry meaning between instances:
+# entity -> entity relationships, plus the temporal hierarchy. Class membership
 # (rdf:type / subClassOf) and chunk mentions are not traversed, so a seed
 # reaches only what it is RELATED to, not everything sharing a class with it.
 # Measured on 182 MultiHop-RAG questions (multihop-rag-subset, 515
 # relationships): walking every edge reached 40/40 documents on every question
 # (7% precision); entity relationships only reached ~7-9 with 98-100% recall
 # on questions that name their subjects.
+#
+# The temporal hierarchy is NOT walked here even though it is instance-level:
+# `intervalDuring` edges are directional and this walk is not, so admitting
+# them would let a MONTH_2023_10 seed climb to YEAR_2023 and then descend into
+# every other month of 2023. `expand_time_instances` below walks it properly.
 _ENTITY_BFS_SQL = sql_text(
     _BFS_SQL.text.replace(
         "WHERE b.hop < CAST(:max_hops AS int)",
@@ -186,6 +192,12 @@ async def fetch_relationships_among_entities(
                  ON p.iri = gr.predicate_iri
          WHERE gr.source_node_type = 'entity'
            AND gr.target_node_type = 'entity'
+           -- World-knowledge edges (enrich-geo's "Frankfurt is in Germany")
+           -- exist to be WALKED, never cited: no document states them, so
+           -- presenting them as evidence would put a sentence the corpus
+           -- never wrote inside a grounded answer.
+           AND coalesce(gr.extra_metadata ->> 'evidence_kind', '')
+               <> 'world_knowledge'
            AND __MATCH__
          ORDER BY support DESC, s.name
          LIMIT :limit
@@ -523,6 +535,58 @@ async def entities_in_chunks(
     return [r[0] for r in result.all()]
 
 
+async def resolve_class_closure(
+    session: AsyncSession,
+    terms: list[str],
+    term_embeddings: list[list[float]],
+    *,
+    classes_per_term: int = 5,
+    max_depth: int = 3,
+) -> dict[uuid.UUID, int]:
+    """Classes matching the question's class terms, plus their subclasses,
+    as `class_id -> number of entities typed with it`.
+
+    Shared by the two class-driven seeding paths so they see exactly the same
+    set of classes: the chunk-mediated one (which caps class size, because
+    500 undifferentiated members are noise) and the relation-filtered one
+    (which does not, because the relation does the narrowing).
+    """
+    class_ids: set[uuid.UUID] = set()
+    for term, vec in zip(terms, term_embeddings, strict=False):
+        r = await session.execute(sql_text("""
+            SELECT id FROM graphrag.ontology_classes
+             WHERE embedding IS NOT NULL
+             ORDER BY embedding <-> CAST(:v AS vector) LIMIT :k
+        """), {"v": _vec_str(vec), "k": classes_per_term})
+        class_ids |= {row[0] for row in r.all()}
+        r = await session.execute(sql_text("""
+            SELECT id FROM graphrag.ontology_classes
+             WHERE label IS NOT NULL
+               AND (lower(label) = lower(:t)
+                    OR lower(replace(label, ' ', '')) = lower(replace(:t, ' ', '')))
+        """), {"t": term})
+        class_ids |= {row[0] for row in r.all()}
+    if not class_ids:
+        return {}
+    r = await session.execute(sql_text("""
+        WITH RECURSIVE down(id, depth) AS (
+            SELECT id, 0 FROM graphrag.ontology_classes WHERE id = ANY(CAST(:ids AS uuid[]))
+          UNION
+            SELECT gr.source_node_id, down.depth + 1
+              FROM down JOIN graphrag.graph_relationships gr
+                ON gr.target_node_id = down.id
+               AND gr.source_node_type = 'ontology_class'
+               AND gr.target_node_type = 'ontology_class'
+               AND gr.predicate_label = 'rdfs:subClassOf'
+             WHERE down.depth < :depth
+        )
+        SELECT e.class_id, count(*) FROM graphrag.entities e
+         WHERE e.class_id IN (SELECT id FROM down)
+         GROUP BY e.class_id
+    """), {"ids": [str(c) for c in class_ids], "depth": max_depth})
+    return {cid: int(n) for cid, n in r.all()}
+
+
 async def class_seed_entities(
     session: AsyncSession,
     terms: list[str],
@@ -542,40 +606,12 @@ async def class_seed_entities(
     members are ranked against the QUESTION and the top few supply the seeds.
     Returns (entity ids, number of classes kept).
     """
-    class_ids: set[uuid.UUID] = set()
-    for term, vec in zip(terms, term_embeddings, strict=False):
-        r = await session.execute(sql_text("""
-            SELECT id FROM graphrag.ontology_classes
-             WHERE embedding IS NOT NULL
-             ORDER BY embedding <-> CAST(:v AS vector) LIMIT :k
-        """), {"v": _vec_str(vec), "k": classes_per_term})
-        class_ids |= {row[0] for row in r.all()}
-        r = await session.execute(sql_text("""
-            SELECT id FROM graphrag.ontology_classes
-             WHERE label IS NOT NULL
-               AND (lower(label) = lower(:t)
-                    OR lower(replace(label, ' ', '')) = lower(replace(:t, ' ', '')))
-        """), {"t": term})
-        class_ids |= {row[0] for row in r.all()}
-    if not class_ids:
+    counts = await resolve_class_closure(
+        session, terms, term_embeddings, classes_per_term=classes_per_term,
+    )
+    if not counts:
         return [], 0
-    r = await session.execute(sql_text("""
-        WITH RECURSIVE down(id, depth) AS (
-            SELECT id, 0 FROM graphrag.ontology_classes WHERE id = ANY(CAST(:ids AS uuid[]))
-          UNION
-            SELECT gr.source_node_id, down.depth + 1
-              FROM down JOIN graphrag.graph_relationships gr
-                ON gr.target_node_id = down.id
-               AND gr.source_node_type = 'ontology_class'
-               AND gr.target_node_type = 'ontology_class'
-               AND gr.predicate_label = 'rdfs:subClassOf'
-             WHERE down.depth < 3
-        )
-        SELECT e.class_id, count(*) FROM graphrag.entities e
-         WHERE e.class_id IN (SELECT id FROM down)
-         GROUP BY e.class_id
-    """), {"ids": [str(c) for c in class_ids]})
-    keep = [cid for cid, n in r.all() if 1 <= n <= max_members]
+    keep = [cid for cid, n in counts.items() if 1 <= n <= max_members]
     if not keep:
         return [], 0
     r = await session.execute(sql_text("""
@@ -1200,3 +1236,281 @@ async def fetch_artifact_rows(
         }
         for aid, airi, atype, atext, conf in result.all()
     }
+
+
+# ---------------------------------------------------------------------------
+# Relationship-aware traversal (0008 `graph_relationships.embedding`)
+# ---------------------------------------------------------------------------
+#
+# The plain BFS treats every edge out of a node as equally relevant: a seed's
+# neighbourhood at 3 hops is whatever it happens to touch. That is right when
+# the question names its subjects and asks for context, and wrong when the
+# question names a RELATION ("who was accused of fraud", "which company is in
+# Germany") -- there the relation is the whole constraint and the graph has the
+# answer, just diluted by every unrelated edge on the same nodes.
+#
+# These helpers score edges by embedding similarity to the relation phrases
+# parsed out of the question, so a walk follows only the edges that MEAN what
+# was asked. Edges with no vector (ontology TBox rows, graphs built before
+# 0008) are invisible here; callers fall back to `bfs_expand`.
+
+_REL_HOP_SQL = sql_text("""
+SELECT g.id, g.source_node_id, g.target_node_id,
+       1 - (g.embedding <=> CAST(:probe AS vector)) AS sim
+  FROM graphrag.graph_relationships g
+ WHERE g.embedding IS NOT NULL
+   AND g.source_node_type = 'entity'
+   AND g.target_node_type = 'entity'
+   AND (g.source_node_id = ANY(CAST(:frontier AS uuid[]))
+     OR g.target_node_id = ANY(CAST(:frontier AS uuid[])))
+   AND 1 - (g.embedding <=> CAST(:probe AS vector)) >= CAST(:threshold AS float)
+ ORDER BY sim DESC
+ LIMIT :limit
+""")
+
+_REL_GLOBAL_SQL = sql_text("""
+SELECT g.id, g.source_node_id, g.target_node_id,
+       1 - (g.embedding <=> CAST(:probe AS vector)) AS sim
+  FROM graphrag.graph_relationships g
+ WHERE g.embedding IS NOT NULL
+   AND g.source_node_type = 'entity'
+   AND g.target_node_type = 'entity'
+   AND 1 - (g.embedding <=> CAST(:probe AS vector)) >= CAST(:threshold AS float)
+ ORDER BY sim DESC
+ LIMIT :limit
+""")
+
+
+async def relationship_hop(
+    session: AsyncSession,
+    frontier: list[uuid.UUID],
+    probes: list[list[float]],
+    *,
+    threshold: float = 0.55,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Edges touching `frontier` that match ANY probe relation, best first.
+
+    Scoring against the MAX over probes (rather than one vector) is what lets
+    a chain whose rungs differ work: "who founded the company that acquired X"
+    parses to two relations, hop 1 matches on `acquired` and hop 2 on
+    `founded`, and neither hop needs to know which rung it is on. It is
+    order-free, so a question that states the chain backwards behaves the same.
+    """
+    if not frontier or not probes:
+        return []
+    best: dict[uuid.UUID, dict[str, Any]] = {}
+    fr = [str(x) for x in frontier]
+    for probe in probes:
+        rows = await session.execute(
+            _REL_HOP_SQL,
+            {"probe": _vec_str(probe), "frontier": fr,
+             "threshold": threshold, "limit": limit},
+        )
+        for rid, src, tgt, sim in rows.all():
+            cur = best.get(rid)
+            if cur is None or float(sim) > cur["sim"]:
+                best[rid] = {"id": rid, "source_node_id": src,
+                             "target_node_id": tgt, "sim": float(sim)}
+    return sorted(best.values(), key=lambda r: r["sim"], reverse=True)[:limit]
+
+
+async def relationship_vector_search(
+    session: AsyncSession,
+    probes: list[list[float]],
+    *,
+    threshold: float = 0.55,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """The same match with no anchor: the corpus's best edges for a relation.
+
+    This is the path for a question that names a relation but no entity the
+    graph knows ("which executives were charged?"). Measured on the 182
+    MultiHop-RAG questions, the unanchored search covered 58% of questions at
+    threshold 0.55 where the anchored hop fired on only 10%.
+    """
+    if not probes:
+        return []
+    best: dict[uuid.UUID, dict[str, Any]] = {}
+    for probe in probes:
+        rows = await session.execute(
+            _REL_GLOBAL_SQL,
+            {"probe": _vec_str(probe), "threshold": threshold, "limit": limit},
+        )
+        for rid, src, tgt, sim in rows.all():
+            cur = best.get(rid)
+            if cur is None or float(sim) > cur["sim"]:
+                best[rid] = {"id": rid, "source_node_id": src,
+                             "target_node_id": tgt, "sim": float(sim)}
+    return sorted(best.values(), key=lambda r: r["sim"], reverse=True)[:limit]
+
+
+_CLASS_BY_RELATION_SQL = sql_text("""
+SELECT e.id, max(1 - (g.embedding <=> CAST(:probe AS vector))) AS sim
+  FROM graphrag.graph_relationships g
+  JOIN graphrag.entities e
+    ON (e.id = g.source_node_id OR e.id = g.target_node_id)
+ WHERE g.embedding IS NOT NULL
+   AND g.source_node_type = 'entity'
+   AND g.target_node_type = 'entity'
+   AND e.class_id = ANY(CAST(:class_ids AS uuid[]))
+   AND e.status = 'ACTIVE'
+   AND 1 - (g.embedding <=> CAST(:probe AS vector)) >= CAST(:threshold AS float)
+ GROUP BY e.id
+ ORDER BY sim DESC
+ LIMIT :limit
+""")
+
+
+async def entities_of_class_by_relation(
+    session: AsyncSession,
+    class_ids: list[uuid.UUID],
+    probes: list[list[float]],
+    *,
+    threshold: float = 0.55,
+    limit: int = 25,
+) -> list[tuple[uuid.UUID, float]]:
+    """Members of `class_ids` ranked by how well their edges match a relation.
+
+    The vague-entity path: "who was accused of fraud" names no entity, so
+    seeding can only fall back to whichever chunks the question's wording
+    happens to hit. Here the CLASS supplies the type constraint (Person) and
+    the relation phrase supplies the rest -- scored against the stored
+    evidence quote, which is where "accused of defrauding customers" actually
+    appears. It is also what makes a big class usable: the member cap that
+    normally drops Person/Organization from class seeding exists because 500
+    undifferentiated members are noise, and a relation filter differentiates
+    them.
+    """
+    if not class_ids or not probes:
+        return []
+    best: dict[uuid.UUID, float] = {}
+    cids = [str(c) for c in class_ids]
+    for probe in probes:
+        rows = await session.execute(
+            _CLASS_BY_RELATION_SQL,
+            {"probe": _vec_str(probe), "class_ids": cids,
+             "threshold": threshold, "limit": limit},
+        )
+        for eid, sim in rows.all():
+            if float(sim) > best.get(eid, 0.0):
+                best[eid] = float(sim)
+    return sorted(best.items(), key=lambda kv: kv[1], reverse=True)[:limit]
+
+
+# ---------------------------------------------------------------------------
+# Temporal expansion
+# ---------------------------------------------------------------------------
+
+_TIME_DESCEND_SQL = sql_text("""
+WITH RECURSIVE down(id, depth) AS (
+    SELECT CAST(x AS uuid), 0
+      FROM unnest(CAST(:seed_ids AS uuid[])) AS x
+  UNION ALL
+    SELECT gr.source_node_id, d.depth + 1
+      FROM down d
+      JOIN graphrag.graph_relationships gr
+        ON gr.target_node_id = d.id
+       AND gr.target_node_type = 'time_instance'
+       AND gr.source_node_type = 'time_instance'
+       AND gr.predicate_label = 'time:intervalDuring'
+     WHERE d.depth < CAST(:max_depth AS int)
+) CYCLE id SET is_cycle USING path
+SELECT id, min(depth) FROM down WHERE NOT is_cycle GROUP BY id
+""")
+
+_TIME_ASCEND_SQL = sql_text("""
+WITH RECURSIVE up(id, depth) AS (
+    SELECT CAST(x AS uuid), 0
+      FROM unnest(CAST(:seed_ids AS uuid[])) AS x
+  UNION ALL
+    SELECT gr.target_node_id, u.depth + 1
+      FROM up u
+      JOIN graphrag.graph_relationships gr
+        ON gr.source_node_id = u.id
+       AND gr.source_node_type = 'time_instance'
+       AND gr.target_node_type = 'time_instance'
+       AND gr.predicate_label = 'time:intervalDuring'
+     WHERE u.depth < CAST(:max_depth AS int)
+) CYCLE id SET is_cycle USING path
+SELECT id, min(depth) FROM up WHERE NOT is_cycle GROUP BY id
+""")
+
+
+async def expand_time_instances(
+    session: AsyncSession,
+    seed_ids: list[uuid.UUID],
+    *,
+    max_depth: int = 3,
+    include_ancestors: bool = True,
+) -> dict[uuid.UUID, float]:
+    """Periods implied by the ones a question named, as `id -> score`.
+
+    Direction matters, which is why this is not part of the generic BFS.
+
+      down  a question about 2023 is about every month and day inside 2023,
+            so descendants come in at full weight.
+      up    a question about October 2023 is also, weakly, about a chunk that
+            only says "2023" -- the year contains the month. Ancestors come in
+            at half weight and are NOT re-descended, or "October" would drag
+            in all eleven other months.
+    """
+    if not seed_ids:
+        return {}
+    sids = [str(s) for s in seed_ids]
+    out: dict[uuid.UUID, float] = {}
+    rows = await session.execute(
+        _TIME_DESCEND_SQL, {"seed_ids": sids, "max_depth": max_depth}
+    )
+    for tid, depth in rows.all():
+        out[tid] = max(out.get(tid, 0.0), 0.8 ** int(depth))
+    if include_ancestors:
+        rows = await session.execute(
+            _TIME_ASCEND_SQL, {"seed_ids": sids, "max_depth": max_depth}
+        )
+        for tid, depth in rows.all():
+            if int(depth) == 0:
+                continue
+            out[tid] = max(out.get(tid, 0.0), 0.5 * (0.8 ** int(depth)))
+    return out
+
+
+async def time_instances_by_identifier(
+    session: AsyncSession, identifiers: list[str],
+) -> list[tuple[uuid.UUID, str]]:
+    """Look up minted periods by canonical identifier (YEAR_2023, Q3_2023,
+    MONTH_2023_10, DAY_2023_10_15)."""
+    if not identifiers:
+        return []
+    rows = await session.execute(
+        sql_text(
+            "SELECT id, display_label FROM graphrag.time_instances "
+            "WHERE time_identifier = ANY(CAST(:idents AS text[]))"
+        ),
+        {"idents": list(identifiers)},
+    )
+    return [(r[0], r[1]) for r in rows.all()]
+
+
+async def entities_without_relationships(
+    session: AsyncSession, entity_ids: list[uuid.UUID],
+) -> list[uuid.UUID]:
+    """Of `entity_ids`, those on no entity -> entity edge at all.
+
+    A seed like this contributes nothing to any graph walk: it is a node with
+    no arcs, so hops 1..N reach exactly itself. Retrieval uses this to decide
+    whether the document arm is needed -- for these seeds the graph genuinely
+    has nothing to give, and a document-level vector match is the only way to
+    recover their context.
+    """
+    if not entity_ids:
+        return []
+    r = await session.execute(sql_text("""
+        SELECT x FROM unnest(CAST(:ids AS uuid[])) AS x
+         WHERE NOT EXISTS (
+            SELECT 1 FROM graphrag.graph_relationships g
+             WHERE g.source_node_type = 'entity'
+               AND g.target_node_type = 'entity'
+               AND (g.source_node_id = x OR g.target_node_id = x))
+    """), {"ids": [str(e) for e in entity_ids]})
+    return [row[0] for row in r.all()]

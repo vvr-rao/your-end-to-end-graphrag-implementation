@@ -2133,6 +2133,113 @@ def question_parse(question: str) -> tuple[str, str]:
     return system, user
 
 
+def geographic_containment(
+    places: list[dict[str, str]],
+) -> tuple[str, str]:
+    """Which of these places contains which other, for `enrich-geo`.
+
+    Prose never states that Frankfurt is in Germany, so extraction never mints
+    the edge, and a question about "companies in Germany" cannot walk there.
+    This recovers the containment -- but ONLY between places the corpus
+    already names, so the pass adds edges and never nodes.
+    """
+    system = (
+        "You state geographic containment between places. You are given a "
+        "list of place names with the kind of place each one is. Return ONE "
+        "JSON object: {\"containments\": [{\"place\": str, "
+        "\"contained_in\": str}]}\n\n"
+        "  - BOTH names must be copied VERBATIM from the list. Never name a "
+        "place that is not in the list, however obvious the containment -- a "
+        "pair naming an absent place is discarded, so it only wastes output.\n"
+        "  - Give the containment at every level the list supports: if the "
+        "list has Frankfurt, Hesse and Germany, return Frankfurt in Hesse AND "
+        "Hesse in Germany. Direct containment at each step, not a shortcut.\n"
+        "  - Only physical, geographic containment. An organization "
+        "headquartered somewhere, a court sitting somewhere, or an event held "
+        "somewhere is NOT containment -- those come from the documents.\n"
+        "  - MEMBERSHIP of a political or economic body is not containment "
+        "either: a country is not 'in' a union, bloc, alliance or treaty "
+        "organisation, however many of its members are neighbours. Those "
+        "change with politics; geography does not.\n"
+        "  - Omit any pair you are not confident about, and any pair where "
+        "two names refer to the SAME place (Holland / the Netherlands).\n"
+        "  - An empty list is a correct answer ONLY when the list holds no "
+        "two places that contain one another. A list of cities and "
+        "countries almost always holds several, so read the whole list "
+        "before concluding it holds none.\n\n"
+        "EXAMPLE. For the list: Buenos Aires (City), Argentina "
+        "(Country), Hamburg (City), Germany (Country), European Union "
+        "(Region), Acme Corp (City) -- return\n"
+        "{\"containments\": [{\"place\": \"Buenos Aires\", "
+        "\"contained_in\": \"Argentina\"}, {\"place\": \"Hamburg\", "
+        "\"contained_in\": \"Germany\"}, {\"place\": \"Germany\", "
+        "\"contained_in\": \"European Union\"}]}\n"
+        "-- Acme Corp appears because something mistyped it as a City; "
+        "it is not a place, so it is simply omitted.\n\n"
+        "Return ONLY the JSON; no preamble, no markdown."
+    )
+    lines = "\n".join(
+        f"  - {p['name']} ({p.get('type') or 'place'})" for p in places
+    )
+    user = f"PLACES:\n{lines}\n\nReturn the JSON now."
+    return system, user
+
+
+def question_relations(question: str) -> tuple[str, str]:
+    """Parse the RELATIONSHIPS a question is about, for relationship-aware
+    graph traversal.
+
+    `question_parse` answers "what things is this about"; this answers "how
+    are they supposed to be related". The difference is what lets a walk
+    follow only the edges that mean what was asked instead of every edge on
+    the same nodes -- and it is the only way a question naming no entity at
+    all ("who was accused of fraud") can reach the graph, by matching the
+    relation phrase against stored edge evidence.
+
+    Returns JSON:
+      {"relations": [{"subject": {"text": str, "kind": str},
+                      "relation": str,
+                      "object":  {"text": str, "kind": str}}]}
+
+    `kind` is entity | class | unknown. An empty list is a normal answer: a
+    question that asks for a list or a description states no relationship,
+    and the caller falls back to the broad walk.
+    """
+    system = (
+        "You extract the RELATIONSHIPS a question is about. Return ONE JSON "
+        "object: {\"relations\": [{\"subject\": {\"text\": str, \"kind\": "
+        "\"entity\"|\"class\"|\"unknown\"}, \"relation\": str, "
+        "\"object\": {\"text\": str, \"kind\": "
+        "\"entity\"|\"class\"|\"unknown\"}}]}\n\n"
+        "  - kind entity: a proper noun named in the question (person, "
+        "organization, product, place).\n"
+        "  - kind class: a kind of thing or a concept ('football players', "
+        "'crypto exchange', 'fraud').\n"
+        "  - kind unknown: what the question ASKS FOR. ALWAYS put the "
+        "category of thing being asked for in text, never the question "
+        "word: 'who' -> 'person', 'which company' -> 'company', "
+        "'where' -> 'place', 'which team' -> 'team'. That category is "
+        "what constrains the answer, so '' is a last resort.\n"
+        "  - relation: a short verb phrase for how the two relate "
+        "('persuaded', 'founded', 'is accused of', 'is located in').\n"
+        "  - Include relationships the question states AND ones it implies "
+        "between the things it names (\"Yedidia's move from Jane Street to "
+        "FTX\" -> Yedidia left Jane Street; Yedidia joined FTX).\n"
+        "  - A question whose answer needs two steps states BOTH: 'which "
+        "company in Germany' -> the company is in a place, and that place is "
+        "in Germany. List each step as its own relation; do not merge them.\n"
+        "  - Publication attributions ('as reported by TechCrunch', "
+        "'according to The Verge') are SOURCES, not relationships -- omit "
+        "them.\n"
+        "  - A question that only asks for a list or a description with no "
+        "relationship ('Which football players are mentioned?') returns an "
+        "empty list. That is a normal answer, not a failure.\n\n"
+        "Return ONLY the JSON; no preamble, no markdown."
+    )
+    user = f"QUESTION: {question}\n\nReturn the JSON now."
+    return system, user
+
+
 def concept_expansion(
     question: str, matched_class_iris_labels: list[tuple[str, str]]
 ) -> tuple[str, str]:
@@ -3702,6 +3809,8 @@ PROMPTS = {
     "document_type_label": document_type_label,
     "document_type_consolidate": document_type_consolidate,
     "question_parse": question_parse,
+    "question_relations": question_relations,
+    "geographic_containment": geographic_containment,
     "concept_expansion": concept_expansion,
     "query_decompose": query_decompose,
     "entity_probes": entity_probes,
