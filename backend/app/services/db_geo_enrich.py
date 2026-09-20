@@ -94,23 +94,25 @@ def _level(class_label: str | None) -> int:
     return _GEO_LEVEL.get((class_label or "").strip().lower(), 0)
 
 
-def containment_is_plausible(child_label: str | None,
-                             parent_label: str | None) -> bool:
-    """True if `parent_label` can contain `child_label` by level alone.
+def levels_are_plausible(child_level: int, parent_level: int) -> bool:
+    """True if a place at `parent_level` can contain one at `child_level`.
 
-    Unknown levels are the interesting case. A generic label ("Place",
+    Unknown levels (0) are the interesting case. A generic label ("Place",
     "Location", or a class the extractor invented) tells us nothing, so the
     pair is admitted only when the OTHER end is specific enough to carry the
     claim: an unknown child may sit in a country or above, and an unknown
     parent is rejected outright -- it is exactly where a mistyped entity would
     smuggle a bogus container in.
     """
-    c, pl = _level(child_label), _level(parent_label)
-    if c and pl:
-        return pl > c
-    if pl >= 3:
-        return True
-    return False
+    if child_level and parent_level:
+        return parent_level > child_level
+    return parent_level >= 3
+
+
+def containment_is_plausible(child_label: str | None,
+                             parent_label: str | None) -> bool:
+    """`levels_are_plausible` on two class labels, with no ontology lookup."""
+    return levels_are_plausible(_level(child_label), _level(parent_label))
 
 
 # Contained places per call, on top of the container list.
@@ -161,12 +163,65 @@ async def _class_closure(session: Any, labels: tuple[str, ...]) -> set[Any]:
     return {r[0] for r in rows.all()}
 
 
+_ANCESTOR_LEVEL_SQL = sql_text("""
+WITH RECURSIVE up(start_id, id, depth) AS (
+    SELECT CAST(x AS uuid), CAST(x AS uuid), 0
+      FROM unnest(CAST(:ids AS uuid[])) AS x
+  UNION ALL
+    SELECT u.start_id, gr.target_node_id, u.depth + 1
+      FROM up u
+      JOIN graphrag.graph_relationships gr
+        ON gr.source_node_id = u.id
+       AND gr.source_node_type = 'ontology_class'
+       AND gr.target_node_type = 'ontology_class'
+       AND gr.predicate_label = 'rdfs:subClassOf'
+     WHERE u.depth < 4
+) CYCLE id SET is_cycle USING path
+SELECT up.start_id, c.label, min(up.depth)
+  FROM up JOIN graphrag.ontology_classes c ON c.id = up.id
+ WHERE NOT up.is_cycle
+ GROUP BY up.start_id, c.label
+""")
+
+
+async def _effective_levels(
+    session: Any, class_ids: list[Any]
+) -> dict[Any, int]:
+    """Containment level per class, falling back to its NEAREST ancestor that
+    has one.
+
+    Needed because prune-expand mints individuals as classes: this corpus has
+    classes literally named `Uzbekistan`, `Saudi Arabia` and `Asia`, so the
+    label alone says nothing and every correct containment through them was
+    being rejected (29 of 72 on the 30-document run). Their parents are
+    `Country` and `Continent` -- the ontology already knows, the guard just
+    was not asking.
+
+    Nearest wins, so a class under both `City` and some abstract root takes
+    the city level rather than whichever sorts first.
+    """
+    if not class_ids:
+        return {}
+    rows = await session.execute(
+        _ANCESTOR_LEVEL_SQL, {"ids": [str(c) for c in class_ids]}
+    )
+    best: dict[Any, tuple[int, int]] = {}          # class_id -> (depth, level)
+    for start_id, label, depth in rows.all():
+        lvl = _level(label)
+        if not lvl:
+            continue
+        cur = best.get(start_id)
+        if cur is None or int(depth) < cur[0]:
+            best[start_id] = (int(depth), lvl)
+    return {cid: lvl for cid, (_d, lvl) in best.items()}
+
+
 async def _place_entities(
     session: Any,
     class_labels: tuple[str, ...],
     non_place_labels: tuple[str, ...] = NON_PLACE_CLASS_LABELS,
-) -> list[tuple[Any, str, str]]:
-    """(entity_id, name, class_label) for every ACTIVE entity typed with a
+) -> list[tuple[Any, str, str, Any]]:
+    """(entity_id, name, class_label, class_id) for every ACTIVE entity typed with a
     geographic class or a subclass of one, minus anything that also descends
     from a class of agents, organizations or events.
 
@@ -181,14 +236,14 @@ async def _place_entities(
     if not place_ids:
         return []
     rows = await session.execute(sql_text("""
-        SELECT e.id, e.name, c.label
+        SELECT e.id, e.name, c.label, e.class_id
           FROM graphrag.entities e
           JOIN graphrag.ontology_classes c ON c.id = e.class_id
          WHERE e.status = 'ACTIVE'
            AND e.class_id = ANY(CAST(:ids AS uuid[]))
          ORDER BY e.name
     """), {"ids": [str(i) for i in place_ids]})
-    return [(r[0], r[1], r[2]) for r in rows.all()]
+    return [(r[0], r[1], r[2], r[3]) for r in rows.all()]
 
 
 async def enrich_geography(
@@ -205,8 +260,13 @@ async def enrich_geography(
 
     async with session_scope() as session:
         places = await _place_entities(session, class_labels)
-    if limit:
-        places = places[:limit]
+        if limit:
+            places = places[:limit]
+        # Level per class, resolved through the subClassOf chain -- see
+        # `_effective_levels` for why the label alone is not enough.
+        levels = await _effective_levels(
+            session, list({cid for _e, _n, _l, cid in places})
+        )
     summary.place_entities = len(places)
     if len(places) < 2:
         if verbose:
@@ -218,14 +278,17 @@ async def enrich_geography(
             )
         return summary
 
-    by_name = {name: (eid, label) for eid, name, label in places}
+    by_name = {name: (eid, label, levels.get(cid, _level(label)))
+               for eid, name, label, cid in places}
+    # A place is a CONTAINER by its resolved level (>= country), not by its
+    # literal class label -- the label may be "Uzbekistan".
     containers = [
-        {"name": n, "type": lbl} for _, n, lbl in places
-        if (lbl or "").lower() in CONTAINER_CLASS_LABELS
+        {"name": n, "type": lbl} for _e, n, lbl, cid in places
+        if levels.get(cid, _level(lbl)) >= 3
     ][:_MAX_CONTAINERS]
     contained = [
-        {"name": n, "type": lbl} for _, n, lbl in places
-        if (lbl or "").lower() not in CONTAINER_CLASS_LABELS
+        {"name": n, "type": lbl} for _e, n, lbl, cid in places
+        if levels.get(cid, _level(lbl)) < 3
     ]
     # (container names are already in `by_name`; no separate index needed)
     if verbose:
@@ -274,8 +337,8 @@ async def enrich_geography(
             if child not in by_name or parent not in by_name:
                 summary.unresolved += 1
                 continue
-            if not containment_is_plausible(by_name[child][1],
-                                            by_name[parent][1]):
+            if not levels_are_plausible(by_name[child][2],
+                                        by_name[parent][2]):
                 summary.rejected_by_level += 1
                 if verbose:
                     print(f"[enrich-geo] rejected: {child} "

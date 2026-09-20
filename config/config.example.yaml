@@ -153,6 +153,20 @@ summarization:
 # LOWER THESE on OpenAI tier 1-2, where 8 concurrent large calls already
 # throttle and time out. Each CLI also takes --concurrency to override per run.
 # -----------------------------------------------------------------------------
+# ---- Database connection pool.
+# A batch worker holds its session across several slow LLM calls, so the pool
+# must be sized against `concurrency:` below, not against API request volume.
+# Measured 2026-09-20: a fixed 4 + 4 pool against concurrency 64 killed 36 of
+# 62 chunks with "QueuePool limit of size 4 overflow 4 reached ... timeout
+# 30.00" -- and a 20-chunk smoke test had passed clean, which is why it stayed
+# hidden. Unset => derived from the largest value under `concurrency:`, capped
+# at 16 (a Supabase project has a finite client-connection budget). The CLI
+# additionally caps worker concurrency at pool_size + max_overflow.
+database:
+  pool_size:
+  max_overflow:
+  pool_timeout: 60
+
 concurrency:
   # register-documents / prune-expand summarization. Also settable as
   # summarization.concurrency (kept for back-compat; this wins if both set).
@@ -377,6 +391,14 @@ extraction:
   # passage developed at least 5. Costs one extra `concept_extract` call per
   # chunk (same cheap tier as entity_extract, ~half the output size).
   # false = behaviour-preserving default; --concept-pass overrides.
+  # Orphans handed to one relationship_orphan_check call. The check is what
+  # rescues entities both relationship passes missed, and its recall collapses
+  # when the list is long: measured on websearch-geo-time, the same chunk,
+  # model and prompt rescued "Beijing" when asked about it alone (conf 0.95)
+  # and labelled it `only_listed` when asked about 31 orphans at once,
+  # proposing 2 rescues for the whole batch. Cost on this step scales with
+  # ceil(orphans / batch); nothing else changes.
+  orphan_batch_size: 8
   concept_pass: false
   # How far the abstention recovery may reach. When the model abstains
   # (NONE_OF_THESE) it names the type it wanted; ~half the time that class
@@ -482,6 +504,16 @@ extraction:
     - Landform
     - Place
     - Event
+    # Abstract-kind classes are pinned for the same reason AdministrativeArea
+    # is, and it bites hardest when the ontology models individuals as classes.
+    # Measured 2026-09-20 on a 30-doc economics corpus whose geography ontology
+    # declares every country as its own class: a chunk about Asian economies
+    # gave 44 of its 50 menu slots to individual-country classes, EconomicConcept
+    # never ranked in, and GDP was not extracted at all -- while Inflation WAS,
+    # from a chunk whose menu had room. Corpus-wide, individual-place classes
+    # took a mean of 14.7 of 50 slots and 40+ slots on 13% of chunks.
+    - EconomicConcept
+    - FinancialObservation
 
 qa:
   # Top-k candidate classes from class-summary ANN.
@@ -684,6 +716,23 @@ qa:
   class_seed_top_chunks: 3
   # Artifact tier: how many nearest artifacts supply the seeds.
   artifact_seed_top_artifacts: 5
+  # ---- Artifact -> chunk bridge. `artifact_sources` records which chunk each
+  # artifact was distilled from (1,277 of 1,278 artifacts on the
+  # websearch-geo-time build), but nothing in retrieval read it: the
+  # Milestone-H chain answer -> artifact -> chunk -> document was only half
+  # wired, so an artifact could win an evidence slot while the passage behind
+  # it appeared only if that chunk won a slot of its own.
+  #
+  #   off         pre-2026-09-20 behaviour
+  #   selected    (default) only the TOP artifacts by vector rank contribute
+  #               their source chunks, so the bridge follows relevance rather
+  #               than volume
+  #   candidates  every candidate artifact's chunks join the pool and the
+  #               ranker decides -- widest recall, but spends chunk slots on
+  #               text the artifact already condensed
+  artifact_chunk_bridge: selected
+  artifact_chunk_bridge_top_artifacts: 10
+  artifact_chunk_bridge_limit: 300
   # ---- Relationship-aware traversal (0008 graph_relationships.embedding).
   # Every extracted edge carries the sentence that supports it; embed-relationships
   # vectorizes it. When a question names a RELATION ("who was accused of fraud",

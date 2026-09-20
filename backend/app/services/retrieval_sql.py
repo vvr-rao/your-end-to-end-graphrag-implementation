@@ -1514,3 +1514,42 @@ async def entities_without_relationships(
                AND (g.source_node_id = x OR g.target_node_id = x))
     """), {"ids": [str(e) for e in entity_ids]})
     return [row[0] for row in r.all()]
+
+
+_ARTIFACT_CHUNKS_SQL = sql_text("""
+SELECT asrc.artifact_id, asrc.chunk_id
+  FROM graphrag.artifact_sources asrc
+  JOIN graphrag.chunks c ON c.id = asrc.chunk_id
+ WHERE asrc.artifact_id = ANY(CAST(:ids AS uuid[]))
+   AND c.status = 'ACTIVE'
+   AND c.embedding IS NOT NULL
+ LIMIT :limit
+""")
+
+
+async def fetch_chunks_for_artifacts(
+    session: AsyncSession,
+    artifact_ids: list[uuid.UUID],
+    *,
+    limit: int = 300,
+) -> list[tuple[uuid.UUID, uuid.UUID]]:
+    """(artifact_id, chunk_id) for the chunks each artifact was derived from.
+
+    The reverse of `fetch_table_artifacts_for_chunks`, and the half of the
+    Milestone-H traceability chain (answer -> artifact -> chunk -> document)
+    that was written at ingestion but never read at query time:
+    `artifact_sources` holds a row for 1,277 of 1,278 artifacts on the
+    websearch-geo-time build, and nothing in retrieval touched it.
+
+    An artifact is a distillation of its chunk, so bringing the chunk back is
+    not free -- it spends a chunk slot on text the artifact already condensed.
+    Whether that is worth it is what `qa.artifact_chunk_bridge` selects
+    between.
+    """
+    if not artifact_ids:
+        return []
+    rows = await session.execute(
+        _ARTIFACT_CHUNKS_SQL,
+        {"ids": [str(a) for a in artifact_ids], "limit": limit},
+    )
+    return [(r[0], r[1]) for r in rows.all()]

@@ -89,6 +89,18 @@ def _qa_cfg(key: str, default: Any) -> Any:
     Every knob added here must keep today's behavior when unset -- these
     features are additive and a missing key must never change results.
     """
+    # QA_OVERRIDES lets an A/B harness vary one knob per process without
+    # editing config.yaml (which every concurrent run would share).
+    import os as _os
+    _ov = _os.environ.get("QA_OVERRIDES")
+    if _ov:
+        try:
+            import json as _json
+            _d = _json.loads(_ov)
+            if key in _d:
+                return _d[key]
+        except Exception:
+            pass
     try:
         value = get_settings().app_config.get("qa", {}).get(key)
         return default if value is None else value
@@ -764,6 +776,45 @@ async def retrieve_and_answer(
     for _gid in global_artifact_ids:
         if _gid not in candidate_artifact_ids:
             candidate_artifact_ids.append(_gid)
+
+    # Artifact -> chunk bridge. `artifact_sources` records which chunk every
+    # artifact was distilled from (1,277 of 1,278 artifacts on the
+    # websearch-geo-time build) and until now NOTHING in retrieval read it --
+    # the Milestone-H chain answer -> artifact -> chunk -> document was only
+    # half wired. An artifact could win an evidence slot while the passage
+    # behind it appeared only if that chunk happened to win a slot of its own.
+    #
+    # `qa.artifact_chunk_bridge`:
+    #   off         today's behaviour
+    #   candidates  every candidate artifact's source chunks join the chunk
+    #               pool, and the ranker decides -- widest recall, but spends
+    #               chunk slots on text the artifact already condensed
+    #   selected    only the source chunks of the TOP artifacts by vector
+    #               rank, so the bridge follows relevance rather than volume
+    _bridge = str(_qa_cfg("artifact_chunk_bridge", "selected")).lower()
+    if _bridge in ("candidates", "selected") and candidate_artifact_ids:
+        _src = candidate_artifact_ids
+        if _bridge == "selected":
+            _top = int(_qa_cfg("artifact_chunk_bridge_top_artifacts", 10))
+            _ranked = [a for a in global_artifact_ids if a in set(candidate_artifact_ids)]
+            _src = (_ranked or candidate_artifact_ids)[:_top]
+        async with session_scope() as session:
+            _pairs = await retrieval_sql.fetch_chunks_for_artifacts(
+                session, _src,
+                limit=int(_qa_cfg("artifact_chunk_bridge_limit", 300)),
+            )
+        _before = len(candidate_chunk_ids)
+        _have = set(candidate_chunk_ids)
+        for _aid, _cid in _pairs:
+            if _cid not in _have:
+                candidate_chunk_ids.append(_cid)
+                _have.add(_cid)
+        if verbose:
+            print(
+                f"[query] artifact->chunk bridge ({_bridge}): "
+                f"{len(_src)} artifact(s) -> {len(candidate_chunk_ids) - _before} "
+                f"new chunk(s) (pool {_before} -> {len(candidate_chunk_ids)})"
+            )
     if verbose and global_artifact_ids:
         print(f"[query] global artifact search: {len(global_artifact_ids)} "
               f"artifact(s); {len(candidate_artifact_ids)} artifact candidates total")

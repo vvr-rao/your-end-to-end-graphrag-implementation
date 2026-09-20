@@ -65,6 +65,38 @@ def _resolve_extraction_opt(
     return cfg[key] if key in cfg and cfg[key] is not None else default
 
 
+def _cap_to_pool(requested: int) -> int:
+    """Make the connection pool serve `requested` workers, or cap to what it can.
+
+    A worker holds its DB session across several slow LLM calls, so running
+    more workers than connections does not go faster -- it queues until
+    `pool_timeout` and then fails the chunk. Measured 2026-09-20:
+    `concurrency.entity_extraction: 64` against a fixed 4 + 4 pool killed 36 of
+    62 chunks with `QueuePool limit of size 4 overflow 4 reached`.
+
+    The request wins where it can: `set_pool_minimum` sizes the pool before the
+    engine is built, so `--concurrency 64` gets 64 connections rather than
+    being quietly reduced. It is capped only when the pool already exists (its
+    size is fixed for the process) or when the request exceeds the hard
+    ceiling that protects the project's connection budget.
+    """
+    try:
+        from backend.app.db.engine import pool_capacity, set_pool_minimum
+        if set_pool_minimum(requested):
+            return requested
+        cap = pool_capacity()
+    except Exception:
+        return requested
+    if requested > cap:
+        print(
+            f"[concurrency] capping {requested} -> {cap}: a worker holds a DB "
+            f"connection across its LLM calls, and the pool serves {cap}. "
+            f"Raise database.pool_size in config.yaml to run wider."
+        )
+        return cap
+    return requested
+
+
 def _resolve_concurrency(args: argparse.Namespace, stage: str) -> int:
     """Concurrency for one pipeline stage: CLI flag > config > legacy > 4.
 
@@ -84,12 +116,12 @@ def _resolve_concurrency(args: argparse.Namespace, stage: str) -> int:
 
     explicit = getattr(args, "concurrency", None)
     if explicit is not None:
-        return int(explicit)
+        return _cap_to_pool(int(explicit))
 
     cfg = get_settings().app_config
     stage_cfg = (cfg.get("concurrency", {}) or {})
     if stage in stage_cfg:
-        return int(stage_cfg[stage])
+        return _cap_to_pool(int(stage_cfg[stage]))
 
     # Legacy fallbacks: summarization had its own key before `concurrency:`.
     if stage == "summarization":
@@ -988,6 +1020,15 @@ def build_parser() -> argparse.ArgumentParser:
             "distances by rank, then exit without extracting. Use it to pick "
             "--max-candidate-l2 from measurement rather than guesswork."
         ),
+    )
+    p_ext.add_argument(
+        "--orphan-batch-size", type=int, default=None,
+        help="Orphans per relationship_orphan_check call (default 8; unset => "
+             "extraction.orphan_batch_size in config.yaml). One call for ALL "
+             "of a chunk's orphans loses recall badly as the list grows -- "
+             "measured, a 31-orphan call proposed 2 rescues where the same "
+             "model asked about one orphan found the edge at 0.95 confidence. "
+             "Smaller batches trade calls for recall.",
     )
     p_ext.add_argument(
         "--no-embed-relationships", action="store_true",
@@ -1989,6 +2030,8 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
                 _extraction_cfg().get("pinned_class_labels") or ()),
             embed_relationships=not getattr(
                 args, "no_embed_relationships", False),
+            orphan_batch_size=int(_resolve_extraction_opt(
+                args, "orphan_batch_size", "orphan_batch_size", 8)),
         )
     )
     return 0
