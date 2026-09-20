@@ -447,6 +447,8 @@ class EntityExtractSummary:
     entities_reused: int = 0
     chunk_entity_edges: int = 0
     entity_relationship_edges: int = 0
+    # Edges given a vector by the post-insert embedding pass (0008).
+    relationship_embeddings: int = 0
     type_edges: int = 0
     tables_scanned: int = 0
     table_entity_edges: int = 0
@@ -928,6 +930,9 @@ _CANDIDATE_POOL_LIMIT = 2000
 # entity count still left a connected roster short; the ceiling exists only to
 # keep one response inside relationship_extract's max_tokens.
 _MIN_RELATIONSHIPS_PER_CHUNK = 10
+# Orphans handed to one `relationship_orphan_check` call. See the batching
+# comment at the call site for the measurement that set this.
+_DEFAULT_ORPHAN_BATCH = 8
 _MAX_RELATIONSHIPS_PER_CHUNK = 100
 # Longest free-text `relation` phrase accepted on a graphrag#relatedTo edge.
 _MAX_RELATION_WORDS = 8
@@ -1783,6 +1788,7 @@ async def _relationships_for_chunk(
     verify: bool = True,
     gap_pass: bool = False,
     orphan_check: bool = False,
+    orphan_batch_size: int = _DEFAULT_ORPHAN_BATCH,
     pass_stats: dict[str, int] | None = None,
     orphan_flags: list[dict[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
@@ -1980,36 +1986,59 @@ async def _relationships_for_chunk(
                    if e["canonical_name"] not in linked]
         if orphans:
             _bump("orphans_flagged", len(orphans))
-            try:
-                o_sys, o_user = PROMPTS["relationship_orphan_check"](
-                    txt, ents_for_prompt, pred_list,
-                    orphans=orphans, found=[_show(c) for c in rels],
-                    max_relationships=max(_MIN_RELATIONSHIPS_PER_CHUNK,
-                                          len(orphans)),
-                )
-                o_out = await router.chat(
-                    "relationship_orphan_check", system=o_sys, user=o_user
-                )
-                o_parsed = _extract_json(o_out.text)
-            except Exception as exc:
-                print(f"[extract-entities] orphan check failed "
-                      f"on {chunk_iri}: {exc}")
-                o_parsed = None
-            _bump("orphan_calls")
-            if isinstance(o_parsed, dict):
-                _add(_gate(o_parsed.get("relationships"), "orphan_check"),
-                     "orphan")
-                valid = set(ORPHAN_REASONS)
-                for f in (o_parsed.get("no_relationship") or []):
-                    if not isinstance(f, dict):
-                        continue
-                    reason = str(f.get("reason") or "").strip().lower()
-                    reason = reason if reason in valid else "unspecified"
-                    _bump(f"orphan_reason_{reason}")
-                    if orphan_flags is not None and len(orphan_flags) < 300:
-                        orphan_flags.append({
-                            "entity": str(f.get("entity") or ""),
-                            "reason": reason, "chunk": chunk_iri})
+            # BATCHED. One call covering every orphan in the chunk loses
+            # recall badly as the list grows: measured on the
+            # websearch-geo-time corpus, the same chunk, model and prompt
+            # rescued Beijing when asked about it alone (conf 0.95) and
+            # labelled it `only_listed` when asked about 31 orphans at once,
+            # proposing just 2 rescues for the whole batch. Labelling is the
+            # cheap path once attention is divided. Smaller batches trade
+            # calls for recall -- cost on this step scales with
+            # ceil(len(orphans)/batch), everything else is unchanged.
+            for _i in range(0, len(orphans), orphan_batch_size):
+                _batch = orphans[_i : _i + orphan_batch_size]
+                try:
+                    o_sys, o_user = PROMPTS["relationship_orphan_check"](
+                        txt, ents_for_prompt, pred_list,
+                        orphans=_batch, found=[_show(c) for c in rels],
+                        max_relationships=max(_MIN_RELATIONSHIPS_PER_CHUNK,
+                                              len(_batch)),
+                    )
+                    o_out = await router.chat(
+                        "relationship_orphan_check", system=o_sys, user=o_user
+                    )
+                    o_parsed = _extract_json(o_out.text)
+                except Exception as exc:
+                    print(f"[extract-entities] orphan check failed "
+                          f"on {chunk_iri}: {exc}")
+                    o_parsed = None
+                _bump("orphan_calls")
+                if isinstance(o_parsed, dict):
+                    _add(_gate(o_parsed.get("relationships"), "orphan_check"),
+                         "orphan")
+                    valid = set(ORPHAN_REASONS)
+                    _verdicted: set[str] = set()
+                    for f in (o_parsed.get("no_relationship") or []):
+                        if not isinstance(f, dict):
+                            continue
+                        _name = str(f.get("entity") or "")
+                        _verdicted.add(_name)
+                        reason = str(f.get("reason") or "").strip().lower()
+                        reason = reason if reason in valid else "unspecified"
+                        _bump(f"orphan_reason_{reason}")
+                        if orphan_flags is not None and len(orphan_flags) < 300:
+                            orphan_flags.append({
+                                "entity": _name,
+                                "reason": reason, "chunk": chunk_iri})
+                    # An orphan that came back with neither a relationship nor
+                    # a reason was silently unaccounted before: the reasons
+                    # summed to 863 against 1066 still-unlinked entities, and
+                    # a 31-orphan call returned 2 + 28 = 30 verdicts for 31.
+                    _rel_names = ({c["subject"] for c in rels}
+                                  | {c["object"] for c in rels})
+                    for _o in _batch:
+                        if _o not in _verdicted and _o not in _rel_names:
+                            _bump("orphan_reason_no_verdict")
             linked = {c["subject"] for c in rels} | {c["object"] for c in rels}
             _bump("orphans_still_unlinked",
                   sum(1 for o in orphans if o not in linked))
@@ -2049,6 +2078,7 @@ async def extract_entities(
     rescue_relationships: bool = False,
     relationship_gap_pass: bool = True,
     relationship_orphan_check: bool = True,
+    orphan_batch_size: int = _DEFAULT_ORPHAN_BATCH,
     entity_identity: str = "name",
     validate_entities: bool = False,
     validation_rounds: int = 2,
@@ -2060,6 +2090,7 @@ async def extract_entities(
     menu_filter_allowlist: frozenset[str] | None = None,
     menu_ancestor_closure: bool = True,
     pinned_class_labels: tuple[str, ...] = (),
+    embed_relationships: bool = True,
 ) -> EntityExtractSummary:
     """Drive entity extraction over chunks that haven't been processed.
 
@@ -2851,6 +2882,7 @@ async def extract_entities(
                     rescue=rescue_relationships, verify=verify_relationships,
                     gap_pass=relationship_gap_pass,
                     orphan_check=relationship_orphan_check,
+                    orphan_batch_size=orphan_batch_size,
                     pass_stats=rel_pass_stats, orphan_flags=orphan_flags,
                 )
 
@@ -3202,6 +3234,7 @@ async def extract_entities(
     # dropped connection doesn't lose the whole run.
     embedder = Embedder()
     iri_to_id: dict[str, Any] = {}
+    _conflicts = 0          # mints whose identifier the table already held
     _EBATCH = 200
     for i in range(0, len(entity_mints), _EBATCH):
         batch = entity_mints[i : i + _EBATCH]
@@ -3212,7 +3245,29 @@ async def extract_entities(
         for _attempt in range(4):
             try:
                 async with session_scope() as session:
-                    await session.execute(pg_insert(Entity).values(batch))
+                    # ON CONFLICT DO NOTHING, not a bare INSERT. Two entities
+                    # can arrive with the same `entity_identifier` --
+                    # `_entity_iri` hashes (canonical_name, class_iri) while
+                    # the reuse check keys on (normalized_name, class_id), and
+                    # the name-collapse step renames entities AFTER that check
+                    # -- so a rename onto a name the DB already holds collided.
+                    # A bare INSERT then rolled back the WHOLE batch, losing
+                    # every LLM call in the run: measured 2026-09-20, two
+                    # consecutive runs spent $1.94 and wrote zero rows, each
+                    # exiting 0. That made the project's own "smoke-test with
+                    # --limit N, then scale up" workflow impossible, because
+                    # the scale-up run is exactly the colliding case.
+                    #
+                    # The SELECT below maps EVERY identifier in the batch back
+                    # to an id, so a row that lost the conflict resolves to the
+                    # entity already in the table -- which is the correct
+                    # outcome: it is the same entity.
+                    _ins = await session.execute(
+                        pg_insert(Entity).values(batch).on_conflict_do_nothing(
+                            index_elements=["entity_identifier"]
+                        )
+                    )
+                    _conflicts += max(0, len(batch) - (_ins.rowcount or 0))
                     r = await session.execute(
                         select(Entity.id, Entity.entity_identifier).where(
                             Entity.entity_identifier.in_(
@@ -3231,9 +3286,19 @@ async def extract_entities(
             p.pop("embedding", None)  # free the vector once persisted
     summary.embedding_cost_usd = embedder.total_cost_usd
     print(
-        f"[extract-entities] embedded + inserted {len(entity_mints)} new "
+        f"[extract-entities] embedded + inserted "
+        f"{len(entity_mints) - _conflicts} new "
         f"entity(ies): ${summary.embedding_cost_usd:.4f}"
     )
+    if _conflicts:
+        summary.entities_reused += _conflicts
+        print(
+            f"[extract-entities] {_conflicts} mint(s) already existed by "
+            f"identifier and were reused rather than inserted (usually a "
+            f"name collapse landing on a name a previous run stored). Before "
+            f"0009 this raised a unique violation that rolled back the whole "
+            f"batch and lost the run's LLM work."
+        )
 
     # Backfill seen_in_this_run with the real IDs + collect type-edge pairs.
     for p in entity_mints:
@@ -3446,6 +3511,31 @@ async def extract_entities(
         for i in range(0, len(rel_payloads), EDGE_BATCH):
             await session.execute(
                 pg_insert(GraphRelationship).values(rel_payloads[i : i + EDGE_BATCH])
+            )
+
+    # Vectorize the new entity->entity edges so retrieval can match a
+    # question against what an edge SAYS, not just who it touches. Embeddings
+    # only (no chat model), pennies per 100k edges, and idempotent -- edges
+    # that already carry a vector are skipped. `embed-relationships` does the
+    # same thing standalone for a graph built before 0008.
+    if embed_relationships and rel_payloads:
+        from backend.app.services.db_relationship_embed import (
+            embed_relationships as _embed_rels,
+        )
+        try:
+            _rel_emb = await _embed_rels(only_missing=True)
+            summary.relationship_embeddings = _rel_emb.embedded
+            print(
+                f"[extract-entities] embedded {_rel_emb.embedded} "
+                f"relationship(s) (${_rel_emb.cost_usd:.4f})"
+            )
+        except Exception as exc:                      # pragma: no cover
+            # Never fail a completed extraction over the vector pass: the
+            # edges are already written and `embed-relationships` can
+            # backfill. Retrieval falls back to the broad walk meanwhile.
+            print(
+                f"[extract-entities] WARNING relationship embedding failed "
+                f"({exc}); run `embed-relationships` to backfill"
             )
 
     # Entity-side accounting. Previously every one of these was a silent

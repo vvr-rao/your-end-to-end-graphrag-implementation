@@ -65,6 +65,38 @@ def _resolve_extraction_opt(
     return cfg[key] if key in cfg and cfg[key] is not None else default
 
 
+def _cap_to_pool(requested: int) -> int:
+    """Make the connection pool serve `requested` workers, or cap to what it can.
+
+    A worker holds its DB session across several slow LLM calls, so running
+    more workers than connections does not go faster -- it queues until
+    `pool_timeout` and then fails the chunk. Measured 2026-09-20:
+    `concurrency.entity_extraction: 64` against a fixed 4 + 4 pool killed 36 of
+    62 chunks with `QueuePool limit of size 4 overflow 4 reached`.
+
+    The request wins where it can: `set_pool_minimum` sizes the pool before the
+    engine is built, so `--concurrency 64` gets 64 connections rather than
+    being quietly reduced. It is capped only when the pool already exists (its
+    size is fixed for the process) or when the request exceeds the hard
+    ceiling that protects the project's connection budget.
+    """
+    try:
+        from backend.app.db.engine import pool_capacity, set_pool_minimum
+        if set_pool_minimum(requested):
+            return requested
+        cap = pool_capacity()
+    except Exception:
+        return requested
+    if requested > cap:
+        print(
+            f"[concurrency] capping {requested} -> {cap}: a worker holds a DB "
+            f"connection across its LLM calls, and the pool serves {cap}. "
+            f"Raise database.pool_size in config.yaml to run wider."
+        )
+        return cap
+    return requested
+
+
 def _resolve_concurrency(args: argparse.Namespace, stage: str) -> int:
     """Concurrency for one pipeline stage: CLI flag > config > legacy > 4.
 
@@ -84,12 +116,12 @@ def _resolve_concurrency(args: argparse.Namespace, stage: str) -> int:
 
     explicit = getattr(args, "concurrency", None)
     if explicit is not None:
-        return int(explicit)
+        return _cap_to_pool(int(explicit))
 
     cfg = get_settings().app_config
     stage_cfg = (cfg.get("concurrency", {}) or {})
     if stage in stage_cfg:
-        return int(stage_cfg[stage])
+        return _cap_to_pool(int(stage_cfg[stage]))
 
     # Legacy fallbacks: summarization had its own key before `concurrency:`.
     if stage == "summarization":
@@ -989,6 +1021,24 @@ def build_parser() -> argparse.ArgumentParser:
             "--max-candidate-l2 from measurement rather than guesswork."
         ),
     )
+    p_ext.add_argument(
+        "--orphan-batch-size", type=int, default=None,
+        help="Orphans per relationship_orphan_check call (default 8; unset => "
+             "extraction.orphan_batch_size in config.yaml). One call for ALL "
+             "of a chunk's orphans loses recall badly as the list grows -- "
+             "measured, a 31-orphan call proposed 2 rescues where the same "
+             "model asked about one orphan found the edge at 0.95 confidence. "
+             "Smaller batches trade calls for recall.",
+    )
+    p_ext.add_argument(
+        "--no-embed-relationships", action="store_true",
+        help=(
+            "Skip the post-insert relationship embedding pass. Retrieval's "
+            "relationship-aware hop and relation-filtered class search then "
+            "fall back to the broad walk for this run's edges; "
+            "`embed-relationships` can backfill later."
+        ),
+    )
     p_ext.set_defaults(func=_cmd_extract_entities)
 
     # ---------- Phase 2: Milestone E (artifacts) ----------
@@ -1119,6 +1169,57 @@ def build_parser() -> argparse.ArgumentParser:
     p_relink.add_argument("--dry-run", action="store_true",
                           help="Report how many edges would be added; write nothing.")
     p_relink.set_defaults(func=_cmd_relink_artifact_entities)
+
+    p_geo = sub.add_parser(
+        "enrich-geo",
+        help=(
+            "Mint geographic containment edges (Frankfurt -> Germany) between "
+            "places the corpus ALREADY names, so a walk can answer 'which "
+            "company in Germany'. Prose never states these, so extraction "
+            "never finds them. Adds edges, never nodes. The edges are world "
+            "knowledge, not corpus evidence: they are marked as such and kept "
+            "OUT of answer citations. ~1 cheap call per 40 places."
+        ),
+    )
+    p_geo.add_argument(
+        "--dry-run", action="store_true",
+        help="Report how many place entities were found and how many batches "
+             "would run; no LLM calls, no writes.",
+    )
+    p_geo.add_argument("--limit", type=int, default=None,
+                       help="Consider at most N place entities (smoke test).")
+    p_geo.add_argument(
+        "--class-labels", nargs="+", default=None,
+        help="Ontology class labels that denote a place (subclasses included). "
+             "Unset => geo_enrichment.class_labels in config.yaml, else a "
+             "generic default (Place/Country/City/Region/...).",
+    )
+    p_geo.set_defaults(func=_cmd_enrich_geo)
+
+    p_embrel = sub.add_parser(
+        "embed-relationships",
+        help=(
+            "Backfill graphrag.graph_relationships.embedding for extracted "
+            "entity->entity edges: one vector over '<source> <relation> "
+            "<target>. <evidence>'. Retrieval uses it for relationship-aware "
+            "hopping and for ranking a class's members by a relation phrase. "
+            "Idempotent (only NULL embeddings by default); embeddings-only, "
+            "so a few cents per 100k edges."
+        ),
+    )
+    p_embrel.add_argument(
+        "--all", dest="only_missing", action="store_false", default=True,
+        help="Re-embed every extracted edge, not just those with no vector. "
+             "Use after changing how the edge text is built.",
+    )
+    p_embrel.add_argument("--limit", type=int, default=None,
+                          help="Embed at most N edges (smoke test).")
+    p_embrel.add_argument(
+        "--dry-run", action="store_true",
+        help="Report how many edges would be embedded and print sample texts; "
+             "no API calls, no writes.",
+    )
+    p_embrel.set_defaults(func=_cmd_embed_relationships)
 
     p_regen = sub.add_parser(
         "regenerate-stale-artifacts",
@@ -1927,8 +2028,79 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
             menu_ancestor_closure=not getattr(args, "no_ancestor_closure", False),
             pinned_class_labels=tuple(
                 _extraction_cfg().get("pinned_class_labels") or ()),
+            embed_relationships=not getattr(
+                args, "no_embed_relationships", False),
+            orphan_batch_size=int(_resolve_extraction_opt(
+                args, "orphan_batch_size", "orphan_batch_size", 8)),
         )
     )
+    return 0
+
+
+def _cmd_enrich_geo(args: argparse.Namespace) -> int:
+    from backend.app.services.db_geo_enrich import (
+        DEFAULT_GEO_CLASS_LABELS,
+        enrich_geography,
+    )
+
+    from backend.app.core.config import get_settings
+
+    labels = tuple(
+        args.class_labels
+        or (get_settings().app_config.get("geo_enrichment", {}) or {}).get(
+            "class_labels")
+        or DEFAULT_GEO_CLASS_LABELS
+    )
+    _geo_cfg = (get_settings().app_config.get("geo_enrichment", {}) or {})
+    summary = asyncio.run(
+        enrich_geography(
+            class_labels=labels,
+            batch_size=int(_geo_cfg.get("batch_size") or 15),
+            max_containers=int(_geo_cfg.get("max_containers") or 60),
+            dry_run=args.dry_run,
+            limit=args.limit,
+            verbose=True,
+        )
+    )
+    print(
+        f"[enrich-geo] places={summary.place_entities} "
+        f"batches={summary.batches} created={summary.edges_created} "
+        f"already_present={summary.edges_existing} "
+        f"unresolved={summary.unresolved} "
+        f"rejected_by_level={summary.rejected_by_level} "
+        f"cost=${summary.cost_usd:.4f}"
+    )
+    for t in summary.samples:
+        print(f"  {t}")
+    if summary.unresolved:
+        print(
+            f"[enrich-geo] {summary.unresolved} containment(s) named a place "
+            f"the corpus does not have as an entity and were skipped -- this "
+            f"pass adds edges, never nodes."
+        )
+    return 0
+
+
+def _cmd_embed_relationships(args: argparse.Namespace) -> int:
+    from backend.app.services.db_relationship_embed import embed_relationships
+
+    summary = asyncio.run(
+        embed_relationships(
+            only_missing=args.only_missing,
+            limit=args.limit,
+            dry_run=args.dry_run,
+            verbose=True,
+        )
+    )
+    print(
+        f"[embed-relationships] considered={summary.considered} "
+        f"embedded={summary.embedded} "
+        f"skipped_no_text={summary.skipped_no_text} "
+        f"cost=${summary.cost_usd:.4f}"
+    )
+    if args.dry_run:
+        for t in summary.samples:
+            print(f"  sample: {t[:160]}")
     return 0
 
 

@@ -70,6 +70,12 @@ TIME_AFTER: Final = f"{TIME_NS}#after"
 # evidence check still applies -- only the domain/range check is skipped.
 GRAPHRAG_NS = "https://veerla-ramrao.ai/ontology/graphrag"
 GRAPHRAG_RELATED_TO: Final = f"{GRAPHRAG_NS}#relatedTo"
+# Geographic containment between two places the corpus already names,
+# minted by `enrich-geo`. Its own predicate rather than a borrowed
+# ontology one because these edges are WORLD KNOWLEDGE, not corpus
+# evidence: they exist so a walk can go Frankfurt -> Germany, and they
+# are kept out of the evidence packet for exactly that reason.
+GRAPHRAG_LOCATED_IN: Final = f"{GRAPHRAG_NS}#locatedInPlace"
 
 # Built-ins that don't appear in `ontology_object_properties`.
 _BUILTIN_ALLOWLIST: Final = frozenset({
@@ -78,6 +84,7 @@ _BUILTIN_ALLOWLIST: Final = frozenset({
     OWL_DISJOINT_WITH,
     RDF_TYPE,
     GRAPHRAG_RELATED_TO,
+    GRAPHRAG_LOCATED_IN,
 })
 
 

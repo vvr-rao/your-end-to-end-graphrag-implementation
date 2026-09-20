@@ -263,6 +263,28 @@ tasks:
     max_tokens: 1024
     response_format: json_object
 
+  # Parses the RELATIONSHIPS a question implies, for relationship-aware
+  # graph traversal. One tier above question_parse for the same reason the
+  # OpenAI preset uses gpt-4.1-mini: multi-step decomposition.
+  question_relations:
+    provider: anthropic
+    model: claude-sonnet-4-6
+    timeout: 90
+    temperature: 0.0
+    max_tokens: 1024
+    response_format: json_object
+
+  # enrich-geo: which named places contain which other named places. A
+  # closed-list multiple-choice task over names the corpus already used, so
+  # the cheap model is right; one call per 40 places.
+  geographic_containment:
+    provider: anthropic
+    model: claude-haiku-4-5
+    timeout: 240
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+
   concept_expansion:
     provider: anthropic
     model: claude-haiku-4-5

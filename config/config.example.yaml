@@ -153,6 +153,20 @@ summarization:
 # LOWER THESE on OpenAI tier 1-2, where 8 concurrent large calls already
 # throttle and time out. Each CLI also takes --concurrency to override per run.
 # -----------------------------------------------------------------------------
+# ---- Database connection pool.
+# A batch worker holds its session across several slow LLM calls, so the pool
+# must be sized against `concurrency:` below, not against API request volume.
+# Measured 2026-09-20: a fixed 4 + 4 pool against concurrency 64 killed 36 of
+# 62 chunks with "QueuePool limit of size 4 overflow 4 reached ... timeout
+# 30.00" -- and a 20-chunk smoke test had passed clean, which is why it stayed
+# hidden. Unset => derived from the largest value under `concurrency:`, capped
+# at 16 (a Supabase project has a finite client-connection budget). The CLI
+# additionally caps worker concurrency at pool_size + max_overflow.
+database:
+  pool_size:
+  max_overflow:
+  pool_timeout: 60
+
 concurrency:
   # register-documents / prune-expand summarization. Also settable as
   # summarization.concurrency (kept for back-compat; this wins if both set).
@@ -377,6 +391,14 @@ extraction:
   # passage developed at least 5. Costs one extra `concept_extract` call per
   # chunk (same cheap tier as entity_extract, ~half the output size).
   # false = behaviour-preserving default; --concept-pass overrides.
+  # Orphans handed to one relationship_orphan_check call. The check is what
+  # rescues entities both relationship passes missed, and its recall collapses
+  # when the list is long: measured on websearch-geo-time, the same chunk,
+  # model and prompt rescued "Beijing" when asked about it alone (conf 0.95)
+  # and labelled it `only_listed` when asked about 31 orphans at once,
+  # proposing 2 rescues for the whole batch. Cost on this step scales with
+  # ceil(orphans / batch); nothing else changes.
+  orphan_batch_size: 8
   concept_pass: false
   # How far the abstention recovery may reach. When the model abstains
   # (NONE_OF_THESE) it names the type it wanted; ~half the time that class
@@ -482,6 +504,16 @@ extraction:
     - Landform
     - Place
     - Event
+    # Abstract-kind classes are pinned for the same reason AdministrativeArea
+    # is, and it bites hardest when the ontology models individuals as classes.
+    # Measured 2026-09-20 on a 30-doc economics corpus whose geography ontology
+    # declares every country as its own class: a chunk about Asian economies
+    # gave 44 of its 50 menu slots to individual-country classes, EconomicConcept
+    # never ranked in, and GDP was not extracted at all -- while Inflation WAS,
+    # from a chunk whose menu had room. Corpus-wide, individual-place classes
+    # took a mean of 14.7 of 50 slots and 40+ slots on 13% of chunks.
+    - EconomicConcept
+    - FinancialObservation
 
 qa:
   # Top-k candidate classes from class-summary ANN.
@@ -684,6 +716,88 @@ qa:
   class_seed_top_chunks: 3
   # Artifact tier: how many nearest artifacts supply the seeds.
   artifact_seed_top_artifacts: 5
+  # The full-text bridge swaps a document's verbatim chunks into the candidate
+  # pool when it has them. It used to DROP the summary chunks at the same time,
+  # keeping them only for documents with no full-text version -- which, on a
+  # corpus ingested wholesale with --full-text-chunks, is none. Measured on the
+  # 66-doc build: 127 graph-selected chunks became 413 verbatim ones and two
+  # enumeration questions the 30-doc build answered correctly began returning
+  # "the retrieved evidence contains no specific list"; both answers lived in a
+  # summary chunk the graph had already picked. Default now AUGMENTS: keep the
+  # summary chunks, add the full text, let RRF fusion decide -- as the table and
+  # artifact bridges already do. true restores the pre-2026-09-20 replacement.
+  fulltext_bridge_replaces_summary: false
+  # How many documents the full-text bridge may expand, ranked by how many
+  # candidate chunks each owns. Unbounded it pulled 464 verbatim chunks from 62
+  # of 66 documents -- the whole corpus -- and a question whose answer ranked
+  # fine among 186 candidates could not be found among 650. 0 = unbounded.
+  fulltext_bridge_max_documents: 10
+  fulltext_bridge_limit: 500
+  # ---- Artifact -> chunk bridge. `artifact_sources` records which chunk each
+  # artifact was distilled from (1,277 of 1,278 artifacts on the
+  # websearch-geo-time build), but nothing in retrieval read it: the
+  # Milestone-H chain answer -> artifact -> chunk -> document was only half
+  # wired, so an artifact could win an evidence slot while the passage behind
+  # it appeared only if that chunk won a slot of its own.
+  #
+  #   off         pre-2026-09-20 behaviour
+  #   selected    (default) only the TOP artifacts by vector rank contribute
+  #               their source chunks, so the bridge follows relevance rather
+  #               than volume
+  #   candidates  every candidate artifact's chunks join the pool and the
+  #               ranker decides -- widest recall, but spends chunk slots on
+  #               text the artifact already condensed
+  artifact_chunk_bridge: selected
+  artifact_chunk_bridge_top_artifacts: 10
+  artifact_chunk_bridge_limit: 300
+  # ---- Relationship-aware traversal (0008 graph_relationships.embedding).
+  # Every extracted edge carries the sentence that supports it; embed-relationships
+  # vectorizes it. When a question names a RELATION ("who was accused of fraud",
+  # "which company in Germany makes chips"), the walk follows only the edges whose
+  # text matches that relation, re-scored at EVERY hop -- which is what carries a
+  # multi-step question: hop 1 matches "Frankfurt is a city in Germany", hop 2
+  # matches "Company X is headquartered in Frankfurt". Each hop scores against ALL
+  # parsed relations and keeps the best, so a chain whose rungs differ ("who
+  # founded the company that acquired X") matches a different one per hop.
+  #
+  # Falls back to the broad walk whenever nothing matches -- a question stating no
+  # relationship, or a graph whose edges were never embedded. false = never use it.
+  relationship_traversal: true
+  # Cosine floor for an edge to count as matching a parsed relation. Measured on
+  # 182 MultiHop-RAG questions: 0.45 fired the anchored hop on 18% of questions
+  # (6.9 documents, 95% recall, 41% precision); 0.55 on 10% (6.3 documents, 90%
+  # recall, 40% precision) and sends the other 32% to the broad walk instead of
+  # following a weak match. Also the floor for relation-filtered class seeding.
+  relationship_similarity: 0.55
+  # Edges admitted per hop, and the per-hop score decay.
+  relationship_hop_limit: 50
+  relationship_hop_decay: 0.7
+  # Vague-entity seeding: "who was accused of fraud" names nobody, so the named
+  # tier finds nothing and the chunk-mediated class tier skips Person/Organization
+  # for exceeding class_seed_max_members. This tier takes the same classes with NO
+  # member cap and ranks their members by how well their edges match the parsed
+  # relation -- the class supplies the type, the relation does the narrowing.
+  # Floor for the vague-entity tier, deliberately BELOW
+  # relationship_similarity: the hop is precision-critical (a wrong edge
+  # at hop 1 propagates), while this tier only ORDERS members of a class
+  # the question already constrained. At 0.55 it never fires -- the best
+  # edge for "who was accused of fraud" scores 0.536.
+  relation_class_seed_similarity: 0.40
+  relation_class_seed_limit: 25
+  # ---- Document arm. "conditional" (default) runs it only where the graph
+  # cannot answer: a seed entity with no relationships at all, or a graph arm
+  # returning fewer than document_arm_min_chunks_factor x k_chunks candidates.
+  # Measured: running it on every query cost precision (41% vs 46%) and bought
+  # no gold documents or fact-bearing chunks. "always" = pre-2026-09-20
+  # behaviour; "off" = disabled, same as k_documents: 0.
+  document_arm: conditional
+  document_arm_min_chunks_factor: 3
+  # ---- Temporal. Question time terms are parsed with the same function
+  # ingestion used on chunk text, so Q3 2023 / October 2023 / 2023-10-15 all
+  # match the rows enrich-time minted (the old query path matched bare years
+  # only). A matched period expands DOWN its hierarchy at full weight and one
+  # level UP at half weight; depth caps the descent.
+  time_expansion_depth: 3
   # Search ALL artifacts by vector on every query (not only artifact_only mode)
   # and add them as candidates alongside the entity-linked ones. Candidates
   # only -- never graph seeds; they share the existing artifact evidence slots.
@@ -725,3 +839,11 @@ jobs:
 storage:
   backend: local   # local | s3 (Phase 3+)
   # Override via STORAGE_DIR env var.
+
+# ---- enrich-geo. Contained places per LLM call, and how many containers
+# ride along in every call. Small on purpose: at ~109 places per call the
+# pass left 58% of cities with no containment edge, the same
+# recall-under-load failure measured in the orphan check.
+geo_enrichment:
+  batch_size: 15
+  max_containers: 60

@@ -159,6 +159,17 @@ def _parent_of(rec: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def extract_time_identifiers(text: str) -> set[str]:
+    """Public alias: the canonical time_identifiers named in `text`.
+
+    Retrieval parses a question's time terms with the SAME function that
+    ingestion used on the chunk, so "Q3 2023" and "October 15, 2023" match
+    the rows enrichment actually minted. The query path previously carried
+    its own 4-digit-year regex and silently dropped everything finer.
+    """
+    return _extract_dates(text)
+
+
 def _extract_dates(text: str) -> set[str]:
     """Return the set of canonical time_identifiers found in text."""
     found: set[str] = set()

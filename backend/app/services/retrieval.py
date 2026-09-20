@@ -57,6 +57,7 @@ from backend.app.db.models.ontology import OntologyClass
 from backend.app.db.session import session_scope
 from backend.app.services.alias_mining import is_acronym, normalize_term
 from backend.app.services.db_artifact_gen import _extract_json
+from backend.app.services.db_temporal_enrich import extract_time_identifiers
 from backend.app.services.embeddings import Embedder
 from backend.app.services.llm_router import LLMRouter
 from backend.app.services.predicates import GRAPHRAG_RELATED_TO
@@ -88,6 +89,18 @@ def _qa_cfg(key: str, default: Any) -> Any:
     Every knob added here must keep today's behavior when unset -- these
     features are additive and a missing key must never change results.
     """
+    # QA_OVERRIDES lets an A/B harness vary one knob per process without
+    # editing config.yaml (which every concurrent run would share).
+    import os as _os
+    _ov = _os.environ.get("QA_OVERRIDES")
+    if _ov:
+        try:
+            import json as _json
+            _d = _json.loads(_ov)
+            if key in _d:
+                return _d[key]
+        except Exception:
+            pass
     try:
         value = get_settings().app_config.get("qa", {}).get(key)
         return default if value is None else value
@@ -529,9 +542,29 @@ async def retrieve_and_answer(
             + "; ".join(f"{t} -> {', '.join(a)}" for t, a in aliases.items())
         )
 
+    # -------- step 3.6: relationship parse --------
+    # `question_parse` answers "what things is this about"; this answers "how
+    # are they supposed to be related", which is what lets the walk follow
+    # only the edges that MEAN what was asked. It also carries multi-step
+    # questions: "which company in Germany" parses to two relations (company
+    # is in a place; that place is in Germany), and the walk matches one at
+    # each hop. An empty list is normal and falls back to the broad walk.
+    _rel_traversal = bool(_qa_cfg("relationship_traversal", True))
+    question_relations: list[dict[str, Any]] = []
+    if _rel_traversal:
+        question_relations = await _question_relations(router, resolved_query)
+        parsed["relations"] = question_relations
+        if verbose and question_relations:
+            print("[query] relations: " + "; ".join(
+                _relation_text(r) for r in question_relations))
+
     # -------- step 4: ontology match --------
     embedder = Embedder()
     qvec = (await embedder.embed([resolved_query]))[0]
+    rel_probes = (
+        await embedder.embed([_relation_text(r) for r in question_relations])
+        if question_relations else []
+    )
     seeds, matched_classes, matched_entities, matched_times = await _ontology_match(
         parsed, qvec, aliases=aliases
     )
@@ -550,7 +583,8 @@ async def retrieve_and_answer(
                     == "entity_relationships")
     if _cascade:
         _ent_seeds, _tier = await _cascade_entity_seeds(
-            parsed, qvec, aliases, embedder, verbose=verbose)
+            parsed, qvec, aliases, embedder, rel_probes=rel_probes,
+            relations=question_relations, verbose=verbose)
         # Time seeds still come from the ontology match; class seeds do not.
         seeds = ([(nid, t) for nid, t in seeds if t == "time_instance"]
                  + [(eid, "entity") for eid in _ent_seeds])
@@ -568,32 +602,76 @@ async def retrieve_and_answer(
         seeds.extend((cid, "ontology_class") for cid in expanded_class_ids)
     seeds = list(set(seeds))   # dedupe
 
-    # -------- step 6+7: BFS --------
+    # -------- step 6+7: graph expansion --------
     if _entity_walk:
         hops = int(_qa_cfg("entity_relationship_hops", hops))
-    async with session_scope() as session:
-        bfs_nodes = await retrieval_sql.bfs_expand(
-            session, seeds, max_hops=hops, decay=0.7,
-            entity_relationships_only=_entity_walk,
+    seed_entity_ids = [nid for nid, t in seeds if t == "entity"]
+    seed_time_ids = [nid for nid, t in seeds if t == "time_instance"]
+
+    # Relationship-aware walk. Where the broad walk takes every edge out of a
+    # seed, this takes only the edges whose stored text matches a relation the
+    # question asked about -- re-scored at EVERY hop, which is what carries a
+    # multi-step question: hop 1 matches "Frankfurt is a city in Germany",
+    # hop 2 matches "Company X is headquartered in Frankfurt". Falls back to
+    # the broad walk whenever it finds nothing, so a question that states no
+    # relationship (or a graph with no edge embeddings) behaves as before.
+    bfs_nodes: dict[tuple[uuid.UUID, str], dict[str, Any]] = {}
+    rel_stage = "off"
+    _rel_edges: list[uuid.UUID] = []
+    if rel_probes and str(_qa_cfg("relationship_traversal", True)).lower() not in (
+        "false", "off", "0"
+    ):
+        rel_nodes, _rel_edges, rel_stage = await _relationship_walk(
+            seed_entity_ids, rel_probes, max_hops=hops, verbose=verbose,
         )
+        for eid, score in rel_nodes.items():
+            bfs_nodes[(eid, "entity")] = {"score": score, "hop": 1}
+    if not bfs_nodes:
+        async with session_scope() as session:
+            bfs_nodes = await retrieval_sql.bfs_expand(
+                session, seeds, max_hops=hops, decay=0.7,
+                entity_relationships_only=_entity_walk,
+            )
+        if rel_stage != "off":
+            rel_stage += "->broad_walk"
+
     expanded_entity_ids = [
         nid for (nid, ntype), _ in bfs_nodes.items() if ntype == "entity"
     ]
     # Seeds may include entities already; merge them in.
-    for nid, ntype in seeds:
-        if ntype == "entity" and nid not in expanded_entity_ids:
+    for nid in seed_entity_ids:
+        if nid not in expanded_entity_ids:
             expanded_entity_ids.append(nid)
+
+    # Temporal expansion is directional, so it is not part of the walk above:
+    # a question about 2023 is about every period INSIDE 2023 (full weight),
+    # and only weakly about the year a finer question sits in (half weight,
+    # not re-descended). An undirected hop would let "October 2023" climb to
+    # the year and come back down into all eleven other months.
     expanded_time_ids = [
         nid for (nid, ntype), _ in bfs_nodes.items() if ntype == "time_instance"
     ]
-    for nid, ntype in seeds:
-        if ntype == "time_instance" and nid not in expanded_time_ids:
+    for nid in seed_time_ids:
+        if nid not in expanded_time_ids:
             expanded_time_ids.append(nid)
+    if seed_time_ids:
+        async with session_scope() as session:
+            _time_scores = await retrieval_sql.expand_time_instances(
+                session, seed_time_ids,
+                max_depth=int(_qa_cfg("time_expansion_depth", 3)),
+            )
+        for tid in _time_scores:
+            if tid not in expanded_time_ids:
+                expanded_time_ids.append(tid)
+        if verbose:
+            print(f"[query] temporal expansion: {len(seed_time_ids)} seed "
+                  f"period(s) -> {len(expanded_time_ids)} period(s)")
     if verbose:
         print(
-            f"[query] BFS yielded {len(bfs_nodes)} nodes "
-            f"({len(expanded_entity_ids)} entities, "
-            f"{len(expanded_time_ids)} time_instances)"
+            f"[query] graph expansion ({rel_stage}) yielded {len(bfs_nodes)} "
+            f"nodes ({len(expanded_entity_ids)} entities, "
+            f"{len(expanded_time_ids)} time_instances) via "
+            f"{len(_rel_edges)} relation-matched edge(s)"
         )
 
     # -------- step 8: candidate retrieval --------
@@ -623,9 +701,51 @@ async def retrieve_and_answer(
     # matches the query's vocabulary -- an independent path to the same
     # recall gap brand/generic names open at chunk level, and one that
     # needs no mined alias pair. `qa.k_documents: 0` disables it.
+    #
+    # `qa.document_arm` decides WHEN it runs. It used to run on every query,
+    # and measurement said that costs precision for recall already had:
+    # switching it off left every gold document and every fact-bearing chunk
+    # in place while precision went 41% -> 46% and the packet shrank from 20
+    # chunks to 17.5. So the default is `conditional` -- run it only where the
+    # graph cannot answer:
+    #
+    #   * a seed entity with no relationships at all is a node with no arcs;
+    #     the walk reaches exactly itself, and a document-level match is the
+    #     only way to recover its context.
+    #   * a graph arm that produced fewer than
+    #     `document_arm_min_chunks_factor` x `k_chunks` candidate chunks has
+    #     not given the ranker enough to work with, whatever the reason.
+    #
+    # `always` restores the old behaviour, `off` disables it like k_documents: 0.
     _k_docs = int(_qa_cfg("k_documents", 10))
+    _doc_arm_mode = str(_qa_cfg("document_arm", "conditional")).lower()
+    _graph_chunks = len({cid for cid, _ in ent_chunks + time_chunks})
+    _doc_arm_floor = int(
+        float(_qa_cfg("document_arm_min_chunks_factor", 3)) * int(_qa_cfg("k_chunks", 20))
+    )
+    _run_doc_arm = _doc_arm_mode == "always"
+    _doc_arm_reason = "qa.document_arm=always"
+    if _doc_arm_mode == "conditional":
+        _orphan_seeds: list[uuid.UUID] = []
+        if seed_entity_ids:
+            async with session_scope() as session:
+                _orphan_seeds = await retrieval_sql.entities_without_relationships(
+                    session, seed_entity_ids
+                )
+        if _orphan_seeds:
+            _run_doc_arm = True
+            _doc_arm_reason = (
+                f"{len(_orphan_seeds)}/{len(seed_entity_ids)} seed entity(ies) "
+                f"have no relationships"
+            )
+        elif _graph_chunks < _doc_arm_floor:
+            _run_doc_arm = True
+            _doc_arm_reason = (
+                f"graph arm returned {_graph_chunks} chunk(s), "
+                f"below the {_doc_arm_floor} floor"
+            )
     doc_chunks: list[tuple[uuid.UUID, float]] = []
-    if _k_docs > 0:
+    if _k_docs > 0 and _run_doc_arm:
         async with session_scope() as session:
             _doc_ids = await retrieval_sql.vector_search_documents(
                 session, qvec, top_k=_k_docs,
@@ -639,9 +759,15 @@ async def retrieve_and_answer(
                 )
         if verbose:
             print(
-                f"[query] document arm: {len(_doc_ids)} document(s) -> "
-                f"{len(doc_chunks)} chunk(s)"
+                f"[query] document arm ({_doc_arm_reason}): "
+                f"{len(_doc_ids)} document(s) -> {len(doc_chunks)} chunk(s)"
             )
+    elif verbose and _k_docs > 0:
+        print(
+            f"[query] document arm skipped: graph arm returned "
+            f"{_graph_chunks} chunk(s) (floor {_doc_arm_floor}) and every "
+            f"seed entity has relationships"
+        )
 
     candidate_chunk_ids = list(
         {cid for cid, _ in ent_chunks + time_chunks + doc_chunks}
@@ -650,6 +776,45 @@ async def retrieve_and_answer(
     for _gid in global_artifact_ids:
         if _gid not in candidate_artifact_ids:
             candidate_artifact_ids.append(_gid)
+
+    # Artifact -> chunk bridge. `artifact_sources` records which chunk every
+    # artifact was distilled from (1,277 of 1,278 artifacts on the
+    # websearch-geo-time build) and until now NOTHING in retrieval read it --
+    # the Milestone-H chain answer -> artifact -> chunk -> document was only
+    # half wired. An artifact could win an evidence slot while the passage
+    # behind it appeared only if that chunk happened to win a slot of its own.
+    #
+    # `qa.artifact_chunk_bridge`:
+    #   off         today's behaviour
+    #   candidates  every candidate artifact's source chunks join the chunk
+    #               pool, and the ranker decides -- widest recall, but spends
+    #               chunk slots on text the artifact already condensed
+    #   selected    only the source chunks of the TOP artifacts by vector
+    #               rank, so the bridge follows relevance rather than volume
+    _bridge = str(_qa_cfg("artifact_chunk_bridge", "selected")).lower()
+    if _bridge in ("candidates", "selected") and candidate_artifact_ids:
+        _src = candidate_artifact_ids
+        if _bridge == "selected":
+            _top = int(_qa_cfg("artifact_chunk_bridge_top_artifacts", 10))
+            _ranked = [a for a in global_artifact_ids if a in set(candidate_artifact_ids)]
+            _src = (_ranked or candidate_artifact_ids)[:_top]
+        async with session_scope() as session:
+            _pairs = await retrieval_sql.fetch_chunks_for_artifacts(
+                session, _src,
+                limit=int(_qa_cfg("artifact_chunk_bridge_limit", 300)),
+            )
+        _before = len(candidate_chunk_ids)
+        _have = set(candidate_chunk_ids)
+        for _aid, _cid in _pairs:
+            if _cid not in _have:
+                candidate_chunk_ids.append(_cid)
+                _have.add(_cid)
+        if verbose:
+            print(
+                f"[query] artifact->chunk bridge ({_bridge}): "
+                f"{len(_src)} artifact(s) -> {len(candidate_chunk_ids) - _before} "
+                f"new chunk(s) (pool {_before} -> {len(candidate_chunk_ids)})"
+            )
     if verbose and global_artifact_ids:
         print(f"[query] global artifact search: {len(global_artifact_ids)} "
               f"artifact(s); {len(candidate_artifact_ids)} artifact candidates total")
@@ -726,35 +891,85 @@ async def retrieve_and_answer(
         chunk_doc_map: dict[uuid.UUID, uuid.UUID] = {}
         async with session_scope() as session:
             ft_rows = await retrieval_sql.fetch_fulltext_chunks_for_chunks(
-                session, candidate_chunk_ids, limit=500,
+                session, candidate_chunk_ids,
+                limit=int(_qa_cfg("fulltext_bridge_limit", 500)),
                 per_document_limit=int(
                     _qa_cfg("max_fulltext_chunks_per_document", 50)
                 ),
             )
+            # Expand only the documents the graph ranked HIGHEST, not every
+            # document it touched. On the 66-doc build the bridge was pulling
+            # 464 verbatim chunks from 62 of 66 documents -- effectively the
+            # whole corpus -- and "which cities are in India" then failed to
+            # rank its answer among 650 candidates, where 186 had found it.
+            # `hits` is the number of candidate chunks the document owns, so
+            # this follows the graph's own document ranking.
+            _max_ft_docs = int(_qa_cfg("fulltext_bridge_max_documents", 10))
+            if _max_ft_docs > 0 and ft_rows:
+                _by_doc: dict[uuid.UUID, float] = {}
+                for _c, _h, _d in ft_rows:
+                    _by_doc[_d] = max(_by_doc.get(_d, 0.0), float(_h))
+                _keep_docs = {
+                    d for d, _ in sorted(
+                        _by_doc.items(), key=lambda kv: kv[1], reverse=True
+                    )[:_max_ft_docs]
+                }
+                ft_rows = [r for r in ft_rows if r[2] in _keep_docs]
             if ft_rows:
                 chunk_doc_map = await retrieval_sql.fetch_chunk_document_ids(
                     session, candidate_chunk_ids,
                 )
         if ft_rows:
             ft_doc_ids = {did for _, _, did in ft_rows}
-            # Keep summary chunks only for docs that have NO full-text chunks.
-            summary_keep = [
-                cid for cid in candidate_chunk_ids
-                if chunk_doc_map.get(cid) not in ft_doc_ids
-            ]
             ft_ids = [cid for cid, _, _ in ft_rows]
-            candidate_chunk_ids = summary_keep + ft_ids
+            # ADD full text, do not REPLACE the summary chunks.
+            #
+            # This used to keep summary chunks only for documents with no
+            # full-text version -- which, on a corpus ingested wholesale with
+            # `--full-text-chunks`, is no documents at all. The entire
+            # graph-selected pool was discarded and replaced by every
+            # full-text chunk of the same documents: measured on the 66-doc
+            # build, 127 curated chunks became 413 verbatim ones and two
+            # enumeration questions that the 30-doc build answered correctly
+            # started returning "the retrieved evidence contains no specific
+            # list". Both answers lived in a summary chunk the graph had
+            # already picked, and both came back when the bridge was disabled.
+            #
+            # The summary chunks are what the entity graph was built from and
+            # what the graph arm actually chose; their document's full-text
+            # chunks inherit a document-level score, not that specific match.
+            # Keeping both and letting RRF fusion decide is how the table and
+            # artifact bridges already work -- this one was the odd one out.
+            #
+            # `qa.fulltext_bridge_replaces_summary: true` restores the old
+            # behaviour.
+            _replace = bool(_qa_cfg("fulltext_bridge_replaces_summary", False))
+            if _replace:
+                kept_summary = [
+                    cid for cid in candidate_chunk_ids
+                    if chunk_doc_map.get(cid) not in ft_doc_ids
+                ]
+            else:
+                kept_summary = list(candidate_chunk_ids)
+            _have = set(kept_summary)
+            candidate_chunk_ids = kept_summary + [
+                cid for cid in ft_ids if cid not in _have
+            ]
             # Propagate graph scores: fulltext chunks inherit their document's
-            # candidate-chunk count; kept summary chunks keep their entity score.
+            # candidate-chunk count; summary chunks keep their entity score.
             ent_score = {cid: sc for cid, sc in ent_chunks}
-            scored = [(cid, ent_score.get(cid, 0.0)) for cid in summary_keep]
-            scored += [(cid, hits) for cid, hits, _ in ft_rows]
+            scored = [(cid, ent_score.get(cid, 0.0)) for cid in kept_summary]
+            scored += [(cid, hits) for cid, hits, _ in ft_rows
+                       if cid not in _have]
             scored.sort(key=lambda t: t[1], reverse=True)
             graph_chunk_ranking = [cid for cid, _ in scored]
             if verbose:
                 print(
-                    f"[query] full-text bridge: {len(ft_ids)} fulltext chunk(s) "
-                    f"across {len(ft_doc_ids)} doc(s); candidate pool now "
+                    f"[query] full-text bridge ("
+                    f"{'replace' if _replace else 'augment'}): "
+                    f"{len(ft_ids)} fulltext chunk(s) across "
+                    f"{len(ft_doc_ids)} doc(s); kept {len(kept_summary)} "
+                    f"summary chunk(s); candidate pool now "
                     f"{len(candidate_chunk_ids)}"
                 )
 
@@ -1069,9 +1284,18 @@ async def retrieve_and_answer(
         # produced a confidently wrong, cited answer, because the quote carries
         # detail about one endpoint only.
         _stmt = f"{rel['subject']} {rel['predicate']} {rel['object']}."
+        if rel.get("world_knowledge"):
+            # Admitted so a containment question can be answered at all, but
+            # never passed off as something a document said. The synthesis
+            # prompt sees the label, so an answer can rely on the fact while
+            # a reader can tell it apart from a corpus claim.
+            _stmt += (" [This geographic fact is VERIFIED and you SHOULD use "
+                      "it to answer. It was derived during ingestion rather "
+                      "than quoted from a document, so it carries no passage "
+                      "-- that is expected, not a reason to withhold it.]")
         _ev = _trim_quote_to_claim(
             rel.get("evidence") or "", rel["subject"], rel["object"])
-        if _ev:
+        if _ev and not rel.get("world_knowledge"):
             _stmt += (f" [supporting quote for THAT relationship only; any "
                       f"other detail in it belongs to whichever one it names, "
                       f"not to both: \"{_ev}\"]")
@@ -1365,12 +1589,136 @@ async def _expand_aliases_from_question(question: str) -> dict[str, list[str]]:
     return out
 
 
+def _relation_text(rel: dict[str, Any]) -> str:
+    """One embeddable line for a parsed relation, in the same shape
+    `db_relationship_embed.build_edge_text` uses for a stored edge:
+    `<subject> <relation> <object>`. The two must agree or the cosine
+    comparison is between differently-shaped strings.
+
+    An end the question leaves open ("who", "which company") contributes its
+    category word when it has one and a neutral placeholder otherwise, so the
+    relation phrase still dominates the vector.
+    """
+    def _end(e: Any, fallback: str) -> str:
+        t = ((e or {}).get("text") or "").strip()
+        return t or fallback
+    return " ".join(x for x in (
+        _end(rel.get("subject"), "someone"),
+        (rel.get("relation") or "").strip(),
+        _end(rel.get("object"), "something"),
+    ) if x)
+
+
+async def _question_relations(
+    router: LLMRouter, question: str
+) -> list[dict[str, Any]]:
+    """Relations the question states or implies. Fails soft: any error or
+    unparseable response yields [], and the caller walks the graph the way it
+    always did."""
+    try:
+        sys_p, user_p = PROMPTS["question_relations"](question)
+        out = await router.chat("question_relations", system=sys_p, user=user_p)
+        data = _extract_json(out.text) or {}
+    except Exception as exc:                                # pragma: no cover
+        log.warning("question_relations failed: %s", exc)
+        return []
+    rels = data.get("relations")
+    if not isinstance(rels, list):
+        return []
+    keep: list[dict[str, Any]] = []
+    for r in rels[:6]:
+        if not isinstance(r, dict) or not (r.get("relation") or "").strip():
+            continue
+        keep.append(r)
+    return keep
+
+
+async def _relationship_walk(
+    seed_entity_ids: list[uuid.UUID],
+    probes: list[list[float]],
+    *,
+    max_hops: int = 3,
+    verbose: bool = False,
+) -> tuple[dict[uuid.UUID, float], list[uuid.UUID], str]:
+    """Walk outward from the seeds along edges that MEAN what was asked.
+
+    Returns `(entity_id -> score, matched edge ids, stage)`. The stage names
+    where it got to, which is the thing worth watching in an eval:
+
+      anchored     seeds existed and at least one of their edges matched
+      unanchored   no seed edge matched (or there were no seeds), so the
+                   corpus's best-matching edges were taken directly -- the
+                   path for a question naming a relation but no entity the
+                   graph knows
+      none         nothing cleared the threshold; the caller falls back to
+                   the broad walk
+
+    Each hop re-scores against ALL parsed relations and keeps the best, so a
+    chain whose rungs differ ("who founded the company that acquired X")
+    matches `acquired` on one hop and `founded` on the next without either
+    hop knowing which rung it is on.
+    """
+    threshold = float(_qa_cfg("relationship_similarity", 0.55))
+    per_hop = int(_qa_cfg("relationship_hop_limit", 50))
+    decay = float(_qa_cfg("relationship_hop_decay", 0.7))
+    reached: dict[uuid.UUID, float] = {sid: 1.0 for sid in seed_entity_ids}
+    edge_ids: list[uuid.UUID] = []
+    frontier = list(seed_entity_ids)
+
+    async with session_scope() as session:
+        for hop in range(max_hops):
+            if not frontier:
+                break
+            hits = await retrieval_sql.relationship_hop(
+                session, frontier, probes,
+                threshold=threshold, limit=per_hop,
+            )
+            if not hits:
+                break
+            nxt: list[uuid.UUID] = []
+            for h in hits:
+                edge_ids.append(h["id"])
+                for end in (h["source_node_id"], h["target_node_id"]):
+                    score = h["sim"] * (decay ** (hop + 1))
+                    if end not in reached:
+                        nxt.append(end)
+                    if score > reached.get(end, 0.0):
+                        reached[end] = score
+            if verbose:
+                print(f"[query] relationship hop {hop + 1}: {len(hits)} edge(s), "
+                      f"{len(nxt)} new entity(ies)")
+            frontier = nxt
+
+        if edge_ids:
+            return reached, edge_ids, "anchored"
+
+        # Nothing anchored matched. Take the corpus's best edges for the
+        # relation outright: measured on 182 MultiHop-RAG questions, the
+        # unanchored search covered 58% of questions at 0.55 where the
+        # anchored hop fired on 10%.
+        hits = await retrieval_sql.relationship_vector_search(
+            session, probes, threshold=threshold, limit=per_hop,
+        )
+    if not hits:
+        return {}, [], "none"
+    for h in hits:
+        edge_ids.append(h["id"])
+        for end in (h["source_node_id"], h["target_node_id"]):
+            if h["sim"] > reached.get(end, 0.0):
+                reached[end] = h["sim"]
+    if verbose:
+        print(f"[query] unanchored relationship search: {len(hits)} edge(s)")
+    return reached, edge_ids, "unanchored"
+
+
 async def _cascade_entity_seeds(
     parsed: dict[str, Any],
     qvec: list[float],
     aliases: dict[str, list[str]],
     embedder: Embedder,
     *,
+    rel_probes: list[list[float]] | None = None,
+    relations: list[dict[str, Any]] | None = None,
     verbose: bool = False,
 ) -> tuple[list[uuid.UUID], str]:
     """Entity seeds for the graph walk, from the first tier that finds any:
@@ -1418,6 +1766,55 @@ async def _cascade_entity_seeds(
         return seeds, "named"
 
     class_terms = [t for t in (parsed.get("classes") or [])[:8] if t and len(t.strip()) >= 3]
+    # The class that constrains the ANSWER is not usually in parsed["classes"]:
+    # "who was accused of fraud" parses to classes=["fraud"], which is what the
+    # relation points AT, not what is being asked for. The relation parse marks
+    # the open end `unknown` and names its category ("person"), and that is the
+    # type constraint the vague-entity tier needs.
+    answer_terms = [
+        t for t in (
+            ((end or {}).get("text") or "").strip()
+            for rel in (relations or [])
+            for end in (rel.get("subject"), rel.get("object"))
+            if (end or {}).get("kind") == "unknown"
+        ) if t and len(t) >= 3
+    ]
+    seed_class_terms = list(dict.fromkeys(answer_terms + class_terms))[:8]
+    if seed_class_terms and rel_probes:
+        # Vague-entity tier. "Who was accused of fraud" names nobody, so the
+        # named tier finds nothing and the chunk-mediated class tier below
+        # cannot help either: it skips any class with more than
+        # `class_seed_max_members` entities, which is exactly the Person /
+        # Organization classes such a question is about. Here the class
+        # supplies the type constraint and the parsed relation supplies the
+        # rest, scored against the stored evidence quote -- where the
+        # question's own wording actually appears. No member cap: the
+        # relation is the narrowing.
+        term_vecs = await embedder.embed(seed_class_terms)
+        async with session_scope() as session:
+            counts = await retrieval_sql.resolve_class_closure(
+                session, seed_class_terms, term_vecs,
+                classes_per_term=int(_qa_cfg("class_seed_classes_per_term", 5)),
+            )
+            ranked = await retrieval_sql.entities_of_class_by_relation(
+                session, list(counts), rel_probes,
+                # A LOWER floor than the hop deliberately. The hop is
+                # precision-critical -- a wrong edge at hop 1 propagates
+                # through hops 2 and 3 -- so it uses the measured 0.55. Here
+                # the class has already constrained the type and the relation
+                # only ORDERS those members, so a weak match costs ranking,
+                # not correctness. At 0.55 this tier never fires at all: the
+                # best edge for "who was accused of fraud" scores 0.536.
+                threshold=float(_qa_cfg("relation_class_seed_similarity", 0.40)),
+                limit=int(_qa_cfg("relation_class_seed_limit", 25)),
+            )
+        if ranked:
+            if verbose:
+                print(f"[query] relation-filtered class seeding: "
+                      f"{len(ranked)} entity seed(s) over {len(counts)} "
+                      f"class(es), best sim {ranked[0][1]:.2f}")
+            return [eid for eid, _ in ranked], "classes+relation"
+
     if class_terms:
         term_vecs = await embedder.embed(class_terms)
         async with session_scope() as session:
@@ -1625,26 +2022,22 @@ async def _ontology_match(
                 )
                 seeds.append((eid, "entity"))
 
-        # Time term matching: try YEAR_YYYY / MONTH_YYYY_MM etc identifiers.
-        for term in parsed.get("time_terms", [])[:5]:
-            m = re.search(r"\b(19|20)\d{2}\b", term)
-            if not m:
-                continue
-            year = m.group(0)
-            ident = f"YEAR_{year}"
-            r = await session.execute(
-                sql_text(
-                    "SELECT id, display_label FROM graphrag.time_instances "
-                    "WHERE time_identifier = :ident"
-                ),
-                {"ident": ident},
-            )
-            row = r.first()
-            if row:
-                matched_times.append(
-                    {"id": row[0], "display_label": row[1]}
-                )
-                seeds.append((row[0], "time_instance"))
+        # Time term matching. The question's time terms are parsed with the
+        # SAME function ingestion used on the chunk text, so every granularity
+        # enrichment minted is reachable: "Q3 2023" -> Q3_2023, "October 15,
+        # 2023" -> DAY_2023_10_15, "between 2023 and 2024" -> both years. The
+        # 4-digit-year regex this replaces matched only YEAR_ rows, so every
+        # finer expression silently degraded to its year and a question that
+        # named no year at all matched nothing.
+        _idents: set[str] = set()
+        for term in parsed.get("time_terms", [])[:8]:
+            _idents |= extract_time_identifiers(term)
+        if _idents:
+            for tid, label in await retrieval_sql.time_instances_by_identifier(
+                session, sorted(_idents)
+            ):
+                matched_times.append({"id": tid, "display_label": label})
+                seeds.append((tid, "time_instance"))
 
     return seeds, matched_classes, matched_entities, matched_times
 
