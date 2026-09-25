@@ -16,6 +16,23 @@ _Requires Python 3.12+. CI runs the test suite on CPython 3.12, 3.13, and 3.14._
 Three surfaces, one process: REST at `/`, MCP at `/mcp`, and a React UI hosted on Render alongside the backend on Postgres.
 
 I have tested this using open source data and common ontologies from Pharma, Finance and Manufacturing and Supply Chain domains.
+
+## Agent Framework
+<div align="center">
+
+<img src="images/YEGI_Agent_Framework.png" alt="Agent Framework" width="75%">
+
+</div>
+
+YEGI organizes knowledge graph generation into three supervised stages, each with sequential steps that perform deterministic operations or bounded LLM calls. 
+
+1. **Ontology creation** Combines standard and purpose-built ontologies with the document corpus to produce a domain-specific OWL ontology; users can also import an existing ontology. 
+2. **Knowledge graph population** Extracts entities and relationships from the documents and stores the resulting graph and vectors in PostgreSQL. 
+3. **Evaluation and deployment** Lets users score the system against a supplied question set, then deploy a React UI, MCP server, and FastAPI backend to Render. 
+
+A separate retrieval pipeline combines graph traversal with vector search to answer questions and support analysis of the corpus.
+
+## Overall System Flow
 <div align="center">
 
 <img src="images/system-flow-and-architecture-2.png" alt="Overall System flow and architecture" width="75%">
