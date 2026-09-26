@@ -188,6 +188,47 @@ those entities' actual classes. The run prints a line to report back:
     (unresolved=.., bad_predicate=.., domain_range=.., no_evidence=..)
 ```
 
+### ALWAYS report two coverage percentages, not just the raw counts
+The run prints absolute numbers; a count alone does not tell the user whether
+the ontology fits their corpus. Compute both and report **percentage AND
+absolute**, because each answers a different question -- the percentage says how
+well the ontology fits, the absolute says how much was actually lost.
+
+**1. Entities dropped for want of a class.** From the `entity drops:` line and
+the `DONE: entities (minted=N` line:
+```
+abstained % = abstained / (minted + abstained) * 100
+```
+Report as: `"X% of entity mentions were dropped (N of M) because no ontology
+class fit them"`, and name 3-5 of the examples the run prints. Then say which
+of the two causes it is -- they need different fixes and the log's own wording
+picks the wrong one often enough to check:
+- If the `recovered ... abstention(s) whose proposed_type named a class that
+  EXISTS` count is **also high**, the menu is too narrow, NOT the ontology. A
+  prune-expand run would not help; `--candidate-classes` or
+  `extraction.pinned_class_labels` would.
+- If the abstained examples are things the ontology plainly *should* cover
+  (an organisation when `Organization` is pinned), it is neither -- flag it as
+  unexplained rather than recommending a prune-expand run.
+Anything **over ~15%** is worth calling out explicitly as a coverage problem.
+Measured reference: a 66-doc corpus with a corpus-fitted 2,160-class ontology
+still abstained on **12.5% (459 of 3,680)**, so double digits is normal and a
+fitted ontology does not drive it to zero.
+
+**2. Relationships that fell back to the generic predicate.** From the
+`relatedTo (no ontology predicate fitted)` line:
+```
+relatedTo % = relatedTo / total edges written * 100
+```
+Report as: `"Y% of relationships (N of M) had no matching ontology predicate and
+were recorded as graphrag:relatedTo, keeping the passage's own phrase"`. These
+edges are NOT lost -- they are traversable and vector-searchable on that phrase
+-- so present this as a vocabulary gap, not a failure. The run also histograms
+the most common phrases; quote the top few, because they are a concrete
+shopping list of predicates the ontology is missing. Measured reference: the
+same 66-doc run routed **15.2% (178 of 1,173)** to relatedTo, with
+`has capacity` x24 and `ranked above` x12 at the top.
+
 **Before launching, confirm all THREE relationship tasks are in
 `config/models.yaml`.** They are NEW tasks; a config predating them makes the
 step print a one-line notice and quietly do less -- easy to miss in a long log,
