@@ -20,6 +20,7 @@ to avoid infinite loops on densely-connected ontology fragments.
 """
 from __future__ import annotations
 
+import math
 import uuid
 from typing import Any
 
@@ -1266,31 +1267,83 @@ async def fetch_artifact_rows(
 # was asked. Edges with no vector (ontology TBox rows, graphs built before
 # 0008) are invisible here; callers fall back to `bfs_expand`.
 
+# COSINE THRESHOLDS, L2 ORDERING. The embeddings are unit-normalised
+# (`text-embedding-3-small` @ 1024; measured mean norm 0.999996 over 200 rows),
+# so `l2 = sqrt(2 - 2*cos)` holds exactly -- verified at 0.942705 vs 0.942740 on
+# a real pair -- which makes ordering by L2 ascending identical to ordering by
+# cosine descending. Using `<->` is therefore not an approximation, and it is
+# what lets the HNSW index (`vector_l2_ops`) serve the query at all: these three
+# searches were originally written with `<=>`, the only cosine queries in this
+# file, and pgvector cannot answer a cosine ordering from an L2 index. Measured
+# on the 66-document build, every one of them fell back to a sequential scan.
+#
+# The threshold is applied OUTSIDE the ordered subquery, not in its WHERE. A
+# predicate over the distance forces it to be computed for every row, which
+# defeats the index just as surely as the wrong operator did. Top-k then filter
+# is how every other vector search in this file already works.
+#
+# Consequence worth knowing: at most `limit` rows come back even when more clear
+# the threshold. `relationship_hop`'s per-hop cap already bounded this.
+def _cosine_to_l2(cosine: float) -> float:
+    """The L2 distance equivalent to a cosine-similarity floor, for unit vectors.
+
+    cos >= t  <=>  l2 <= sqrt(2 - 2t).  Config stays in cosine terms because
+    that is what the thresholds were measured in (0.55 for the hop, 0.40 for
+    relation-filtered class seeding).
+    """
+    return math.sqrt(max(0.0, 2.0 - 2.0 * float(cosine)))
+
+
 _REL_HOP_SQL = sql_text("""
-SELECT g.id, g.source_node_id, g.target_node_id,
-       1 - (g.embedding <=> CAST(:probe AS vector)) AS sim
-  FROM graphrag.graph_relationships g
- WHERE g.embedding IS NOT NULL
-   AND g.source_node_type = 'entity'
-   AND g.target_node_type = 'entity'
-   AND (g.source_node_id = ANY(CAST(:frontier AS uuid[]))
-     OR g.target_node_id = ANY(CAST(:frontier AS uuid[])))
-   AND 1 - (g.embedding <=> CAST(:probe AS vector)) >= CAST(:threshold AS float)
- ORDER BY sim DESC
- LIMIT :limit
+SELECT t.id, t.source_node_id, t.target_node_id, t.d
+  FROM (
+    SELECT g.id, g.source_node_id, g.target_node_id,
+           g.embedding <-> CAST(:probe AS vector) AS d
+      FROM graphrag.graph_relationships g
+     WHERE g.embedding IS NOT NULL
+       AND g.source_node_type = 'entity'
+       AND g.target_node_type = 'entity'
+       AND (g.source_node_id = ANY(CAST(:frontier AS uuid[]))
+         OR g.target_node_id = ANY(CAST(:frontier AS uuid[])))
+     ORDER BY g.embedding <-> CAST(:probe AS vector)
+     LIMIT :limit
+  ) t
+ WHERE t.d <= CAST(:l2_ceiling AS float)
+ ORDER BY t.d
 """)
 
 _REL_GLOBAL_SQL = sql_text("""
-SELECT g.id, g.source_node_id, g.target_node_id,
-       1 - (g.embedding <=> CAST(:probe AS vector)) AS sim
-  FROM graphrag.graph_relationships g
- WHERE g.embedding IS NOT NULL
-   AND g.source_node_type = 'entity'
-   AND g.target_node_type = 'entity'
-   AND 1 - (g.embedding <=> CAST(:probe AS vector)) >= CAST(:threshold AS float)
- ORDER BY sim DESC
- LIMIT :limit
+SELECT t.id, t.source_node_id, t.target_node_id, t.d
+  FROM (
+    SELECT g.id, g.source_node_id, g.target_node_id,
+           g.embedding <-> CAST(:probe AS vector) AS d
+      FROM graphrag.graph_relationships g
+     WHERE g.embedding IS NOT NULL
+       AND g.source_node_type = 'entity'
+       AND g.target_node_type = 'entity'
+     ORDER BY g.embedding <-> CAST(:probe AS vector)
+     LIMIT :limit
+  ) t
+ WHERE t.d <= CAST(:l2_ceiling AS float)
+ ORDER BY t.d
 """)
+
+
+async def _widen_hnsw(session: AsyncSession, want: int) -> None:
+    """Raise `hnsw.ef_search` for this transaction so a top-k scan can return k.
+
+    pgvector defaults `ef_search` to 40, and HNSW never returns more candidates
+    than that however large the LIMIT -- so a `LIMIT 50` silently came back with
+    40 rows. Measured while switching these queries onto the index: the probe
+    "country is located in Asia" went from 50 matches to 40, a strict SUBSET
+    (nothing wrong, ten real matches above the threshold simply missing).
+
+    Set to 2x the requested k with a floor of 64: enough headroom that the
+    outer threshold filter still has k candidates to choose from after the
+    approximate search, without making every query pay for a large ef.
+    """
+    ef = max(64, int(want) * 2)
+    await session.execute(sql_text(f"SET LOCAL hnsw.ef_search = {ef}"))
 
 
 async def relationship_hop(
@@ -1313,17 +1366,22 @@ async def relationship_hop(
         return []
     best: dict[uuid.UUID, dict[str, Any]] = {}
     fr = [str(x) for x in frontier]
+    ceiling = _cosine_to_l2(threshold)
+    await _widen_hnsw(session, limit)
     for probe in probes:
         rows = await session.execute(
             _REL_HOP_SQL,
             {"probe": _vec_str(probe), "frontier": fr,
-             "threshold": threshold, "limit": limit},
+             "l2_ceiling": ceiling, "limit": limit},
         )
-        for rid, src, tgt, sim in rows.all():
+        for rid, src, tgt, dist in rows.all():
+            # Back to cosine for the caller: `sim` is what the walk scores and
+            # what the config thresholds are expressed in.
+            sim = 1.0 - (float(dist) ** 2) / 2.0
             cur = best.get(rid)
-            if cur is None or float(sim) > cur["sim"]:
+            if cur is None or sim > cur["sim"]:
                 best[rid] = {"id": rid, "source_node_id": src,
-                             "target_node_id": tgt, "sim": float(sim)}
+                             "target_node_id": tgt, "sim": sim}
     return sorted(best.values(), key=lambda r: r["sim"], reverse=True)[:limit]
 
 
@@ -1344,32 +1402,48 @@ async def relationship_vector_search(
     if not probes:
         return []
     best: dict[uuid.UUID, dict[str, Any]] = {}
+    ceiling = _cosine_to_l2(threshold)
+    await _widen_hnsw(session, limit)
     for probe in probes:
         rows = await session.execute(
             _REL_GLOBAL_SQL,
-            {"probe": _vec_str(probe), "threshold": threshold, "limit": limit},
+            {"probe": _vec_str(probe), "l2_ceiling": ceiling, "limit": limit},
         )
-        for rid, src, tgt, sim in rows.all():
+        for rid, src, tgt, dist in rows.all():
+            sim = 1.0 - (float(dist) ** 2) / 2.0
             cur = best.get(rid)
-            if cur is None or float(sim) > cur["sim"]:
+            if cur is None or sim > cur["sim"]:
                 best[rid] = {"id": rid, "source_node_id": src,
-                             "target_node_id": tgt, "sim": float(sim)}
+                             "target_node_id": tgt, "sim": sim}
     return sorted(best.values(), key=lambda r: r["sim"], reverse=True)[:limit]
 
 
+# The worst of the three as originally written: it joined every embedded edge
+# against every entity BEFORE aggregating, so the distance was computed once per
+# (edge, endpoint) pair over the whole table. Now the ordered top-k runs FIRST,
+# on its own and index-servable, and only those rows are joined out to entities.
+# `edge_pool` over-fetches relative to `limit` because several edges can share
+# an endpoint and the class filter discards an unknown fraction.
 _CLASS_BY_RELATION_SQL = sql_text("""
-SELECT e.id, max(1 - (g.embedding <=> CAST(:probe AS vector))) AS sim
-  FROM graphrag.graph_relationships g
+WITH near AS (
+    SELECT g.id, g.source_node_id, g.target_node_id,
+           g.embedding <-> CAST(:probe AS vector) AS d
+      FROM graphrag.graph_relationships g
+     WHERE g.embedding IS NOT NULL
+       AND g.source_node_type = 'entity'
+       AND g.target_node_type = 'entity'
+     ORDER BY g.embedding <-> CAST(:probe AS vector)
+     LIMIT :edge_pool
+)
+SELECT e.id, min(near.d) AS d
+  FROM near
   JOIN graphrag.entities e
-    ON (e.id = g.source_node_id OR e.id = g.target_node_id)
- WHERE g.embedding IS NOT NULL
-   AND g.source_node_type = 'entity'
-   AND g.target_node_type = 'entity'
+    ON (e.id = near.source_node_id OR e.id = near.target_node_id)
+ WHERE near.d <= CAST(:l2_ceiling AS float)
    AND e.class_id = ANY(CAST(:class_ids AS uuid[]))
    AND e.status = 'ACTIVE'
-   AND 1 - (g.embedding <=> CAST(:probe AS vector)) >= CAST(:threshold AS float)
  GROUP BY e.id
- ORDER BY sim DESC
+ ORDER BY d ASC
  LIMIT :limit
 """)
 
@@ -1398,15 +1472,22 @@ async def entities_of_class_by_relation(
         return []
     best: dict[uuid.UUID, float] = {}
     cids = [str(c) for c in class_ids]
+    ceiling = _cosine_to_l2(threshold)
+    # Over-fetch edges: several can share an endpoint, and the class filter
+    # discards an unknown fraction, so a pool the size of `limit` would
+    # routinely return fewer than `limit` entities.
+    pool = max(int(limit) * 20, 200)
+    await _widen_hnsw(session, pool)
     for probe in probes:
         rows = await session.execute(
             _CLASS_BY_RELATION_SQL,
             {"probe": _vec_str(probe), "class_ids": cids,
-             "threshold": threshold, "limit": limit},
+             "l2_ceiling": ceiling, "limit": limit, "edge_pool": pool},
         )
-        for eid, sim in rows.all():
-            if float(sim) > best.get(eid, 0.0):
-                best[eid] = float(sim)
+        for eid, dist in rows.all():
+            sim = 1.0 - (float(dist) ** 2) / 2.0
+            if sim > best.get(eid, 0.0):
+                best[eid] = sim
     return sorted(best.items(), key=lambda kv: kv[1], reverse=True)[:limit]
 
 
