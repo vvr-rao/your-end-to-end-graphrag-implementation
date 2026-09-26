@@ -777,7 +777,7 @@ async def retrieve_and_answer(
             )
             if _doc_ids:
                 doc_chunks = await retrieval_sql.fetch_chunks_for_documents(
-                    session, _doc_ids, limit=300,
+                    session, _doc_ids, qvec, limit=300,
                     per_document_limit=int(
                         _qa_cfg("max_fulltext_chunks_per_document", 50)
                     ),
@@ -916,7 +916,7 @@ async def retrieve_and_answer(
         chunk_doc_map: dict[uuid.UUID, uuid.UUID] = {}
         async with session_scope() as session:
             ft_rows = await retrieval_sql.fetch_fulltext_chunks_for_chunks(
-                session, candidate_chunk_ids,
+                session, candidate_chunk_ids, qvec,
                 limit=int(_qa_cfg("fulltext_bridge_limit", 500)),
                 per_document_limit=int(
                     _qa_cfg("max_fulltext_chunks_per_document", 50)
