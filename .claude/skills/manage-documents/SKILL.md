@@ -38,8 +38,12 @@ uv run python scripts/job_status.py <RUN_ID> 40
 
 **Then fold them into the graph.** New docs create chunks but NOT yet entities or
 artifacts. Re-run the extraction steps — each is idempotent and processes only the
-new, unprocessed chunks: `extract-entities`, `enrich-time`, `generate-artifacts`
-(see **ingest-corpus** Steps 3–5). **If the corpus is full-text (`fulltext=yes`),
+new, unprocessed chunks: `extract-entities`, `enrich-time`, `enrich-geo` +
+`embed-relationships`, `generate-artifacts` (see **ingest-corpus** Steps 3–5,
+including Step 4b). **`embed-relationships` matters most here**: new documents
+bring new edges, and an unembedded edge is invisible to the relation-matched
+walk -- silently, with no error. `extract-entities` embeds the edges it writes,
+but `enrich-geo`'s are new, so run it after. **If the corpus is full-text (`fulltext=yes`),
 run all three with `--from-fulltext`** — the same consistency rule as the initial
 ingest. Record it:
 ```

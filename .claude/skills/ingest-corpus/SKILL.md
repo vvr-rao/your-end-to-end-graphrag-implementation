@@ -32,9 +32,18 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
 - **Record each step** so the cross-session tracker can resume after a restart.
 - **Full-text consistency (important).** `--full-text-chunks` at Step 2 stores BOTH
   summary and full-text chunks — but `extract-entities` and `generate-artifacts`
-  default to the *summary* chunks. So **whenever full-text was ingested, you MUST
-  pass `--from-fulltext` to Steps 3, 4, AND 5** (`extract-entities`, `enrich-time`,
-  `generate-artifacts`), or the full-text chunks you paid to store are never mined.
+  default to the *summary* chunks. Decide DELIBERATELY which you want, and apply
+  the same choice to Steps 3, 4 and 5 so the graph is internally consistent.
+  - **(A) extract from summaries** (cheap, the default). Retrieval STILL serves
+    answers from the full-text chunks -- its full-text bridge swaps them in
+    document-by-document -- so they are not wasted. What you give up is direct
+    entity edges into verbatim text: the graph reaches full text only through
+    that bridge and the document arm.
+  - **(B) `--from-fulltext` on Steps 3, 4 AND 5** (~18x the LLM calls). Entities
+    and artifacts are mined from verbatim text, so the graph points straight at
+    it. Worth it when the corpus is dense with facts summaries drop.
+  Do NOT describe (A) as leaving the full-text chunks "never mined" -- they are
+  embedded and retrieved; only extraction skips them.
   The choice is stored in the tracker as `fulltext=yes|no` on the
   `register-documents` step — check it (`build_state.py show`) and apply
   `--from-fulltext` consistently across all three downstream steps.
@@ -249,6 +258,41 @@ cheap — run in the foreground. **Add `--from-fulltext` if Step 2 recorded
 uv run python -m backend.app.cli enrich-time [--from-fulltext (REQUIRED if fulltext=yes)]
 uv run python scripts/build_state.py record enrich-time instances=<n>
 ```
+
+## Step 4b — enrich-geo + embed-relationships (short, ~cents)
+Two small steps that the relationship-aware retrieval depends on. Both are cheap
+and fast; run them in the foreground.
+
+**`enrich-geo`** mints geographic containment (`Bangalore -> Republic of India`)
+between places the corpus ALREADY names. Prose never states these, so extraction
+never finds them: a 40-document news corpus had exactly ONE `locatedin` edge, and
+"which cities are in India" had no edge to walk. It adds EDGES, NEVER NODES -- a
+container the corpus does not name is skipped -- and the edges are marked
+`evidence_kind: world_knowledge`, so an answer may use them but they are labelled
+rather than presented as something a document said.
+```
+uv run python -m backend.app.cli enrich-geo [--dry-run] [--limit N]
+```
+Report `created` and `rejected_by_level`. A high `unresolved` count means the
+model named containers the corpus has no entity for -- expected, not a fault. If
+`places=` is near zero on a corpus full of places, the ontology's place classes
+are named something this pass does not recognise; set
+`geo_enrichment.class_labels`.
+
+**`embed-relationships`** vectorises each extracted edge as
+`<source> <relation> <target>`, which is what the relationship-aware walk matches
+a question against. `extract-entities` runs it automatically for the edges IT
+writes, so you only need it explicitly:
+- after `enrich-geo` (its edges are new and unembedded), and
+- on any graph built before migration 0008 (idempotent -- embeds only NULLs).
+```
+uv run python -m backend.app.cli embed-relationships [--dry-run]
+```
+Costs embeddings only: a few cents per 100k edges.
+
+**Both are required for the graph to be walkable by relation.** Skip them and
+retrieval still works, but it falls back to the broad neighbourhood walk and
+loses the relation-matched hop -- silently, with no error.
 
 ## Step 5 — generate-artifacts (Claims/Findings/… ; long, paid)
 Per-chunk `Claim`/`Finding`/`Observation`/`Event` + per-doc `Summary`. Opt-in

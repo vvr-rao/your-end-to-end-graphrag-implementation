@@ -197,6 +197,34 @@ hierarchy -- generated ontologies get it locally wrong. Measured: one ontology
 put `Player` under `Organization` while `BaseballPlayer` sat under `Person`, so
 no downward walk could connect them.
 
+## Reaching content deep inside a long document
+
+Worth knowing when someone asks why a fact in the back half of a filing is not
+found.
+
+**Entity edges only ever point at SUMMARY chunks** -- `extract-entities` defaults
+to `kind='summary'` -- so the graph cannot reach a full-text chunk directly.
+Every route to verbatim text is document-mediated, and there are exactly two:
+
+    graph -> summary chunks -> their documents -> full-text chunks   (full-text bridge)
+    query embedding -> nearest documents -> full-text chunks         (document arm)
+
+Both cap each document's contribution at `qa.max_fulltext_chunks_per_document`
+(50). Until 2026-09-26 both also chose WHICH chunks by `chunk_index`, i.e. the
+front of the file -- so a 476-chunk annual report could only ever offer its first
+50, and 426 chunks (89%) were unreachable by any path. Measured on that corpus,
+asking for BHP's FY2025 carbon price assumptions (chunk 299) and its shareholder
+register (chunk 449) returned "the retrieved evidence contains no ..." while the
+text sat in the database. Both now rank by embedding distance to the question, and
+both answer.
+
+Two consequences to pass on:
+- **A document longer than ~50 chunks still only contributes 50.** Relevance now
+  picks which, but a question needing broad coverage of one long document may want
+  `qa.max_fulltext_chunks_per_document` raised.
+- **`--from-fulltext` at extraction is the other lever.** It gives the graph direct
+  entity edges into verbatim text, bypassing both bridges -- at ~18x the LLM calls.
+
 ## Entity-to-entity relationships
 
 `extract-entities` mints typed `entity -> entity` edges. It runs as **TWO LLM
@@ -248,6 +276,7 @@ Other things worth knowing:
 `uv run python -m backend.app.cli <subcommand>`. Discover everything with
 `uv run python -m backend.app.cli --help`. Groups: ontology (`merge`, `prune`,
 `expand`, `prune-expand`, `build`), DB (`db-migrate`, `db-status`, `db-size`,
+`enrich-geo`, `embed-relationships`,
 `db-init`, `clear-corpus`), corpus (`register-documents`, `list-documents`,
 `update-document`, `delete-document`), enrichment (`extract-entities`,
 `enrich-time`, `generate-artifacts`), retrieval (`query`, `evaluate-queries`,
