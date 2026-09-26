@@ -79,6 +79,14 @@ uv run python scripts/build_state.py record database kind=<local|external>
 ```
 - Success looks like: alembic upgrade to head + a db-status report (schema
   present, tables listed, size comfortably within the database's storage limit).
+- **On an EXISTING database, `db-init` still migrates it -- run it anyway after
+  pulling new code.** Migrations are not only schema: `0008` added the
+  relationship embedding column and `0009` the HNSW index that the
+  relationship-aware walk searches through. Without them the walk silently falls
+  back to the broad neighbourhood walk, with no error to notice. A graph built
+  before `0008` also needs a one-off
+  `uv run python -m backend.app.cli embed-relationships` to backfill the vectors
+  (idempotent, embeddings only, a few cents per 100k edges).
 - If it fails to connect: the fix is almost always `DATABASE_URL` in `.env`
   (typo, wrong host, direct-vs-pooler for Supabase, or pgvector not enabled).
   Point the user back to `.env`; never ask for the string in chat.

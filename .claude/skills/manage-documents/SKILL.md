@@ -38,10 +38,25 @@ uv run python scripts/job_status.py <RUN_ID> 40
 
 **Then fold them into the graph.** New docs create chunks but NOT yet entities or
 artifacts. Re-run the extraction steps — each is idempotent and processes only the
-new, unprocessed chunks: `extract-entities`, `enrich-time`, `generate-artifacts`
-(see **ingest-corpus** Steps 3–5). **If the corpus is full-text (`fulltext=yes`),
+new, unprocessed chunks: `extract-entities`, `enrich-time`, `enrich-geo` +
+`embed-relationships`, `generate-artifacts` (see **ingest-corpus** Steps 3–5,
+including Step 4b). **`embed-relationships` matters most here**: new documents
+bring new edges, and an unembedded edge is invisible to the relation-matched
+walk -- silently, with no error. `extract-entities` embeds the edges it writes,
+but `enrich-geo`'s are new, so run it after. **If the corpus is full-text (`fulltext=yes`),
 run all three with `--from-fulltext`** — the same consistency rule as the initial
-ingest. Record it:
+ingest.
+
+**Report the two coverage percentages for the NEW documents** exactly as
+**ingest-corpus** Step 3 specifies — abstained entities as a % of mentions, and
+`relatedTo` edges as a % of edges written, each with the absolute numbers. These
+matter more on an incremental add than on the first ingest: the ontology was
+fitted to the ORIGINAL corpus, so new documents on a new topic are where
+coverage degrades first. A jump against the initial ingest's figures is the
+earliest signal that the added documents need an ontology the current one does
+not cover — compare them and say whether they moved.
+
+Record it:
 ```
 uv run python scripts/build_state.py record add-documents docs=<n> fulltext=<yes|no>
 ```
@@ -64,6 +79,18 @@ document → **STALE** (mixed-source artifacts stay `ACTIVE`). Follow up with
 `extract-entities` (covers the new chunks) and **`regenerate-stale-artifacts`**
 (regenerates artifacts for the new version + retires the stale rows) — see below.
 Corpus synonyms refresh automatically (this routes through the same ingest path).
+
+## Repair: artifacts linked to the wrong entities
+`relink-artifact-entities` re-links intelligence artifacts to entities by ALIAS as
+well as canonical name. It exists because the original linker required the full
+canonical name, so an artifact about "FTX" missed the entity stored as
+"FTX Trading Ltd." -- measured, only 3 of 59 FTX artifacts were linked, and the
+repair added 1,150 edges on one corpus. No LLM calls, additive, safe to re-run.
+```
+uv run python -m backend.app.cli relink-artifact-entities [--dry-run]
+```
+Run it after a bulk add if artifact-grounded answers seem to be missing entities
+they should mention. `--dry-run` reports how many edges WOULD be added.
 
 ## Delete a document
 ```bash

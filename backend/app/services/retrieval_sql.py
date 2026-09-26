@@ -20,6 +20,7 @@ to avoid infinite loops on densely-connected ontology fragments.
 """
 from __future__ import annotations
 
+import math
 import uuid
 from typing import Any
 
@@ -231,32 +232,52 @@ async def fetch_relationships_among_entities(
     return out
 
 
+_ENTITY_CHUNKS_SQL = sql_text("""
+SELECT gr.source_chunk_id, sum(w.weight) AS score
+  FROM graphrag.graph_relationships gr
+  JOIN unnest(CAST(:entity_ids AS uuid[]), CAST(:weights AS float8[]))
+         AS w(id, weight)
+    ON w.id = gr.target_node_id
+ WHERE gr.predicate_label = 'viao:assertsAbout'
+   AND gr.relationship_source = 'DOCUMENT_EXTRACTION'
+   AND gr.target_node_type = 'entity'
+   AND gr.source_chunk_id IS NOT NULL
+ GROUP BY gr.source_chunk_id
+ ORDER BY score DESC
+ LIMIT :limit
+""")
+
+
 async def fetch_candidate_chunks_for_entities(
     session: AsyncSession,
     entity_ids: list[uuid.UUID],
     *,
     limit: int = 500,
+    weights: dict[uuid.UUID, float] | None = None,
 ) -> list[tuple[uuid.UUID, float]]:
-    """Chunks that assertAbout any of the given entities. Ordered by
-    how many of the listed entities each chunk asserts about."""
+    """Chunks that assertAbout any of the given entities, best-first.
+
+    `weights` is how much each entity's mention counts. Without it every entity
+    counts 1.0, so the ranking is a plain count of how many of the listed
+    entities a chunk mentions -- which is what this did unconditionally, and it
+    threw away the only relevance signal the graph had. The relationship walk
+    computes `sim * decay^hop` per entity (a seed matched at 0.95 versus
+    something reached at hop 3 for 0.55 * 0.7^3 = 0.19), and that score never
+    reached the ranking: a chunk mentioning five weakly-reached entities
+    outranked one mentioning a single strong seed.
+
+    Passing no weights reproduces the old ordering exactly, so the caller can
+    opt in per query.
+    """
     if not entity_ids:
         return []
+    ws = [float((weights or {}).get(eid, 1.0)) for eid in entity_ids]
     result = await session.execute(
-        sql_text("""
-        SELECT gr.source_chunk_id, count(*) AS hits
-          FROM graphrag.graph_relationships gr
-         WHERE gr.predicate_label = 'viao:assertsAbout'
-           AND gr.relationship_source = 'DOCUMENT_EXTRACTION'
-           AND gr.target_node_type = 'entity'
-           AND gr.target_node_id = ANY(CAST(:entity_ids AS uuid[]))
-           AND gr.source_chunk_id IS NOT NULL
-         GROUP BY gr.source_chunk_id
-         ORDER BY hits DESC
-         LIMIT :limit
-        """),
-        {"entity_ids": [str(eid) for eid in entity_ids], "limit": limit},
+        _ENTITY_CHUNKS_SQL,
+        {"entity_ids": [str(eid) for eid in entity_ids],
+         "weights": ws, "limit": limit},
     )
-    return [(cid, float(hits)) for cid, hits in result.all()]
+    return [(cid, float(score)) for cid, score in result.all()]
 
 
 async def fetch_candidate_chunks_for_time_instances(
@@ -383,6 +404,7 @@ async def fetch_table_artifacts_for_chunks(
 async def fetch_fulltext_chunks_for_chunks(
     session: AsyncSession,
     chunk_ids: list[uuid.UUID],
+    probe_embedding: list[float],
     *,
     limit: int = 500,
     per_document_limit: int = 50,
@@ -423,7 +445,16 @@ async def fetch_fulltext_chunks_for_chunks(
             SELECT ft.id, cd.n_chunks::float AS hits, ft.document_id,
                    ft.chunk_index,
                    row_number() OVER (
-                       PARTITION BY ft.document_id ORDER BY ft.chunk_index
+                       PARTITION BY ft.document_id
+                       -- BY RELEVANCE. Same defect as the document arm, and
+                       -- it mattered more here: entity edges only ever point
+                       -- at SUMMARY chunks (extract-entities defaults to
+                       -- kind='summary'), so the graph cannot reach a
+                       -- full-text chunk directly -- this bridge and the
+                       -- document arm are the ONLY routes to verbatim text,
+                       -- and both took the first `per_doc` by file position.
+                       ORDER BY ft.embedding <-> CAST(:probe AS vector),
+                                ft.chunk_index
                    ) AS rn
               FROM graphrag.chunks ft
               JOIN candidate_docs cd ON cd.document_id = ft.document_id
@@ -434,13 +465,14 @@ async def fetch_fulltext_chunks_for_chunks(
         SELECT id, hits, document_id
           FROM ranked
          WHERE rn <= :per_doc
-         ORDER BY hits DESC, chunk_index
+         ORDER BY hits DESC, rn
          LIMIT :limit
         """),
         {
             "chunk_ids": [str(cid) for cid in chunk_ids],
             "limit": limit,
             "per_doc": per_document_limit,
+            "probe": _vec_str(probe_embedding),
         },
     )
     return [(cid, float(hits), did) for cid, hits, did in result.all()]
@@ -731,6 +763,7 @@ async def vector_search_documents(
 async def fetch_chunks_for_documents(
     session: AsyncSession,
     document_ids: list[uuid.UUID],
+    probe_embedding: list[float],
     *,
     limit: int = 300,
     per_document_limit: int = 50,
@@ -763,7 +796,20 @@ async def fetch_chunks_for_documents(
         WITH eligible AS (
             SELECT c.id, c.document_id, c.chunk_index,
                    row_number() OVER (
-                       PARTITION BY c.document_id ORDER BY c.chunk_index
+                       PARTITION BY c.document_id
+                       -- BY RELEVANCE, not by position in the file. Ranking
+                       -- the per-document window by `chunk_index` meant a
+                       -- document could only ever contribute its FIRST
+                       -- `per_doc` chunks: measured on a 476-chunk BHP annual
+                       -- report, 426 chunks (89%) were unreachable by any
+                       -- path, and the survivors were the front matter. Asked
+                       -- for its FY2025 carbon price assumptions (chunk ~300)
+                       -- and its shareholder register (chunk ~450), retrieval
+                       -- declined -- the text was in the corpus and could not
+                       -- be reached. A 10-K's first 50 chunks are the cover
+                       -- and the table of contents.
+                       ORDER BY c.embedding <-> CAST(:probe AS vector),
+                                c.chunk_index
                    ) AS rn
               FROM graphrag.chunks c
              WHERE c.document_id = ANY(CAST(:ids AS uuid[]))
@@ -780,14 +826,15 @@ async def fetch_chunks_for_documents(
          WHERE rn <= :per_doc
          -- Order by the caller's document ranking BEFORE truncating, so
          -- the limit trims the least-relevant documents rather than an
-         -- arbitrary slice.
-         ORDER BY array_position(CAST(:ids AS uuid[]), document_id), chunk_index
+         -- arbitrary slice. Within a document, `rn` is now relevance order.
+         ORDER BY array_position(CAST(:ids AS uuid[]), document_id), rn
          LIMIT :limit
         """),
         {
             "ids": [str(d) for d in document_ids],
             "limit": limit,
             "per_doc": per_document_limit,
+            "probe": _vec_str(probe_embedding),
         },
     )
     out: list[tuple[uuid.UUID, float]] = []
@@ -1266,31 +1313,83 @@ async def fetch_artifact_rows(
 # was asked. Edges with no vector (ontology TBox rows, graphs built before
 # 0008) are invisible here; callers fall back to `bfs_expand`.
 
+# COSINE THRESHOLDS, L2 ORDERING. The embeddings are unit-normalised
+# (`text-embedding-3-small` @ 1024; measured mean norm 0.999996 over 200 rows),
+# so `l2 = sqrt(2 - 2*cos)` holds exactly -- verified at 0.942705 vs 0.942740 on
+# a real pair -- which makes ordering by L2 ascending identical to ordering by
+# cosine descending. Using `<->` is therefore not an approximation, and it is
+# what lets the HNSW index (`vector_l2_ops`) serve the query at all: these three
+# searches were originally written with `<=>`, the only cosine queries in this
+# file, and pgvector cannot answer a cosine ordering from an L2 index. Measured
+# on the 66-document build, every one of them fell back to a sequential scan.
+#
+# The threshold is applied OUTSIDE the ordered subquery, not in its WHERE. A
+# predicate over the distance forces it to be computed for every row, which
+# defeats the index just as surely as the wrong operator did. Top-k then filter
+# is how every other vector search in this file already works.
+#
+# Consequence worth knowing: at most `limit` rows come back even when more clear
+# the threshold. `relationship_hop`'s per-hop cap already bounded this.
+def _cosine_to_l2(cosine: float) -> float:
+    """The L2 distance equivalent to a cosine-similarity floor, for unit vectors.
+
+    cos >= t  <=>  l2 <= sqrt(2 - 2t).  Config stays in cosine terms because
+    that is what the thresholds were measured in (0.55 for the hop, 0.40 for
+    relation-filtered class seeding).
+    """
+    return math.sqrt(max(0.0, 2.0 - 2.0 * float(cosine)))
+
+
 _REL_HOP_SQL = sql_text("""
-SELECT g.id, g.source_node_id, g.target_node_id,
-       1 - (g.embedding <=> CAST(:probe AS vector)) AS sim
-  FROM graphrag.graph_relationships g
- WHERE g.embedding IS NOT NULL
-   AND g.source_node_type = 'entity'
-   AND g.target_node_type = 'entity'
-   AND (g.source_node_id = ANY(CAST(:frontier AS uuid[]))
-     OR g.target_node_id = ANY(CAST(:frontier AS uuid[])))
-   AND 1 - (g.embedding <=> CAST(:probe AS vector)) >= CAST(:threshold AS float)
- ORDER BY sim DESC
- LIMIT :limit
+SELECT t.id, t.source_node_id, t.target_node_id, t.d
+  FROM (
+    SELECT g.id, g.source_node_id, g.target_node_id,
+           g.embedding <-> CAST(:probe AS vector) AS d
+      FROM graphrag.graph_relationships g
+     WHERE g.embedding IS NOT NULL
+       AND g.source_node_type = 'entity'
+       AND g.target_node_type = 'entity'
+       AND (g.source_node_id = ANY(CAST(:frontier AS uuid[]))
+         OR g.target_node_id = ANY(CAST(:frontier AS uuid[])))
+     ORDER BY g.embedding <-> CAST(:probe AS vector)
+     LIMIT :limit
+  ) t
+ WHERE t.d <= CAST(:l2_ceiling AS float)
+ ORDER BY t.d
 """)
 
 _REL_GLOBAL_SQL = sql_text("""
-SELECT g.id, g.source_node_id, g.target_node_id,
-       1 - (g.embedding <=> CAST(:probe AS vector)) AS sim
-  FROM graphrag.graph_relationships g
- WHERE g.embedding IS NOT NULL
-   AND g.source_node_type = 'entity'
-   AND g.target_node_type = 'entity'
-   AND 1 - (g.embedding <=> CAST(:probe AS vector)) >= CAST(:threshold AS float)
- ORDER BY sim DESC
- LIMIT :limit
+SELECT t.id, t.source_node_id, t.target_node_id, t.d
+  FROM (
+    SELECT g.id, g.source_node_id, g.target_node_id,
+           g.embedding <-> CAST(:probe AS vector) AS d
+      FROM graphrag.graph_relationships g
+     WHERE g.embedding IS NOT NULL
+       AND g.source_node_type = 'entity'
+       AND g.target_node_type = 'entity'
+     ORDER BY g.embedding <-> CAST(:probe AS vector)
+     LIMIT :limit
+  ) t
+ WHERE t.d <= CAST(:l2_ceiling AS float)
+ ORDER BY t.d
 """)
+
+
+async def _widen_hnsw(session: AsyncSession, want: int) -> None:
+    """Raise `hnsw.ef_search` for this transaction so a top-k scan can return k.
+
+    pgvector defaults `ef_search` to 40, and HNSW never returns more candidates
+    than that however large the LIMIT -- so a `LIMIT 50` silently came back with
+    40 rows. Measured while switching these queries onto the index: the probe
+    "country is located in Asia" went from 50 matches to 40, a strict SUBSET
+    (nothing wrong, ten real matches above the threshold simply missing).
+
+    Set to 2x the requested k with a floor of 64: enough headroom that the
+    outer threshold filter still has k candidates to choose from after the
+    approximate search, without making every query pay for a large ef.
+    """
+    ef = max(64, int(want) * 2)
+    await session.execute(sql_text(f"SET LOCAL hnsw.ef_search = {ef}"))
 
 
 async def relationship_hop(
@@ -1313,17 +1412,22 @@ async def relationship_hop(
         return []
     best: dict[uuid.UUID, dict[str, Any]] = {}
     fr = [str(x) for x in frontier]
+    ceiling = _cosine_to_l2(threshold)
+    await _widen_hnsw(session, limit)
     for probe in probes:
         rows = await session.execute(
             _REL_HOP_SQL,
             {"probe": _vec_str(probe), "frontier": fr,
-             "threshold": threshold, "limit": limit},
+             "l2_ceiling": ceiling, "limit": limit},
         )
-        for rid, src, tgt, sim in rows.all():
+        for rid, src, tgt, dist in rows.all():
+            # Back to cosine for the caller: `sim` is what the walk scores and
+            # what the config thresholds are expressed in.
+            sim = 1.0 - (float(dist) ** 2) / 2.0
             cur = best.get(rid)
-            if cur is None or float(sim) > cur["sim"]:
+            if cur is None or sim > cur["sim"]:
                 best[rid] = {"id": rid, "source_node_id": src,
-                             "target_node_id": tgt, "sim": float(sim)}
+                             "target_node_id": tgt, "sim": sim}
     return sorted(best.values(), key=lambda r: r["sim"], reverse=True)[:limit]
 
 
@@ -1344,32 +1448,48 @@ async def relationship_vector_search(
     if not probes:
         return []
     best: dict[uuid.UUID, dict[str, Any]] = {}
+    ceiling = _cosine_to_l2(threshold)
+    await _widen_hnsw(session, limit)
     for probe in probes:
         rows = await session.execute(
             _REL_GLOBAL_SQL,
-            {"probe": _vec_str(probe), "threshold": threshold, "limit": limit},
+            {"probe": _vec_str(probe), "l2_ceiling": ceiling, "limit": limit},
         )
-        for rid, src, tgt, sim in rows.all():
+        for rid, src, tgt, dist in rows.all():
+            sim = 1.0 - (float(dist) ** 2) / 2.0
             cur = best.get(rid)
-            if cur is None or float(sim) > cur["sim"]:
+            if cur is None or sim > cur["sim"]:
                 best[rid] = {"id": rid, "source_node_id": src,
-                             "target_node_id": tgt, "sim": float(sim)}
+                             "target_node_id": tgt, "sim": sim}
     return sorted(best.values(), key=lambda r: r["sim"], reverse=True)[:limit]
 
 
+# The worst of the three as originally written: it joined every embedded edge
+# against every entity BEFORE aggregating, so the distance was computed once per
+# (edge, endpoint) pair over the whole table. Now the ordered top-k runs FIRST,
+# on its own and index-servable, and only those rows are joined out to entities.
+# `edge_pool` over-fetches relative to `limit` because several edges can share
+# an endpoint and the class filter discards an unknown fraction.
 _CLASS_BY_RELATION_SQL = sql_text("""
-SELECT e.id, max(1 - (g.embedding <=> CAST(:probe AS vector))) AS sim
-  FROM graphrag.graph_relationships g
+WITH near AS (
+    SELECT g.id, g.source_node_id, g.target_node_id,
+           g.embedding <-> CAST(:probe AS vector) AS d
+      FROM graphrag.graph_relationships g
+     WHERE g.embedding IS NOT NULL
+       AND g.source_node_type = 'entity'
+       AND g.target_node_type = 'entity'
+     ORDER BY g.embedding <-> CAST(:probe AS vector)
+     LIMIT :edge_pool
+)
+SELECT e.id, min(near.d) AS d
+  FROM near
   JOIN graphrag.entities e
-    ON (e.id = g.source_node_id OR e.id = g.target_node_id)
- WHERE g.embedding IS NOT NULL
-   AND g.source_node_type = 'entity'
-   AND g.target_node_type = 'entity'
+    ON (e.id = near.source_node_id OR e.id = near.target_node_id)
+ WHERE near.d <= CAST(:l2_ceiling AS float)
    AND e.class_id = ANY(CAST(:class_ids AS uuid[]))
    AND e.status = 'ACTIVE'
-   AND 1 - (g.embedding <=> CAST(:probe AS vector)) >= CAST(:threshold AS float)
  GROUP BY e.id
- ORDER BY sim DESC
+ ORDER BY d ASC
  LIMIT :limit
 """)
 
@@ -1398,15 +1518,22 @@ async def entities_of_class_by_relation(
         return []
     best: dict[uuid.UUID, float] = {}
     cids = [str(c) for c in class_ids]
+    ceiling = _cosine_to_l2(threshold)
+    # Over-fetch edges: several can share an endpoint, and the class filter
+    # discards an unknown fraction, so a pool the size of `limit` would
+    # routinely return fewer than `limit` entities.
+    pool = max(int(limit) * 20, 200)
+    await _widen_hnsw(session, pool)
     for probe in probes:
         rows = await session.execute(
             _CLASS_BY_RELATION_SQL,
             {"probe": _vec_str(probe), "class_ids": cids,
-             "threshold": threshold, "limit": limit},
+             "l2_ceiling": ceiling, "limit": limit, "edge_pool": pool},
         )
-        for eid, sim in rows.all():
-            if float(sim) > best.get(eid, 0.0):
-                best[eid] = float(sim)
+        for eid, dist in rows.all():
+            sim = 1.0 - (float(dist) ** 2) / 2.0
+            if sim > best.get(eid, 0.0):
+                best[eid] = sim
     return sorted(best.items(), key=lambda kv: kv[1], reverse=True)[:limit]
 
 

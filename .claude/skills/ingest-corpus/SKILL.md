@@ -32,9 +32,18 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
 - **Record each step** so the cross-session tracker can resume after a restart.
 - **Full-text consistency (important).** `--full-text-chunks` at Step 2 stores BOTH
   summary and full-text chunks — but `extract-entities` and `generate-artifacts`
-  default to the *summary* chunks. So **whenever full-text was ingested, you MUST
-  pass `--from-fulltext` to Steps 3, 4, AND 5** (`extract-entities`, `enrich-time`,
-  `generate-artifacts`), or the full-text chunks you paid to store are never mined.
+  default to the *summary* chunks. Decide DELIBERATELY which you want, and apply
+  the same choice to Steps 3, 4 and 5 so the graph is internally consistent.
+  - **(A) extract from summaries** (cheap, the default). Retrieval STILL serves
+    answers from the full-text chunks -- its full-text bridge swaps them in
+    document-by-document -- so they are not wasted. What you give up is direct
+    entity edges into verbatim text: the graph reaches full text only through
+    that bridge and the document arm.
+  - **(B) `--from-fulltext` on Steps 3, 4 AND 5** (~18x the LLM calls). Entities
+    and artifacts are mined from verbatim text, so the graph points straight at
+    it. Worth it when the corpus is dense with facts summaries drop.
+  Do NOT describe (A) as leaving the full-text chunks "never mined" -- they are
+  embedded and retrieved; only extraction skips them.
   The choice is stored in the tracker as `fulltext=yes|no` on the
   `register-documents` step — check it (`build_state.py show`) and apply
   `--from-fulltext` consistently across all three downstream steps.
@@ -188,6 +197,47 @@ those entities' actual classes. The run prints a line to report back:
     (unresolved=.., bad_predicate=.., domain_range=.., no_evidence=..)
 ```
 
+### ALWAYS report two coverage percentages, not just the raw counts
+The run prints absolute numbers; a count alone does not tell the user whether
+the ontology fits their corpus. Compute both and report **percentage AND
+absolute**, because each answers a different question -- the percentage says how
+well the ontology fits, the absolute says how much was actually lost.
+
+**1. Entities dropped for want of a class.** From the `entity drops:` line and
+the `DONE: entities (minted=N` line:
+```
+abstained % = abstained / (minted + abstained) * 100
+```
+Report as: `"X% of entity mentions were dropped (N of M) because no ontology
+class fit them"`, and name 3-5 of the examples the run prints. Then say which
+of the two causes it is -- they need different fixes and the log's own wording
+picks the wrong one often enough to check:
+- If the `recovered ... abstention(s) whose proposed_type named a class that
+  EXISTS` count is **also high**, the menu is too narrow, NOT the ontology. A
+  prune-expand run would not help; `--candidate-classes` or
+  `extraction.pinned_class_labels` would.
+- If the abstained examples are things the ontology plainly *should* cover
+  (an organisation when `Organization` is pinned), it is neither -- flag it as
+  unexplained rather than recommending a prune-expand run.
+Anything **over ~15%** is worth calling out explicitly as a coverage problem.
+Measured reference: a 66-doc corpus with a corpus-fitted 2,160-class ontology
+still abstained on **12.5% (459 of 3,680)**, so double digits is normal and a
+fitted ontology does not drive it to zero.
+
+**2. Relationships that fell back to the generic predicate.** From the
+`relatedTo (no ontology predicate fitted)` line:
+```
+relatedTo % = relatedTo / total edges written * 100
+```
+Report as: `"Y% of relationships (N of M) had no matching ontology predicate and
+were recorded as graphrag:relatedTo, keeping the passage's own phrase"`. These
+edges are NOT lost -- they are traversable and vector-searchable on that phrase
+-- so present this as a vocabulary gap, not a failure. The run also histograms
+the most common phrases; quote the top few, because they are a concrete
+shopping list of predicates the ontology is missing. Measured reference: the
+same 66-doc run routed **15.2% (178 of 1,173)** to relatedTo, with
+`has capacity` x24 and `ranked above` x12 at the top.
+
 **Before launching, confirm all THREE relationship tasks are in
 `config/models.yaml`.** They are NEW tasks; a config predating them makes the
 step print a one-line notice and quietly do less -- easy to miss in a long log,
@@ -223,6 +273,13 @@ What to tell the user afterwards:
   The largest rejection bucket is `domain_range`: the ontology offers no
   predicate whose declared domain AND range fit that pair. That is usually a
   vocabulary gap, not a bad extraction.
+- `--orphan-batch-size N` (default 8) -- orphans per `relationship_orphan_check`
+  call. The check is what rescues entities both relationship passes missed, and
+  its recall collapses on a long list: measured, a 31-orphan call proposed 2
+  rescues where the same model asked about ONE found the edge at 0.95 confidence.
+  Batching at 8 moved edges 192 -> 226 (+18%) and still-unlinked 1066 -> 926 on a
+  30-document corpus, for +48% on this step's cost ($2.09 -> $3.10). Raise it to
+  cut cost at the price of recall; lower it to spend more for more edges.
 - `--no-relationships` reproduces the older entity-only behaviour.
 - `--no-verify-relationships` skips the third pass. Only for reproducing
   pre-verification behaviour; it lets contradicting quotes through.
@@ -249,6 +306,42 @@ cheap — run in the foreground. **Add `--from-fulltext` if Step 2 recorded
 uv run python -m backend.app.cli enrich-time [--from-fulltext (REQUIRED if fulltext=yes)]
 uv run python scripts/build_state.py record enrich-time instances=<n>
 ```
+
+## Step 4b — enrich-geo + embed-relationships (short, ~cents)
+Two small steps that the relationship-aware retrieval depends on. Both are cheap
+and fast; run them in the foreground.
+
+**`enrich-geo`** mints geographic containment (`Bangalore -> Republic of India`)
+between places the corpus ALREADY names. Prose never states these, so extraction
+never finds them: a 40-document news corpus had exactly ONE `locatedin` edge, and
+"which cities are in India" had no edge to walk. It adds EDGES, NEVER NODES -- a
+container the corpus does not name is skipped -- and the edges are marked
+`evidence_kind: world_knowledge`, so an answer may use them but they are labelled
+rather than presented as something a document said.
+```
+uv run python -m backend.app.cli enrich-geo [--dry-run] [--limit N]
+```
+Report `created` and `rejected_by_level`. A high `unresolved` count means the
+model named containers the corpus has no entity for -- expected, not a fault. If
+`places=` is near zero on a corpus full of places, the ontology's place classes
+are named something this pass does not recognise; set
+`geo_enrichment.class_labels`.
+
+**`embed-relationships`** vectorises each extracted edge as
+`<source> <relation> <target>`, which is what the relationship-aware walk matches
+a question against. `extract-entities` runs it automatically for the edges IT
+writes, so you only need it explicitly:
+- after `enrich-geo` (its edges are new and unembedded), and
+- on any graph built before migration 0008 (idempotent -- embeds only NULLs).
+```
+uv run python -m backend.app.cli embed-relationships [--dry-run]
+uv run python scripts/build_state.py record enrich-geo edges=<n>
+```
+Costs embeddings only: a few cents per 100k edges.
+
+**Both are required for the graph to be walkable by relation.** Skip them and
+retrieval still works, but it falls back to the broad neighbourhood walk and
+loses the relation-matched hop -- silently, with no error.
 
 ## Step 5 — generate-artifacts (Claims/Findings/… ; long, paid)
 Per-chunk `Claim`/`Finding`/`Observation`/`Event` + per-doc `Summary`. Opt-in

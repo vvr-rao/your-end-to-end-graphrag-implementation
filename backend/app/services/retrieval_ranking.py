@@ -28,6 +28,7 @@ def rrf_fuse(
     ranked_lists: list[list[uuid.UUID]],
     *,
     k: int = 60,
+    weights: list[float] | None = None,
 ) -> list[tuple[uuid.UUID, float]]:
     """Reciprocal Rank Fusion. Each `ranked_lists[i]` is an ordered
     list of UUIDs (best first). Returns a single sorted (uuid, score)
@@ -35,11 +36,27 @@ def rrf_fuse(
 
     Candidates appearing in more lists, or higher in any one list, get
     more weight. Empty lists are ignored.
+
+    `weights` scales each list's contribution; it defaults to 1.0 for every
+    list, which is what this did unconditionally. That default treats every
+    voter as equally informative, and they are not: a chunk reached by a
+    relationship hop whose stored text MATCHES the question's relation is a
+    far more specific claim than a chunk that merely sits in a document with a
+    similar embedding. Unweighted, the precise path contributes 1/(k+rank)
+    while a chunk near the top of three probe rankings collects 3/(k+rank) and
+    outvotes it 3:1 -- so the walk's precision was diluted by being a minority
+    voter rather than by anything about the walk itself.
+
+    Passing no weights reproduces the old scores exactly.
     """
     scores: dict[uuid.UUID, float] = defaultdict(float)
-    for lst in ranked_lists:
+    ws = list(weights or [])
+    for i, lst in enumerate(ranked_lists):
+        w = float(ws[i]) if i < len(ws) else 1.0
+        if w == 0.0:
+            continue
         for rank, cid in enumerate(lst, start=1):
-            scores[cid] += 1.0 / (k + rank)
+            scores[cid] += w / (k + rank)
     return sorted(scores.items(), key=lambda kv: -kv[1])
 
 

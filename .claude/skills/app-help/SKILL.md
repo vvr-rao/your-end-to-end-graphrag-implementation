@@ -197,6 +197,105 @@ hierarchy -- generated ontologies get it locally wrong. Measured: one ontology
 put `Player` under `Organization` while `BaseballPlayer` sat under `Person`, so
 no downward walk could connect them.
 
+## Tuning retrieval: which knobs actually move results
+
+All of these live under `qa:` in `config.yaml`, each documented there with the
+measurement behind its default. Point people at the few that matter and say
+plainly which do not.
+
+**Worth changing.**
+- `max_fulltext_chunks_per_document` (50) -- the hard ceiling on how much of ONE
+  long document can reach an answer. A 476-chunk annual report contributes 50
+  chunks however relevant the rest. Raise it for corpora of long filings; it costs
+  vector-rerank time, not LLM spend.
+- `document_arm` (`conditional`) -- runs the document arm only where the graph
+  cannot answer. Measured: running it on every query cost precision (41% vs 46%)
+  and bought no gold documents. `always` restores the old behaviour.
+- `relationship_similarity` (0.55) -- the cosine floor for an edge to count as
+  matching a question's relation. Lower fires the relation-matched hop more often
+  on weaker matches; at 0.55 it fires on roughly 10% of questions and the rest
+  fall back to the broad walk.
+- `k_chunks` / `k_documents` -- the ordinary breadth dials.
+
+**Documented but measured NEUTRAL -- do not suggest these as fixes.**
+- `graph_score_weighting` (false) and `rrf_weight_graph_walk` (1.0). Both weight
+  the graph's contribution to RANKING more heavily. On a 182-question gold set,
+  raising the RRF weight degraded every metric monotonically (MRR 0.799 -> 0.774
+  -> 0.744) and score weighting made no difference outside run-to-run noise. The
+  finding is that the graph's value is RECALL, not ranking: its chunk ordering is
+  entity-mention count, a weak signal, and the vector probes rank better.
+
+**A measurement caution to pass on.** Gold-set MRR on a 40-document corpus varies
+by ~0.015 between identical runs, because `question_parse` and `query_decompose`
+are LLM calls. Any retrieval change claiming less than ~0.02 MRR needs repeats
+before it is believable -- a single run showed one of the above as +2.0% and it
+vanished on repeat.
+
+## Reaching content deep inside a long document
+
+Worth knowing when someone asks why a fact in the back half of a filing is not
+found.
+
+**Entity edges only ever point at SUMMARY chunks** -- `extract-entities` defaults
+to `kind='summary'` -- so the graph cannot reach a full-text chunk directly.
+Every route to verbatim text is document-mediated, and there are exactly two:
+
+    graph -> summary chunks -> their documents -> full-text chunks   (full-text bridge)
+    query embedding -> nearest documents -> full-text chunks         (document arm)
+
+Both cap each document's contribution at `qa.max_fulltext_chunks_per_document`
+(50). Until 2026-09-26 both also chose WHICH chunks by `chunk_index`, i.e. the
+front of the file -- so a 476-chunk annual report could only ever offer its first
+50, and 426 chunks (89%) were unreachable by any path. Measured on that corpus,
+asking for BHP's FY2025 carbon price assumptions (chunk 299) and its shareholder
+register (chunk 449) returned "the retrieved evidence contains no ..." while the
+text sat in the database. Both now rank by embedding distance to the question, and
+both answer.
+
+Two consequences to pass on:
+- **A document longer than ~50 chunks still only contributes 50.** Relevance now
+  picks which, but a question needing broad coverage of one long document may want
+  `qa.max_fulltext_chunks_per_document` raised.
+- **`--from-fulltext` at extraction is the other lever.** It gives the graph direct
+  entity edges into verbatim text, bypassing both bridges -- at ~18x the LLM calls.
+
+## What gets dropped, and how to read it
+
+Two numbers decide whether the ontology fits a corpus. `extract-entities` prints
+both as absolute counts; always give the user the **percentage alongside the
+absolute**, because the percentage says how well the ontology fits and the
+absolute says how much was lost.
+
+**Entities with no fitting class are DROPPED, not mis-typed.** `entities.class_id`
+is `NOT NULL`, so an untyped entity cannot be stored. The model returns
+`NONE_OF_THESE` with the type it wanted; if that class exists but simply missed
+the chunk's top-50 menu it is RECOVERED (searching the nearest 400), otherwise
+the mention is discarded and counted as `abstained` with a sample of names.
+```
+abstained % = abstained / (minted + abstained) * 100
+```
+Reference: a 66-doc corpus with a corpus-FITTED 2,160-class ontology still
+abstained on **12.5% (459 of 3,680)**, while recovering 295 off-menu ones. So
+double digits is normal, and a fitted ontology does not drive it to zero. Above
+~15% is a real coverage problem. Read it with care, because three different
+causes look identical in the total:
+- high `recovered ... proposed_type` alongside it -> the MENU is too narrow, not
+  the ontology (`--candidate-classes`, `extraction.pinned_class_labels`)
+- examples the ontology plainly covers (an organisation while `Organization` is
+  pinned) -> neither; unexplained, do not recommend prune-expand
+- genuinely novel kinds -> an ontology gap, prune-expand would help
+
+**Relationships with no fitting predicate are KEPT, not dropped.** They become
+`graphrag:relatedTo` carrying the passage's own verb phrase, which is what gets
+embedded — so they stay traversable and vector-searchable.
+```
+relatedTo % = relatedTo / edges written * 100
+```
+Reference: the same run routed **15.2% (178 of 1,173)** to relatedTo, topped by
+`has capacity` x24, `ranked above` x12, `ranked below` x11. The run histograms
+these phrases; they are a concrete shopping list of predicates the ontology
+lacks. Present this as a vocabulary gap, never as a failure.
+
 ## Entity-to-entity relationships
 
 `extract-entities` mints typed `entity -> entity` edges. It runs as **TWO LLM
@@ -248,6 +347,7 @@ Other things worth knowing:
 `uv run python -m backend.app.cli <subcommand>`. Discover everything with
 `uv run python -m backend.app.cli --help`. Groups: ontology (`merge`, `prune`,
 `expand`, `prune-expand`, `build`), DB (`db-migrate`, `db-status`, `db-size`,
+`enrich-geo`, `embed-relationships`, `relink-artifact-entities`,
 `db-init`, `clear-corpus`), corpus (`register-documents`, `list-documents`,
 `update-document`, `delete-document`), enrichment (`extract-entities`,
 `enrich-time`, `generate-artifacts`), retrieval (`query`, `evaluate-queries`,
