@@ -45,7 +45,18 @@ bring new edges, and an unembedded edge is invisible to the relation-matched
 walk -- silently, with no error. `extract-entities` embeds the edges it writes,
 but `enrich-geo`'s are new, so run it after. **If the corpus is full-text (`fulltext=yes`),
 run all three with `--from-fulltext`** — the same consistency rule as the initial
-ingest. Record it:
+ingest.
+
+**Report the two coverage percentages for the NEW documents** exactly as
+**ingest-corpus** Step 3 specifies — abstained entities as a % of mentions, and
+`relatedTo` edges as a % of edges written, each with the absolute numbers. These
+matter more on an incremental add than on the first ingest: the ontology was
+fitted to the ORIGINAL corpus, so new documents on a new topic are where
+coverage degrades first. A jump against the initial ingest's figures is the
+earliest signal that the added documents need an ontology the current one does
+not cover — compare them and say whether they moved.
+
+Record it:
 ```
 uv run python scripts/build_state.py record add-documents docs=<n> fulltext=<yes|no>
 ```

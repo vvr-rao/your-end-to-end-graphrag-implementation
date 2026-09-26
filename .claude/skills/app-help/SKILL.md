@@ -259,6 +259,43 @@ Two consequences to pass on:
 - **`--from-fulltext` at extraction is the other lever.** It gives the graph direct
   entity edges into verbatim text, bypassing both bridges -- at ~18x the LLM calls.
 
+## What gets dropped, and how to read it
+
+Two numbers decide whether the ontology fits a corpus. `extract-entities` prints
+both as absolute counts; always give the user the **percentage alongside the
+absolute**, because the percentage says how well the ontology fits and the
+absolute says how much was lost.
+
+**Entities with no fitting class are DROPPED, not mis-typed.** `entities.class_id`
+is `NOT NULL`, so an untyped entity cannot be stored. The model returns
+`NONE_OF_THESE` with the type it wanted; if that class exists but simply missed
+the chunk's top-50 menu it is RECOVERED (searching the nearest 400), otherwise
+the mention is discarded and counted as `abstained` with a sample of names.
+```
+abstained % = abstained / (minted + abstained) * 100
+```
+Reference: a 66-doc corpus with a corpus-FITTED 2,160-class ontology still
+abstained on **12.5% (459 of 3,680)**, while recovering 295 off-menu ones. So
+double digits is normal, and a fitted ontology does not drive it to zero. Above
+~15% is a real coverage problem. Read it with care, because three different
+causes look identical in the total:
+- high `recovered ... proposed_type` alongside it -> the MENU is too narrow, not
+  the ontology (`--candidate-classes`, `extraction.pinned_class_labels`)
+- examples the ontology plainly covers (an organisation while `Organization` is
+  pinned) -> neither; unexplained, do not recommend prune-expand
+- genuinely novel kinds -> an ontology gap, prune-expand would help
+
+**Relationships with no fitting predicate are KEPT, not dropped.** They become
+`graphrag:relatedTo` carrying the passage's own verb phrase, which is what gets
+embedded — so they stay traversable and vector-searchable.
+```
+relatedTo % = relatedTo / edges written * 100
+```
+Reference: the same run routed **15.2% (178 of 1,173)** to relatedTo, topped by
+`has capacity` x24, `ranked above` x12, `ranked below` x11. The run histograms
+these phrases; they are a concrete shopping list of predicates the ontology
+lacks. Present this as a vocabulary gap, never as a failure.
+
 ## Entity-to-entity relationships
 
 `extract-entities` mints typed `entity -> entity` edges. It runs as **TWO LLM
