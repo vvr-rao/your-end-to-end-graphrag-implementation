@@ -32,7 +32,6 @@ YEGI organizes knowledge graph generation into three supervised stages, each wit
 
 A separate retrieval pipeline combines graph traversal with vector search to answer questions and support analysis of the corpus.
 
-
 ## Why YEGI?
 
 1. **End-to-end in one tool.** Starts with the raw documents and ends with a deployment of a React UI and an MCP server. Supports Document ingestion → ontology curation → entity + intelligence-artifact extraction → ontology-aware retrieval → React UI + MCP server deployed on Postgres (Supabase) + Render. No glue scripts between stages — every step is a subcommand of the same CLI. UI has basic functionality - multi-turn conversation, ability to store and retrieve old conversations, etc.
@@ -49,7 +48,7 @@ A separate retrieval pipeline combines graph traversal with vector search to ans
 
 7. **Output formatting.** Two modes of information retrieval - *simple_qa* and *deep_research*. *deep_research* does a deep search, identifies facts, provides the analysis and insights on the facts, identifies claims made and **calls out whether or not the claim is backed with evidence** (I feel this is important), identifies **imbalances in data within the corpus** (e.g. more information on one company/country/product etc. than another - a key issue I see in real world RAG applications). 
 
-### Platform support
+## Platform support
 
 **LLMs Used** - Multi-LLM support via config presets: default (Groq + OpenAI), OpenAI-only, or Anthropic-only chat. Provider/model per task is set in `config/models.yaml`. Embeddings always run on OpenAI (Anthropic has no embeddings API).
 
@@ -132,7 +131,7 @@ What makes it safe and resumable:
 Render deploys from **your** GitHub repository via the `render.yaml` blueprint, so to deploy you must **fork this repo to your own GitHub account** (or push a copy there), then point Claude / `render-init` at your fork. You can build and run everything locally without forking — the fork is only needed for the Render deploy step.
 
 
-## Notes
+## Other Important Details
 
 ### Intelligence artifacts
 
