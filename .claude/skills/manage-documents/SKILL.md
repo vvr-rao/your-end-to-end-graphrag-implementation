@@ -69,6 +69,18 @@ document → **STALE** (mixed-source artifacts stay `ACTIVE`). Follow up with
 (regenerates artifacts for the new version + retires the stale rows) — see below.
 Corpus synonyms refresh automatically (this routes through the same ingest path).
 
+## Repair: artifacts linked to the wrong entities
+`relink-artifact-entities` re-links intelligence artifacts to entities by ALIAS as
+well as canonical name. It exists because the original linker required the full
+canonical name, so an artifact about "FTX" missed the entity stored as
+"FTX Trading Ltd." -- measured, only 3 of 59 FTX artifacts were linked, and the
+repair added 1,150 edges on one corpus. No LLM calls, additive, safe to re-run.
+```
+uv run python -m backend.app.cli relink-artifact-entities [--dry-run]
+```
+Run it after a bulk add if artifact-grounded answers seem to be missing entities
+they should mention. `--dry-run` reports how many edges WOULD be added.
+
 ## Delete a document
 ```bash
 # Soft delete (DEFAULT) — status -> DELETED; rows kept so existing citations resolve

@@ -232,6 +232,13 @@ What to tell the user afterwards:
   The largest rejection bucket is `domain_range`: the ontology offers no
   predicate whose declared domain AND range fit that pair. That is usually a
   vocabulary gap, not a bad extraction.
+- `--orphan-batch-size N` (default 8) -- orphans per `relationship_orphan_check`
+  call. The check is what rescues entities both relationship passes missed, and
+  its recall collapses on a long list: measured, a 31-orphan call proposed 2
+  rescues where the same model asked about ONE found the edge at 0.95 confidence.
+  Batching at 8 moved edges 192 -> 226 (+18%) and still-unlinked 1066 -> 926 on a
+  30-document corpus, for +48% on this step's cost ($2.09 -> $3.10). Raise it to
+  cut cost at the price of recall; lower it to spend more for more edges.
 - `--no-relationships` reproduces the older entity-only behaviour.
 - `--no-verify-relationships` skips the third pass. Only for reproducing
   pre-verification behaviour; it lets contradicting quotes through.
@@ -287,6 +294,7 @@ writes, so you only need it explicitly:
 - on any graph built before migration 0008 (idempotent -- embeds only NULLs).
 ```
 uv run python -m backend.app.cli embed-relationships [--dry-run]
+uv run python scripts/build_state.py record enrich-geo edges=<n>
 ```
 Costs embeddings only: a few cents per 100k edges.
 

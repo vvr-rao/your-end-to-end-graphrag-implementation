@@ -39,6 +39,12 @@ ORDER: list[tuple[str, str]] = [
     ("register-documents", "chunk + embed the corpus"),
     ("extract-entities", "extract entities + relationships"),
     ("enrich-time", "temporal enrichment"),
+    # Cheap, and the relation-matched walk depends on them: enrich-geo mints
+    # geographic containment the prose never states, and embed-relationships
+    # vectorises edges so the walk can match them. Skipping either degrades
+    # retrieval to the broad neighbourhood walk SILENTLY, so it belongs in the
+    # tracked order rather than as optional advice.
+    ("enrich-geo", "geographic containment + embed relationships"),
     ("generate-artifacts", "generate intelligence artifacts"),
     ("deploy", "deploy to Render"),
 ]

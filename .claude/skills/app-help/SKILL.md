@@ -197,6 +197,40 @@ hierarchy -- generated ontologies get it locally wrong. Measured: one ontology
 put `Player` under `Organization` while `BaseballPlayer` sat under `Person`, so
 no downward walk could connect them.
 
+## Tuning retrieval: which knobs actually move results
+
+All of these live under `qa:` in `config.yaml`, each documented there with the
+measurement behind its default. Point people at the few that matter and say
+plainly which do not.
+
+**Worth changing.**
+- `max_fulltext_chunks_per_document` (50) -- the hard ceiling on how much of ONE
+  long document can reach an answer. A 476-chunk annual report contributes 50
+  chunks however relevant the rest. Raise it for corpora of long filings; it costs
+  vector-rerank time, not LLM spend.
+- `document_arm` (`conditional`) -- runs the document arm only where the graph
+  cannot answer. Measured: running it on every query cost precision (41% vs 46%)
+  and bought no gold documents. `always` restores the old behaviour.
+- `relationship_similarity` (0.55) -- the cosine floor for an edge to count as
+  matching a question's relation. Lower fires the relation-matched hop more often
+  on weaker matches; at 0.55 it fires on roughly 10% of questions and the rest
+  fall back to the broad walk.
+- `k_chunks` / `k_documents` -- the ordinary breadth dials.
+
+**Documented but measured NEUTRAL -- do not suggest these as fixes.**
+- `graph_score_weighting` (false) and `rrf_weight_graph_walk` (1.0). Both weight
+  the graph's contribution to RANKING more heavily. On a 182-question gold set,
+  raising the RRF weight degraded every metric monotonically (MRR 0.799 -> 0.774
+  -> 0.744) and score weighting made no difference outside run-to-run noise. The
+  finding is that the graph's value is RECALL, not ranking: its chunk ordering is
+  entity-mention count, a weak signal, and the vector probes rank better.
+
+**A measurement caution to pass on.** Gold-set MRR on a 40-document corpus varies
+by ~0.015 between identical runs, because `question_parse` and `query_decompose`
+are LLM calls. Any retrieval change claiming less than ~0.02 MRR needs repeats
+before it is believable -- a single run showed one of the above as +2.0% and it
+vanished on repeat.
+
 ## Reaching content deep inside a long document
 
 Worth knowing when someone asks why a fact in the back half of a filing is not
@@ -276,7 +310,7 @@ Other things worth knowing:
 `uv run python -m backend.app.cli <subcommand>`. Discover everything with
 `uv run python -m backend.app.cli --help`. Groups: ontology (`merge`, `prune`,
 `expand`, `prune-expand`, `build`), DB (`db-migrate`, `db-status`, `db-size`,
-`enrich-geo`, `embed-relationships`,
+`enrich-geo`, `embed-relationships`, `relink-artifact-entities`,
 `db-init`, `clear-corpus`), corpus (`register-documents`, `list-documents`,
 `update-document`, `delete-document`), enrichment (`extract-entities`,
 `enrich-time`, `generate-artifacts`), retrieval (`query`, `evaluate-queries`,
