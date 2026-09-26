@@ -750,6 +750,58 @@ qa:
   artifact_chunk_bridge: selected
   artifact_chunk_bridge_top_artifacts: 10
   artifact_chunk_bridge_limit: 300
+  # Weight the graph's chunk ranking by the relationship walk's own relevance
+  # score (sim * decay^hop) instead of counting every reached entity equally.
+  # Without it the walk's only relevance signal never reaches the ranker: a
+  # chunk mentioning five entities reached at hop 3 (0.55 * 0.7^3 = 0.19 each)
+  # outranks one mentioning a single seed matched at 0.95.
+  #
+  # MEASURED, AND IT MAKES NO DIFFERENCE. 182-question MultiHop-RAG gold set,
+  # base x3 and this x2, evidence-level metrics:
+  #
+  #   base  MRR 0.7994 / 0.7920 / 0.8069   spread 0.0149
+  #   on    MRR 0.8151 / 0.8067            spread 0.0084
+  #
+  # Every gap (MRR +0.0115, precision +0.0008, gold@top5 +0.022, mean rank
+  # -0.020) is SMALLER than the base-to-base variation. A first single run
+  # showed +2.0% MRR and looked like a win; the repeat landed inside the base
+  # range. Retrieval is not deterministic -- question_parse and query_decompose
+  # are LLM calls -- so gold-set MRR here has a run-to-run spread of ~0.015 and
+  # any change claiming less than ~0.02 needs repeats before it is believable.
+  #
+  # Kept because the mechanism is sound and may matter on a corpus whose graph
+  # ranks better; off because it demonstrably does not matter on this one.
+  graph_score_weighting: false
+  # ---- RRF voter weights. Fusion previously gave every ranked list the same
+  # weight, so a chunk reached by a relationship hop whose stored text MATCHED
+  # the question's relation cast one vote, while a chunk merely near the top of
+  # three probe rankings collected three and outvoted it 3:1. The walk's
+  # precision was diluted by being a minority voter, not by anything about the
+  # walk. These scale each voter's 1/(k+rank) contribution.
+  #
+  # The graph voter can be weighted by HOW the graph found its chunks: a matched
+  # relationship hop (anchored/unanchored) versus the broad neighbourhood walk.
+  #
+  # MEASURED, AND THE ANSWER IS 1.0. On the 182-question MultiHop-RAG gold set
+  # (evidence-level metrics, so generation noise cannot confound it), raising
+  # the walk weight degraded every metric monotonically:
+  #
+  #             walk=1.0   walk=2.0   walk=3.0
+  #   MRR        0.7994     0.7740     0.7444
+  #   gold@top5  2.71       2.62       2.62
+  #   precision  0.314      0.311      0.309
+  #   recall     0.996      0.996      0.993
+  #
+  # The arithmetic argument for upweighting was right -- a precisely-walked
+  # chunk did cast one vote against three from the probes -- but it missed that
+  # `graph_chunk_ranking` is ordered by ENTITY-MENTION COUNT, which is a weak
+  # ordering. The graph arm is good at RECALL (finding the right documents at
+  # all) and poor at RANKING them, so giving it more weight dilutes the vector
+  # probes, which rank better. Raise these only with a gold-set measurement.
+  rrf_weight_probe: 1.0
+  rrf_weight_graph_walk: 1.0
+  rrf_weight_graph_broad: 1.0
+  rrf_weight_document: 1.0
   # ---- Relationship-aware traversal (0008 graph_relationships.embedding).
   # Every extracted edge carries the sentence that supports it; embed-relationships
   # vectorizes it. When a question names a RELATION ("who was accused of fraud",

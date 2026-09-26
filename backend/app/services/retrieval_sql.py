@@ -232,32 +232,52 @@ async def fetch_relationships_among_entities(
     return out
 
 
+_ENTITY_CHUNKS_SQL = sql_text("""
+SELECT gr.source_chunk_id, sum(w.weight) AS score
+  FROM graphrag.graph_relationships gr
+  JOIN unnest(CAST(:entity_ids AS uuid[]), CAST(:weights AS float8[]))
+         AS w(id, weight)
+    ON w.id = gr.target_node_id
+ WHERE gr.predicate_label = 'viao:assertsAbout'
+   AND gr.relationship_source = 'DOCUMENT_EXTRACTION'
+   AND gr.target_node_type = 'entity'
+   AND gr.source_chunk_id IS NOT NULL
+ GROUP BY gr.source_chunk_id
+ ORDER BY score DESC
+ LIMIT :limit
+""")
+
+
 async def fetch_candidate_chunks_for_entities(
     session: AsyncSession,
     entity_ids: list[uuid.UUID],
     *,
     limit: int = 500,
+    weights: dict[uuid.UUID, float] | None = None,
 ) -> list[tuple[uuid.UUID, float]]:
-    """Chunks that assertAbout any of the given entities. Ordered by
-    how many of the listed entities each chunk asserts about."""
+    """Chunks that assertAbout any of the given entities, best-first.
+
+    `weights` is how much each entity's mention counts. Without it every entity
+    counts 1.0, so the ranking is a plain count of how many of the listed
+    entities a chunk mentions -- which is what this did unconditionally, and it
+    threw away the only relevance signal the graph had. The relationship walk
+    computes `sim * decay^hop` per entity (a seed matched at 0.95 versus
+    something reached at hop 3 for 0.55 * 0.7^3 = 0.19), and that score never
+    reached the ranking: a chunk mentioning five weakly-reached entities
+    outranked one mentioning a single strong seed.
+
+    Passing no weights reproduces the old ordering exactly, so the caller can
+    opt in per query.
+    """
     if not entity_ids:
         return []
+    ws = [float((weights or {}).get(eid, 1.0)) for eid in entity_ids]
     result = await session.execute(
-        sql_text("""
-        SELECT gr.source_chunk_id, count(*) AS hits
-          FROM graphrag.graph_relationships gr
-         WHERE gr.predicate_label = 'viao:assertsAbout'
-           AND gr.relationship_source = 'DOCUMENT_EXTRACTION'
-           AND gr.target_node_type = 'entity'
-           AND gr.target_node_id = ANY(CAST(:entity_ids AS uuid[]))
-           AND gr.source_chunk_id IS NOT NULL
-         GROUP BY gr.source_chunk_id
-         ORDER BY hits DESC
-         LIMIT :limit
-        """),
-        {"entity_ids": [str(eid) for eid in entity_ids], "limit": limit},
+        _ENTITY_CHUNKS_SQL,
+        {"entity_ids": [str(eid) for eid in entity_ids],
+         "weights": ws, "limit": limit},
     )
-    return [(cid, float(hits)) for cid, hits in result.all()]
+    return [(cid, float(score)) for cid, score in result.all()]
 
 
 async def fetch_candidate_chunks_for_time_instances(

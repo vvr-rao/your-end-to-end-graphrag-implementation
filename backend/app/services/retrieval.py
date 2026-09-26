@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 import time
 import uuid
@@ -625,7 +626,15 @@ async def retrieve_and_answer(
             seed_entity_ids, rel_probes, max_hops=hops, verbose=verbose,
         )
         for eid, score in rel_nodes.items():
-            bfs_nodes[(eid, "entity")] = {"score": score, "hop": 1}
+            # `hop` was hardcoded to 1 here, discarding depth. Recover it from
+            # the score: the walk sets score = sim * decay^hop with sim <= 1,
+            # so a seed is 1.0 and each hop multiplies by `decay`. Only used
+            # for reporting; the score itself is what ranks.
+            _decay = float(_qa_cfg("relationship_hop_decay", 0.7))
+            _hop = 0 if score >= 1.0 else max(
+                1, int(round(math.log(max(score, 1e-9)) / math.log(_decay)))
+            )
+            bfs_nodes[(eid, "entity")] = {"score": score, "hop": _hop}
     if not bfs_nodes:
         async with session_scope() as session:
             bfs_nodes = await retrieval_sql.bfs_expand(
@@ -676,8 +685,24 @@ async def retrieve_and_answer(
 
     # -------- step 8: candidate retrieval --------
     async with session_scope() as session:
+        # Graph relevance weighting. Without it the chunk ranking counts
+        # entities equally, so the walk's `sim * decay^hop` -- the only
+        # relevance signal the graph produces -- never reaches the ranker and a
+        # chunk mentioning five weakly-reached entities outranks one mentioning
+        # a single strong seed. `qa.graph_score_weighting: false` restores the
+        # unweighted count.
+        _weights: dict[uuid.UUID, float] | None = None
+        if bool(_qa_cfg("graph_score_weighting", False)):
+            _weights = {
+                nid: float(meta.get("score") or 0.0)
+                for (nid, ntype), meta in bfs_nodes.items() if ntype == "entity"
+            }
+            # Seeds merged in above may have no walk entry; they are the
+            # strongest signal there is, so they must not weigh zero.
+            for nid in seed_entity_ids:
+                _weights.setdefault(nid, 1.0)
         ent_chunks = await retrieval_sql.fetch_candidate_chunks_for_entities(
-            session, expanded_entity_ids, limit=500,
+            session, expanded_entity_ids, limit=500, weights=_weights,
         )
         time_chunks = await retrieval_sql.fetch_candidate_chunks_for_time_instances(
             session, expanded_time_ids, limit=200,
@@ -1057,6 +1082,9 @@ async def retrieve_and_answer(
     # rerank can't use the HNSW index (exact scan), so the real levers are fewer
     # probes (max_probes) and a smaller candidate set, not concurrency.
     chunk_rankings: list[list[uuid.UUID]] = []
+    # One weight per entry in `chunk_rankings`, so the voters that carry more
+    # information can outvote the ones that carry less. See `rrf_fuse`.
+    chunk_weights: list[float] = []
     artifact_rankings: list[list[uuid.UUID]] = []
     # Score EVERY probe before trimming any: the floor's real question is
     # "did this probe do worse than its siblings", which is a comparison and
@@ -1085,11 +1113,13 @@ async def retrieve_and_answer(
     _cohort_best = min(
         (min(d for _, d in r) for _, r, _ in _scored if r), default=None
     )
+    _w_probe = float(_qa_cfg("rrf_weight_probe", 1.0))
     for probe_text, ranked, ranked_a in _scored:
         chunk_rankings.append(
             _trim_by_distance(ranked, label=probe_text, verbose=verbose,
                               cohort_best=_cohort_best)
         )
+        chunk_weights.append(_w_probe)
         if ranked_a:
             artifact_rankings.append(
                 _trim_by_distance(ranked_a, cohort_best=_cohort_best)
@@ -1098,7 +1128,18 @@ async def retrieve_and_answer(
     # Graph-distance ranking: BFS score per chunk (via its entities). Uses the
     # entity-coverage ranking from step 8, propagated to full-text chunks by the
     # step-8.5 bridge when present (else identical to `ent_chunks`).
+    # The graph voter, weighted by HOW the graph found these chunks. A
+    # relationship hop that matched the question's own relation is a far more
+    # specific claim than a broad neighbourhood walk, and previously both cast
+    # the same single vote -- which is why a chunk near the top of three probe
+    # rankings outvoted a precisely-walked one 3:1.
+    _w_graph = float(
+        _qa_cfg("rrf_weight_graph_walk", 1.0)
+        if rel_stage in ("anchored", "unanchored")
+        else _qa_cfg("rrf_weight_graph_broad", 1.0)
+    )
     chunk_rankings.append(graph_chunk_ranking)
+    chunk_weights.append(_w_graph)
     # Document-similarity ranking as its own RRF voter. Filtered to the
     # surviving candidate set -- the step-8.5 bridge may have swapped a
     # document's summary chunks out for its full-text ones, and voting for
@@ -1109,6 +1150,7 @@ async def retrieve_and_answer(
         _doc_ranking = [cid for cid, _ in doc_chunks if cid in _cand]
         if _doc_ranking:
             chunk_rankings.append(_doc_ranking)
+            chunk_weights.append(float(_qa_cfg("rrf_weight_document", 1.0)))
     if artifact_candidates:
         artifact_rankings.append([aid for aid, _ in artifact_candidates])
 
@@ -1119,7 +1161,13 @@ async def retrieve_and_answer(
     if mode == "artifact_only":
         fused_chunks: list[tuple[uuid.UUID, float]] = []
     else:
-        _fused_all = rrf_fuse(chunk_rankings)
+        _fused_all = rrf_fuse(chunk_rankings, weights=chunk_weights)
+        if verbose:
+            print(
+                f"[query] RRF voters: {len(chunk_rankings)} "
+                f"(weights {[round(w, 2) for w in chunk_weights]}; "
+                f"graph={_w_graph} via {rel_stage})"
+            )
         # -------- step 10b: optional vector rerank of the fused pool --------
         # RRF fuses rank ORDER and throws the distances away (see
         # `_trim_by_distance`), so a chunk that merely placed well across
