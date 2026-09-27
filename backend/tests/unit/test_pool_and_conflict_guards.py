@@ -86,3 +86,63 @@ def test_pool_is_not_a_fixed_four():
     assert "concurrency" in src, "pool should derive from configured concurrency"
     assert "_MAX_POOL" in src, "auto-derived pool must stay capped"
     assert "_pool_minimum" in src, "a declared worker count must size the pool"
+
+
+# ---------------------------------------------------------------------------
+# An explicit database.pool_size is the SERVER'S limit, not a suggestion.
+# Found 2026-09-27, before an end-to-end run, by checking rather than assuming.
+# ---------------------------------------------------------------------------
+
+def _fake_db_cfg(monkeypatch, db: dict, concurrency: dict | None = None):
+    from backend.app.db import engine as eng
+
+    cfg = {"database": db, "concurrency": concurrency or {"entity_extraction": 64}}
+    monkeypatch.setattr(
+        eng, "get_settings",
+        lambda: type("S", (), {"app_config": cfg})(), raising=True,
+    )
+    monkeypatch.setattr(eng, "_pool_minimum", 0, raising=False)
+    return eng
+
+
+def test_explicit_pool_size_is_a_hard_ceiling(monkeypatch):
+    """`set_pool_minimum` must refuse to grow the pool past a declared size.
+
+    Supabase free tier in session mode caps the PROJECT at 15 client
+    connections. `database.pool_size: 10` was silently overridden by
+    `set_pool_minimum(64)` -- which `_resolve_concurrency` calls for the
+    config's own `concurrency.entity_extraction: 64`, no CLI flag involved --
+    and the engine opened a 64-connection pool, reproducing the very
+    EMAXCONNSESSION failure the pin was added to prevent.
+    """
+    eng = _fake_db_cfg(monkeypatch, {"pool_size": 10, "max_overflow": 2})
+    assert eng.configured_pool_ceiling() == 12
+    assert eng.set_pool_minimum(64) is False, (
+        "a request beyond the declared ceiling must be refused so the CALLER "
+        "reduces concurrency; growing the pool past it fails at the server"
+    )
+    assert eng.set_pool_minimum(12) is True
+
+
+def test_no_explicit_pool_size_still_scales(monkeypatch):
+    """A self-hosted / docker Postgres has no such cap -- do not cripple it."""
+    eng = _fake_db_cfg(monkeypatch, {"pool_size": None, "max_overflow": None})
+    assert eng.configured_pool_ceiling() is None
+    assert eng.set_pool_minimum(64) is True
+
+
+def test_only_db_bound_stages_are_capped():
+    """Capping a stage that holds no DB session slows it for nothing.
+
+    Measured 2026-09-26 on one 15-client Supabase DB: register-documents ran
+    42 docs at concurrency 64 with zero pool errors, while extract-entities at
+    32 lost 62 of 71 chunks to EMAXCONNSESSION.
+    """
+    from backend.app.cli import main as cli
+
+    assert "entity_extraction" in cli._POOL_BOUND_STAGES
+    assert "artifact_generation" in cli._POOL_BOUND_STAGES
+    assert "summarization" not in cli._POOL_BOUND_STAGES, (
+        "summarization is LLM+disk work whose DB writes happen after fan-in; "
+        "capping it to the pool slows the long pole of ingestion for no gain"
+    )

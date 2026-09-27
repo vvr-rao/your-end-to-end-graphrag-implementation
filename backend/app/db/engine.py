@@ -31,6 +31,29 @@ _ABS_MAX_POOL = 64
 _pool_minimum: int = 0
 
 
+def configured_pool_ceiling() -> int | None:
+    """`pool_size + max_overflow` when `database.pool_size` is set explicitly.
+
+    An explicit pool_size is the OPERATOR DECLARING THE SERVER'S LIMIT, so it
+    is a hard ceiling that a concurrency request may not breach. Supabase free
+    tier in session mode caps the whole project at 15 client connections;
+    without this, `database.pool_size: 10` was silently overridden by
+    `set_pool_minimum(64)` (which `_resolve_concurrency` calls for the config's
+    own `concurrency.entity_extraction: 64`, with no CLI flag involved) and the
+    engine opened a 64-connection pool -- reproducing the EMAXCONNSESSION
+    failure the pin was added to prevent. Measured 2026-09-27.
+
+    Returns None when pool_size is unset, leaving the derived-pool behaviour
+    (and `_ABS_MAX_POOL`) in charge -- a self-hosted Postgres has no such cap.
+    """
+    cfg = (get_settings().app_config.get("database", {}) or {})
+    if cfg.get("pool_size") in (None, ""):
+        return None
+    pool = int(cfg["pool_size"])
+    overflow = int(cfg.get("max_overflow") or pool)
+    return pool + overflow
+
+
 def set_pool_minimum(n: int) -> bool:
     """Ask for a pool able to serve `n` concurrent workers.
 
@@ -38,9 +61,18 @@ def set_pool_minimum(n: int) -> bool:
     engine is created -- `get_engine` is lru_cached, so once a pool exists its
     size is fixed for the process and the caller must reduce concurrency
     instead.
+
+    Returns False when the request exceeds an explicit `database.pool_size`
+    ceiling, so the caller reduces concurrency rather than the pool growing
+    past what the server accepts.
     """
     global _pool_minimum
     if get_engine.cache_info().currsize:        # engine already built
+        return False
+    ceiling = configured_pool_ceiling()
+    if ceiling is not None and int(n) > ceiling:
+        # Do not raise the minimum: the pool must stay within the declared
+        # ceiling, and the caller is told to cap its worker count instead.
         return False
     _pool_minimum = max(_pool_minimum, min(int(n), _ABS_MAX_POOL))
     return int(n) <= _ABS_MAX_POOL
@@ -106,11 +138,14 @@ def get_engine() -> AsyncEngine:
     _derived = min(_MAX_POOL, _want)
     _pool = int(_db_cfg.get("pool_size") or _derived)
     _overflow = int(_db_cfg.get("max_overflow") or _pool)
-    # A caller that declared its worker count wins over the derived default:
-    # the pool exists to serve the work, not the other way round.
+    # A caller that declared its worker count wins over the DERIVED default:
+    # the pool exists to serve the work, not the other way round. But it does
+    # NOT win over an explicit `database.pool_size`, which is the operator
+    # declaring what the server accepts -- see `configured_pool_ceiling`.
     if _pool_minimum and (_pool + _overflow) < _pool_minimum:
-        _pool = min(_ABS_MAX_POOL, _pool_minimum)
-        _overflow = 0
+        if _db_cfg.get("pool_size") in (None, ""):
+            _pool = min(_ABS_MAX_POOL, _pool_minimum)
+            _overflow = 0
     return create_async_engine(
         dsn,
         connect_args=connect_args,

@@ -131,6 +131,20 @@ def _resolve_chunk_kind_following_corpus(args: argparse.Namespace) -> str:
     return kind
 
 
+# Stages whose workers hold a DB session ACROSS their LLM calls, and so cannot
+# usefully outnumber the connection pool. Only these are capped.
+#
+# `summarization` is deliberately absent. Measured 2026-09-26 on the same
+# 15-client Supabase DB: `register-documents` ran 42 documents at concurrency 64
+# with zero pool errors (383s), while `extract-entities` at 32 lost 62 of its
+# first 71 chunks to EMAXCONNSESSION. Summarization is LLM-and-disk work whose
+# DB writes happen after the fan-in, so capping it to the pool would slow the
+# long pole of ingestion for no benefit.
+_POOL_BOUND_STAGES = frozenset({
+    "entity_extraction", "artifact_generation", "evaluation",
+})
+
+
 def _cap_to_pool(requested: int) -> int:
     """Make the connection pool serve `requested` workers, or cap to what it can.
 
@@ -180,14 +194,16 @@ def _resolve_concurrency(args: argparse.Namespace, stage: str) -> int:
     """
     from backend.app.core.config import get_settings
 
+    _cap = _cap_to_pool if stage in _POOL_BOUND_STAGES else int
+
     explicit = getattr(args, "concurrency", None)
     if explicit is not None:
-        return _cap_to_pool(int(explicit))
+        return _cap(int(explicit))
 
     cfg = get_settings().app_config
     stage_cfg = (cfg.get("concurrency", {}) or {})
     if stage in stage_cfg:
-        return _cap_to_pool(int(stage_cfg[stage]))
+        return _cap(int(stage_cfg[stage]))
 
     # Legacy fallbacks: summarization had its own key before `concurrency:`.
     if stage == "summarization":

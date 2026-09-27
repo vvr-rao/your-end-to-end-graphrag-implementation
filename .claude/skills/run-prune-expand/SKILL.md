@@ -34,7 +34,7 @@ they accept, use the matching ontology and tell them how it's obtained:
 | Finance | FIBO | Downloaded live from EDM Council (bundled fallback) |
 | Manufacturing / supply chain | OntoCAPE | **NOT bundled** — `fetch_ontology.py` prints the RWTH form URL + where to drop the zip; **pause until they supply it**, don't substitute another ontology |
 
-**2. Another domain** — no domain ontology; merge the 7 core ontologies only. Still
+**2. Another domain** — no domain ontology; merge the 8 core ontologies only. Still
 fully works, just without a domain-specific starting vocabulary.
 
 **3. Their own ontology** — we accept `.owl` and `.rdf` (also `.ttl`, `.xml`, or a
@@ -48,10 +48,14 @@ this tool produced (`output_ontologies/v*-.../`). Read "Step 1c — Re-ingesting
 edited ontology" first: whether their hand-edits are honored depends on HOW it's
 fed back.
 
-The 7 core ontologies are ALWAYS merged in, on every path.
+The 8 core ontologies are ALWAYS merged in, on every path (VIAO, foaf, org,
+geography, geography-features-extension, time, skos, domain-concepts). The
+geography features extension supplies `AdministrativeArea` -- without it no
+sub-national place can sit inside its country, because `Region` outranks
+`Country` in enrich-geo's level table.
 
 ## Step 1 — Merge (fast, foreground, no LLM)
-Run ONE of the following, matching the Step-0 choice. Each merges the pinned 7 core
+Run ONE of the following, matching the Step-0 choice. Each merges the pinned 8 core
 ontologies + your choice, records the merge, and **prints the version-folder path on
 its last line** — read that path from the command output and use it as `MERGE_DIR`
 in Step 3 (no shell-variable capture needed, so this works in any shell):
