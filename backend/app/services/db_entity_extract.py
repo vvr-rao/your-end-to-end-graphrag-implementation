@@ -2930,6 +2930,10 @@ async def extract_entities(
         f"[extract-entities] LLM done: ${summary.llm_cost_usd:.4f}, "
         f"{summary.chunks_scanned} success / {summary.chunks_failed} failed"
     )
+    # Wall time of the write phase, by step. It runs sequentially against the
+    # DB, so on a high-latency link it can dwarf the (parallel) LLM phase.
+    _phase: dict[str, float] = {}
+    _t_write = time.time()
 
     # Fail loudly when nothing worked. Previously this returned normally after
     # 0 successes, printing "DONE: entities (minted=0)" and exiting 0 -- making
@@ -3114,22 +3118,10 @@ async def extract_entities(
             existing_exact[(nname, cid)] = eid
     had_existing = bool(existing_exact)
 
-    async def _fuzzy_existing(normalized: str, class_id: Any) -> Any | None:
-        """pg_trgm fuzzy match against the DB in a SHORT-lived session (no
-        long-held connection). Only called for exact-misses when the table
-        already had entities."""
-        async with session_scope() as session:
-            r = await session.execute(
-                sql_text("""
-                    SELECT id FROM graphrag.entities
-                     WHERE class_id = :cls
-                       AND similarity(normalized_name, :nrm) >= 0.85
-                     ORDER BY similarity(normalized_name, :nrm) DESC
-                     LIMIT 1
-                """),
-                {"cls": class_id, "nrm": normalized},
-            )
-            return r.scalar_one_or_none()
+    # Fuzzy fallback for exact misses, resolved in ONE batched query further
+    # down (after the class vote), not one query per entity. See
+    # `_fuzzy_existing_batch` for why.
+    fuzzy_hits: dict[tuple[str, Any], Any] = {}
 
     # ---- Name-level identity ------------------------------------------------
     #
@@ -3170,6 +3162,31 @@ async def extract_entities(
     else:
         primary_class_by_name = {}
 
+    # Every key the loop below would send to the fuzzy fallback: first-seen
+    # exact misses. The DB does not change during the loop and each key is
+    # looked up at most once, so resolving them up front gives the same answer.
+    if had_existing:
+        _t_fuzzy = time.time()
+        _miss: list[tuple[str, Any]] = []
+        _miss_seen: set[tuple[str, Any]] = set()
+        for tup in results:
+            if tup is None or not tup[3]:
+                continue
+            for e in tup[3]:
+                normalized = _normalize_name(e["canonical_name"])
+                if not normalized:
+                    continue
+                class_id = class_id_by_iri.get(
+                    primary_class_by_name.get(normalized, e["class_iri"]))
+                key = (normalized, class_id)
+                if class_id is None or key in existing_exact or key in _miss_seen:
+                    continue
+                _miss_seen.add(key)
+                _miss.append(key)
+        fuzzy_hits = await _fuzzy_existing_batch(_miss)
+        _phase["fuzzy_lookup"] = time.time() - _t_fuzzy
+        _phase["fuzzy_keys"] = len(_miss)
+
     for tup in results:
         if tup is None:
             continue
@@ -3204,7 +3221,7 @@ async def extract_entities(
                 continue
             # Fuzzy fallback -- only when the table already had entities.
             if had_existing:
-                match = await _fuzzy_existing(normalized, class_id)
+                match = fuzzy_hits.get(key)
                 if match is not None:
                     seen_in_this_run[key] = match
                     existing_exact[key] = match
@@ -3241,6 +3258,8 @@ async def extract_entities(
                 })
             chunk_entity_pairs.append((chunk_id, key, doc_id))
 
+    _phase["resolve"] = time.time() - _t_write
+    _t_step = time.time()
     # Stream embed -> insert -> discard per batch: never hold all entity vectors
     # in RAM (bounds peak memory), and retry transient pooler drops so one
     # dropped connection doesn't lose the whole run.
@@ -3441,14 +3460,23 @@ async def extract_entities(
                 else:
                     to_update.append((row_id, pay["extra_metadata"]))
             if to_update:
+                # One read for every row, fold in memory, one multi-row write.
+                # Was a SELECT + UPDATE per row -- two sequential round trips
+                # each, ~300 ms apiece from a dev machine to the pooler, and the
+                # count grows with every incremental run over the same graph.
+                # Folding through `cur_meta` keeps the old semantics when two
+                # payloads hit the same row: the second sees the first's merge,
+                # exactly as the per-row SELECT inside one transaction did.
                 async with session_scope() as session:
+                    cur = await session.execute(
+                        select(GraphRelationship.id, GraphRelationship.extra_metadata)
+                        .where(GraphRelationship.id.in_(
+                            list({rid for rid, _ in to_update})))
+                    )
+                    cur_meta = {rid: (m or {}) for rid, m in cur.all()}
+                    changed: dict[Any, dict] = {}
                     for row_id, meta in to_update:
-                        cur = await session.execute(
-                            select(GraphRelationship.extra_metadata).where(
-                                GraphRelationship.id == row_id
-                            )
-                        )
-                        old_meta = cur.scalar_one_or_none() or {}
+                        old_meta = cur_meta.get(row_id) or {}
                         old_chunks = list(old_meta.get("supporting_chunks") or [])
                         new_chunks = [
                             c for c in (meta.get("supporting_chunks") or [])
@@ -3456,28 +3484,28 @@ async def extract_entities(
                         ]
                         if not new_chunks:
                             continue
+                        cur_meta[row_id] = changed[row_id] = {
+                            **old_meta,
+                            "support_count": (
+                                int(old_meta.get("support_count") or
+                                    len(old_chunks))
+                                + int(meta.get("support_count") or 0)
+                            ),
+                            "supporting_chunks": (
+                                old_chunks + new_chunks
+                            )[:_MAX_SUPPORTING_CHUNKS],
+                        }
+                        merged += 1
+                    if changed:
                         await session.execute(
                             sql_text("""
                             UPDATE graphrag.graph_relationships
                                SET extra_metadata = :meta
                              WHERE id = :id
                             """),
-                            {
-                                "id": row_id,
-                                "meta": json.dumps({
-                                    **old_meta,
-                                    "support_count": (
-                                        int(old_meta.get("support_count") or
-                                            len(old_chunks))
-                                        + int(meta.get("support_count") or 0)
-                                    ),
-                                    "supporting_chunks": (
-                                        old_chunks + new_chunks
-                                    )[:_MAX_SUPPORTING_CHUNKS],
-                                }),
-                            },
+                            [{"id": rid, "meta": json.dumps(m)}
+                             for rid, m in changed.items()],
                         )
-                        merged += 1
             if merged:
                 print(
                     f"[extract-entities] merged new supporting chunk(s) into "
@@ -3525,6 +3553,8 @@ async def extract_entities(
                 pg_insert(GraphRelationship).values(rel_payloads[i : i + EDGE_BATCH])
             )
 
+    _phase["insert"] = time.time() - _t_step
+    _t_step = time.time()
     # Vectorize the new entity->entity edges so retrieval can match a
     # question against what an edge SAYS, not just who it touches. Embeddings
     # only (no chat model), pennies per 100k edges, and idempotent -- edges
@@ -3550,6 +3580,8 @@ async def extract_entities(
                 f"({exc}); run `embed-relationships` to backfill"
             )
 
+    _phase["embed_relationships"] = time.time() - _t_step
+    _t_step = time.time()
     # Entity-side accounting. Previously every one of these was a silent
     # `continue`, so a corpus could lose entities steadily with nothing in the
     # output to show for it.
@@ -3706,6 +3738,14 @@ async def extract_entities(
     # time-bounded-query semantics graph_version exists for.
     if link_tables:
         await _link_tables_to_entities(summary)
+    _phase["link_and_report"] = time.time() - _t_step
+    print(
+        f"[extract-entities] write phase {time.time() - _t_write:.1f}s: "
+        + ", ".join(
+            f"{k}={v:.1f}s" if isinstance(v, float) else f"{k}={v}"
+            for k, v in _phase.items()
+        )
+    )
 
     if bump_graph_version:
         async with session_scope() as session:
@@ -3926,6 +3966,47 @@ async def _link_tables_to_entities(summary: EntityExtractSummary) -> None:
 # ---------------------------------------------------------------------------
 # Batch-streamed, resumable driver
 # ---------------------------------------------------------------------------
+
+_FUZZY_BATCH = 500
+
+
+async def _fuzzy_existing_batch(
+    keys: list[tuple[str, Any]],
+) -> dict[tuple[str, Any], Any]:
+    """pg_trgm fuzzy match for many (normalized_name, class_id) keys at once.
+
+    Same predicate as the old per-entity lookup -- same class, similarity >=
+    0.85, best match wins -- but one round trip per `_FUZZY_BATCH` keys instead
+    of one short-lived session per key. The query itself is cheap (~16 ms: the
+    class_id index narrows it first); what cost time was the round trip, ~1 s
+    per session from a dev machine to the Supabase pooler (pre-ping + query +
+    commit at ~300 ms each). Measured 2026-09-27: ~450 lookups made up most of
+    the ~11 minutes a 40-chunk batch spent AFTER its LLM calls had finished.
+    """
+    hits: dict[tuple[str, Any], Any] = {}
+    for i in range(0, len(keys), _FUZZY_BATCH):
+        batch = keys[i : i + _FUZZY_BATCH]
+        async with session_scope() as session:
+            r = await session.execute(
+                sql_text("""
+                    SELECT q.i, m.id
+                      FROM unnest(CAST(:nrms AS text[]), CAST(:clss AS uuid[]))
+                           WITH ORDINALITY AS q(nrm, cls, i)
+                     CROSS JOIN LATERAL (
+                           SELECT e.id FROM graphrag.entities e
+                            WHERE e.class_id = q.cls
+                              AND similarity(e.normalized_name, q.nrm) >= 0.85
+                            ORDER BY similarity(e.normalized_name, q.nrm) DESC
+                            LIMIT 1
+                     ) m
+                """),
+                {"nrms": [k[0] for k in batch],
+                 "clss": [str(k[1]) for k in batch]},
+            )
+            for idx, eid in r.all():
+                hits[batch[int(idx) - 1]] = eid
+    return hits
+
 
 async def _unprocessed_chunk_count(
     *, chunk_kind: str, scope_document_iri: str | None = None
