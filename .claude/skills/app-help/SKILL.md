@@ -257,7 +257,29 @@ Two consequences to pass on:
   picks which, but a question needing broad coverage of one long document may want
   `qa.max_fulltext_chunks_per_document` raised.
 - **`--from-fulltext` at extraction is the other lever.** It gives the graph direct
-  entity edges into verbatim text, bypassing both bridges -- at ~18x the LLM calls.
+  entity edges into verbatim text, bypassing both bridges. It is **OFF by default**
+  (`extraction.from_fulltext: false`) because it is the most expensive switch in
+  the pipeline — measured on the 42-doc `mixed-regression` corpus, 282 summary
+  chunks cost **$8.75** while its 1,222 full-text chunks project to **~$38**
+  (~4.3x; ~18x on corpora of long reports). Two traps: `--max-cost-usd` defaults
+  to 5.0 so it trips almost at once, and extraction writes only at the end, so a
+  cap trip loses the whole run. Recommend it for **entity recall inside long
+  documents**, never for citation quality — the full-text bridge already gives
+  verbatim citations without it.
+
+### Full-text defaults, by stage (changed 2026-09-27)
+
+| stage | default | knob |
+|---|---|---|
+| `register-documents` | **full-text ON** (both kinds stored) | `chunking.full_text_chunks`, `--no-full-text-chunks` |
+| `extract-entities` | **summary** (opt in) | `extraction.from_fulltext`, `--from-fulltext` |
+| `enrich-time` | **follows the corpus** | auto; `--from-fulltext` / `--no-from-fulltext` |
+| `generate-artifacts` | **follows the corpus** | auto; `--from-fulltext` / `--no-from-fulltext` |
+| `prune-expand --select-subset` | **OFF** (uses every document) | `--select-subset` |
+
+"Follows the corpus" = the stage checks whether `kind='fulltext'` chunks exist and
+uses them if so, else summary. Older transcripts saying `--from-fulltext` is
+"REQUIRED if fulltext=yes" are out of date.
 
 ## What gets dropped, and how to read it
 

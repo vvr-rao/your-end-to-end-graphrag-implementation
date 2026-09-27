@@ -65,6 +65,72 @@ def _resolve_extraction_opt(
     return cfg[key] if key in cfg and cfg[key] is not None else default
 
 
+def _config_block(name: str) -> dict:
+    """A top-level block from config.yaml (or its shipped .example fallback)."""
+    from backend.app.core.config import get_settings
+
+    return (get_settings().app_config.get(name, {}) or {})
+
+
+def _resolve_bool_opt(
+    args: argparse.Namespace, attr: str, block: str, key: str, default: bool
+) -> bool:
+    """CLI flag > `<block>.<key>` in config.yaml > `default`.
+
+    The flags using this are BooleanOptionalAction with `default=None`, so
+    "not passed" is distinguishable from "passed false" -- otherwise a config
+    default of true could never be turned off from the command line.
+    """
+    explicit = getattr(args, attr, None)
+    if explicit is not None:
+        return bool(explicit)
+    cfg = _config_block(block)
+    return bool(cfg[key]) if key in cfg and cfg[key] is not None else default
+
+
+async def _corpus_has_fulltext_chunks() -> bool:
+    from sqlalchemy import text as _sql
+
+    from backend.app.db.session import session_scope
+
+    async with session_scope() as session:
+        row = await session.execute(
+            _sql("SELECT EXISTS (SELECT 1 FROM graphrag.chunks "
+                 "WHERE kind = 'fulltext')")
+        )
+        return bool(row.scalar())
+
+
+def _resolve_chunk_kind_following_corpus(args: argparse.Namespace) -> str:
+    """Chunk kind for the stages that FOLLOW ingestion.
+
+    `enrich-time` and `generate-artifacts` are not independently configured:
+    they read whatever `register-documents` produced. Passing
+    --from-fulltext / --no-from-fulltext still wins, so a run stays
+    reproducible from its command line; with neither, the corpus decides.
+    Falling back to 'summary' when no full-text chunks exist keeps a
+    summary-only corpus working instead of scanning an empty set.
+    """
+    from backend.app.db.engine import reset_engine_cache
+
+    explicit = getattr(args, "from_fulltext", None)
+    if explicit is not None:
+        return "fulltext" if explicit else "summary"
+    try:
+        found = asyncio.run(_corpus_has_fulltext_chunks())
+    except Exception as exc:                                  # pragma: no cover
+        print(f"[cli] could not detect chunk kinds ({exc}); using summary")
+        return "summary"
+    finally:
+        # This asyncio.run leaves the cached engine bound to a now-dead loop;
+        # the command's own asyncio.run needs a fresh one. See the loop-mismatch
+        # note in CLAUDE.local.md.
+        reset_engine_cache()
+    kind = "fulltext" if found else "summary"
+    print(f"[cli] following the corpus: using kind='{kind}' chunks")
+    return kind
+
+
 def _cap_to_pool(requested: int) -> int:
     """Make the connection pool serve `requested` workers, or cap to what it can.
 
@@ -694,13 +760,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_reg.add_argument(
-        "--full-text-chunks", action="store_true",
+        "--full-text-chunks", action=argparse.BooleanOptionalAction, default=None,
         help=(
             "Also store verbatim full-text chunks (kind='fulltext') in addition "
             "to the summary chunks. Retrieval prefers full-text chunks (better "
-            "recall + exact citations); entity/artifact extraction still use "
-            "summary chunks. Increases DB size — smoke-test with --limit and "
-            "check `db-size`. Default: OFF."
+            "recall + exact citations), and enrich-time / generate-artifacts "
+            "follow whatever this produces. Increases DB size — smoke-test with "
+            "--limit and check `db-size`. Default: ON "
+            "(chunking.full_text_chunks); --no-full-text-chunks for "
+            "summary-only."
         ),
     )
     p_reg.add_argument(
@@ -794,11 +862,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bottom of the time hierarchy + gap-fill granularity.",
     )
     p_time.add_argument(
-        "--from-fulltext", action="store_true",
+        "--from-fulltext", action=argparse.BooleanOptionalAction, default=None,
         help=(
             "Scan the verbatim FULL-TEXT chunks for dates instead of summary "
-            "chunks, matching extract-entities / generate-artifacts so time "
-            "edges anchor on the same chunk kind. Default: summary."
+            "chunks. Default: FOLLOW the corpus — full-text when the corpus was "
+            "ingested with full-text chunks, summary when it was not. Pass the "
+            "flag (or --no-from-fulltext) to force one."
         ),
     )
     p_time.set_defaults(func=_cmd_enrich_time)
@@ -836,12 +905,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Abort if LLM spend exceeds this within the run.",
     )
     p_ext.add_argument(
-        "--from-fulltext", action="store_true",
+        "--from-fulltext", action=argparse.BooleanOptionalAction, default=None,
         help=(
             "Mine entities from the verbatim FULL-TEXT chunks (kind='fulltext') "
             "instead of the summary chunks. Far more complete (captures every "
-            "study/entity in the source), but ~18x more LLM calls + more DB rows. "
-            "Requires the corpus was ingested with --full-text-chunks. Default: summary."
+            "study/entity in the source), but the most expensive switch in the "
+            "pipeline: every full-text chunk is another entity+relationship "
+            "round trip. Measured on the 42-doc mixed-regression corpus, 282 "
+            "summary chunks cost $8.75 while its 1222 full-text chunks project "
+            "to ~$38 (~4.3x; ~18x on corpora of long reports). --max-cost-usd "
+            "defaults to 5.0, so raise it or the run trips the cap almost "
+            "immediately. Retrieval reaches full-text chunks via the "
+            "document-mediated bridge either way, so turn this on for entity "
+            "RECALL in long documents, not for citation quality. Requires the "
+            "corpus was ingested with full-text chunks. Default: OFF "
+            "(extraction.from_fulltext). Set independently of the other "
+            "stages, which follow the corpus."
         ),
     )
     p_ext.add_argument(
@@ -1103,12 +1182,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_art.add_argument(
-        "--from-fulltext", action="store_true",
+        "--from-fulltext", action=argparse.BooleanOptionalAction, default=None,
         help=(
             "Extract per-chunk artifacts (Claim/Finding/Observation/Event) from "
             "the verbatim FULL-TEXT chunks instead of the summary chunks. More "
-            "complete, but ~18x more LLM calls + more DB rows. Requires the corpus "
-            "was ingested with --full-text-chunks. Default: summary."
+            "complete, but ~18x more LLM calls + more DB rows. Default: FOLLOW "
+            "the corpus — full-text when it was ingested with full-text chunks, "
+            "summary when it was not. Pass the flag (or --no-from-fulltext) to "
+            "force one."
         ),
     )
     # ---- Hierarchical clustered rollups (post-processing over existing artifacts) ----
@@ -1906,7 +1987,9 @@ def _cmd_register_documents(args: argparse.Namespace) -> int:
             concurrency=concurrency,
             extract_tables=getattr(args, "tables", False),
             table_vision=getattr(args, "table_vision", True),
-            full_text_chunks=getattr(args, "full_text_chunks", False),
+            full_text_chunks=_resolve_bool_opt(
+                args, "full_text_chunks", "chunking", "full_text_chunks", True
+            ),
             summarization_method=(
                 "single_pass" if getattr(args, "single_pass_summaries", False) else None
             ),
@@ -1957,7 +2040,7 @@ def _cmd_enrich_time(args: argparse.Namespace) -> int:
             limit=args.limit,
             highest_level=args.highest_level,
             lowest_level=args.lowest_level,
-            chunk_kind="fulltext" if getattr(args, "from_fulltext", False) else "summary",
+            chunk_kind=_resolve_chunk_kind_following_corpus(args),
         )
     )
     return 0
@@ -1965,7 +2048,12 @@ def _cmd_enrich_time(args: argparse.Namespace) -> int:
 
 def _cmd_extract_entities(args: argparse.Namespace) -> int:
     _conc = _resolve_concurrency(args, "entity_extraction")
-    _chunk_kind = "fulltext" if getattr(args, "from_fulltext", False) else "summary"
+    _chunk_kind = (
+        "fulltext"
+        if _resolve_bool_opt(args, "from_fulltext", "extraction",
+                             "from_fulltext", False)
+        else "summary"
+    )
 
     if getattr(args, "report_candidate_distances", False):
         from backend.app.services.db_entity_extract import (
@@ -2140,7 +2228,7 @@ def _cmd_generate_artifacts(args: argparse.Namespace) -> int:
                 concurrency=_conc,
                 max_cost_usd=args.max_cost_usd,
                 use_entities=use_entities,
-                chunk_kind="fulltext" if getattr(args, "from_fulltext", False) else "summary",
+                chunk_kind=_resolve_chunk_kind_following_corpus(args),
             )
         )
         # The above asyncio.run's loop is now dead; drop the cached

@@ -30,23 +30,49 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
 - **Watch DB size.** Before and after big steps: `uv run python -m backend.app.cli
   db-size`. Free-tier Postgres often caps around 500 MB — flag headroom as it grows.
 - **Record each step** so the cross-session tracker can resume after a restart.
-- **Full-text consistency (important).** `--full-text-chunks` at Step 2 stores BOTH
-  summary and full-text chunks — but `extract-entities` and `generate-artifacts`
-  default to the *summary* chunks. Decide DELIBERATELY which you want, and apply
-  the same choice to Steps 3, 4 and 5 so the graph is internally consistent.
-  - **(A) extract from summaries** (cheap, the default). Retrieval STILL serves
-    answers from the full-text chunks -- its full-text bridge swaps them in
-    document-by-document -- so they are not wasted. What you give up is direct
-    entity edges into verbatim text: the graph reaches full text only through
-    that bridge and the document arm.
-  - **(B) `--from-fulltext` on Steps 3, 4 AND 5** (~18x the LLM calls). Entities
-    and artifacts are mined from verbatim text, so the graph points straight at
-    it. Worth it when the corpus is dense with facts summaries drop.
-  Do NOT describe (A) as leaving the full-text chunks "never mined" -- they are
+- **Full-text handling — know the three different defaults.** Changed
+  2026-09-27; older transcripts describe the previous behaviour.
+
+  | stage | shipped default | knob |
+  |---|---|---|
+  | Step 2 `register-documents` | **full-text ON** — stores BOTH summary and verbatim chunks | `chunking.full_text_chunks: true`, or `--no-full-text-chunks` |
+  | Step 3 `extract-entities` | **summary** (opt in per run) | `extraction.from_fulltext: false`, or `--from-fulltext` |
+  | Step 4 `enrich-time` | **follows the corpus** | auto; force with `--from-fulltext` / `--no-from-fulltext` |
+  | Step 5 `generate-artifacts` | **follows the corpus** | auto; force with `--from-fulltext` / `--no-from-fulltext` |
+
+  "Follows the corpus" means the stage checks whether `kind='fulltext'` chunks
+  exist and uses them if so, falling back to summary when the corpus was
+  ingested summary-only. You no longer have to pass `--from-fulltext` to these
+  two by hand, and the old instruction that it was "REQUIRED if fulltext=yes"
+  is obsolete.
+
+  **`extract-entities` is deliberately NOT driven by ingestion, because it is
+  the most expensive switch in the pipeline.** Measured 2026-09-26 on the
+  42-doc `mixed-regression` corpus (40 news articles + 2 long PDFs):
+
+  | | chunks | cost | wall |
+  |---|---|---|---|
+  | summary (default) | 282 | **$8.75** | 17 min @ concurrency 12 |
+  | full-text | 1,222 | **~$38** (extrapolated at $0.031/chunk) | ~70 min |
+
+  That is ~4.3x on a mixed corpus and ~18x on corpora of long reports, where
+  summaries compress hardest. Two traps before you pass `--from-fulltext`:
+  - **`--max-cost-usd` defaults to 5.0**, so a full-text run trips the cap
+    almost immediately. Raise it explicitly and say the number to the user.
+  - **Extraction is all-or-nothing** — it writes everything at the end, so a
+    cap trip or a kill loses the whole run's spend.
+
+  **What you actually give up by leaving it OFF is narrower than it sounds.**
+  Retrieval reaches the full-text chunks regardless, through the
+  document-mediated full-text bridge — citations still quote verbatim text.
+  What you lose is *direct entity edges into* verbatim text, i.e. entity recall
+  for facts that appear only deep inside a long document and never reach its
+  summary. Turn it on for that recall, never for citation quality. Do NOT
+  describe the default as leaving full-text chunks "never mined" — they are
   embedded and retrieved; only extraction skips them.
-  The choice is stored in the tracker as `fulltext=yes|no` on the
-  `register-documents` step — check it (`build_state.py show`) and apply
-  `--from-fulltext` consistently across all three downstream steps.
+
+  Step 2 still records the choice in the tracker as `fulltext=yes|no`; it is
+  now what Steps 4 and 5 detect automatically.
 - **Check rate-limit headroom and RECOMMEND raising concurrency. Do this before
   every long paid step.** Run:
   ```
@@ -142,7 +168,8 @@ Step 1c — so `merged.json` reflects the edits before this import.)
 Confirm the corpus path (reuse the one from run-prune-expand if it's the same;
 otherwise ask — never scan+pick). Discuss the options with the user:
 - `--tables` — also extract structured tables from PDFs (retrievable rows/columns).
-- `--full-text-chunks` — additionally store verbatim full-text chunks (better recall
+- `--full-text-chunks` — **ON by default** (`chunking.full_text_chunks: true`); pass
+  `--no-full-text-chunks` for summary-only. Additionally stores verbatim full-text chunks (better recall
   + exact citations) at the cost of DB size. **If you use it, Steps 3 and 5 must run
   with `--from-fulltext`** (see the full-text-consistency rule above) — decide this
   once, here.
@@ -151,12 +178,13 @@ otherwise ask — never scan+pick). Discuss the options with the user:
 smoke test only (see the alias note below). Launch detached (single-line command;
 choose a fresh `RUN_ID`, e.g. `register_docs_<date+time>`):
 ```
-uv run python scripts/run_detached.py <RUN_ID> uv run python -m backend.app.cli register-documents --input "<DOCS>" [--tables] [--full-text-chunks]
+uv run python scripts/run_detached.py <RUN_ID> uv run python -m backend.app.cli register-documents --input "<DOCS>" [--tables] [--no-full-text-chunks]
 uv run python scripts/job_status.py <RUN_ID> 40
 ```
 On completion, check `db-size`, then record — **including whether full-text was used**
-(`fulltext=yes` if you passed `--full-text-chunks`, else `fulltext=no`) so downstream
-steps and future sessions know to apply `--from-fulltext`:
+(`fulltext=yes` unless you passed `--no-full-text-chunks`). Steps 4 and 5 now
+detect this from the corpus themselves; the record is for humans and for
+`extract-entities`, which stays opt-in:
 ```
 uv run python scripts/build_state.py record register-documents docs=<n> chunks=<n> fulltext=<yes|no> tables=<n>
 ```
@@ -180,10 +208,12 @@ whole corpus, so:
 ## Step 3 — extract-entities (entities + relationships; long, paid)
 Mints entities/relationships per chunk — **no new ontology classes**. **If Step 2
 recorded `fulltext=yes` (check `uv run python scripts/build_state.py show`), you MUST
-add `--from-fulltext`** so entities come from the full-text chunks, not the summary
+`--from-fulltext` is OPT-IN and costs ~4.3x (~$38 vs $8.75 on the 42-doc
+reference corpus) — see the full-text table at the top. If you pass it, also raise
+`--max-cost-usd` (default 5.0 trips almost immediately). Default takes entities from the summary
 ones. Single-line launch:
 ```
-uv run python scripts/run_detached.py <RUN_ID> uv run python -m backend.app.cli extract-entities [--limit 5] [--from-fulltext (REQUIRED if fulltext=yes)] [--max-cost-usd <cap>]
+uv run python scripts/run_detached.py <RUN_ID> uv run python -m backend.app.cli extract-entities [--limit 5] [--from-fulltext (OPT-IN: ~4.3x cost, raise --max-cost-usd)] [--max-cost-usd <cap>]
 uv run python scripts/job_status.py <RUN_ID> 40
 uv run python scripts/build_state.py record extract-entities entities=<n>
 ```
@@ -300,10 +330,11 @@ What to tell the user afterwards:
 
 ## Step 4 — enrich-time (short)
 Temporal enrichment (Year/Quarter/Month/Day, parent creation + gap-fill). Fast and
-cheap — run in the foreground. **Add `--from-fulltext` if Step 2 recorded
+cheap — run in the foreground. Chunk kind is automatic (follows the corpus); the
+old rule below is obsolete. **Formerly: add `--from-fulltext` if Step 2 recorded
 `fulltext=yes`** (scan the full-text chunks for dates, consistent with Steps 3 & 5):
 ```
-uv run python -m backend.app.cli enrich-time [--from-fulltext (REQUIRED if fulltext=yes)]
+uv run python -m backend.app.cli enrich-time            # chunk kind follows the corpus automatically
 uv run python scripts/build_state.py record enrich-time instances=<n>
 ```
 
@@ -346,10 +377,11 @@ loses the relation-matched hop -- silently, with no error.
 ## Step 5 — generate-artifacts (Claims/Findings/… ; long, paid)
 Per-chunk `Claim`/`Finding`/`Observation`/`Event` + per-doc `Summary`. Opt-in
 cross-cluster `Insight`/`Recommendation` via `--type` (gpt-4.1 — more expensive),
-and `--rollup` for hierarchical consolidation. **Add `--from-fulltext` if Step 2
+and `--rollup` for hierarchical consolidation. Chunk kind is automatic (follows the
+corpus). **Formerly: add `--from-fulltext` if Step 2
 recorded `fulltext=yes`** (consistent with Steps 3 & 4). Single-line launch:
 ```
-uv run python scripts/run_detached.py <RUN_ID> uv run python -m backend.app.cli generate-artifacts [--limit 5] [--type Insight --type Recommendation] [--rollup] [--from-fulltext (REQUIRED if fulltext=yes)] [--max-cost-usd <cap>]
+uv run python scripts/run_detached.py <RUN_ID> uv run python -m backend.app.cli generate-artifacts [--limit 5] [--type Insight --type Recommendation] [--rollup] [--max-cost-usd <cap>]   # chunk kind follows the corpus
 uv run python scripts/job_status.py <RUN_ID> 40
 uv run python -m backend.app.cli db-size
 uv run python scripts/build_state.py record generate-artifacts artifacts=<n>

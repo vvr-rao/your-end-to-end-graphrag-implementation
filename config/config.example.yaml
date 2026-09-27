@@ -25,6 +25,13 @@ chunking:
   # Cuts Stage 2 cost dramatically on corpora dominated by a few large
   # documents. Set to 0 to disable; the pipeline then chunks raw text.
   summarization_threshold_tokens: 2000
+  # register-documents: also store the VERBATIM text as kind='fulltext'
+  # chunks alongside the summaries. Retrieval prefers full-text (better
+  # recall + exact citations), and enrich-time / generate-artifacts follow
+  # whatever this produces. Costs DB size -- check `db-size` after a run.
+  # extract-entities is NOT driven by this; it has its own
+  # `extraction.from_fulltext`.
+  full_text_chunks: true
   # Persistent disk cache for document summaries at
   # ~/.cache/your-end-to-end-graphrag-implementation/doc_summaries/. Cache
   # key hashes the doc text + model + prompt version, so editing a doc
@@ -384,6 +391,28 @@ expansion:
 # `concurrency.entity_extraction` above; this section is about accuracy.
 # -----------------------------------------------------------------------------
 extraction:
+  # extract-entities: mine entities from kind='fulltext' chunks rather than
+  # the summaries. Set independently of the other stages on purpose --
+  # ingestion decides what EXISTS, this decides whether extraction pays for it.
+  #
+  # DEFAULT OFF, because this is the single most expensive switch in the
+  # pipeline. Summaries compress ~4x on a mixed corpus and far more on long
+  # reports, and every full-text chunk is one more entity+relationship LLM
+  # round trip. Measured 2026-09-26 on the 42-doc mixed-regression corpus
+  # (40 news articles + 2 long PDFs):
+  #
+  #   summary chunks   282  -> $8.75   (17 min at concurrency 12)
+  #   fulltext chunks 1222  -> ~$38    (~4.3x, extrapolated at $0.031/chunk)
+  #
+  # The CLI help's "~18x" is the ratio on corpora of long reports, where
+  # summarization compresses hardest. Note --max-cost-usd defaults to 5.0, so
+  # a full-text run trips the cap almost immediately unless raised.
+  #
+  # Retrieval does NOT need this: it reaches full-text chunks through the
+  # document-mediated bridge regardless of which kind entities were mined
+  # from, so the usual reason to turn this on is entity RECALL inside long
+  # documents, not citation quality.
+  from_fulltext: false
   # Validate-and-review loop, enabled per run with --validate-entities (OFF by
   # default). After entities are extracted, a DIFFERENT model (models.yaml task
   # `entity_validate`) reviews each entity + its class assignment; anything
