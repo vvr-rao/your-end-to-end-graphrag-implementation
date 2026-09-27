@@ -574,6 +574,16 @@ extraction:
     - EconomicConcept
     - FinancialObservation
 
+# generate-artifacts, per-chunk stage (Claim/Finding/Observation/Event).
+artifact_generation:
+  # 0 = single-shot: every chunk's LLM call first, one write at the end, so a
+  # kill or a --max-cost-usd trip discards the whole run and memory grows with
+  # the corpus. N > 0 commits every N chunks; a re-run resumes by itself
+  # because chunks that already carry artifacts are skipped. Unlike
+  # extract-entities, batching costs no quality here -- each chunk's artifacts
+  # are generated independently. Overridden by --batch-size.
+  batch_size: 0
+
 qa:
   # Top-k candidate classes from class-summary ANN.
   k_classes: 15

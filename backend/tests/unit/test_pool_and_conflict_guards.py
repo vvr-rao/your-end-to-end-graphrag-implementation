@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import inspect
 
+import pytest
+
 from backend.app.services import db_entity_extract as dee
 
 
@@ -134,15 +136,64 @@ def test_no_explicit_pool_size_still_scales(monkeypatch):
 def test_only_db_bound_stages_are_capped():
     """Capping a stage that holds no DB session slows it for nothing.
 
-    Measured 2026-09-26 on one 15-client Supabase DB: register-documents ran
-    42 docs at concurrency 64 with zero pool errors, while extract-entities at
-    32 lost 62 of 71 chunks to EMAXCONNSESSION.
+    The 2026-09-26 EMAXCONNSESSION loss (extract-entities at 32, 62 of 71
+    chunks) came from `set_pool_minimum(32)` GROWING the pool past Supabase's
+    15-client cap, not from workers holding connections -- none of the
+    extraction or artifact stages holds a session across an LLM call.
     """
     from backend.app.cli import main as cli
 
-    assert "entity_extraction" in cli._POOL_BOUND_STAGES
-    assert "artifact_generation" in cli._POOL_BOUND_STAGES
+    assert "entity_extraction" not in cli._POOL_BOUND_STAGES
+    assert "artifact_generation" not in cli._POOL_BOUND_STAGES
     assert "summarization" not in cli._POOL_BOUND_STAGES, (
         "summarization is LLM+disk work whose DB writes happen after fan-in; "
         "capping it to the pool slows the long pole of ingestion for no gain"
     )
+
+
+_UNCAPPED_STAGE_MODULES = [
+    "backend/app/services/db_entity_extract.py",
+    "backend/app/services/db_artifact_gen.py",
+    "backend/app/services/db_insight_gen.py",
+    "backend/app/services/db_recommendation_gen.py",
+    "backend/app/services/db_artifact_rollup.py",
+]
+# Awaited inside a session block and known to be pure SQL.
+_DB_ONLY_HELPERS = {
+    "current_version", "bump_version", "_candidate_predicates",
+    "_wide_predicates", "_max_rollup_layer", "_scope_doc_id",
+    "retrieval_sql.same_type_neighbor_edges",
+}
+
+
+@pytest.mark.parametrize("path", _UNCAPPED_STAGE_MODULES)
+def test_uncapped_stages_hold_no_session_across_an_await(path):
+    """The premise that lets entity_extraction / artifact_generation run wider
+    than the pool: nothing slow is awaited while a `session_scope()` is open.
+
+    If this fails, someone put an LLM call (or a helper that makes one) inside
+    a session block. Either move it out, or put the stage back in
+    `_POOL_BOUND_STAGES` -- otherwise 64 workers queue on 12 connections and
+    chunks fail on pool_timeout.
+    """
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[3]
+    tree = ast.parse((root / path).read_text())
+    offenders: list[str] = []
+
+    def walk(node, in_session: bool) -> None:
+        if isinstance(node, (ast.With, ast.AsyncWith)) and any(
+            "session_scope" in ast.unparse(i.context_expr) for i in node.items
+        ):
+            in_session = True
+        if in_session and isinstance(node, ast.Await) and isinstance(node.value, ast.Call):
+            fn = ast.unparse(node.value.func)
+            if not fn.startswith(("session.", "s.", "conn.")) and fn not in _DB_ONLY_HELPERS:
+                offenders.append(f"{fn} (line {node.lineno})")
+        for child in ast.iter_child_nodes(node):
+            walk(child, in_session)
+
+    walk(tree, False)
+    assert not offenders, f"awaited inside session_scope in {path}: {offenders}"

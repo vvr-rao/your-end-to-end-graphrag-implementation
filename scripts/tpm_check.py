@@ -384,15 +384,17 @@ def analyse_corpus(
 def db_pool_report(mini_suggestion: int | None) -> None:
     """The THIRD constraint on concurrency, after TPM/RPM and memory.
 
-    A worker in a DB-bound stage holds its connection across its LLM calls, so
-    such a stage cannot usefully outnumber the pool -- and the pool itself cannot
-    outgrow what the server accepts. Supabase free tier in SESSION mode caps the
-    whole PROJECT at 15 client connections, shared by every process.
+    The pool cannot outgrow what the server accepts: Supabase free tier in
+    SESSION mode caps the whole PROJECT at 15 client connections, shared by
+    every process. Measured 2026-09-26, `extract-entities --concurrency 32` lost
+    62 of its first 71 chunks to
+    `(EMAXCONNSESSION) max clients reached in session mode` -- because the pool
+    was GROWN to 32, not because workers held connections.
 
-    This half used to be invisible here, so the gate would recommend a number
-    the CLI then overrode: measured 2026-09-26, `extract-entities --concurrency
-    32` lost 62 of its first 71 chunks to
-    `(EMAXCONNSESSION) max clients reached in session mode`.
+    Worker concurrency is a separate question. Only stages whose workers hold a
+    connection across an LLM call (`_POOL_BOUND_STAGES`) are capped to the pool;
+    extraction and artifact generation take a connection only for millisecond
+    reads, so they run at their configured concurrency against a small pool.
     """
     try:
         from backend.app.cli.main import _POOL_BOUND_STAGES
@@ -430,7 +432,7 @@ def db_pool_report(mini_suggestion: int | None) -> None:
             print(f"  *** {ceiling} EXCEEDS the 15-client cap -- lower pool_size ***")
         cap = ceiling
 
-    print("  DB-bound stages (a worker holds its connection across LLM calls):")
+    print("  Pool-capped stages (a worker holds its connection across LLM calls):")
     for k in sorted(_POOL_BOUND_STAGES):
         now = conc.get(k, "(unset)")
         note = ""
@@ -441,9 +443,10 @@ def db_pool_report(mini_suggestion: int | None) -> None:
         print(f"  NOTE: the rate-limit suggestion above ({mini_suggestion}) exceeds the")
         print(f"  pool ceiling ({cap}), so DB-bound stages will run at {cap} however high")
         print("  you set them. Raising pool_size only helps if the SERVER allows it.")
-    print("  NOT capped: summarization (its workers hold no DB session -- measured,")
-    print("  42 docs at concurrency 64 with zero pool errors), and every prune-expand")
-    print("  stage, which never touches the database at all.")
+    print("  NOT capped: summarization, entity_extraction and artifact_generation")
+    print("  (their workers hold no DB session while waiting on the LLM, so they share")
+    print("  the pool in millisecond slices), and every prune-expand stage, which")
+    print("  never touches the database at all.")
 
 
 async def main() -> int:
