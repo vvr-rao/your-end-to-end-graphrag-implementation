@@ -75,6 +75,42 @@ Ask "have a Postgres DSN, or make a local one?" — warn that a local DB isn't
 deploy-ready. Bring up docker Postgres if needed, then migrate + verify. Can run
 concurrently with step 3 (prune-expand doesn't need the DB).
 
+### 2b. Size the run ONCE, up front — rate limits + database → `concurrency:`
+Do this after steps 1 and 2 (it reads the active `models.yaml` and the DB
+settings) and before any paid step:
+```
+uv run python scripts/tpm_check.py "<DOCS>"
+```
+Costs ~nothing (one tiny probe per model, per provider — OpenAI, Anthropic
+and Groq alike). It prints a table of every concurrency knob with **now**,
+**suggest**, and the **binding task** — each stage is sized by the tightest
+model among the tasks it runs, so e.g. `entity_extraction` is bounded by
+whichever of its seven tasks has the least headroom. Two rules to tell the user:
+
+- **LLM-driven stages follow the RATE LIMITS** — `summarization`,
+  `chunk_classification`, `class_proposal`, `dedup`, `table_mining`,
+  `entity_extraction`, `artifact_generation`. `extract-entities` and
+  `generate-artifacts` touch the DB but hold no connection while waiting on the
+  LLM, so the DB does not bound their worker count.
+- **The DATABASE bounds the POOL** — `database.pool_size` + `max_overflow`
+  (Supabase session mode: 15 clients for the whole project; set by
+  **setup-database**) — and only `evaluation`'s worker count.
+
+Present conservative / recommended / aggressive options (the table and the
+four effects to state are in **run-prune-expand** Step 2c: speed not savings,
+~2% more spend from cache dilution, 429 risk on the 32k-token gpt-4.1 stages,
+hard-kill risk on `table_extraction`). When the user picks, WRITE it — the tool
+edits only the `concurrency:` block and keeps every comment:
+```
+uv run python scripts/tpm_check.py --apply                          # take every suggestion
+uv run python scripts/tpm_check.py --set entity_extraction=32 --set dedup=8   # or their own values
+```
+Never pass `--apply` without their go-ahead. Record it:
+`uv run python scripts/build_state.py record sizing applied=<yes|custom|kept>`.
+Later steps re-run the check only if the LLM mode (step 1) or the account's
+tier changes; run-prune-expand Step 2c and ingest-corpus still show it before
+their paid runs so the user sees current numbers.
+
 ### 3. Merge + prune-expand  →  invoke skill **run-prune-expand**
 Pick the ontology source (supported domain / other→core-only / their own .owl-.rdf
 / modify an existing folder), merge with the 7 core ontologies, then **report the

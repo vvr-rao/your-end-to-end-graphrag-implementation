@@ -225,14 +225,26 @@ do not silently apply them.**
 
 **This is a REQUIRED step, not optional.** Run it, read the output back to the
 user, and propose a full settings block before launching. The tool reads free
-memory, swap, the provider's own rate-limit headers, and the corpus shape.
+memory, swap, the provider's own rate-limit headers, and the corpus shape. If
+**build-app** step 2b already sized the run (tracker step `sizing`), still show
+the table, but only re-propose if the LLM mode or the account tier changed.
 
-**What it reads from the provider:** the account's real limits, not a guess --
-`x-ratelimit-limit-tokens` (**TPM**) and `x-ratelimit-limit-requests` (**RPM**),
-plus remaining headroom, per model in `config/models.yaml`. Both bound the
-suggestion: a stage is capped by whichever runs out first, which is why the
-mini-model stages land at 32 (TPM-rich) while `class_proposal` stays at 4. Cost
-is one 10-token probe per model.
+**What it reads from the provider:** the account's real limits, not a guess,
+for every model `config/models.yaml` routes to -- OpenAI and Groq
+`x-ratelimit-limit-tokens` (**TPM**) + `-requests` (**RPM**; Groq's is per day,
+so it is ignored), Anthropic's separate input/output token limits + requests.
+Each row of the output is one knob with **now**, **suggest**, and the
+**binding task**: a stage is sized by the tightest model among the tasks it
+runs, and within a model by whichever of TPM / RPM runs out first. Tasks with
+a 32k output budget (`class_proposal`, `match_dedup`) are additionally capped at
+16, because concurrent large gpt-4.1 calls throttle even with TPM to spare.
+Cost is one tiny probe per model.
+
+**Writing the choice:** once the user picks, apply it with
+`uv run python scripts/tpm_check.py --apply` (every suggestion) or
+`--set <stage>=N` (repeatable, their own values). It edits only the
+`concurrency:` block and keeps every comment. Never `--apply` without their
+go-ahead. Per-run flags below still override config for a single run.
 
 **Platform:** the rate-limit half is a plain HTTPS call, so it behaves
 identically on Linux, macOS and Windows. Only the *memory* half is
@@ -248,8 +260,8 @@ Knobs, grouped by what actually constrains them:
 | **Memory** | `concurrency.table_extraction` | ~152 MB per PDF subprocess | 1 |
 | **DB connection pool** | `database.pool_size` + `max_overflow` (and `evaluation` concurrency) | Supabase session mode caps the PROJECT at 15 clients | 10 + 2 |
 | **Memory (cheap) + caps concurrency** | `chunking.streaming_batch_size` | ~50 MB at 16 docs | 8 |
-| **Mini-model rate limit (~10M TPM)** | `summarization`, `chunk_classification`, `entity_extraction`, `artifact_generation`, `table_mining` | measured ~3% of tier at 32 | 32 |
-| **Big-model rate limit (~2M TPM, 32k requests)** | `class_proposal`, `dedup` | measured **6.2% of tier at 4** | 4 |
+| **Rate limit of the stage's tightest model** | `summarization`, `chunk_classification`, `table_mining`, `entity_extraction` (incl. gpt-4.1 orphan check), `artifact_generation` (incl. gpt-4.1 / gpt-5.4 rollup) | measured ~3% of a 10M-TPM tier at 32 | 32 |
+| **Rate limit + 32k-request cap (16)** | `class_proposal`, `dedup` | measured **6.2% of a 2M-TPM tier at 4** | 4 |
 
 Per-run flags on prune-expand/build (each falls back to its config key):
 ```

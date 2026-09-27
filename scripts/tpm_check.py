@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """Report your provider rate limits and recommend a concurrency setting.
 
-    uv run python scripts/tpm_check.py [<documents-dir>]
+    uv run python scripts/tpm_check.py [<documents-dir>] [--selection F]
+    uv run python scripts/tpm_check.py --apply            # write the suggestions
+    uv run python scripts/tpm_check.py --set entity_extraction=32 --set dedup=8
 
 Pass a corpus directory to also size `streaming_batch_size`, which silently
 CAPS effective concurrency: only the current batch's windows exist, so a
 semaphore larger than that has nothing to schedule.
 
-Reads OpenAI's authoritative rate-limit headers (one ~10-token probe per
-model) and turns them into a concrete suggestion for `concurrency:` in
-config/config.yaml.
+Reads each provider's authoritative rate-limit headers (one ~10-token probe per
+model the active models.yaml routes to -- OpenAI, Anthropic and Groq) and turns
+them into a per-STAGE suggestion for `concurrency:` in config/config.yaml. A
+stage's suggestion is the minimum over every task it runs, so a stage that
+mixes a cheap model with a tight one is sized by the tight one, and the report
+names the task that binds.
+
+Nothing is written unless --apply (write every suggestion) or --set
+stage=N (write your own value) is passed; the skills ask the user first.
 
 WHY THIS EXISTS: the shipped default of 4 was tuned for a low tier. On a
 tier-3+ account it leaves most of the allowance unused -- a 1.6M-token
@@ -22,6 +30,7 @@ Reads only whether keys are present, never prints key values.
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 from pathlib import Path
 
@@ -32,10 +41,6 @@ from backend.app.services.llm_router import (  # noqa: E402
     _openai_uses_completion_tokens,
 )
 
-# Rough per-call shape of the heavy stages: a ~12k-token source window plus
-# up to 8k of output, taking ~60s. Used only to size the suggestion.
-TOKENS_PER_CALL = 20_000
-SECONDS_PER_CALL = 60
 # Stay well under the ceiling: bursts, retries and other traffic share the bucket.
 TARGET_UTILISATION = 0.25
 
@@ -57,20 +62,75 @@ def _num(v) -> int | None:
     return None
 
 
-def _models_in_use() -> list[str]:
-    """Every distinct OpenAI model the active models.yaml routes to."""
-    tasks = (get_settings().models_config.get("tasks") or {})
-    seen: list[str] = []
-    for spec in tasks.values():
-        if spec.get("provider") != "openai":
-            continue
-        m = spec.get("model")
-        if m and m not in seen and not str(m).startswith("text-embedding"):
-            seen.append(m)
-    return seen or ["gpt-4.1", "gpt-4.1-mini"]
+# Every concurrency knob that bounds LLM calls, and the models.yaml tasks that
+# run under it. A stage is sized by the TIGHTEST of its tasks: one semaphore
+# covers all of them, so a mini-model stage that also makes gpt-4.1 calls
+# (extract-entities' orphan check; generate-artifacts' Insight / rollup) can
+# only go as wide as gpt-4.1 allows.
+#
+# test_tpm_check.py asserts every task listed here exists in the shipped
+# models presets, and that every task the stage's own modules call is listed.
+STAGE_TASKS: dict[str, tuple[str, ...]] = {
+    "summarization": (
+        "evaluated_summary_chunk", "summary_question_gen", "summary_evaluate",
+        "summary_revise",
+    ),
+    "chunk_classification": ("chunk_classification",),
+    "class_proposal": ("class_proposal",),
+    "dedup": ("match_dedup",),
+    "table_mining": ("table_concept_grouping",),
+    "entity_extraction": (
+        "entity_extract", "concept_extract", "entity_validate",
+        "relationship_extract", "relationship_verify",
+        "relationship_orphan_check", "relationship_repair",
+    ),
+    "artifact_generation": (
+        "artifact_chunk_extract", "artifact_chunk_extract_with_entities",
+        "artifact_document_summary", "insight_gen",
+        "artifact_merge", "artifact_merge_evaluate", "artifact_merge_revise",
+        "summary_merge", "summary_merge_evaluate", "summary_merge_revise",
+    ),
+    "evaluation": (
+        "judge_comprehensiveness", "judge_no_hallucination",
+        "judge_gap_detection", "judge_consistency",
+        "question_parse", "query_decompose", "entity_probes",
+        "answer_simple_qa", "answer_deep_research",
+    ),
+}
+
+# Stages that touch Postgres. They are sized by TPM/RPM like the rest; the DB
+# only bounds the POOL (see db_pool_report), except for `_POOL_BOUND_STAGES`.
+PHASE2_STAGES = ("entity_extraction", "artifact_generation", "evaluation")
+
+# The rough input side of one call (a source window plus the prompt).
+INPUT_TOKENS_PER_CALL = 12_000
+MAX_SUGGESTION = 128
+# Tasks with a 32k output budget (class_proposal, match_dedup on gpt-4.1)
+# throttle when many run at once even with TPM to spare -- models.yaml warns of
+# it, and the measured-safe range is 12-16. TPM alone would suggest 128 on a
+# 30M-TPM account. Raise past this only incrementally, watching for 429s.
+LARGE_CALL_OUTPUT_TOKENS = 32_768
+LARGE_CALL_CAP = 16
 
 
-async def probe(client, model: str) -> dict:
+def _task_specs() -> dict[str, dict]:
+    return (get_settings().models_config.get("tasks") or {})
+
+
+def _models_in_use() -> list[tuple[str, str]]:
+    """Every distinct (provider, chat model) a stage in STAGE_TASKS routes to."""
+    specs = _task_specs()
+    seen: list[tuple[str, str]] = []
+    for tasks in STAGE_TASKS.values():
+        for t in tasks:
+            spec = specs.get(t) or {}
+            key = (spec.get("provider"), spec.get("model"))
+            if key[0] and key[1] and key not in seen:
+                seen.append(key)
+    return seen
+
+
+async def _probe_openai_compatible(client, provider: str, model: str) -> dict:
     # gpt-5.x / o-series reject `max_tokens` and non-default temperature.
     #
     # They are also REASONING models: a budget of 1 is spent entirely on
@@ -81,30 +141,149 @@ async def probe(client, model: str) -> dict:
     # generate-artifacts even without --rollup) is one of them. 16 is enough to
     # get a reply and still costs ~nothing. Measured 2026-09-27: gpt-5.4 then
     # reports 40M TPM / 15k RPM.
-    kw = ({"max_completion_tokens": 16} if _openai_uses_completion_tokens(model)
+    kw = ({"max_completion_tokens": 16}
+          if provider == "openai" and _openai_uses_completion_tokens(model)
           else {"max_tokens": 1})
-    try:
-        raw = await client.chat.completions.with_raw_response.create(
-            model=model, messages=[{"role": "user", "content": "hi"}], **kw,
-        )
-    except Exception as exc:
-        return {"model": model, "error": f"{type(exc).__name__}: {str(exc)[:70]}"}
+    raw = await client.chat.completions.with_raw_response.create(
+        model=model, messages=[{"role": "user", "content": "hi"}], **kw,
+    )
     h = raw.headers
     return {
-        "model": model,
         "tpm": _num(h.get("x-ratelimit-limit-tokens")),
-        "rpm": _num(h.get("x-ratelimit-limit-requests")),
-        "remaining": _num(h.get("x-ratelimit-remaining-tokens")),
+        # Groq's x-ratelimit-limit-requests is per DAY, not per minute --
+        # dividing it as RPM would overstate headroom 1440x. Leave RPM unknown.
+        "rpm": None if provider == "groq" else _num(h.get("x-ratelimit-limit-requests")),
     }
 
 
-def suggest(tpm: int | None, rpm: int | None) -> int | None:
-    if not tpm:
+async def _probe_anthropic(client, model: str) -> dict:
+    raw = await client.messages.with_raw_response.create(
+        model=model, max_tokens=1, messages=[{"role": "user", "content": "hi"}],
+    )
+    h = raw.headers
+    # Anthropic meters input and output tokens separately (ITPM / OTPM).
+    return {
+        "itpm": _num(h.get("anthropic-ratelimit-input-tokens-limit")),
+        "otpm": _num(h.get("anthropic-ratelimit-output-tokens-limit")),
+        "tpm": _num(h.get("anthropic-ratelimit-tokens-limit")),
+        "rpm": _num(h.get("anthropic-ratelimit-requests-limit")),
+    }
+
+
+async def probe(provider: str, model: str) -> dict:
+    """One tiny call; returns the model's limits, or an `error`."""
+    s = get_settings()
+    row: dict = {"provider": provider, "model": model}
+    try:
+        if provider == "openai":
+            if not s.openai_api_key:
+                return {**row, "error": "OPENAI_API_KEY not set"}
+            from openai import AsyncOpenAI
+            client = AsyncOpenAI(api_key=s.openai_api_key, max_retries=0)
+            row.update(await _probe_openai_compatible(client, provider, model))
+        elif provider == "groq":
+            if not s.groq_api_key:
+                return {**row, "error": "GROQ_API_KEY not set"}
+            from groq import AsyncGroq
+            client = AsyncGroq(api_key=s.groq_api_key, max_retries=0)
+            row.update(await _probe_openai_compatible(client, provider, model))
+        elif provider == "anthropic":
+            if not s.anthropic_api_key:
+                return {**row, "error": "ANTHROPIC_API_KEY not set"}
+            from anthropic import AsyncAnthropic
+            client = AsyncAnthropic(api_key=s.anthropic_api_key, max_retries=0)
+            row.update(await _probe_anthropic(client, model))
+        else:
+            return {**row, "error": f"unknown provider {provider!r}"}
+    except Exception as exc:
+        return {**row, "error": f"{type(exc).__name__}: {str(exc)[:70]}"}
+    return row
+
+
+def suggest(limits: dict, output_tokens: int) -> int | None:
+    """Workers one model's limits support for calls of this shape.
+
+    Assumes each worker issues about one call a minute (heavy calls take tens
+    of seconds) and aims at 25% of the limit, leaving room for bursts, retries
+    and other traffic on the same key. Returns None when no token limit is
+    known -- an unknown limit must not look like an unlimited one.
+    """
+    per_call = INPUT_TOKENS_PER_CALL + output_tokens
+    bounds: list[int] = []
+    if limits.get("itpm"):
+        bounds.append(int(limits["itpm"] * TARGET_UTILISATION / INPUT_TOKENS_PER_CALL))
+    if limits.get("otpm"):
+        bounds.append(int(limits["otpm"] * TARGET_UTILISATION / max(1, output_tokens)))
+    if limits.get("tpm") and not (limits.get("itpm") or limits.get("otpm")):
+        bounds.append(int(limits["tpm"] * TARGET_UTILISATION / per_call))
+    if not bounds:
         return None
-    by_tokens = int((tpm * TARGET_UTILISATION) /
-                    (TOKENS_PER_CALL * (60 / SECONDS_PER_CALL)))
-    by_requests = int((rpm or 10_000) * TARGET_UTILISATION * (SECONDS_PER_CALL / 60))
-    return max(1, min(by_tokens, by_requests, 128))
+    if limits.get("rpm"):
+        bounds.append(int(limits["rpm"] * TARGET_UTILISATION))
+    if output_tokens >= LARGE_CALL_OUTPUT_TOKENS:
+        bounds.append(LARGE_CALL_CAP)
+    return max(1, min(min(bounds), MAX_SUGGESTION))
+
+
+def stage_suggestions(limits_by_model: dict[tuple[str, str], dict]) -> dict[str, dict]:
+    """Per stage: the suggestion and the task/model that binds it."""
+    specs = _task_specs()
+    out: dict[str, dict] = {}
+    for stage, tasks in STAGE_TASKS.items():
+        best: dict | None = None
+        unknown: list[str] = []
+        for t in tasks:
+            spec = specs.get(t)
+            if not spec:
+                continue  # task not routed in this preset
+            key = (spec.get("provider"), spec.get("model"))
+            lim = limits_by_model.get(key) or {}
+            n = None if lim.get("error") else suggest(lim, int(spec.get("max_tokens") or 8192))
+            if n is None:
+                unknown.append(f"{t} ({key[0]}/{key[1]})")
+                continue
+            if best is None or n < best["value"]:
+                best = {"value": n, "task": t, "provider": key[0], "model": key[1]}
+        out[stage] = {**(best or {"value": None}), "unknown": unknown}
+    return out
+
+
+def apply_concurrency(path: Path, values: dict[str, int]) -> list[str]:
+    """Set `concurrency.<stage>: N` in a YAML file, keeping every comment.
+
+    A line edit, not a YAML round-trip: config.yaml is mostly comments that
+    record measurements, and a dump would erase them. Missing keys are added at
+    the end of the block. Returns a line per change.
+    """
+    lines = path.read_text().splitlines(keepends=True)
+    try:
+        start = next(i for i, ln in enumerate(lines) if ln.rstrip() == "concurrency:")
+    except StopIteration:
+        lines.append("\nconcurrency:\n")
+        start = len(lines) - 1
+    end = start + 1
+    while end < len(lines) and (
+        not lines[end].strip() or lines[end].startswith((" ", "\t"))
+    ):
+        end += 1
+    changes: list[str] = []
+    pending = dict(values)
+    for i in range(start + 1, end):
+        m = re.match(r"^(\s+)([a-z_]+):\s*(\S+)(.*)$", lines[i].rstrip("\n"))
+        if m and m.group(2) in pending:
+            new = pending.pop(m.group(2))
+            if str(new) != m.group(3):
+                changes.append(f"concurrency.{m.group(2)}: {m.group(3)} -> {new}")
+            lines[i] = f"{m.group(1)}{m.group(2)}: {new}{m.group(4)}\n"
+    insert_at = end
+    while insert_at > start + 1 and not lines[insert_at - 1].strip():
+        insert_at -= 1
+    for k, v in pending.items():
+        lines.insert(insert_at, f"  {k}: {v}\n")
+        insert_at += 1
+        changes.append(f"concurrency.{k}: (unset) -> {v}")
+    path.write_text("".join(lines))
+    return changes
 
 
 def _mem_linux() -> tuple[int, int]:
@@ -449,80 +628,85 @@ def db_pool_report(mini_suggestion: int | None) -> None:
     print("  never touches the database at all.")
 
 
+def _parse_sets(argv: list[str]) -> dict[str, int]:
+    """`--set stage=N` pairs (repeatable). Unknown stages are rejected."""
+    out: dict[str, int] = {}
+    for i, a in enumerate(argv):
+        if a == "--set" and i + 1 < len(argv):
+            k, _, v = argv[i + 1].partition("=")
+            if k not in STAGE_TASKS and k != "table_extraction":
+                raise SystemExit(f"--set: unknown stage {k!r}; "
+                                 f"one of {sorted([*STAGE_TASKS, 'table_extraction'])}")
+            out[k] = int(v)
+    return out
+
+
 async def main() -> int:
-    s = get_settings()
-    if not s.openai_api_key:
-        print("OPENAI_API_KEY not set — cannot probe rate limits.")
-        return 1
-    from openai import AsyncOpenAI
+    argv = sys.argv[1:]
+    manual = _parse_sets(argv)
+    do_apply = "--apply" in argv
 
-    client = AsyncOpenAI(api_key=s.openai_api_key, max_retries=0)
     models = _models_in_use()
-    rows = await asyncio.gather(*[probe(client, m) for m in models])
+    rows = await asyncio.gather(*[probe(p, m) for p, m in models])
+    limits = {(r["provider"], r["model"]): r for r in rows}
 
-    print("Provider rate limits (from OpenAI's own headers)\n")
-    print(f"{'model':<18} {'TPM limit':>12} {'RPM limit':>10} {'suggested conc.':>16}")
-    print("-" * 60)
-    # Bucket by tier: the mini-class models drive the cheap high-volume stages;
-    # the big models drive Stage 1/2 and sit on a much tighter limit. Taking one
-    # minimum across both would pin the cheap stages to the tight limit -- the
-    # exact mistake these separate knobs exist to prevent.
-    mini: list[int] = []
-    big: list[int] = []
+    print("Provider rate limits (from each provider's own headers)\n")
+    print(f"{'provider/model':<34} {'TPM (in/out)':>22} {'RPM':>8}")
+    print("-" * 66)
     for r in rows:
+        name = f"{r['provider']}/{r['model']}"
         if r.get("error"):
-            print(f"{r['model']:<18} {r['error'][:44]}")
+            print(f"{name:<34} {r['error'][:40]}")
             continue
-        sug = suggest(r["tpm"], r["rpm"])
-        if sug:
-            (mini if (r["tpm"] or 0) >= 5_000_000 else big).append(sug)
-        print(f"{r['model']:<18} {r['tpm'] or '?':>12} {r['rpm'] or '?':>10} {sug or '?':>16}")
+        tok = (f"{r.get('itpm') or '?'}/{r.get('otpm') or '?'}"
+               if r.get("itpm") or r.get("otpm") else f"{r.get('tpm') or '?'}")
+        print(f"{name:<34} {tok:>22} {r.get('rpm') or '?':>8}")
 
-    cfg = get_settings().app_config
-    cur = (cfg.get("concurrency") or {})
-    print("\nCurrent config/config.yaml:")
-    for k in ("summarization", "entity_extraction", "artifact_generation",
-              "table_mining", "evaluation"):
-        print(f"  concurrency.{k:<20} {cur.get(k, '(unset -> 4)')}")
-    print(f"  expansion.max_concurrent_llm_calls  "
-          f"{(cfg.get('expansion') or {}).get('max_concurrent_llm_calls', '(unset -> 4)')}"
-          "   <- keep LOW (gpt-4.1 @ 32k max_tokens on the tighter tier)")
+    sugg = stage_suggestions(limits)
+    cur = (get_settings().app_config.get("concurrency") or {})
+    print("\nSuggested concurrency per stage (bound by its TIGHTEST task):\n")
+    print(f"  {'stage':<22} {'now':>6} {'suggest':>8}   binding task (model)")
+    for stage, sg in sugg.items():
+        now = cur.get(stage, "unset")
+        val = sg["value"] if sg["value"] is not None else "?"
+        bind = (f"{sg['task']} ({sg['model']})" if sg.get("task")
+                else "no limits known -- keep current")
+        mark = ""
+        if isinstance(now, int) and isinstance(sg["value"], int):
+            mark = " <- raise" if now < sg["value"] // 2 else (
+                " <- LOWER" if now > sg["value"] else "")
+        print(f"  {stage:<22} {now!s:>6} {val!s:>8}   {bind}{mark}")
+        if sg["unknown"]:
+            print(f"  {'':<22} {'':>6} {'':>8}   (unprobed: {', '.join(sg['unknown'][:3])})")
 
-    if mini or big:
-        cur = (get_settings().app_config.get("concurrency") or {})
-        if mini:
-            m = min(mini)
-            print(f"\nMINI-MODEL stages (~10M TPM) -- suggested {m}:")
-            for k in ("summarization", "chunk_classification", "entity_extraction",
-                      "artifact_generation", "table_mining"):
-                now = cur.get(k, "(unset)")
-                flag = "  <- raise" if isinstance(now, int) and now < m // 2 else ""
-                print(f"    concurrency.{k:<22} now {now}{flag}")
-            print("    chunk_classification is Stage 1: it ran at 4 for a long time only")
-            print("    because it shared Stage 2's semaphore. It is independent now.")
-            sel_now = (get_settings().app_config.get("corpus_selection") or {}).get(
-                "label_concurrency", 8)
-            print(f"\n    corpus_selection.label_concurrency  now {sel_now}"
-                  f"{'  <- raise' if isinstance(sel_now, int) and sel_now < m // 2 else ''}")
-            print("    Drives --select-subset's doc-type labelling + embed compression")
-            print("    (cheap model, so it belongs in this tier). Pass it as")
-            print(f"    --selection-concurrency {m}; the SUMMARIZATION inside selection")
-            print("    takes --summarization-concurrency and is the real long pole.")
-        if big:
-            b = min(big)
-            print(f"\nBIG-MODEL stages (~2M TPM, 32k-token requests) -- ceiling ~{b}:")
-            for k in ("class_proposal", "dedup"):
-                print(f"    concurrency.{k:<22} now {cur.get(k, '(unset)')}")
-            print("    MEASURED: class_proposal used only 6.2% of the 2M tier at 4,")
-            print("    so 12-16 is likely safe. But models.yaml warns that concurrent")
-            print("    large gpt-4.1 calls throttle -- raise INCREMENTALLY, watch 429s.")
-            print("    class_proposal is ~65% of prune-expand cost; dedup ~22%.")
-        print("\nThis buys SPEED, not savings. Wall time falls close to linearly;")
-        print("total cost is unchanged because the same tokens are sent either way.")
-        print("A higher value does slightly lower the prompt-cache hit rate")
-        print("(measured 69% -> 49% going 4 -> 32, about +2% spend).")
+    print("\n  Phase-2 stages (" + ", ".join(PHASE2_STAGES) + ") are sized by the")
+    print("  RATE LIMIT above like every other stage. The database bounds the POOL,")
+    print("  reported below, not their worker count -- except `evaluation`.")
+    print("  class_proposal / dedup send 32k-token gpt-4.1 requests; models.yaml warns")
+    print("  concurrent large calls throttle, so raise those INCREMENTALLY and watch")
+    print("  for 429s. class_proposal is ~65% of prune-expand cost; dedup ~22%.")
+    sel = (get_settings().app_config.get("corpus_selection") or {}).get(
+        "label_concurrency", 8)
+    mini = sugg.get("chunk_classification", {}).get("value")
+    if mini:
+        print(f"\n  corpus_selection.label_concurrency now {sel}: pass "
+              f"--selection-concurrency {mini} to --select-subset runs.")
+    print("\nThis buys SPEED, not savings. Wall time falls close to linearly;")
+    print("total cost is unchanged because the same tokens are sent either way.")
+    print("A higher value does slightly lower the prompt-cache hit rate")
+    print("(measured 69% -> 49% going 4 -> 32, about +2% spend).")
 
-    db_pool_report(min(mini) if mini else None)
+    db_pool_report(sugg.get("evaluation", {}).get("value"))
+
+    if do_apply or manual:
+        values = {k: v["value"] for k, v in sugg.items()
+                  if do_apply and v["value"] is not None}
+        values.update(manual)
+        path = Path(__file__).resolve().parent.parent / "config" / "config.yaml"
+        changes = apply_concurrency(path, values)
+        print(f"\nWROTE {path.relative_to(path.parent.parent)}:")
+        for c in changes or ["(no changes -- already at these values)"]:
+            print(f"  {c}")
 
     cfg1 = get_settings().app_config
     advise_memory(
@@ -532,7 +716,9 @@ async def main() -> int:
 
     # Minimal arg handling: first positional is the corpus, optional
     # --selection <selection.json> narrows it to a chosen subset.
-    positional = [a for a in sys.argv[1:] if not a.startswith("-")]
+    set_values = {argv[i + 1] for i, a in enumerate(argv)
+                  if a == "--set" and i + 1 < len(argv)}
+    positional = [a for a in argv if not a.startswith("-") and a not in set_values]
     selection = None
     if "--selection" in sys.argv:
         i = sys.argv.index("--selection")

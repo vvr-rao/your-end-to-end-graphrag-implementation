@@ -417,8 +417,13 @@ Other things worth knowing:
   each table individually and skips non-financial ones, so a mixed corpus is
   safe. Retrieval never needs `--table-mining`.
 - **If the user asks why a run is slow:** run `uv run python scripts/tpm_check.py`
-  first, then recommend raising concurrency. It reads OpenAI's rate-limit headers
-  and suggests a value per stage. Measured on a tier-4 account at concurrency 32:
+  first, then recommend raising concurrency. It reads each provider's rate-limit
+  headers (OpenAI, Anthropic, Groq) and suggests a value per stage, bound by the
+  tightest model among the tasks that stage runs, naming that task. It writes
+  the agreed values with `--apply` / `--set stage=N` (only after the user
+  agrees). LLM stages -- including `extract-entities` and `generate-artifacts`
+  -- follow the rate limits; the database bounds only the connection pool and
+  `evaluate-queries`. Measured on a tier-4 account at concurrency 32:
   ~0.5% sustained TPM and ZERO burst pressure, so on tier 3+ the provider limit
   is almost never the constraint -- the config is.
   - **Always say that concurrency buys SPEED, not savings.** Users assume a
@@ -426,10 +431,11 @@ Other things worth knowing:
     prompt-cache hit rate). Wall time scales close to linearly: a 1.6M-token
     corpus took ~4h to summarize at 4 and ~25 min at 32.
   - Settings live under `concurrency:` in `config/config.yaml`
-    (`summarization`, `entity_extraction`, `artifact_generation`,
-    `table_mining`, `evaluation`). Suggest 32-64 on tier 3+, 4-8 on tier 1-2.
-  - `expansion.max_concurrent_llm_calls` is deliberately SEPARATE and stays at
-    4-8 -- it drives gpt-4.1 at 32k max_tokens against a ~2M TPM tier.
+    (`summarization`, `chunk_classification`, `class_proposal`, `dedup`,
+    `table_mining`, `entity_extraction`, `artifact_generation`, `evaluation`).
+    Use the tool's per-stage numbers rather than a rule of thumb.
+  - `class_proposal` / `dedup` send 32k-token gpt-4.1 requests; the tool caps
+    them at 16 because concurrent large calls throttle even with TPM to spare.
   - Flags: most commands take `--concurrency N`; `prune-expand` and `build` take
     three (`--summarization-concurrency`, `--table-mining-concurrency`,
     `--expansion-concurrency`) since they drive three stages on different models.

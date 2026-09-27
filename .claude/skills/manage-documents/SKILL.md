@@ -47,9 +47,19 @@ bring new edges, and an unembedded edge is invisible to the relation-matched
 walk -- silently, with no error. `extract-entities` embeds the edges it writes,
 but `enrich-geo`'s are new, so run it after.
 
-**Chunk kind: `enrich-time` and `generate-artifacts` follow the corpus
-automatically** — no flag needed (changed 2026-09-27; the old "run all three with
-`--from-fulltext`" rule is obsolete). `extract-entities` stays **opt-in** and
+**Size it first if the batch is large.** Before the paid steps on more than a
+handful of documents, run `uv run python scripts/tpm_check.py` and show the
+per-stage table (see **build-app** step 2b). If the tracker has a `sizing` step
+and the LLM mode has not changed since, the config is already right -- just
+confirm. Otherwise propose values and write the agreed ones with `--apply` /
+`--set stage=N`. `extract-entities` and `generate-artifacts` follow the RATE
+LIMITS, not the DB pool. For a large add, pass `--batch-size` to both so each
+batch commits and a killed run resumes.
+
+**Chunk kind: `enrich-time` follows the corpus, `generate-artifacts` follows
+EXTRACTION** (the chunk kind that carries `extract-entities`' edges) -- no flag
+needed (the old "run all three with `--from-fulltext`" rule is obsolete).
+`extract-entities` stays **opt-in** and
 defaults to summary chunks, because full-text extraction costs ~4.3x (~$38 vs
 $8.75 on the 42-doc reference corpus) and `--max-cost-usd` defaults to 5.0. Match
 whatever the initial ingest used, so the graph is not half summary-derived and
