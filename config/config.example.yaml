@@ -25,6 +25,13 @@ chunking:
   # Cuts Stage 2 cost dramatically on corpora dominated by a few large
   # documents. Set to 0 to disable; the pipeline then chunks raw text.
   summarization_threshold_tokens: 2000
+  # register-documents: also store the VERBATIM text as kind='fulltext'
+  # chunks alongside the summaries. Retrieval prefers full-text (better
+  # recall + exact citations), and enrich-time / generate-artifacts follow
+  # whatever this produces. Costs DB size -- check `db-size` after a run.
+  # extract-entities is NOT driven by this; it has its own
+  # `extraction.from_fulltext`.
+  full_text_chunks: true
   # Persistent disk cache for document summaries at
   # ~/.cache/your-end-to-end-graphrag-implementation/doc_summaries/. Cache
   # key hashes the doc text + model + prompt version, so editing a doc
@@ -163,8 +170,18 @@ summarization:
 # at 16 (a Supabase project has a finite client-connection budget). The CLI
 # additionally caps worker concurrency at pool_size + max_overflow.
 database:
-  pool_size:
-  max_overflow:
+  # Supabase free tier in SESSION mode caps the PROJECT at `pool_size: 15`
+  # client connections, shared by the backend web service and the arq worker.
+  # Left blank, the engine derives the pool from the largest `concurrency:`
+  # value and sets max_overflow to match it (engine.py), which lands on 8 + 8
+  # = 16 here -- one over the server's hard cap. Measured 2026-09-26:
+  # `extract-entities --concurrency 32` derived a 32-connection pool and failed
+  # 62 of its first 71 chunks on
+  #   (EMAXCONNSESSION) max clients reached in session mode
+  # Pinned so the derived default cannot outgrow the server. Raise both on a
+  # self-hosted / docker Postgres, which has no such cap.
+  pool_size: 10
+  max_overflow: 2
   pool_timeout: 60
 
 concurrency:
@@ -374,6 +391,28 @@ expansion:
 # `concurrency.entity_extraction` above; this section is about accuracy.
 # -----------------------------------------------------------------------------
 extraction:
+  # extract-entities: mine entities from kind='fulltext' chunks rather than
+  # the summaries. Set independently of the other stages on purpose --
+  # ingestion decides what EXISTS, this decides whether extraction pays for it.
+  #
+  # DEFAULT OFF, because this is the single most expensive switch in the
+  # pipeline. Summaries compress ~4x on a mixed corpus and far more on long
+  # reports, and every full-text chunk is one more entity+relationship LLM
+  # round trip. Measured 2026-09-26 on the 42-doc mixed-regression corpus
+  # (40 news articles + 2 long PDFs):
+  #
+  #   summary chunks   282  -> $8.75   (17 min at concurrency 12)
+  #   fulltext chunks 1222  -> ~$38    (~4.3x, extrapolated at $0.031/chunk)
+  #
+  # The CLI help's "~18x" is the ratio on corpora of long reports, where
+  # summarization compresses hardest. Note --max-cost-usd defaults to 5.0, so
+  # a full-text run trips the cap almost immediately unless raised.
+  #
+  # Retrieval does NOT need this: it reaches full-text chunks through the
+  # document-mediated bridge regardless of which kind entities were mined
+  # from, so the usual reason to turn this on is entity RECALL inside long
+  # documents, not citation quality.
+  from_fulltext: false
   # Validate-and-review loop, enabled per run with --validate-entities (OFF by
   # default). After entities are extracted, a DIFFERENT model (models.yaml task
   # `entity_validate`) reviews each entity + its class assignment; anything
@@ -399,6 +438,26 @@ extraction:
   # proposing 2 rescues for the whole batch. Cost on this step scales with
   # ceil(orphans / batch); nothing else changes.
   orphan_batch_size: 8
+  # extract-entities: process chunks in COMMITTED batches of this many instead
+  # of one all-or-nothing pass. 0 = single-shot (today's behaviour, the default).
+  #
+  # WHY: the single-shot path makes every LLM call first and writes once at the
+  # end. Measured 2026-09-26, a 282-chunk run costs $8.75 and takes 17 minutes
+  # with nothing durable until the final second -- a kill, a crash or a
+  # --max-cost-usd trip at 90% discards all of it. With a batch size set, each
+  # batch commits, and because chunk selection already skips chunks that have
+  # entity edges, a re-run resumes by itself: the graph is the progress marker,
+  # there is no checkpoint file.
+  #
+  # COST OF BATCHING: `_resolve_canonical_forms` (variant-spelling collapse) and
+  # the plurality class vote see one batch rather than the whole run, so a
+  # spelling appearing in batch 1 and batch 5 may not merge into one entity.
+  # Entities already in the DB are still reused on exact normalised match, so
+  # identity survives; it is near-duplicate merging that degrades. Chunks are
+  # ordered by created_at (document by document), so variants of one name
+  # usually land in the same batch. Prefer the LARGEST batch you can afford to
+  # lose -- e.g. 100-200 on a multi-thousand-chunk full-text run.
+  batch_size: 0
   concept_pass: false
   # How far the abstention recovery may reach. When the model abstains
   # (NONE_OF_THESE) it names the type it wanted; ~half the time that class
@@ -523,7 +582,10 @@ qa:
   # Graph-BFS depth (Milestone-F retrieval step 7): how many hops to walk
   # out from the seed nodes over graph_relationships. Higher = broader
   # evidence but more candidates + cost. `query --hops N` overrides per-run.
-  hops: 3
+  # Lowered 3 -> 2: on the dense full-text graph, 3-hop recursion explodes and
+  # spills to Postgres temp disk -> DiskFullError on Supabase free tier. 2 hops
+  # gives good coverage without the blowup. (Real fix = bounded BFS + bigger DB.)
+  hops: 2
   # Max characters of each evidence item's text placed in the answer-synthesis
   # prompt. MUST be >= the longest chunk, or evidence is silently discarded
   # after being correctly retrieved.

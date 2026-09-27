@@ -29,12 +29,14 @@ by sha256)**, so pointing it at a folder containing new files adds only the new
 ones. Smoke-test a big batch with `--limit` first, then launch detached (single-line
 command; choose a fresh `RUN_ID`, e.g. `add_docs_<date+time>`):
 ```
-uv run python scripts/run_detached.py <RUN_ID> uv run python -m backend.app.cli register-documents --input "<folder-with-new-docs>" [--tables] [--full-text-chunks]
+uv run python scripts/run_detached.py <RUN_ID> uv run python -m backend.app.cli register-documents --input "<folder-with-new-docs>" [--tables] [--no-full-text-chunks]
 uv run python scripts/job_status.py <RUN_ID> 40
 ```
-**Match the corpus's full-text setting.** If the corpus was originally ingested with
-`--full-text-chunks` (check the tracker: `register-documents … fulltext=yes`), pass
-`--full-text-chunks` here too, so the new docs get full-text chunks like the rest.
+**Match the corpus's full-text setting.** Full-text chunks are now **ON by
+default** (`chunking.full_text_chunks: true`). If the existing corpus was ingested
+summary-only (check the tracker: `register-documents … fulltext=no`), pass
+`--no-full-text-chunks` here so the new docs match the rest rather than silently
+becoming the only full-text documents in the graph.
 
 **Then fold them into the graph.** New docs create chunks but NOT yet entities or
 artifacts. Re-run the extraction steps — each is idempotent and processes only the
@@ -43,9 +45,15 @@ new, unprocessed chunks: `extract-entities`, `enrich-time`, `enrich-geo` +
 including Step 4b). **`embed-relationships` matters most here**: new documents
 bring new edges, and an unembedded edge is invisible to the relation-matched
 walk -- silently, with no error. `extract-entities` embeds the edges it writes,
-but `enrich-geo`'s are new, so run it after. **If the corpus is full-text (`fulltext=yes`),
-run all three with `--from-fulltext`** — the same consistency rule as the initial
-ingest.
+but `enrich-geo`'s are new, so run it after.
+
+**Chunk kind: `enrich-time` and `generate-artifacts` follow the corpus
+automatically** — no flag needed (changed 2026-09-27; the old "run all three with
+`--from-fulltext`" rule is obsolete). `extract-entities` stays **opt-in** and
+defaults to summary chunks, because full-text extraction costs ~4.3x (~$38 vs
+$8.75 on the 42-doc reference corpus) and `--max-cost-usd` defaults to 5.0. Match
+whatever the initial ingest used, so the graph is not half summary-derived and
+half full-text-derived.
 
 **Report the two coverage percentages for the NEW documents** exactly as
 **ingest-corpus** Step 3 specifies — abstained entities as a % of mentions, and

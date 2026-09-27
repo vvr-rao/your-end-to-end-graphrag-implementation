@@ -2091,6 +2091,9 @@ async def extract_entities(
     menu_ancestor_closure: bool = True,
     pinned_class_labels: tuple[str, ...] = (),
     embed_relationships: bool = True,
+    link_tables: bool = True,
+    bump_graph_version: bool = True,
+    chunk_offset: int = 0,
 ) -> EntityExtractSummary:
     """Drive entity extraction over chunks that haven't been processed.
 
@@ -2133,7 +2136,10 @@ async def extract_entities(
                 Chunk.kind == chunk_kind,  # 'summary' (default) or 'fulltext' (--from-fulltext)
                 Chunk.id.notin_(already_subq),
             )
-            .order_by(Chunk.created_at)
+            # `Chunk.id` breaks created_at ties so the order is TOTAL. The
+            # streaming driver pages with `chunk_offset`, and an unstable sort
+            # would make it skip or repeat chunks between batches.
+            .order_by(Chunk.created_at, Chunk.id)
         )
         if scope_document_iri is not None:
             doc_row = await session.execute(
@@ -2145,6 +2151,12 @@ async def extract_entities(
             if doc_id is None:
                 raise ValueError(f"document not found: {scope_document_iri}")
             stmt = stmt.where(Chunk.document_id == doc_id)
+        # `chunk_offset` lets the streaming driver step PAST chunks that yield
+        # no entities. Such a chunk never gets a viao:assertsAbout edge, so it
+        # stays "unprocessed" forever; without an offset it would sit at the
+        # head of every batch and starve the chunks behind it.
+        if chunk_offset:
+            stmt = stmt.offset(chunk_offset)
         if limit is not None:
             stmt = stmt.limit(limit)
 
@@ -3686,10 +3698,18 @@ async def extract_entities(
     # AFTER the per-chunk entity-mining pass so all just-minted entities
     # are visible. Idempotent (ON CONFLICT DO NOTHING) -- safe to re-run
     # on existing corpora to backfill linkage.
-    await _link_tables_to_entities(summary)
+    # `link_tables` / `bump_graph_version` exist for the batch-streaming driver
+    # (`extract_entities_streamed`), which calls this function once per batch and
+    # wants both to happen ONCE for the whole run rather than per batch: table
+    # linkage needs every entity visible, and bumping the version per batch would
+    # turn one logical ingestion run into N versions, breaking the
+    # time-bounded-query semantics graph_version exists for.
+    if link_tables:
+        await _link_tables_to_entities(summary)
 
-    async with session_scope() as session:
-        summary.new_graph_version = await bump_version(session)
+    if bump_graph_version:
+        async with session_scope() as session:
+            summary.new_graph_version = await bump_version(session)
 
     summary.total_cost_usd = summary.llm_cost_usd + summary.embedding_cost_usd
     summary.wall_seconds = time.time() - t0
@@ -3901,3 +3921,197 @@ async def _link_tables_to_entities(summary: EntityExtractSummary) -> None:
         f"[link-tables] inserted {len(fresh)} table->entity edge(s) "
         f"({len(edge_payloads) - len(fresh)} duplicate(s) skipped)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Batch-streamed, resumable driver
+# ---------------------------------------------------------------------------
+
+async def _unprocessed_chunk_count(
+    *, chunk_kind: str, scope_document_iri: str | None = None
+) -> int:
+    """How many chunks `extract_entities` would still pick up.
+
+    Mirrors the selection predicate at the top of `extract_entities` exactly.
+    If the two ever drift, the streaming loop's progress guard stops firing and
+    a zero-entity batch becomes an infinite paid loop -- so they are asserted
+    against each other in test_entity_streaming.py.
+    """
+    async with session_scope() as session:
+        already_subq = select(GraphRelationship.source_chunk_id).where(
+            GraphRelationship.predicate_iri == VIAO_ASSERTS_ABOUT,
+            GraphRelationship.relationship_source == "DOCUMENT_EXTRACTION",
+            GraphRelationship.source_chunk_id.isnot(None),
+        )
+        stmt = select(func.count()).select_from(Chunk).where(
+            Chunk.status == "ACTIVE",
+            Chunk.kind == chunk_kind,
+            Chunk.id.notin_(already_subq),
+        )
+        if scope_document_iri is not None:
+            doc_id = (await session.execute(
+                select(Document.id).where(
+                    Document.document_identifier == scope_document_iri
+                )
+            )).scalar_one_or_none()
+            if doc_id is None:
+                raise ValueError(f"document not found: {scope_document_iri}")
+            stmt = stmt.where(Chunk.document_id == doc_id)
+        return int((await session.execute(stmt)).scalar() or 0)
+
+
+def _merge_summaries(
+    total: EntityExtractSummary, batch: EntityExtractSummary
+) -> None:
+    """Accumulate a batch's summary into the run total, in place."""
+    for f in (
+        "chunks_scanned", "chunks_skipped_already", "chunks_failed",
+        "entities_minted", "entities_reused", "chunk_entity_edges",
+        "entity_relationship_edges", "relationship_embeddings", "type_edges",
+        "tables_scanned", "table_entity_edges", "menu_classes_withheld",
+        "relationship_endpoints_renamed",
+    ):
+        setattr(total, f, getattr(total, f) + getattr(batch, f))
+    for f in ("llm_cost_usd", "embedding_cost_usd", "total_cost_usd"):
+        setattr(total, f, getattr(total, f) + getattr(batch, f))
+    for f in ("entity_drops", "entity_validation", "concept_extraction",
+              "relationship_pass_stats"):
+        dst, src = getattr(total, f), getattr(batch, f) or {}
+        for k, v in src.items():
+            dst[k] = dst.get(k, 0) + v
+    # Bounded: samples exist to be eyeballed, not enumerated. Without a cap a
+    # 10M-token run would accumulate every sample from every batch in memory,
+    # which is the very thing streaming is here to avoid.
+    for f, cap in (("samples", 8), ("abstained_samples", 200),
+                   ("renamed_entities", 50), ("orphan_flags", 50)):
+        dst, src = getattr(total, f), getattr(batch, f) or []
+        if len(dst) < cap:
+            dst.extend(src[: cap - len(dst)])
+    total.new_graph_version = max(total.new_graph_version,
+                                  batch.new_graph_version)
+
+
+async def extract_entities_streamed(
+    *,
+    batch_size: int,
+    max_cost_usd: float = 5.0,
+    chunk_kind: str = "summary",
+    scope_document_iri: str | None = None,
+    limit: int | None = None,
+    **kwargs: Any,
+) -> EntityExtractSummary:
+    """`extract_entities` in committed batches, resumable after a kill.
+
+    WHY: the single-shot path does every LLM call first and writes once at the
+    end, so a kill, a crash or a `--max-cost-usd` trip at 90% discards the whole
+    run's spend. Measured 2026-09-26: a 282-chunk run costs $8.75 and takes 17
+    minutes with nothing durable until the final second.
+
+    Each batch commits, and `extract_entities` already selects only chunks with
+    no `viao:assertsAbout` edge -- so the NEXT call naturally resumes where this
+    one stopped, whether it stopped cleanly or not. No checkpoint file, no
+    resume token: the graph itself is the progress marker.
+
+    The cost of batching is that `_resolve_canonical_forms` (variant-spelling
+    collapse) and the plurality class vote see one batch rather than the whole
+    run, so a spelling that appears in batch 1 and batch 5 may not merge.
+    `existing_exact` still reuses entities already in the DB, so identity is
+    preserved for exact normalised matches; it is near-duplicate merging that
+    degrades. Chunks are ordered by `created_at`, i.e. document by document, so
+    variants of one name usually land in the same batch. Prefer the largest
+    batch you can afford to lose.
+    """
+    t0 = time.time()
+    total = EntityExtractSummary()
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+
+    remaining_chunks = limit
+    batch_no = 0
+    # Chunks that yield NO entities never get a viao:assertsAbout edge, so they
+    # stay "unprocessed" for ever and sit at the head of every batch. Stepping
+    # past them with an offset is what lets the loop terminate AND still reach
+    # the chunks behind them -- a plain "no progress -> stop" guard would let a
+    # front-loaded cluster of them starve everything newer.
+    offset = 0
+    stalled = 0
+    while True:
+        before = await _unprocessed_chunk_count(
+            chunk_kind=chunk_kind, scope_document_iri=scope_document_iri
+        )
+        if before <= offset:
+            if stalled:
+                print(f"[extract-entities] {stalled} chunk(s) yielded no "
+                      f"entities and cannot be marked done; they were skipped "
+                      f"after being attempted once. This is a corpus/ontology-"
+                      f"fit signal -- see the abstention counts above.")
+            break
+
+        spent = total.llm_cost_usd + total.embedding_cost_usd
+        budget = max_cost_usd - spent
+        if budget <= 0:
+            print(f"[extract-entities] cost cap ${max_cost_usd:.2f} reached "
+                  f"after {batch_no} batch(es); {before} chunk(s) left. "
+                  f"Re-run to continue -- completed batches are committed.")
+            break
+
+        this_batch = batch_size
+        if remaining_chunks is not None:
+            if remaining_chunks <= 0:
+                break
+            this_batch = min(this_batch, remaining_chunks)
+
+        batch_no += 1
+        print(f"[extract-entities] --- batch {batch_no}: up to {this_batch} "
+              f"of {before} remaining chunk(s), budget ${budget:.2f} ---")
+
+        batch = await extract_entities(
+            limit=this_batch,
+            chunk_offset=offset,
+            max_cost_usd=budget,
+            chunk_kind=chunk_kind,
+            scope_document_iri=scope_document_iri,
+            # Once for the whole run, after the loop -- not per batch.
+            link_tables=False,
+            bump_graph_version=False,
+            **kwargs,
+        )
+        _merge_summaries(total, batch)
+        if remaining_chunks is not None:
+            remaining_chunks -= batch.chunks_scanned
+
+        after = await _unprocessed_chunk_count(
+            chunk_kind=chunk_kind, scope_document_iri=scope_document_iri
+        )
+        if after >= before:
+            # No progress: every chunk in this batch yielded no entities, so
+            # none can be marked done. Step past them rather than re-selecting
+            # (and re-paying for) the same chunks on the next pass. The loop
+            # terminates because `offset` only ever grows and `before` is finite.
+            attempted = batch.chunks_scanned or this_batch
+            offset += attempted
+            stalled += attempted
+            print(f"[extract-entities] batch {batch_no}: {attempted} chunk(s) "
+                  f"yielded no entities; skipping past them (offset={offset}) "
+                  f"so the chunks behind them are still reached.")
+
+    # Deferred to here so table linkage sees every entity from every batch, and
+    # one logical run produces exactly one graph_version.
+    await _link_tables_to_entities(total)
+    async with session_scope() as session:
+        total.new_graph_version = await bump_version(session)
+
+    total.total_cost_usd = total.llm_cost_usd + total.embedding_cost_usd
+    total.wall_seconds = time.time() - t0
+    print(
+        f"[extract-entities] STREAMED DONE: {batch_no} batch(es), "
+        f"chunks={total.chunks_scanned}, "
+        f"entities (minted={total.entities_minted}, "
+        f"reused={total.entities_reused}), "
+        f"chunk_entity_edges={total.chunk_entity_edges}, "
+        f"entity_relationship_edges={total.entity_relationship_edges}, "
+        f"cost=${total.total_cost_usd:.4f}, "
+        f"wall={total.wall_seconds:.1f}s, "
+        f"graph_version -> {total.new_graph_version}"
+    )
+    return total
