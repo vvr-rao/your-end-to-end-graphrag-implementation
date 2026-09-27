@@ -19,6 +19,8 @@ I have tested this using open source data and common ontologies from Pharma, Fin
 
 **The Goal:** Replace large development teams and lengthy development cycles with a fast, automated tool for building and deploying GraphRAG applications that support both retrieval and research across corpora containing tens of millions of tokens.
 
+**See YEGI in action:** Follow a [step-by-step walkthrough of an example run](https://medium.com/@venkat.ramrao/a-tool-to-build-and-deploy-a-fully-functioning-graphrag-application-in-less-than-a-day-91d4f9c5b212?source=friends_link&sk=959794ce85389b439ba941965fbd34c3), from document ingestion through GraphRAG application deployment.
+
 ## Agent Framework
 <div align="center">
 
