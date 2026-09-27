@@ -194,28 +194,34 @@ def _resolve_chunk_kind_following_corpus(args: argparse.Namespace) -> str:
     return kind
 
 
-# Stages whose workers hold a DB session ACROSS their LLM calls, and so cannot
-# usefully outnumber the connection pool. Only these are capped.
+# Stages capped to the connection pool. Only `evaluation` remains, and only
+# because it has not been audited.
 #
-# `summarization` is deliberately absent. Measured 2026-09-26 on the same
-# 15-client Supabase DB: `register-documents` ran 42 documents at concurrency 64
-# with zero pool errors (383s), while `extract-entities` at 32 lost 62 of its
-# first 71 chunks to EMAXCONNSESSION. Summarization is LLM-and-disk work whose
-# DB writes happen after the fan-in, so capping it to the pool would slow the
-# long pole of ingestion for no benefit.
-_POOL_BOUND_STAGES = frozenset({
-    "entity_extraction", "artifact_generation", "evaluation",
-})
+# `entity_extraction` and `artifact_generation` were removed 2026-09-27. An AST
+# scan of db_entity_extract / db_artifact_gen / db_insight_gen /
+# db_recommendation_gen / db_artifact_rollup found no LLM or embedding call --
+# direct or through a helper -- inside a `session_scope()` block: each worker
+# takes a connection for a millisecond-scale read, releases it, then spends its
+# LLM time holding nothing. Workers never outnumber connections in USE, so the
+# cap only slowed them (64 -> 12 on Supabase).
+#
+# The 2026-09-26 EMAXCONNSESSION failure (`extract-entities` at 32 lost 62 of
+# its first 71 chunks) was a POOL-SIZING bug, not worker contention:
+# `set_pool_minimum(32)` grew the pool to 32 connections against Supabase
+# session mode's 15-client cap. Uncapped stages never call `_cap_to_pool`, so
+# they never grow the pool; `database.pool_size` + `max_overflow` stay the
+# ceiling.
+_POOL_BOUND_STAGES = frozenset({"evaluation"})
 
 
 def _cap_to_pool(requested: int) -> int:
     """Make the connection pool serve `requested` workers, or cap to what it can.
 
-    A worker holds its DB session across several slow LLM calls, so running
-    more workers than connections does not go faster -- it queues until
-    `pool_timeout` and then fails the chunk. Measured 2026-09-20:
-    `concurrency.entity_extraction: 64` against a fixed 4 + 4 pool killed 36 of
-    62 chunks with `QueuePool limit of size 4 overflow 4 reached`.
+    For a stage whose worker holds its DB session across slow LLM calls,
+    running more workers than connections does not go faster -- it queues
+    until `pool_timeout` and then fails the item. Only stages in
+    `_POOL_BOUND_STAGES` pass through here; see that comment for why the
+    extraction and artifact stages no longer do.
 
     The request wins where it can: `set_pool_minimum` sizes the pool before the
     engine is built, so `--concurrency 64` gets 64 connections rather than
@@ -1267,6 +1273,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Abort if LLM spend exceeds this within the run.",
     )
     p_art.add_argument(
+        "--batch-size", type=int, default=None,
+        help=(
+            "Per-chunk artifacts (Claim/Finding/Observation/Event) in COMMITTED "
+            "batches of this size instead of one all-or-nothing pass. A kill or "
+            "a --max-cost-usd trip keeps every finished batch, and re-running "
+            "resumes automatically (chunks with artifacts are skipped). Memory "
+            "stays flat regardless of corpus size. Unset => "
+            "artifact_generation.batch_size in config.yaml (0 = single-shot)."
+        ),
+    )
+    p_art.add_argument(
         "--no-entities", action="store_true",
         help=(
             "Skip entity grounding -- run with the generic prompt. "
@@ -2316,6 +2333,7 @@ def _cmd_generate_artifacts(args: argparse.Namespace) -> int:
     from backend.app.services.db_artifact_gen import (
         generate_document_summaries,
         generate_per_chunk_artifacts,
+        generate_per_chunk_artifacts_streamed,
     )
 
     types_requested = tuple(args.type) if args.type else (
@@ -2331,8 +2349,18 @@ def _cmd_generate_artifacts(args: argparse.Namespace) -> int:
 
     use_entities = not args.no_entities
     if per_chunk:
+        # Batch-streamed when a positive batch size resolves, single-shot
+        # otherwise. Each batch commits, so a re-run resumes from the graph.
+        _batch = args.batch_size
+        if _batch is None:
+            _batch = _config_block("artifact_generation").get("batch_size") or 0
+        _batch = int(_batch)
+        _runner = (generate_per_chunk_artifacts_streamed if _batch > 0
+                   else generate_per_chunk_artifacts)
+        _batch_kw = {"batch_size": _batch} if _batch > 0 else {}
         asyncio.run(
-            generate_per_chunk_artifacts(
+            _runner(
+                **_batch_kw,
                 scope_document_iri=args.scope_iri,
                 limit=args.limit,
                 types=per_chunk,

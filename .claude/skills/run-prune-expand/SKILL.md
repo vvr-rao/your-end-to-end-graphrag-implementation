@@ -204,9 +204,11 @@ Notes:
 
 > **prune-expand is exempt from the DB pool limit** -- it never touches the
 > database, so its concurrency is bounded only by TPM/RPM and memory. The pool
-> matters for the Phase-2 steps in **ingest-corpus**. `tpm_check.py` reports all
-> three limits together, and a DB-bound stage runs at
-> `min(rate-limit suggestion, pool ceiling)` however high it is configured.
+> matters for the Phase-2 steps in **ingest-corpus**, and there it bounds the
+> POOL SIZE (Supabase session mode: 15 clients per project), not the worker
+> count of `entity_extraction` / `artifact_generation` -- those hold no
+> connection while waiting on the LLM, so their concurrency follows TPM/RPM.
+> Only `evaluation` is still capped to the pool.
 
 ```
 uv run python scripts/tpm_check.py "<DOCS>"
@@ -244,7 +246,7 @@ Knobs, grouped by what actually constrains them:
 | Group | Knobs | Constraint | Shipped |
 |---|---|---|---|
 | **Memory** | `concurrency.table_extraction` | ~152 MB per PDF subprocess | 1 |
-| **DB connection pool** | `entity_extraction`, `artifact_generation`, `evaluation` | `database.pool_size` + `max_overflow`; Supabase session mode caps the PROJECT at 15 clients | 10 + 2 |
+| **DB connection pool** | `database.pool_size` + `max_overflow` (and `evaluation` concurrency) | Supabase session mode caps the PROJECT at 15 clients | 10 + 2 |
 | **Memory (cheap) + caps concurrency** | `chunking.streaming_batch_size` | ~50 MB at 16 docs | 8 |
 | **Mini-model rate limit (~10M TPM)** | `summarization`, `chunk_classification`, `entity_extraction`, `artifact_generation`, `table_mining` | measured ~3% of tier at 32 | 32 |
 | **Big-model rate limit (~2M TPM, 32k requests)** | `class_proposal`, `dedup` | measured **6.2% of tier at 4** | 4 |

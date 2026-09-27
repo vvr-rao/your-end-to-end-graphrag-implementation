@@ -181,6 +181,62 @@ def _extract_json(text: str) -> Any:
     return None
 
 
+def _unprocessed_chunk_filter(
+    types: tuple[str, ...], chunk_kind: str, doc_id: Any = None
+) -> list[Any]:
+    """WHERE clauses for chunks that still need per-chunk artifacts.
+
+    The ONE definition shared by the selection in `generate_per_chunk_artifacts`
+    and the count in `_unprocessed_artifact_chunk_count`. If those drift, the
+    streaming loop misjudges progress and either skips real work or re-pays for
+    the same chunks.
+    """
+    already_processed_subq = (
+        select(ArtifactSource.chunk_id)
+        .join(
+            IntelligenceArtifact,
+            IntelligenceArtifact.id == ArtifactSource.artifact_id,
+        )
+        .where(IntelligenceArtifact.artifact_type.in_(types))
+    )
+    clauses = [
+        Chunk.status == "ACTIVE",
+        Chunk.kind == chunk_kind,  # 'summary' (default) or 'fulltext' (--from-fulltext)
+        Chunk.id.notin_(already_processed_subq),
+    ]
+    if doc_id is not None:
+        clauses.append(Chunk.document_id == doc_id)
+    return clauses
+
+
+async def _scope_doc_id(session: Any, scope_document_iri: str | None) -> Any:
+    if scope_document_iri is None:
+        return None
+    doc_id = (await session.execute(
+        select(Document.id).where(
+            Document.document_identifier == scope_document_iri
+        )
+    )).scalar_one_or_none()
+    if doc_id is None:
+        raise ValueError(f"document not found: {scope_document_iri}")
+    return doc_id
+
+
+async def _unprocessed_artifact_chunk_count(
+    *,
+    types: tuple[str, ...],
+    chunk_kind: str,
+    scope_document_iri: str | None = None,
+) -> int:
+    """How many chunks `generate_per_chunk_artifacts` would still pick up."""
+    async with session_scope() as session:
+        doc_id = await _scope_doc_id(session, scope_document_iri)
+        stmt = select(func.count()).select_from(Chunk).where(
+            *_unprocessed_chunk_filter(types, chunk_kind, doc_id)
+        )
+        return int((await session.execute(stmt)).scalar() or 0)
+
+
 async def generate_per_chunk_artifacts(
     *,
     scope_document_iri: str | None = None,
@@ -190,6 +246,8 @@ async def generate_per_chunk_artifacts(
     max_cost_usd: float = 5.0,
     use_entities: bool = True,
     chunk_kind: str = "summary",
+    chunk_offset: int = 0,
+    bump_graph_version: bool = True,
 ) -> ArtifactGenSummary:
     """Drive per-chunk Claim+Finding+Observation extraction.
 
@@ -203,39 +261,25 @@ async def generate_per_chunk_artifacts(
 
     Idempotent: skips chunks that already have ANY of the target
     artifact types attached.
+
+    `chunk_offset` / `bump_graph_version` exist for
+    `generate_per_chunk_artifacts_streamed`, which calls this once per batch.
     """
     t0 = time.time()
     summary = ArtifactGenSummary()
     summary.by_type = {t: 0 for t in types}
 
     async with session_scope() as session:
-        already_processed_subq = (
-            select(ArtifactSource.chunk_id)
-            .join(
-                IntelligenceArtifact,
-                IntelligenceArtifact.id == ArtifactSource.artifact_id,
-            )
-            .where(IntelligenceArtifact.artifact_type.in_(types))
-        )
+        doc_id = await _scope_doc_id(session, scope_document_iri)
         stmt = (
             select(Chunk.id, Chunk.chunk_identifier, Chunk.text, Chunk.document_id)
-            .where(
-                Chunk.status == "ACTIVE",
-                Chunk.kind == chunk_kind,  # 'summary' (default) or 'fulltext' (--from-fulltext)
-                Chunk.id.notin_(already_processed_subq),
-            )
-            .order_by(Chunk.created_at)
+            .where(*_unprocessed_chunk_filter(types, chunk_kind, doc_id))
+            # A TOTAL order, so `chunk_offset` names the same chunks from one
+            # batch to the next (created_at alone ties within a document).
+            .order_by(Chunk.created_at, Chunk.id)
         )
-        if scope_document_iri is not None:
-            doc_row = await session.execute(
-                select(Document.id).where(
-                    Document.document_identifier == scope_document_iri
-                )
-            )
-            doc_id = doc_row.scalar_one_or_none()
-            if doc_id is None:
-                raise ValueError(f"document not found: {scope_document_iri}")
-            stmt = stmt.where(Chunk.document_id == doc_id)
+        if chunk_offset:
+            stmt = stmt.offset(chunk_offset)
         if limit is not None:
             stmt = stmt.limit(limit)
 
@@ -599,8 +643,9 @@ async def generate_per_chunk_artifacts(
     summary.sources_inserted = len(source_payloads)
     summary.edges_inserted = len(edge_payloads)
 
-    async with session_scope() as session:
-        summary.new_graph_version = await bump_version(session)
+    if bump_graph_version:
+        async with session_scope() as session:
+            summary.new_graph_version = await bump_version(session)
 
     summary.total_cost_usd = summary.llm_cost_usd + summary.embedding_cost_usd
     summary.wall_seconds = time.time() - t0
@@ -624,6 +669,139 @@ async def generate_per_chunk_artifacts(
     )
 
     return summary
+
+
+def _merge_artifact_summaries(
+    total: ArtifactGenSummary, batch: ArtifactGenSummary
+) -> None:
+    """Accumulate a batch's summary into the run total, in place."""
+    for f in (
+        "chunks_scanned", "chunks_skipped_already_processed", "chunks_failed",
+        "artifacts_inserted", "edges_inserted", "sources_inserted",
+        "docs_summarized", "llm_cost_usd", "embedding_cost_usd",
+    ):
+        setattr(total, f, getattr(total, f) + getattr(batch, f))
+    for k, v in batch.by_type.items():
+        total.by_type[k] = total.by_type.get(k, 0) + v
+    if len(total.samples) < 5:
+        total.samples.extend(batch.samples[: 5 - len(total.samples)])
+
+
+async def generate_per_chunk_artifacts_streamed(
+    *,
+    batch_size: int,
+    max_cost_usd: float = 5.0,
+    types: tuple[str, ...] = _DEFAULT_PER_CHUNK_TYPES,
+    chunk_kind: str = "summary",
+    scope_document_iri: str | None = None,
+    limit: int | None = None,
+    **kwargs: Any,
+) -> ArtifactGenSummary:
+    """`generate_per_chunk_artifacts` in committed batches, resumable after a kill.
+
+    The single-shot path makes every LLM call first and writes once at the end,
+    so a kill or a `--max-cost-usd` trip discards the whole run, and memory
+    grows with the corpus. Here each batch commits; because selection already
+    skips chunks that carry any target artifact type, the NEXT call resumes
+    where this one stopped. The graph is the progress marker -- no checkpoint.
+
+    Unlike entity extraction, batching costs nothing in quality: each chunk's
+    artifacts are generated independently, with no cross-chunk consolidation.
+
+    A chunk the model returns nothing for (or whose call failed) stays
+    "unprocessed". Those are stepped past with an offset rather than
+    re-selected, so they are attempted once per run and never starve the
+    chunks behind them. Unlike `extract_entities_streamed`, the offset moves by
+    the exact number of such chunks in every batch, not only in a batch that
+    made no progress at all -- so a PARTIALLY stalled batch does not re-pay for
+    its leftovers either.
+    """
+    t0 = time.time()
+    total = ArtifactGenSummary()
+    total.by_type = {t: 0 for t in types}
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+
+    remaining_chunks = limit
+    batch_no = 0
+    offset = 0
+    stalled = 0
+    while True:
+        before = await _unprocessed_artifact_chunk_count(
+            types=types, chunk_kind=chunk_kind,
+            scope_document_iri=scope_document_iri,
+        )
+        if before <= offset:
+            break
+
+        budget = max_cost_usd - (total.llm_cost_usd + total.embedding_cost_usd)
+        if budget <= 0:
+            print(f"[generate-artifacts] cost cap ${max_cost_usd:.2f} reached "
+                  f"after {batch_no} batch(es); {before - offset} chunk(s) left. "
+                  f"Re-run to continue -- completed batches are committed.")
+            break
+
+        this_batch = batch_size
+        if remaining_chunks is not None:
+            if remaining_chunks <= 0:
+                break
+            this_batch = min(this_batch, remaining_chunks)
+
+        batch_no += 1
+        print(f"[generate-artifacts] --- batch {batch_no}: up to {this_batch} "
+              f"of {before - offset} remaining chunk(s), budget ${budget:.2f} ---")
+
+        batch = await generate_per_chunk_artifacts(
+            limit=this_batch,
+            chunk_offset=offset,
+            max_cost_usd=budget,
+            types=types,
+            chunk_kind=chunk_kind,
+            scope_document_iri=scope_document_iri,
+            # Once for the whole run, after the loop -- not per batch.
+            bump_graph_version=False,
+            **kwargs,
+        )
+        _merge_artifact_summaries(total, batch)
+        attempted = batch.chunks_scanned + batch.chunks_failed
+        if remaining_chunks is not None:
+            remaining_chunks -= attempted
+        if attempted == 0:
+            # Nothing selected, or the cost cap tripped before any call
+            # finished: stop rather than spin on the same offset.
+            break
+
+        after = await _unprocessed_artifact_chunk_count(
+            types=types, chunk_kind=chunk_kind,
+            scope_document_iri=scope_document_iri,
+        )
+        left_behind = max(0, attempted - max(0, before - after))
+        if left_behind:
+            offset += left_behind
+            stalled += left_behind
+            print(f"[generate-artifacts] batch {batch_no}: {left_behind} "
+                  f"chunk(s) produced no artifacts or failed; stepping past "
+                  f"them (offset={offset}).")
+
+    if stalled:
+        print(f"[generate-artifacts] {stalled} chunk(s) produced no artifacts "
+              f"or failed; attempted once and skipped. A re-run retries them.")
+
+    async with session_scope() as session:
+        total.new_graph_version = await bump_version(session)
+    total.total_cost_usd = total.llm_cost_usd + total.embedding_cost_usd
+    total.wall_seconds = time.time() - t0
+    print(
+        f"[generate-artifacts] STREAMED DONE: {batch_no} batch(es), "
+        f"chunks={total.chunks_scanned} ok / {total.chunks_failed} failed, "
+        f"artifacts={total.artifacts_inserted} "
+        f"({', '.join(f'{t}={n}' for t, n in total.by_type.items())}), "
+        f"edges={total.edges_inserted}, "
+        f"cost=${total.total_cost_usd:.4f}, "
+        f"wall={total.wall_seconds:.1f}s, "
+        f"graph_version -> {total.new_graph_version}"
+    )
+    return total
 
 
 async def _auto_summary_rollup(max_cost_usd: float) -> float:

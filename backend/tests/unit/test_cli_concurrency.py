@@ -48,8 +48,7 @@ def test_cli_flag_wins_when_the_pool_can_serve_it(stage, cfg, monkeypatch) -> No
     assert _resolve_concurrency(argparse.Namespace(concurrency=64), stage) == 64
 
 
-@pytest.mark.parametrize(
-    "stage", ["entity_extraction", "artifact_generation", "evaluation"])
+@pytest.mark.parametrize("stage", ["evaluation"])
 def test_a_declared_pool_ceiling_caps_even_an_explicit_flag(
     stage, cfg, monkeypatch
 ) -> None:
@@ -70,20 +69,25 @@ def test_a_declared_pool_ceiling_caps_even_an_explicit_flag(
     assert _resolve_concurrency(argparse.Namespace(concurrency=64), stage) == 12
 
 
-def test_summarization_is_not_capped_by_the_pool(cfg, monkeypatch) -> None:
-    """Its workers hold no DB session, so the pool is irrelevant to it.
+@pytest.mark.parametrize(
+    "stage", ["summarization", "entity_extraction", "artifact_generation"])
+def test_stages_holding_no_session_across_llm_calls_are_not_capped(
+    stage, cfg, monkeypatch
+) -> None:
+    """Their workers hold no DB session while waiting on the LLM, so the pool
+    is irrelevant to how many can run.
 
-    register-documents ran 42 docs at concurrency 64 against that same
-    15-client DB with zero pool errors. Capping it would slow the long pole of
-    ingestion for nothing.
+    register-documents ran 42 docs at concurrency 64 against a 15-client
+    Supabase DB with zero pool errors. extract-entities and generate-artifacts
+    take a connection only for millisecond reads between LLM calls (AST-checked
+    2026-09-27), so capping them to 12 made them ~5x slower for nothing.
     """
     cfg({"concurrency": {s: 16 for s in STAGES}})
     monkeypatch.setattr(
         "backend.app.db.engine.set_pool_minimum", lambda n: False, raising=False)
     monkeypatch.setattr(
         "backend.app.db.engine.pool_capacity", lambda: 12, raising=False)
-    assert _resolve_concurrency(
-        argparse.Namespace(concurrency=64), "summarization") == 64
+    assert _resolve_concurrency(argparse.Namespace(concurrency=64), stage) == 64
 
 
 @pytest.mark.parametrize("stage", STAGES)
