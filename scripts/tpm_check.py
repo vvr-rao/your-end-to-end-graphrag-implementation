@@ -72,7 +72,17 @@ def _models_in_use() -> list[str]:
 
 async def probe(client, model: str) -> dict:
     # gpt-5.x / o-series reject `max_tokens` and non-default temperature.
-    kw = {"max_completion_tokens": 1} if _openai_uses_completion_tokens(model) else {"max_tokens": 1}
+    #
+    # They are also REASONING models: a budget of 1 is spent entirely on
+    # reasoning tokens and the call 400s with "Could not finish the message
+    # because max_tokens or model output limit was reached", so the probe used
+    # to report gpt-5.x as an error and silently omit its TPM/RPM from the gate
+    # -- which matters, because summary_merge (the Summary rollup that runs in
+    # generate-artifacts even without --rollup) is one of them. 16 is enough to
+    # get a reply and still costs ~nothing. Measured 2026-09-27: gpt-5.4 then
+    # reports 40M TPM / 15k RPM.
+    kw = ({"max_completion_tokens": 16} if _openai_uses_completion_tokens(model)
+          else {"max_tokens": 1})
     try:
         raw = await client.chat.completions.with_raw_response.create(
             model=model, messages=[{"role": "user", "content": "hi"}], **kw,
