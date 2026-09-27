@@ -371,6 +371,71 @@ def analyse_corpus(
     print("  speed of its slowest document -- one 6-window doc holds up its whole batch.")
 
 
+def db_pool_report(mini_suggestion: int | None) -> None:
+    """The THIRD constraint on concurrency, after TPM/RPM and memory.
+
+    A worker in a DB-bound stage holds its connection across its LLM calls, so
+    such a stage cannot usefully outnumber the pool -- and the pool itself cannot
+    outgrow what the server accepts. Supabase free tier in SESSION mode caps the
+    whole PROJECT at 15 client connections, shared by every process.
+
+    This half used to be invisible here, so the gate would recommend a number
+    the CLI then overrode: measured 2026-09-26, `extract-entities --concurrency
+    32` lost 62 of its first 71 chunks to
+    `(EMAXCONNSESSION) max clients reached in session mode`.
+    """
+    try:
+        from backend.app.cli.main import _POOL_BOUND_STAGES
+        from backend.app.db.engine import configured_pool_ceiling
+    except Exception as exc:                                   # pragma: no cover
+        print(f"\nDATABASE pool: could not inspect ({exc}); skipping.")
+        return
+
+    cfg = get_settings().app_config
+    db = (cfg.get("database") or {})
+    conc = (cfg.get("concurrency") or {})
+    ceiling = configured_pool_ceiling()
+
+    print("\nDATABASE connection pool (the third limit -- NOT a rate limit)")
+    dsn = get_settings().database_url or ""
+    host = dsn.split("@")[-1].split("/")[0].split(":")[0]
+    is_supabase = "supabase" in host
+    if is_supabase:
+        print("  target: Supabase  ->  SESSION MODE CAPS THE PROJECT AT 15 CLIENTS")
+    elif host:
+        print("  target: self-hosted / docker  ->  no fixed client cap")
+
+    if ceiling is None:
+        derived = min(16, max([4, *(int(v) for v in conc.values()
+                                    if isinstance(v, (int, float)) and v)]))
+        print("  database.pool_size is UNSET -> pool derived from the largest")
+        print(f"  concurrency value: {derived} + {derived} overflow = {derived * 2},")
+        print("  and a stage may raise it to 64. Fine on docker; on Supabase set")
+        print("  database.pool_size explicitly or a big stage will exceed the cap.")
+        cap = None
+    else:
+        print(f"  database.pool_size {db.get('pool_size')} + max_overflow "
+              f"{db.get('max_overflow')} = {ceiling} connections (a HARD ceiling)")
+        if is_supabase and ceiling > 15:
+            print(f"  *** {ceiling} EXCEEDS the 15-client cap -- lower pool_size ***")
+        cap = ceiling
+
+    print("  DB-bound stages (a worker holds its connection across LLM calls):")
+    for k in sorted(_POOL_BOUND_STAGES):
+        now = conc.get(k, "(unset)")
+        note = ""
+        if cap and isinstance(now, int) and now > cap:
+            note = f"  -> CAPPED to {cap} at runtime"
+        print(f"    concurrency.{k:<22} config {now}{note}")
+    if cap and mini_suggestion and mini_suggestion > cap:
+        print(f"  NOTE: the rate-limit suggestion above ({mini_suggestion}) exceeds the")
+        print(f"  pool ceiling ({cap}), so DB-bound stages will run at {cap} however high")
+        print("  you set them. Raising pool_size only helps if the SERVER allows it.")
+    print("  NOT capped: summarization (its workers hold no DB session -- measured,")
+    print("  42 docs at concurrency 64 with zero pool errors), and every prune-expand")
+    print("  stage, which never touches the database at all.")
+
+
 async def main() -> int:
     s = get_settings()
     if not s.openai_api_key:
@@ -443,6 +508,8 @@ async def main() -> int:
         print("total cost is unchanged because the same tokens are sent either way.")
         print("A higher value does slightly lower the prompt-cache hit rate")
         print("(measured 69% -> 49% going 4 -> 32, about +2% spend).")
+
+    db_pool_report(min(mini) if mini else None)
 
     cfg1 = get_settings().app_config
     advise_memory(

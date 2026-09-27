@@ -93,6 +93,30 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
   OS's own command (see **run-prune-expand** Step 2c for the per-OS table and
   the macOS "Pages free" trap).
 
+  **It now reports THREE limits, not two.** The third is the DATABASE connection
+  pool, and it is the one that has actually broken a run. A worker in a DB-bound
+  stage holds its connection across its LLM calls, so such a stage cannot
+  usefully outnumber the pool -- and the pool cannot outgrow what the server
+  accepts. Supabase free tier in SESSION mode caps the whole PROJECT at 15
+  client connections. Measured 2026-09-26: `extract-entities --concurrency 32`
+  lost 62 of its first 71 chunks to
+  `(EMAXCONNSESSION) max clients reached in session mode`.
+
+  | limit | bounds | set by |
+  |---|---|---|
+  | **TPM / RPM** | every LLM stage | the provider, read from response headers |
+  | **Memory** | `table_extraction`, `streaming_batch_size` | this machine |
+  | **DB pool** | `entity_extraction`, `artifact_generation`, `evaluation` | `database.pool_size` + `max_overflow` |
+
+  So the rate-limit suggestion is an UPPER BOUND, not an instruction: a DB-bound
+  stage runs at `min(suggestion, pool ceiling)` however high you set it, and the
+  CLI prints the reduction when it applies. `summarization` is exempt -- its
+  workers hold no DB session (42 docs at concurrency 64, zero pool errors) -- and
+  every `prune-expand` stage is exempt too, because it never touches the
+  database. Do not recommend a number above the pool ceiling for a DB-bound
+  stage without also raising `database.pool_size`, and only raise that if the
+  SERVER allows it.
+
   **Explain BOTH knobs, because batch size usually wins.** `streaming_batch_size`
   (default 8) is how many DOCUMENTS are summarized at a time, and batches are a
   hard barrier -- only the current batch's work exists. So
