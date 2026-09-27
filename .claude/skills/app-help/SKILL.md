@@ -267,6 +267,16 @@ Two consequences to pass on:
   documents**, never for citation quality — the full-text bridge already gives
   verbatim citations without it.
 
+### Resumable extraction (`--batch-size`)
+
+`extract-entities` defaults to a single all-or-nothing pass: every LLM call
+first, one write at the end. `--batch-size N` (or `extraction.batch_size`)
+commits each batch instead, so a kill or a cost-cap trip keeps what was already
+paid for, and re-running resumes automatically — chunk selection skips chunks
+that already have entity edges, so no checkpoint file is needed. Cost of
+batching: variant-spelling collapse and the class plurality vote see one batch,
+not the whole run. Default 0 = single-shot.
+
 ### Full-text defaults, by stage (changed 2026-09-27)
 
 | stage | default | knob |

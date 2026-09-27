@@ -905,6 +905,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Abort if LLM spend exceeds this within the run.",
     )
     p_ext.add_argument(
+        "--batch-size", type=int, default=None,
+        help=(
+            "Process chunks in COMMITTED batches of this size instead of one "
+            "all-or-nothing pass. Each batch's entities, relationships and edges "
+            "are written before the next starts, so a kill, a crash or a "
+            "--max-cost-usd trip keeps everything already paid for; re-running "
+            "resumes automatically because chunk selection skips chunks that "
+            "already have entity edges (no checkpoint file). Recommended for "
+            "long/expensive runs: the single-shot path holds a 282-chunk, $8.75, "
+            "17-minute run entirely in memory with nothing durable until the "
+            "final second. Trade-off: variant-spelling collapse and the class "
+            "plurality vote see one batch, not the whole run, so prefer the "
+            "largest batch you can afford to lose. Unset => "
+            "extraction.batch_size in config.yaml (0 = single-shot)."
+        ),
+    )
+    p_ext.add_argument(
         "--from-fulltext", action=argparse.BooleanOptionalAction, default=None,
         help=(
             "Mine entities from the verbatim FULL-TEXT chunks (kind='fulltext') "
@@ -2083,10 +2100,21 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
         print(f"[extract-entities] entity review ON, up to {_rounds} round(s)")
     if _concepts:
         print("[extract-entities] concept pass ON (one extra call per chunk)")
-    from backend.app.services.db_entity_extract import extract_entities
+    from backend.app.services.db_entity_extract import (
+        extract_entities,
+        extract_entities_streamed,
+    )
+
+    # Batch-streamed when a positive batch size resolves, single-shot otherwise.
+    # Streaming commits each batch, so a kill or a cost-cap trip keeps the work
+    # already paid for and a re-run resumes from the graph itself.
+    _batch = int(_resolve_extraction_opt(args, "batch_size", "batch_size", 0) or 0)
+    _runner = extract_entities_streamed if _batch > 0 else extract_entities
+    _batch_kw = {"batch_size": _batch} if _batch > 0 else {}
 
     asyncio.run(
-        extract_entities(
+        _runner(
+            **_batch_kw,
             scope_document_iri=args.scope_iri,
             limit=args.limit,
             candidate_classes_per_chunk=args.candidate_classes,

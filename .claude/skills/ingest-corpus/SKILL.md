@@ -208,12 +208,28 @@ whole corpus, so:
 ## Step 3 — extract-entities (entities + relationships; long, paid)
 Mints entities/relationships per chunk — **no new ontology classes**. **If Step 2
 recorded `fulltext=yes` (check `uv run python scripts/build_state.py show`), you MUST
+**Use `--batch-size` on any run you would mind losing.** Without it the run is
+all-or-nothing: every LLM call happens first and everything is written once at
+the end, so a kill, a crash or a `--max-cost-usd` trip at 90% discards the whole
+spend (measured: 282 chunks, $8.75, 17 minutes, nothing durable until the final
+second). With `--batch-size N` each batch commits, and a re-run resumes by
+itself — chunk selection already skips chunks that have entity edges, so the
+graph is the progress marker and there is no checkpoint file. Prefer the
+LARGEST batch you can afford to lose (100-200 on a multi-thousand-chunk run):
+variant-spelling collapse and the class plurality vote see one batch rather than
+the whole run, so a spelling split across batches may not merge. Default is 0
+(single-shot) via `extraction.batch_size`.
+
+Chunks that yield NO entities never get an edge and so can never be marked done;
+the streaming loop attempts each once, then steps past it, and reports the count
+at the end as an ontology-fit signal.
+
 `--from-fulltext` is OPT-IN and costs ~4.3x (~$38 vs $8.75 on the 42-doc
 reference corpus) — see the full-text table at the top. If you pass it, also raise
 `--max-cost-usd` (default 5.0 trips almost immediately). Default takes entities from the summary
 ones. Single-line launch:
 ```
-uv run python scripts/run_detached.py <RUN_ID> uv run python -m backend.app.cli extract-entities [--limit 5] [--from-fulltext (OPT-IN: ~4.3x cost, raise --max-cost-usd)] [--max-cost-usd <cap>]
+uv run python scripts/run_detached.py <RUN_ID> uv run python -m backend.app.cli extract-entities [--limit 5] [--batch-size 100] [--from-fulltext (OPT-IN: ~4.3x cost, raise --max-cost-usd)] [--max-cost-usd <cap>]
 uv run python scripts/job_status.py <RUN_ID> 40
 uv run python scripts/build_state.py record extract-entities entities=<n>
 ```

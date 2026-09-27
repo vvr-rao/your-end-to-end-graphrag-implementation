@@ -438,6 +438,26 @@ extraction:
   # proposing 2 rescues for the whole batch. Cost on this step scales with
   # ceil(orphans / batch); nothing else changes.
   orphan_batch_size: 8
+  # extract-entities: process chunks in COMMITTED batches of this many instead
+  # of one all-or-nothing pass. 0 = single-shot (today's behaviour, the default).
+  #
+  # WHY: the single-shot path makes every LLM call first and writes once at the
+  # end. Measured 2026-09-26, a 282-chunk run costs $8.75 and takes 17 minutes
+  # with nothing durable until the final second -- a kill, a crash or a
+  # --max-cost-usd trip at 90% discards all of it. With a batch size set, each
+  # batch commits, and because chunk selection already skips chunks that have
+  # entity edges, a re-run resumes by itself: the graph is the progress marker,
+  # there is no checkpoint file.
+  #
+  # COST OF BATCHING: `_resolve_canonical_forms` (variant-spelling collapse) and
+  # the plurality class vote see one batch rather than the whole run, so a
+  # spelling appearing in batch 1 and batch 5 may not merge into one entity.
+  # Entities already in the DB are still reused on exact normalised match, so
+  # identity survives; it is near-duplicate merging that degrades. Chunks are
+  # ordered by created_at (document by document), so variants of one name
+  # usually land in the same batch. Prefer the LARGEST batch you can afford to
+  # lose -- e.g. 100-200 on a multi-thousand-chunk full-text run.
+  batch_size: 0
   concept_pass: false
   # How far the abstention recovery may reach. When the model abstains
   # (NONE_OF_THESE) it names the type it wanted; ~half the time that class
