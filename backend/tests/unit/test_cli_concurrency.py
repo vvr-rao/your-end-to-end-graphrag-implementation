@@ -40,9 +40,50 @@ def cfg(monkeypatch):
 
 
 @pytest.mark.parametrize("stage", STAGES)
-def test_cli_flag_always_wins(stage, cfg) -> None:
+def test_cli_flag_wins_when_the_pool_can_serve_it(stage, cfg, monkeypatch) -> None:
+    """The flag beats config wherever it is physically possible."""
     cfg({"concurrency": {s: 16 for s in STAGES}})
+    monkeypatch.setattr(
+        "backend.app.db.engine.set_pool_minimum", lambda n: True, raising=False)
     assert _resolve_concurrency(argparse.Namespace(concurrency=64), stage) == 64
+
+
+@pytest.mark.parametrize(
+    "stage", ["entity_extraction", "artifact_generation", "evaluation"])
+def test_a_declared_pool_ceiling_caps_even_an_explicit_flag(
+    stage, cfg, monkeypatch
+) -> None:
+    """Refines "the flag always wins" -- it cannot win past the SERVER.
+
+    Where `database.pool_size` is set explicitly the operator is declaring what
+    the server accepts (Supabase free tier session mode: 15 client connections
+    for the whole project). Honouring `--concurrency 64` there does not give 64
+    workers, it gives ~90% failed chunks: measured 2026-09-26, extract-entities
+    at 32 lost 62 of its first 71 chunks to EMAXCONNSESSION. So the request is
+    capped -- and `_cap_to_pool` PRINTS the reduction, so it is never silent.
+    """
+    cfg({"concurrency": {s: 16 for s in STAGES}})
+    monkeypatch.setattr(
+        "backend.app.db.engine.set_pool_minimum", lambda n: False, raising=False)
+    monkeypatch.setattr(
+        "backend.app.db.engine.pool_capacity", lambda: 12, raising=False)
+    assert _resolve_concurrency(argparse.Namespace(concurrency=64), stage) == 12
+
+
+def test_summarization_is_not_capped_by_the_pool(cfg, monkeypatch) -> None:
+    """Its workers hold no DB session, so the pool is irrelevant to it.
+
+    register-documents ran 42 docs at concurrency 64 against that same
+    15-client DB with zero pool errors. Capping it would slow the long pole of
+    ingestion for nothing.
+    """
+    cfg({"concurrency": {s: 16 for s in STAGES}})
+    monkeypatch.setattr(
+        "backend.app.db.engine.set_pool_minimum", lambda n: False, raising=False)
+    monkeypatch.setattr(
+        "backend.app.db.engine.pool_capacity", lambda: 12, raising=False)
+    assert _resolve_concurrency(
+        argparse.Namespace(concurrency=64), "summarization") == 64
 
 
 @pytest.mark.parametrize("stage", STAGES)

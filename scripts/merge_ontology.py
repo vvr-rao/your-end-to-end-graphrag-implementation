@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Merge the 7 pinned core ontologies with a chosen domain ontology (or the user's
+"""Merge the 8 pinned core ontologies with a chosen domain ontology (or the user's
 own, or none), record the merge, and print the resulting version-folder path.
 
 Cross-platform replacement for the bash array + fetch + `merge` + `ls|head` block.
@@ -8,7 +8,7 @@ Cross-platform replacement for the bash array + fetch + `merge` + `ls|head` bloc
     uv run python scripts/merge_ontology.py --ontology /path/to/mine.owl
     uv run python scripts/merge_ontology.py --core-only
 
-The 7 core ontologies are ALWAYS included. Exactly one source mode is required:
+The 8 core ontologies are ALWAYS included. Exactly one source mode is required:
 --domain (pharma|finance|manufacturing, fetched via fetch_ontology.py), --ontology
 (one or more of the user's own .owl/.rdf/.ttl/.xml/.zip files), or --core-only.
 Prints the merge folder as its LAST line so a caller can capture it.
@@ -29,6 +29,21 @@ CORE = [
     "source_ontologies/core_ontologies/foaf.rdf",
     "source_ontologies/core_ontologies/org.ttl",
     "source_ontologies/core_ontologies/geography_ontology.owl",
+    # Added 2026-09-27. It sat in core_ontologies/ unmerged, and its absence
+    # caused three separate downstream failures:
+    #   1. enrich-geo rejected `California (Region) in United States (Country)`
+    #      -- 44% of its rejections. The base geography ontology has no
+    #      sub-national class, so states typed as `Region`, which the
+    #      containment level table ranks ABOVE `Country`.
+    #   2. a utility 10-K typed California, Iowa, Nevada, Oregon, Utah, Wyoming
+    #      and five more US STATES as `City`, because City was on the candidate
+    #      menu and its sibling was not (see config.yaml pinned_class_labels).
+    #   3. `AdministrativeArea` and `Landform` were listed in
+    #      extraction.pinned_class_labels, pinning labels that did not exist --
+    #      silent no-ops.
+    # Declares: AdministrativeArea, PopulatedPlace, City, Landform, WaterBody,
+    # Waterway, GeologicalFormation.
+    "source_ontologies/core_ontologies/geography_features_extension.owl",
     "source_ontologies/core_ontologies/time.ttl",
     "source_ontologies/core_ontologies/skos.rdf",
     "source_ontologies/core_ontologies/domain_concepts.owl",
@@ -70,7 +85,7 @@ def main(argv: list[str]) -> int:
     cmd = [sys.executable, "-m", "backend.app.cli", "merge", *cli_args,
            "--output-dir", args.output_dir]
 
-    print(f"[merge] {len(ontologies)} ontologies (7 core + {len(extra)} domain)")
+    print(f"[merge] {len(ontologies)} ontologies (8 core + {len(extra)} domain)")
     proc = subprocess.run(cmd, cwd=str(ROOT))
     if proc.returncode != 0:
         print("[merge] merge failed — see the error above.", file=sys.stderr)
