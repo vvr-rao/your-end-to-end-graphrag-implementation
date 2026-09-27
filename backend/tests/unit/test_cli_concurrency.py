@@ -378,3 +378,44 @@ def test_ancestor_closure_is_on_by_default() -> None:
 
     args = build_parser().parse_args(["extract-entities"])
     assert args.no_ancestor_closure is False
+
+
+# ---------------------------------------------------------------------------
+# generate-artifacts must follow EXTRACTION, not the corpus.
+# Measured failure 2026-09-27: a full-text corpus extracted from summary chunks
+# sent artifacts at the 583 full-text chunks -> "0/583 chunks have >=1 entity",
+# 7,384 artifacts written, 0.9% entity-linked. Over the summary chunks: 25.3%.
+# ---------------------------------------------------------------------------
+
+def test_artifacts_follow_extraction_not_the_corpus():
+    """The two resolvers are deliberately different rules."""
+    import inspect
+
+    from backend.app.cli import main as cli
+
+    art = inspect.getsource(cli._cmd_generate_artifacts)
+    assert "_resolve_chunk_kind_following_extraction" in art, (
+        "generate-artifacts needs the chunk kind that CARRIES entity edges; "
+        "following the corpus produces artifacts no entity can reach"
+    )
+    time_src = inspect.getsource(cli._cmd_enrich_time)
+    assert "_resolve_chunk_kind_following_corpus" in time_src, (
+        "enrich-time only needs text, so following the corpus is correct there"
+    )
+
+
+def test_artifact_chunk_kind_honours_an_explicit_flag(monkeypatch):
+    """An explicit flag must still win, so a run is reproducible from argv."""
+    from backend.app.cli import main as cli
+
+    called = []
+    monkeypatch.setattr(
+        cli, "_chunk_kind_with_entity_edges",
+        lambda: called.append(1), raising=True)
+    p = cli.build_parser()
+    for argv, want in ((["--from-fulltext"], "fulltext"),
+                       (["--no-from-fulltext"], "summary")):
+        got = cli._resolve_chunk_kind_following_extraction(
+            p.parse_args(["generate-artifacts", *argv]))
+        assert got == want
+    assert not called, "an explicit flag must not need a DB round trip"
