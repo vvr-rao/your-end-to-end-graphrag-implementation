@@ -17,6 +17,8 @@ Three surfaces, one process: REST at `/`, MCP at `/mcp`, and a React UI hosted o
 
 I have tested this using open source data and common ontologies from Pharma, Finance and Manufacturing and Supply Chain domains.
 
+**The Goal:** Replace large development teams and long development cycles with a tool that can build and deploy a GraphRAG application capable of both retrieval and research over corpora containing tens of millions of tokens - in a single day.
+
 ## Agent Framework
 <div align="center">
 
