@@ -284,11 +284,15 @@ not the whole run. Default 0 = single-shot.
 | `register-documents` | **full-text ON** (both kinds stored) | `chunking.full_text_chunks`, `--no-full-text-chunks` |
 | `extract-entities` | **summary** (opt in) | `extraction.from_fulltext`, `--from-fulltext` |
 | `enrich-time` | **follows the corpus** | auto; `--from-fulltext` / `--no-from-fulltext` |
-| `generate-artifacts` | **follows the corpus** | auto; `--from-fulltext` / `--no-from-fulltext` |
+| `generate-artifacts` | **follows EXTRACTION** (the kind carrying entity edges) | auto; `--from-fulltext` / `--no-from-fulltext` |
 | `prune-expand --select-subset` | **OFF** (uses every document) | `--select-subset` |
 
-"Follows the corpus" = the stage checks whether `kind='fulltext'` chunks exist and
-uses them if so, else summary. Older transcripts saying `--from-fulltext` is
+"Follows the corpus" (enrich-time) = checks whether `kind='fulltext'` chunks exist
+and uses them if so, else summary — correct there because it only needs text.
+"Follows extraction" (generate-artifacts) = uses whichever kind carries
+`viao:assertsAbout` edges, because artifacts are entity-grounded; a kind with no
+entity edges yields artifacts no entity can reach (measured 2026-09-27: 0.9% vs
+25.3% entity-linked). Older transcripts saying `--from-fulltext` is
 "REQUIRED if fulltext=yes" are out of date.
 
 ## What gets dropped, and how to read it

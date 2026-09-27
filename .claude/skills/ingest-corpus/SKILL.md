@@ -38,13 +38,23 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
   | Step 2 `register-documents` | **full-text ON** — stores BOTH summary and verbatim chunks | `chunking.full_text_chunks: true`, or `--no-full-text-chunks` |
   | Step 3 `extract-entities` | **summary** (opt in per run) | `extraction.from_fulltext: false`, or `--from-fulltext` |
   | Step 4 `enrich-time` | **follows the corpus** | auto; force with `--from-fulltext` / `--no-from-fulltext` |
-  | Step 5 `generate-artifacts` | **follows the corpus** | auto; force with `--from-fulltext` / `--no-from-fulltext` |
+  | Step 5 `generate-artifacts` | **follows EXTRACTION** (Step 3) | auto; force with `--from-fulltext` / `--no-from-fulltext` |
 
-  "Follows the corpus" means the stage checks whether `kind='fulltext'` chunks
-  exist and uses them if so, falling back to summary when the corpus was
-  ingested summary-only. You no longer have to pass `--from-fulltext` to these
-  two by hand, and the old instruction that it was "REQUIRED if fulltext=yes"
-  is obsolete.
+  `enrich-time` **follows the corpus**: it checks whether `kind='fulltext'`
+  chunks exist and uses them if so, falling back to summary. It only needs text,
+  so that is the right rule for it.
+
+  `generate-artifacts` **follows EXTRACTION** instead — whichever chunk kind
+  carries `viao:assertsAbout` edges. Corrected 2026-09-27 after a measured
+  failure: a corpus ingested with full-text chunks but extracted from summary
+  chunks sent artifacts at the 583 full-text chunks, which reported
+  `0/583 chunks have >=1 entity` and wrote 7,384 artifacts of which **0.9%**
+  were entity-linked. Re-running over the 218 summary chunks took that to
+  **25.3%**. Artifacts no entity can reach are invisible to the graph arm of
+  retrieval, so following the corpus was wrong for this stage.
+
+  Either way you no longer pass `--from-fulltext` by hand, and the old
+  instruction that it was "REQUIRED if fulltext=yes" is obsolete.
 
   **`extract-entities` is deliberately NOT driven by ingestion, because it is
   the most expensive switch in the pipeline.** Measured 2026-09-26 on the

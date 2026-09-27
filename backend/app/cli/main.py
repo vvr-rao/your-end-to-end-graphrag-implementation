@@ -101,6 +101,69 @@ async def _corpus_has_fulltext_chunks() -> bool:
         return bool(row.scalar())
 
 
+async def _chunk_kind_with_entity_edges() -> str | None:
+    """Which chunk kind carries viao:assertsAbout edges, i.e. what extraction used.
+
+    Returns the kind with the most entity-bearing chunks, or None when no chunk
+    has any entity edge yet.
+    """
+    from sqlalchemy import text as _sql
+
+    from backend.app.db.session import session_scope
+
+    async with session_scope() as session:
+        row = await session.execute(_sql("""
+            SELECT c.kind, count(DISTINCT c.id) AS n
+              FROM graphrag.chunks c
+              JOIN graphrag.graph_relationships g
+                ON g.source_node_type = 'chunk' AND g.source_node_id = c.id
+               AND g.target_node_type = 'entity'
+             GROUP BY c.kind ORDER BY n DESC LIMIT 1
+        """))
+        hit = row.first()
+        return str(hit[0]) if hit else None
+
+
+def _resolve_chunk_kind_following_extraction(args: argparse.Namespace) -> str:
+    """Chunk kind for `generate-artifacts`, which needs ENTITY edges.
+
+    NOT the same rule as `enrich-time`. enrich-time only needs text, so
+    following the corpus is right for it. generate-artifacts generates
+    ENTITY-GROUNDED artifacts, so it must follow whatever `extract-entities`
+    actually mined -- the chunk kind that carries viao:assertsAbout edges.
+
+    Following the corpus here produced a measured failure on 2026-09-27: a
+    corpus ingested with full-text chunks but extracted from summary chunks
+    sent generate-artifacts at the 583 full-text chunks, which reported
+    `0/583 chunks have >=1 entity` and wrote 7,384 artifacts with NO entity
+    edges at all -- 0.9% of artifacts entity-linked. Re-running over the 218
+    summary chunks (which do carry the edges) took that to 25.3%. Artifacts
+    unreachable from an entity are invisible to the graph arm of retrieval.
+
+    An explicit --from-fulltext / --no-from-fulltext still wins, so a run stays
+    reproducible from its command line. With no entity edges anywhere yet
+    (artifacts before extraction), fall back to following the corpus.
+    """
+    from backend.app.db.engine import reset_engine_cache
+
+    explicit = getattr(args, "from_fulltext", None)
+    if explicit is not None:
+        return "fulltext" if explicit else "summary"
+    try:
+        kind = asyncio.run(_chunk_kind_with_entity_edges())
+    except Exception as exc:                                  # pragma: no cover
+        print(f"[cli] could not detect where entities live ({exc}); using summary")
+        return "summary"
+    finally:
+        # See the loop-mismatch note in CLAUDE.local.md.
+        reset_engine_cache()
+    if kind is None:
+        print("[cli] no entity edges yet; following the corpus instead")
+        return _resolve_chunk_kind_following_corpus(args)
+    print(f"[cli] following EXTRACTION: entities live on kind='{kind}' chunks")
+    return kind
+
+
 def _resolve_chunk_kind_following_corpus(args: argparse.Namespace) -> str:
     """Chunk kind for the stages that FOLLOW ingestion.
 
@@ -1218,11 +1281,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--from-fulltext", action=argparse.BooleanOptionalAction, default=None,
         help=(
             "Extract per-chunk artifacts (Claim/Finding/Observation/Event) from "
-            "the verbatim FULL-TEXT chunks instead of the summary chunks. More "
-            "complete, but ~18x more LLM calls + more DB rows. Default: FOLLOW "
-            "the corpus — full-text when it was ingested with full-text chunks, "
-            "summary when it was not. Pass the flag (or --no-from-fulltext) to "
-            "force one."
+            "the verbatim FULL-TEXT chunks instead of the summary chunks. "
+            "Default: FOLLOW EXTRACTION — whichever chunk kind carries "
+            "viao:assertsAbout edges, because artifacts are ENTITY-GROUNDED "
+            "and a chunk kind with no entity edges yields artifacts no entity "
+            "can reach. Measured 2026-09-27: forcing full-text on a "
+            "summary-extracted corpus reported `0/583 chunks have >=1 entity` "
+            "and wrote 7,384 artifacts with 0.9%% entity-linked; over the "
+            "summary chunks it was 25.3%%. Pass the flag (or "
+            "--no-from-fulltext) to force one anyway."
         ),
     )
     # ---- Hierarchical clustered rollups (post-processing over existing artifacts) ----
@@ -2272,7 +2339,7 @@ def _cmd_generate_artifacts(args: argparse.Namespace) -> int:
                 concurrency=_conc,
                 max_cost_usd=args.max_cost_usd,
                 use_entities=use_entities,
-                chunk_kind=_resolve_chunk_kind_following_corpus(args),
+                chunk_kind=_resolve_chunk_kind_following_extraction(args),
             )
         )
         # The above asyncio.run's loop is now dead; drop the cached
