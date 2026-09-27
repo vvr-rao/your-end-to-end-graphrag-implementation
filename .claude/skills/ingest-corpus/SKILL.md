@@ -88,12 +88,22 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
   ```
   uv run python scripts/tpm_check.py "<DOCS>"
   ```
-  It reads the account's own rate-limit headers -- `x-ratelimit-limit-tokens`
-  (**TPM**) and `x-ratelimit-limit-requests` (**RPM**), plus remaining headroom
-  -- per model in `config/models.yaml`, and prints the current config next to a
-  suggested value per stage. Both limits bound the suggestion; a stage is capped
-  by whichever runs out first. Passing the corpus also sizes
-  `chunking.streaming_batch_size`. Costs ~nothing (one 10-token probe per model).
+  It reads each provider's own rate-limit headers (OpenAI / Groq
+  `x-ratelimit-limit-tokens` + `-requests`; Anthropic's separate input/output
+  token limits + requests) for every model `config/models.yaml` routes to, and
+  prints one row per concurrency knob: **now**, **suggest**, and the **binding
+  task**. A stage is sized by the TIGHTEST model among the tasks it runs --
+  `entity_extraction` covers seven tasks, one of them
+  (`relationship_orphan_check`) on gpt-4.1; `artifact_generation` also drives
+  Insight / rollup on gpt-4.1 and gpt-5.4. Passing the corpus also sizes
+  `chunking.streaming_batch_size`. Costs ~nothing (one tiny probe per model).
+
+  If **build-app** step 2b already sized the run (tracker step `sizing`), show
+  the table again so the user sees current numbers, but only re-propose changes
+  if the mode or tier changed. When the user agrees to values, WRITE them --
+  the tool edits only the `concurrency:` block and keeps every comment:
+  `--apply` takes every suggestion, `--set stage=N` (repeatable) sets their
+  own. Never `--apply` without their go-ahead.
 
   **Platform:** the rate-limit probe is a plain HTTPS call and behaves the same
   on Linux, macOS and Windows. Only the *memory* half is OS-specific

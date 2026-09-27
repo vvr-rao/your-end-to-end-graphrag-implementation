@@ -33,6 +33,10 @@ STATE = Path(os.environ.get("YEGI_STATE_FILE") or (ROOT / ".build" / "state.json
 ORDER: list[tuple[str, str]] = [
     ("llm-mode", "choose the LLM provider mode"),
     ("database", "set up the database"),
+    # Once, before the first paid step: probe the provider rate limits and the
+    # DB pool, and write the agreed `concurrency:` block (tpm_check.py --apply
+    # / --set). Every later stage's wall time depends on it.
+    ("sizing", "size concurrency from rate limits + database (tpm_check.py)"),
     ("merge", "merge the ontologies"),
     ("prune-expand", "build the ontology from documents (prune-expand)"),
     ("db-init", "load the ontology into the database"),

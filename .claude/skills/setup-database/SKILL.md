@@ -91,6 +91,25 @@ uv run python scripts/build_state.py record database kind=<local|external>
   (typo, wrong host, direct-vs-pooler for Supabase, or pgvector not enabled).
   Point the user back to `.env`; never ask for the string in chat.
 
+## Step 4 — Check the connection pool fits the server
+The pool (`database.pool_size` + `max_overflow` in `config/config.yaml`) is the
+only setting the DATABASE drives. Worker concurrency for `extract-entities` and
+`generate-artifacts` is set by the rate limits (**build-app** step 2b), because
+their workers hold no connection while waiting on the LLM. Only
+`evaluate-queries` is capped to the pool. Check the block matches the target:
+
+| Target | Pool | Why |
+|---|---|---|
+| **Supabase** (session pooler) | `pool_size: 10`, `max_overflow: 2` (the shipped values) | Session mode caps the whole PROJECT at **15 clients**, shared by this CLI, the deployed backend and the arq worker. A pool over 15 fails on the first burst with `(EMAXCONNSESSION) max clients reached in session mode`. Leaving it blank derives 8 + 8 = 16, one over. |
+| **Local docker / self-hosted** | the shipped 10 + 2 is fine | No client cap. Raise it only to widen `evaluate-queries`, the one pool-capped stage. |
+
+If the user's `config.yaml` has a pool over 15 against Supabase, or the keys
+removed, propose restoring 10 + 2 and edit `database:` once they agree.
+While a deployed app is also connected to the same Supabase project, a local
+CLI run and the service share those 15, so do not raise it on the grounds that
+"the CLI only uses 12". `tpm_check.py` prints the same check in its DATABASE
+section.
+
 ## Done
 Report the DB is ready and which target was used (local vs external). Note for
 the orchestrator: the ontology import (`db-init --input <prune-expand folder>`)
