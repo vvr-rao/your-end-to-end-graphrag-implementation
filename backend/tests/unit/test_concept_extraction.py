@@ -185,6 +185,7 @@ def test_concept_roots_exclude_the_other_passes_territory(path: str) -> None:
     "config/models.example.yaml",
     "config/models.openai.example.yaml",
     "config/models.anthropic.example.yaml",
+    "config/models.deepinfra.example.yaml",
 ])
 def test_concept_extract_task_exists_in_every_preset(preset: str) -> None:
     """Missing in one preset means that provider mode degrades to no concept

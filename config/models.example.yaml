@@ -631,6 +631,18 @@ tasks:
 # Retry / backoff defaults (applied by the router via tenacity unless overridden
 # at the task level above).
 # =============================================================================
+
+  # Stage 3b duplicate-class merge: OFF in this preset (enabled only in the
+  # deepinfra preset, which ships the model-specific judge prompt).
+  class_synonym_judge:
+    provider: openai
+    model: gpt-4.1-mini
+    enabled: false
+    timeout: 600
+    temperature: 0.0
+    max_tokens: 4096   # 60 decisions ~1.5k tokens
+    response_format: json_object
+
 defaults:
   retries:
     max_attempts: 5

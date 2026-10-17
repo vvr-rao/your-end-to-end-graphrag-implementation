@@ -27,6 +27,7 @@ PRESETS = [
     "config/models.example.yaml",
     "config/models.openai.example.yaml",
     "config/models.anthropic.example.yaml",
+    "config/models.deepinfra.example.yaml",
 ]
 
 # The modules whose LLM calls run under each stage's semaphore.

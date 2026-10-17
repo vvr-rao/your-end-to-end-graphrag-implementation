@@ -213,6 +213,13 @@ Notes:
 ```
 uv run python scripts/tpm_check.py "<DOCS>"
 ```
+
+> **DeepInfra/Qwen mode:** a dedicated deployment has no TPM/RPM, so `tpm_check.py`
+> does not size it. Use `uv run python scripts/deepinfra_sizing.py "<DOCS>"` instead
+> (corpus → GPU configuration → concurrency); the full order — size, approve the
+> hourly rate, deploy, `--probe`, `--apply`, delete when done — is in the
+> **choose-llm-mode** skill, "DeepInfra mode".
+
 If a PREVIOUS run already produced a selection.json for this corpus, point
 this at it so the numbers describe the subset rather than the whole corpus:
 ```

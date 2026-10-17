@@ -40,6 +40,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from backend.app.core.config import cache_root
+
 
 # Bump when the extractor's routing logic or vision prompt changes
 # materially. Lower bumps (cosmetic) are OK to skip; on the wire what
@@ -84,7 +86,7 @@ def user_cache_dir() -> Path:
 
     Mirrors `_doc_summary_cache_dir` in pipeline_llm.py so the cache
     lives under the same root as other caches."""
-    root = Path.home() / ".cache" / "your-end-to-end-graphrag-implementation" / "tables"
+    root = cache_root() / "tables"
     root.mkdir(parents=True, exist_ok=True)
     return root
 

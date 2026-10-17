@@ -5,7 +5,7 @@ Inserted by the initial migration. The graph_version helpers
 model exists for Alembic autogen + introspection."""
 from __future__ import annotations
 
-from sqlalchemy import CheckConstraint, Integer
+from sqlalchemy import CheckConstraint, Integer, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.app.db.base import Base
@@ -21,3 +21,6 @@ class GraphVersionState(Base):
     current_value: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
+    # Which embedding model wrote this database's vectors (0010). NULL =
+    # unstamped; see backend/app/db/embedding_guard.py.
+    embedding_model: Mapped[str | None] = mapped_column(Text, nullable=True)

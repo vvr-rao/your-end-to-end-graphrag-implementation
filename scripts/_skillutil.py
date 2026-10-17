@@ -52,6 +52,29 @@ def env_present(key: str, env_path: Path | None = None) -> bool:
     return False
 
 
+# Keys whose VALUE a script may read: identifiers, never credentials.
+_NON_SECRET_KEYS = frozenset({"DEEPINFRA_FLASH_MODEL"})
+
+
+def env_value_nonsecret(key: str, env_path: Path | None = None) -> str | None:
+    """Value of a NON-secret .env key (e.g. a deployment's model id).
+
+    Refuses any key not on the allow-list, so it can never become a path for
+    reading credentials. Blank / placeholder values return None.
+    """
+    if key not in _NON_SECRET_KEYS:
+        raise ValueError(f"{key} is not an allow-listed non-secret key")
+    p = env_path or (ROOT / ".env")
+    if not p.exists():
+        return None
+    for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+        s = line.strip()
+        if s.startswith(f"{key}="):
+            val = s[len(key) + 1:].strip().strip('"').strip("'")
+            return val if val and not _PLACEHOLDER.search(val) else None
+    return None
+
+
 def latest_version_dir(suffix: str, root: Path | None = None) -> Path | None:
     """Newest output_ontologies/v<TS>-<suffix>/ folder.
 

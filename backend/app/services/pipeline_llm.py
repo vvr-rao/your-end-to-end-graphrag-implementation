@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from backend.app.core.config import get_settings
+from backend.app.core.config import get_settings, cache_root
 from backend.app.helpers.ontology_pruning import (
     _collect_orphan_classes,
     add_new_classes_from_match_not_found,
@@ -488,13 +488,82 @@ async def _propose_for_chunk(
         # proposals against a trivially-empty slice. The prompt still works.
         ontology_slice = {}
     hint = {"user_suggested": suggested_new_classes} if suggested_new_classes else None
-    system, user = PROMPTS["class_proposal"](ontology_slice, chunk.text, suggested_new_classes=hint)
+    try:
+        prompt_set = router.task_spec("class_proposal").get("prompt_set")
+    except (AttributeError, KeyError):  # test doubles without a task map
+        prompt_set = None
+    if prompt_set == "qwen":
+        from backend.app.services.prompts_qwen import qwen_class_proposal
+
+        system, user = qwen_class_proposal(ontology_slice, chunk.text, suggested_new_classes=hint)
+    else:
+        system, user = PROMPTS["class_proposal"](ontology_slice, chunk.text, suggested_new_classes=hint)
     try:
         result = await router.chat("class_proposal", system=system, user=user)
     except Exception as exc:
         print(f"[stage2] chunk #{chunk.index} ({chunk.source_name}) failed: {exc}")
         return None
-    return extract_json_from_output(result.text)
+    parsed = extract_json_from_output(result.text)
+    if parsed is None:
+        # Diagnostic only: an unparseable reply used to vanish silently, which
+        # hid WHY a model lost chunks (cut off at max_tokens vs malformed JSON).
+        print(
+            f"[stage2] chunk #{chunk.index} ({chunk.source_name}) unparseable reply: "
+            f"finish={result.finish_reason} out_tokens={result.completion_tokens} "
+            f"chars={len(result.text)} head={result.text[:80]!r} tail={result.text[-80:]!r}"
+        )
+        if _salvage_enabled(router):
+            parsed = _salvage_class_proposal(result.text, chunk)
+    return parsed
+
+
+def _salvage_enabled(router: Any) -> bool:
+    """Opt-in per task (`salvage_truncated: true`); off keeps today's behaviour."""
+    try:
+        return bool(router.task_spec("class_proposal").get("salvage_truncated"))
+    except (AttributeError, KeyError):
+        return False
+
+
+def _salvage_class_proposal(text: str, chunk: TextChunk) -> dict[str, Any] | None:
+    """Keep the complete entries of a cut-off class_proposal reply.
+
+    A reply that ran to max_tokens is usually a runaway: a list that kept
+    growing. Salvage keeps every entry written in full before the cut, then
+    (1) drops exact repeats and (2) drops MATCHES FOUND whose snippet does not
+    occur in the chunk -- the observed runaway walked DATA_CLASSES pairing
+    classes with words the text never uses as those concepts.
+    """
+    from backend.app.helpers.json_salvage import salvage_truncated_json
+
+    data = salvage_truncated_json(text)
+    if not data:
+        return None
+    hay = " ".join(re.sub(r"[*_`#|>]+", " ", chunk.text).split()).lower()
+    kept: dict[str, Any] = {}
+    counts: list[str] = []
+    for section, items in data.items():
+        if not isinstance(items, list):
+            kept[section] = items
+            continue
+        seen: set[str] = set()
+        out: list[Any] = []
+        dropped = 0
+        for it in items:
+            key = json.dumps(it, sort_keys=True, ensure_ascii=False)
+            if key in seen:
+                continue
+            seen.add(key)
+            if section == "MATCHES FOUND" and isinstance(it, dict):
+                snip = " ".join(str(it.get("TEXT_SNIPPET") or "").split()).lower()
+                if not snip or snip not in hay:
+                    dropped += 1
+                    continue
+            out.append(it)
+        kept[section] = out
+        counts.append(f"{section}={len(out)}" + (f" (-{dropped} not in text)" if dropped else ""))
+    print(f"[stage2] chunk #{chunk.index} ({chunk.source_name}) SALVAGED: " + ", ".join(counts))
+    return kept
 
 
 # ---------- Stage 2 post-filter: drop entity-shaped class proposals ----------
@@ -1391,7 +1460,11 @@ async def _dedup(
 
     matches_found = merged_results.get("MATCHES FOUND", [])
     existing_concepts = _existing_concept_names(matches_found)
-    max_tokens = int(router.task_spec("match_dedup").get("max_tokens", 4096))
+    _dedup_spec = router.task_spec("match_dedup")
+    # Batches are sized against the ANSWER budget. `batch_budget_tokens` lets a
+    # reasoning ("thinking") model get a larger max_tokens for its trace
+    # without also changing how much each batch holds. Default: max_tokens.
+    max_tokens = int(_dedup_spec.get("batch_budget_tokens", _dedup_spec.get("max_tokens", 4096)))
     batches = await _plan_dedup_batches(merged_results, existing_concepts, max_tokens)
     n = len(batches)
     if n > 1:
@@ -2345,7 +2418,7 @@ _DOC_SUMMARY_PROMPT_VERSION = "v4"
 
 def _doc_summary_cache_dir() -> Path:
     """Return the on-disk cache root, creating it if missing."""
-    root = Path.home() / ".cache" / "your-end-to-end-graphrag-implementation" / "doc_summaries"
+    root = cache_root() / "doc_summaries"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -3352,6 +3425,12 @@ async def _run_llm_stages(
     # and predicate explosion (merged#holds vs org#holds).
     deduped = _coerce_canonical_labels(deduped, loaded_ontology)
     _append_audit(audit_path, -1, "match_dedup", None, deduped)
+    # Stage 3b (opt-in per preset): merge synonym classes dedup left behind.
+    from backend.app.services.class_synonym_merge import semantic_class_merge
+
+    deduped, merges = await semantic_class_merge(router, deduped)
+    if merges:
+        _append_audit(audit_path, -1, "class_synonym_merge", None, {"merges": merges})
     return deduped
 
 

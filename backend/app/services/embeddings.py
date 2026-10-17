@@ -1,9 +1,10 @@
-"""OpenAI embeddings service.
+"""Embeddings service (OpenAI, or DeepInfra's OpenAI-compatible endpoint).
 
 Wraps the async OpenAI client with batching, retry, and cost tracking.
 Defaults to text-embedding-3-small @ 1024 dim per the Phase 2 plan
 (33% storage saving vs the 1536 default; negligible retrieval-quality
-cost per OpenAI's benchmarks).
+cost per OpenAI's benchmarks). The `embeddings:` entry in models.yaml
+selects provider/model/dim; when absent, those defaults apply unchanged.
 
 Usage:
     embedder = Embedder()
@@ -13,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import math
 from dataclasses import dataclass, field
 
 from openai import AsyncOpenAI
@@ -35,6 +37,60 @@ _EMBED_MAX_REQUEST_TOKENS = 250_000
 
 # text-embedding-3-small: $0.020 per 1M input tokens.
 _EMBED3_SMALL_USD_PER_M_TOK = 0.020
+
+# USD per 1M input tokens. An unlisted model falls back to the 3-small rate
+# (the historical behaviour) rather than reporting $0.
+_EMBED_USD_PER_M_TOK = {
+    "text-embedding-3-small": _EMBED3_SMALL_USD_PER_M_TOK,
+    "Qwen/Qwen3-Embedding-8B": 0.010,
+    "Qwen/Qwen3-Embedding-4B": 0.020,
+    "Qwen/Qwen3-Embedding-0.6B": 0.010,
+}
+
+_DEFAULT_PROVIDER = "openai"
+_DEFAULT_MODEL = "text-embedding-3-small"
+_DEFAULT_DIM = 1024
+
+# Qwen3-Embedding is asymmetric: queries carry a task instruction, documents
+# do not. Omitting it costs a few points of retrieval quality per the model
+# card. OpenAI embeddings are symmetric, so their query prefix is empty.
+_QWEN_QUERY_INSTRUCTION = (
+    "Instruct: Given a question, retrieve passages that answer the question\n"
+    "Query: "
+)
+
+
+def configured_embedding() -> dict:
+    """The active `embeddings:` spec from models.yaml, with defaults filled.
+
+    Single source of truth for provider/model/dim -- the Embedder and the
+    DB embedding-model guard both read it, so they cannot disagree.
+    """
+    try:
+        tasks = get_settings().models_config.get("tasks", {}) or {}
+    except Exception:  # no .env / config (bare unit tests)
+        tasks = {}
+    spec = tasks.get("embeddings") or {}
+    out = {
+        "provider": spec.get("provider", _DEFAULT_PROVIDER),
+        "model": spec.get("model", _DEFAULT_MODEL),
+        "dim": int(spec.get("dim", _DEFAULT_DIM)),
+        "batch_size": int(spec.get("batch_size", _DEFAULT_BATCH_SIZE)),
+    }
+    # Optional override of the query-side instruction (asymmetric models);
+    # "" disables it. Absent -> the per-model default in `default_query_prefix`.
+    if "query_prefix" in spec:
+        out["query_prefix"] = str(spec["query_prefix"] or "")
+    return out
+
+
+def default_query_prefix(model: str) -> str:
+    return _QWEN_QUERY_INSTRUCTION if model.startswith("Qwen/Qwen3-Embedding") else ""
+
+
+def _l2_normalize(vec: list[float]) -> list[float]:
+    norm = math.sqrt(sum(x * x for x in vec))
+    return [x / norm for x in vec] if norm else vec
 
 # text-embedding-3-small + -3-large + ada-002 all share an 8192-token
 # input cap. We truncate at 8000 to leave headroom for any encoder
@@ -108,25 +164,63 @@ class EmbedResult:
 
 @dataclass
 class Embedder:
-    """OpenAI embeddings wrapper with batching + cost tracking.
+    """Embeddings wrapper with batching + cost tracking.
 
-    Reads OPENAI_API_KEY from app settings (validated at startup).
-    Stateful: tracks cumulative cost across all calls so the caller
-    can attribute spend per ingestion run.
+    provider/model/dim default to the models.yaml `embeddings:` entry (see
+    `configured_embedding`); explicit arguments win. Stateful: tracks
+    cumulative cost across all calls so the caller can attribute spend per
+    ingestion run.
     """
 
-    model: str = "text-embedding-3-small"
-    dim: int = 1024
-    batch_size: int = _DEFAULT_BATCH_SIZE
+    # Defaults are resolved in field factories (not __post_init__) so a test
+    # that neutralises __post_init__ still gets a usable model/dim.
+    model: str = field(default_factory=lambda: configured_embedding()["model"])
+    dim: int = field(default_factory=lambda: configured_embedding()["dim"])
+    batch_size: int = field(default_factory=lambda: configured_embedding()["batch_size"])
     concurrency: int = 4
+    provider: str = field(default_factory=lambda: configured_embedding()["provider"])
     settings: Settings | None = field(default=None, repr=False)
+    # Query-side instruction. None -> models.yaml `embeddings.query_prefix`
+    # when that spec is for this model, else the per-model default.
+    query_prefix_override: str | None = None
     total_cost_usd: float = field(default=0.0, init=False)
     total_tokens: int = field(default=0, init=False)
     _client: AsyncOpenAI = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         s = self.settings or get_settings()
-        self._client = AsyncOpenAI(api_key=s.openai_api_key)
+        if self.provider == "deepinfra":
+            from backend.app.services.llm_router import DEEPINFRA_BASE_URL
+
+            key = getattr(s, "deepinfra_api_key", None)
+            if not key:
+                raise RuntimeError(
+                    "embeddings are routed to provider 'deepinfra' but "
+                    "DEEPINFRA_API_KEY is not set"
+                )
+            self._client = AsyncOpenAI(api_key=key, base_url=DEEPINFRA_BASE_URL)
+        elif self.provider == "openai":
+            self._client = AsyncOpenAI(api_key=s.openai_api_key)
+        else:
+            raise ValueError(f"unsupported embeddings provider: {self.provider!r}")
+
+    @property
+    def query_prefix(self) -> str:
+        if self.query_prefix_override is not None:
+            return self.query_prefix_override
+        spec = configured_embedding()
+        if "query_prefix" in spec and spec["model"] == self.model:
+            return spec["query_prefix"]
+        return default_query_prefix(self.model)
+
+    async def embed_query(self, texts: list[str]) -> list[list[float]]:
+        """Embed retrieval QUERIES (as opposed to stored passages).
+
+        Identical to `embed` for symmetric models (OpenAI); prepends the
+        query instruction for asymmetric ones (Qwen3-Embedding).
+        """
+        prefix = self.query_prefix
+        return await self.embed([prefix + t for t in texts] if prefix else texts)
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         """Embed all `texts` in batches. Preserves input order.
@@ -208,8 +302,14 @@ class Embedder:
                     dimensions=self.dim,
                 )
                 vectors = [d.embedding for d in resp.data]
+                if self.provider != "openai":
+                    # The L2<->cosine identities in retrieval_sql assume unit
+                    # vectors; OpenAI guarantees it, Matryoshka truncation
+                    # does not.
+                    vectors = [_l2_normalize(v) for v in vectors]
                 prompt_tokens = resp.usage.prompt_tokens if resp.usage else 0
-                cost = prompt_tokens / 1_000_000.0 * _EMBED3_SMALL_USD_PER_M_TOK
+                rate = _EMBED_USD_PER_M_TOK.get(self.model, _EMBED3_SMALL_USD_PER_M_TOK)
+                cost = prompt_tokens / 1_000_000.0 * rate
                 self.total_tokens += prompt_tokens
                 self.total_cost_usd += cost
                 return EmbedResult(

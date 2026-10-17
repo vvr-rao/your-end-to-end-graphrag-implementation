@@ -6,6 +6,7 @@ that mode's required keys, and record the step. Cross-platform.
     uv run python scripts/select_llm_mode.py groq-openai
     uv run python scripts/select_llm_mode.py openai
     uv run python scripts/select_llm_mode.py anthropic
+    uv run python scripts/select_llm_mode.py deepinfra
 
 Never reads or prints key VALUES — only whether each required key is present in
 .env (which the user fills in themselves).
@@ -17,7 +18,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _skillutil import ROOT, env_present  # noqa: E402
+from _skillutil import ROOT, env_present, env_value_nonsecret  # noqa: E402
 import build_state  # noqa: E402
 
 # mode -> (models preset relative to config/, required .env keys)
@@ -25,7 +26,16 @@ MODES: dict[str, tuple[str, list[str]]] = {
     "groq-openai": ("models.example.yaml", ["OPENAI_API_KEY", "GROQ_API_KEY"]),
     "openai": ("models.openai.example.yaml", ["OPENAI_API_KEY"]),
     "anthropic": ("models.anthropic.example.yaml", ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]),
+    # DeepInfra-only: every task, embeddings and judges included, runs on
+    # DeepInfra -- no OpenAI or Anthropic key.
+    "deepinfra": (
+        "models.deepinfra.example.yaml",
+        ["DEEPINFRA_API_KEY", "DEEPINFRA_FLASH_MODEL"],
+    ),
 }
+
+# Placeholder in the deepinfra preset for the dedicated deployment's model id.
+_FLASH_PLACEHOLDER = "__DEEPINFRA_FLASH_MODEL__"
 
 
 def _scaffold(src_rel: str, dst_rel: str) -> None:
@@ -51,10 +61,19 @@ def main(argv: list[str]) -> int:
     if not src.exists():
         print(f"ERROR: preset not found: config/{preset}", file=sys.stderr)
         return 1
-    shutil.copyfile(src, ROOT / "config" / "models.yaml")
+    text = src.read_text(encoding="utf-8")
+    if _FLASH_PLACEHOLDER in text:
+        # The dedicated deployment's id is an identifier, not a secret. Without
+        # it, leave the placeholder: every creation task then fails loudly
+        # (404) instead of silently hitting some other model.
+        flash = env_value_nonsecret("DEEPINFRA_FLASH_MODEL")
+        if flash:
+            text = text.replace(_FLASH_PLACEHOLDER, flash)
+            print(f"  creation tasks -> dedicated deployment '{flash}'")
+    (ROOT / "config" / "models.yaml").write_text(text, encoding="utf-8")
     print(f"  activated LLM mode '{mode}' -> config/models.yaml (from {preset})")
 
-    # 3. Presence-check required keys (values never shown). Embeddings always need OpenAI.
+    # 3. Presence-check required keys (values never shown).
     missing = [k for k in required if not env_present(k)]
     for k in required:
         print(f"  {k}: {'present' if k not in missing else 'MISSING'}")

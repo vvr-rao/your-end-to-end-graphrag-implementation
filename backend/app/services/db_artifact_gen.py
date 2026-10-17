@@ -38,6 +38,7 @@ from typing import Any
 from sqlalchemy import func, select, text as sql_text, update as sql_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from backend.app.db.embedding_guard import ensure_embedding_model
 from backend.app.core.config import get_settings
 from backend.app.db.graph_version import bump_version, current_version
 from backend.app.db.models.artifacts import ArtifactSource, IntelligenceArtifact
@@ -59,6 +60,14 @@ from backend.app.services.prompts import PROMPTS
 _VIAO_NS = "https://veerla-ramrao.ai/ontology/intelligence-artifact"
 _DEFAULT_PER_CHUNK_TYPES = ("Claim", "Finding", "Observation", "Event")
 
+
+
+def _task_model(router, task: str) -> str | None:
+    """The model the router runs `task` on (recorded on each artifact)."""
+    try:
+        return router.task_spec(task).get("model")
+    except (AttributeError, KeyError):
+        return None
 
 @dataclass
 class ArtifactGenSummary:
@@ -521,7 +530,7 @@ async def generate_per_chunk_artifacts(
                     "title": None,
                     "text": text,
                     "confidence": conf,
-                    "model_name": "gpt-4o-mini",
+                    "model_name": _task_model(router, "artifact_chunk_extract_with_entities" if used_entities else "artifact_chunk_extract"),
                     "prompt_version": prompt_version,
                     "status": "ACTIVE",
                     "graph_version": 0,  # filled in below
@@ -539,6 +548,7 @@ async def generate_per_chunk_artifacts(
 
     # Embed
     embedder = Embedder()
+    await ensure_embedding_model(embedder)
     embeds = await embedder.embed(embed_texts)
     summary.embedding_cost_usd = embedder.total_cost_usd
     print(
@@ -988,6 +998,7 @@ async def generate_document_summaries(
         return summary
 
     embedder = Embedder()
+    await ensure_embedding_model(embedder)
     embeds = await embedder.embed(embed_texts)
     summary.embedding_cost_usd = embedder.total_cost_usd
 

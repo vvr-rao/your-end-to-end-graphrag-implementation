@@ -88,6 +88,13 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
   ```
   uv run python scripts/tpm_check.py "<DOCS>"
   ```
+
+  > **DeepInfra/Qwen mode:** a dedicated deployment has no TPM/RPM, so `tpm_check.py`
+  > does not size it. Use `uv run python scripts/deepinfra_sizing.py "<DOCS>"` instead
+  > (corpus → GPU configuration → concurrency); the full order — size, approve the
+  > hourly rate, deploy, `--probe`, `--apply`, delete when done — is in the
+  > **choose-llm-mode** skill, "DeepInfra mode".
+
   It reads each provider's own rate-limit headers (OpenAI / Groq
   `x-ratelimit-limit-tokens` + `-requests`; Anthropic's separate input/output
   token limits + requests) for every model `config/models.yaml` routes to, and

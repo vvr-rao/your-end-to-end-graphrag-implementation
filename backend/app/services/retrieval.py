@@ -50,6 +50,7 @@ from sqlalchemy import select, text as sql_text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.db.embedding_guard import ensure_embedding_model
 from backend.app.core.config import get_settings
 from backend.app.db.graph_version import current_version
 from backend.app.db.models.documents import Chunk, Document
@@ -561,7 +562,8 @@ async def retrieve_and_answer(
 
     # -------- step 4: ontology match --------
     embedder = Embedder()
-    qvec = (await embedder.embed([resolved_query]))[0]
+    await ensure_embedding_model(embedder)
+    qvec = (await embedder.embed_query([resolved_query]))[0]
     rel_probes = (
         await embedder.embed([_relation_text(r) for r in question_relations])
         if question_relations else []
@@ -1072,7 +1074,7 @@ async def retrieve_and_answer(
     if verbose:
         print(f"[query] probes ({len(probes)}): {probes}")
 
-    probe_vecs = await embedder.embed(probes)
+    probe_vecs = await embedder.embed_query(probes)
 
     # Rerank all probes on ONE session so the per-connection query-plan cache /
     # warm pgvector state is reused (first rerank ~cold, the rest are ~5x faster).

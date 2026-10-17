@@ -563,7 +563,8 @@ def test_rescue_does_not_lower_the_evidence_bar() -> None:
     src = inspect.getsource(dee._rescue_relationships)
     assert "_evidence_names(ev, s_ent)" in src
     assert "_evidence_names(ev, o_ent)" in src
-    assert "ev.lower() not in hay" in src
+    # verbatim check still applied (markdown-insensitive since 2026-10-14)
+    assert "_evidence_norm(ev) not in hay" in src
 
 
 def test_rescue_only_accepts_predicates_from_the_offered_menu() -> None:

@@ -10,6 +10,7 @@ Runtime configuration loaded once at startup.
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,19 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CONFIG_DIR = REPO_ROOT / "config"
+
+
+def cache_root() -> Path:
+    """Root of the on-disk caches (summaries, tables, corpus profiles).
+
+    `GRAPHRAG_CACHE_ROOT` relocates it -- used to give each benchmark arm its
+    own cache, since the table cache is keyed on document bytes only and would
+    otherwise hand one LLM mode's extractions to another.
+    """
+    override = os.environ.get("GRAPHRAG_CACHE_ROOT")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".cache" / "your-end-to-end-graphrag-implementation"
 
 
 class Settings(BaseSettings):
@@ -41,6 +55,7 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     groq_api_key: str | None = None
     anthropic_api_key: str | None = None
+    deepinfra_api_key: str | None = None
 
     render_api_key: str | None = None
 
@@ -79,11 +94,14 @@ class Settings(BaseSettings):
     # --- Layered YAML config (loaded lazily) ---
     @property
     def app_config(self) -> dict[str, Any]:
-        return _load_yaml(CONFIG_DIR / "config.yaml")
+        # APP_CONFIG_PATH / MODELS_CONFIG_PATH point a run at an alternate
+        # file (e.g. one benchmark arm) without swapping config/*.yaml.
+        cfg = _load_yaml(Path(os.environ.get("APP_CONFIG_PATH") or CONFIG_DIR / "config.yaml"))
+        return apply_embedding_profile(cfg, self.models_config)
 
     @property
     def models_config(self) -> dict[str, Any]:
-        return _load_yaml(CONFIG_DIR / "models.yaml")
+        return _load_yaml(Path(os.environ.get("MODELS_CONFIG_PATH") or CONFIG_DIR / "models.yaml"))
 
 
 _SUPABASE_HOST_SUFFIXES = (".supabase.co", ".supabase.com")
@@ -135,6 +153,37 @@ def _load_yaml(path: Path) -> dict[str, Any]:
             )
     with path.open("r") as f:
         return yaml.safe_load(f) or {}
+
+
+def apply_embedding_profile(app_cfg: dict[str, Any], models_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Overlay the active embedding model's calibrated thresholds.
+
+    Similarity thresholds (probe distance floors, the relationship hop floor,
+    ...) are measured on ONE embedding model's distance distribution. An
+    optional block
+
+        embedding_profiles:
+          Qwen/Qwen3-Embedding-8B:
+            qa.relationship_similarity: 0.62
+
+    replaces those dotted keys when that model is the configured embedder.
+    No block, or no entry for the active model -> config returned unchanged.
+    """
+    profiles = app_cfg.get("embedding_profiles") or {}
+    spec = ((models_cfg or {}).get("tasks") or {}).get("embeddings") or {}
+    overrides = profiles.get(spec.get("model", "text-embedding-3-small")) or {}
+    if not overrides:
+        return app_cfg
+    import copy
+
+    out = copy.deepcopy(app_cfg)
+    for dotted, value in overrides.items():
+        node = out
+        *parents, leaf = str(dotted).split(".")
+        for part in parents:
+            node = node.setdefault(part, {})
+        node[leaf] = value
+    return out
 
 
 @lru_cache(maxsize=1)

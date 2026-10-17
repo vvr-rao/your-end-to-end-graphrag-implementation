@@ -45,6 +45,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from backend.app.core.config import cache_root
 from backend.app.services import document_io
 from backend.app.services.document_io import LoadedDocument
 from backend.app.services.embed_compress import compress_for_embed, count_embed_tokens
@@ -168,12 +169,7 @@ class SelectionResult:
 
 
 def _profile_cache_dir() -> Path:
-    root = (
-        Path.home()
-        / ".cache"
-        / "your-end-to-end-graphrag-implementation"
-        / "corpus_profiles"
-    )
+    root = cache_root() / "corpus_profiles"
     root.mkdir(parents=True, exist_ok=True)
     return root
 

@@ -38,6 +38,7 @@ from sqlalchemy import func, select, text as sql_text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.db.embedding_guard import ensure_embedding_model
 from backend.app.db.graph_version import bump_version, current_version
 from backend.app.db.models.artifacts import IntelligenceArtifact
 from backend.app.db.models.documents import Chunk, Document
@@ -485,6 +486,58 @@ class EntityExtractSummary:
     orphan_flags: list[dict[str, str]] = field(default_factory=list)
 
 
+def _relationship_prompt(router: Any) -> Any:
+    """The relationship_extract prompt builder for this router's preset.
+
+    `prompt_set: qwen` / `deepseek` on the task selects that model's own
+    prompt (prompts_qwen.py / prompts_deepseek.py); otherwise the shared one.
+    """
+    try:
+        prompt_set = router.task_spec("relationship_extract").get("prompt_set")
+    except (AttributeError, KeyError):  # test doubles without a task map
+        prompt_set = None
+    if prompt_set == "qwen":
+        from backend.app.services.prompts_qwen import qwen_relationship_extract
+
+        return qwen_relationship_extract
+    if prompt_set == "deepseek":
+        from backend.app.services.prompts_deepseek import deepseek_relationship_extract
+
+        return deepseek_relationship_extract
+    return PROMPTS["relationship_extract"]
+
+
+def _repair_prompt(router: Any) -> Any:
+    """The relationship_repair prompt builder: `prompt_set: deepseek` selects
+    DeepSeek's own (prompts_deepseek.py); otherwise the shared one."""
+    try:
+        prompt_set = router.task_spec("relationship_repair").get("prompt_set")
+    except (AttributeError, KeyError):  # test doubles without a task map
+        prompt_set = None
+    if prompt_set == "deepseek":
+        from backend.app.services.prompts_deepseek import deepseek_relationship_repair
+
+        return deepseek_relationship_repair
+    return PROMPTS["relationship_repair"]
+
+
+# Markdown symbols a model may drop (or add) when quoting a markdown-formatted
+# chunk: emphasis, headings, table pipes, code ticks, blockquote marks.
+_MARKDOWN_CHARS = re.compile(r"[*_`#|>]+")
+
+
+def _evidence_norm(text: str) -> str:
+    """Normalise a quote AND its chunk identically for the verbatim check.
+
+    The words must still match exactly; only markdown symbols and whitespace
+    are ignored. Qwen writes markdown summaries ("**Mechanism:** Mimic ..."),
+    so a word-perfect quote without the asterisks failed the old check: 45 of
+    65 relationships in a 27B run (2026-10-14). OpenAI's plain-text summaries
+    contain none of these characters, so its checks are unchanged.
+    """
+    return " ".join(_MARKDOWN_CHARS.sub(" ", text or "").split()).lower()
+
+
 def _normalize_name(name: str) -> str:
     """Lowercase + strip non-alphanumerics (except internal spaces)."""
     s = re.sub(r"[^\w\s]", "", name, flags=re.UNICODE).strip().lower()
@@ -574,9 +627,130 @@ def _word_order_merges(names_by_class: dict[str, set[str]]) -> dict[str, str]:
     return out
 
 
+# A class-style label ("CardiovascularAdverseEvent", "DryCough") used as an
+# entity's canonical_name. Such a name is a CATEGORY, so a short form paired
+# with it is a member of the category, not another spelling of it.
+_CAMEL_LABEL_RE = re.compile(r"^[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+$")
+# Phrases that state an alias outright in running text.
+_ALIAS_PHRASES = (r"also known as|known as|aka|marketed as|sold as|"
+                  r"sold under the brand name|brand name|trade name")
+
+
+def _alias_text_norm(text: str) -> str:
+    """Chunk text in the same alphabet as `_normalize_name`, keeping the
+    parentheses and commas the alias patterns need."""
+    s = re.sub(r"[^\w\s(),;]", "", text or "", flags=re.UNICODE).lower()
+    return re.sub(r"\s+", " ", s)
+
+
+def _stem(tok: str) -> str:
+    """Plural to singular, enough for name comparison (antibodies/antibody,
+    vials/vial, NSAIDs/NSAID)."""
+    if tok.endswith("ies") and len(tok) > 4:
+        return tok[:-3] + "y"
+    if tok.endswith("s") and len(tok) > 3:
+        return tok[:-1]
+    return tok
+
+
+def _is_abbreviation(short_raw: str, long_words: list[str]) -> bool:
+    """`FDA`, `SGLT2i`, `GI`, `HCTZ`, `JNC`: a capitalised short form whose
+    letters run, in order, through the long form starting at the first letter
+    of one of its words. Requiring 2+ capitals keeps ordinary words
+    ("Ozempic", "Rash") out; requiring a word-initial start keeps "Rash" from
+    matching "dermatological adverse event"."""
+    if sum(c.isupper() for c in short_raw) < 2:
+        return False
+    compact = re.sub(r"[^\w]", "", short_raw)
+    if compact.endswith("s") and compact[:-1].isupper():
+        compact = compact[:-1]                      # NSAIDs, ARBs, AEs
+    compact = compact.lower()
+    if not (2 <= len(compact) <= 8):
+        return False
+    for i in range(len(long_words)):
+        flat = "".join(long_words[i:])
+        if flat[:1] == compact[0]:
+            it = iter(flat)
+            if all(ch in it for ch in compact):
+                return True
+    return False
+
+
+def _names_match_by_shape(a_raw: str, b_raw: str) -> bool:
+    """Shape alone proves `b` names the same thing as `a`: one's words are a
+    subset of the other's (after plural folding), the words are prefixes of
+    each other's (`Val-Pro-Pro` / `Valine-Proline-Proline`), or -- once the
+    shared words are set aside -- what is left of one is an abbreviation of
+    what is left of the other (`ACE inhibitor` / `Angiotensin-converting
+    enzyme inhibitor`, `exenatide ER` / `exenatide extended release`)."""
+    # Words split at hyphens too: `_normalize_name` joins "Moller-Maersk"
+    # into one token, which would hide "Maersk".
+    aw = [_stem(t) for t in re.findall(r"\w+", a_raw.lower())]
+    bw = [_stem(t) for t in re.findall(r"\w+", b_raw.lower())]
+    if not aw or not bw:
+        return False
+    if set(aw) <= set(bw) or set(bw) <= set(aw):
+        return True
+    if len(aw) == len(bw) and all(
+            x.startswith(y) or y.startswith(x) for x, y in zip(aw, bw, strict=True)):
+        return True
+    shared = set(aw) & set(bw)
+
+    def _rest(raw: str) -> str:
+        # The leftover words in their RAW case: the abbreviation test reads
+        # the capitals.
+        return " ".join(w for w in re.findall(r"\w+", raw)
+                        if _stem(w.lower()) not in shared)
+
+    return (_is_abbreviation(_rest(a_raw), [t for t in bw if t not in shared])
+            or _is_abbreviation(_rest(b_raw), [t for t in aw if t not in shared]))
+
+
+def _short_form_supported(canon_raw: str, short_raw: str, text: str | None) -> bool:
+    """Is the extractor's `short_name` really another name for `canon_raw`?
+
+    The pairing is applied to EVERY chunk of the run, so one wrong pair
+    rewrites an entity everywhere. Measured on two 27B pharma builds
+    (2026-10-17): `Trulicity` paired with canonical `Tirzepatide` folded a
+    second drug into the first (35 edges carried Trulicity's label facts on
+    Tirzepatide), `Ozempic` and `semaglutide` collapsed into the class name
+    `GLP-1 receptor agonists`, and `Hypotension`, `Nausea`, `Rash` merged
+    into class-style names like `CardiovascularAdverseEvent`.
+
+    A pair is accepted when its shape proves it (`_names_match_by_shape`:
+    `Maersk` of `A.P. Moller-Maersk A/S`, a surname, a plural, `FDA`,
+    `ACE inhibitor`). Otherwise the chunk must state the alias: `A (B)` /
+    `B (A)` with nothing else in the parentheses but a few words (so the
+    example list in `GLP-1 receptor agonists (semaglutide, liraglutide)`
+    does not count), or `A, also known as B`. A class-style CamelCase
+    canonical never takes a short form on text alone. A rejected pair only
+    means the two names stay separate entities -- the behaviour before
+    pairings were used.
+    """
+    canon, short = _normalize_name(canon_raw), _normalize_name(short_raw)
+    if not canon or not short or canon == short:
+        return True
+    if _names_match_by_shape(canon_raw, short_raw):
+        return True
+    if _CAMEL_LABEL_RE.match(canon_raw.strip()):
+        return False
+    hay = _alias_text_norm(text or "")
+    if not hay:
+        return False
+    for a, b in ((canon, short), (short, canon)):
+        ea, eb = re.escape(a), re.escape(b)
+        if re.search(rf"\b{ea}\s*\(\s*{eb}(?:\s+\w+){{0,3}}\s*\)", hay):
+            return True
+        if re.search(rf"\b{ea}\W+(?:{_ALIAS_PHRASES})\W+{eb}\b", hay):
+            return True
+    return False
+
+
 def _resolve_canonical_forms(
     results: list[Any],
     person_class_iris: set[str] | None = None,
+    chunk_text: dict[Any, str] | None = None,
+    rejected: list[tuple[str, str]] | None = None,
 ) -> tuple[dict[str, str], int]:
     """Map every extracted name to ONE canonical form for the run.
 
@@ -593,6 +767,10 @@ def _resolve_canonical_forms(
     surviving form is the LONGEST variant seen, matching the extract prompt's
     instruction that canonical_name be "the entity's most complete proper
     name as commonly written".
+
+    A pairing joins only when `_short_form_supported` accepts it against the
+    text of the chunk it came from (`chunk_text`: chunk_id -> text). Each
+    refused (canonical, short) pair is appended to `rejected` when given.
     """
     groups: dict[str, set[str]] = {}
     longest: dict[str, str] = {}
@@ -628,6 +806,16 @@ def _resolve_canonical_forms(
             if short and short != canon:
                 ct, st_ = canon.split(), short.split()
                 is_prefix = len(st_) < len(ct) and ct[:len(st_)] == st_
+                # Same suffix-stripped key = already one identity; the
+                # guard is for pairings that join DIFFERENT keys.
+                if _dedup_key(short) != key and not _short_form_supported(
+                    e.get("canonical_name") or "", e.get("short_name") or "",
+                    (chunk_text or {}).get(tup[0]),
+                ):
+                    if rejected is not None:
+                        rejected.append((e.get("canonical_name") or "",
+                                         e.get("short_name") or ""))
+                    continue
                 if not is_prefix or (e.get("class_iri") or "") in (
                     person_class_iris or set()
                 ):
@@ -1104,7 +1292,7 @@ async def _rescue_relationships(
     if not rejects or not wide_preds:
         return []
     try:
-        s_sys, s_user = PROMPTS["relationship_repair"](
+        s_sys, s_user = _repair_prompt(router)(
             chunk_text, rejects, wide_preds
         )
         out = await router.chat("relationship_repair", system=s_sys, user=s_user)
@@ -1116,7 +1304,7 @@ async def _rescue_relationships(
     if not isinstance(parsed, dict):
         return []
 
-    hay = " ".join(chunk_text.split()).lower()
+    hay = _evidence_norm(chunk_text)
     wide_index = _predicate_menu_index(wide_preds)
     rescued: list[dict[str, Any]] = []
     for rel in (parsed.get("relationships") or []):
@@ -1140,7 +1328,7 @@ async def _rescue_relationships(
         ev = " ".join((rel.get("evidence") or "").split())
         # Same evidence bar as the strict path -- widening WHICH predicate may
         # be used never widens what counts as proof.
-        if len(ev) < 12 or len(ev) > _MAX_EVIDENCE_CHARS or ev.lower() not in hay:
+        if len(ev) < 12 or len(ev) > _MAX_EVIDENCE_CHARS or _evidence_norm(ev) not in hay:
             continue
         if not (_evidence_names(ev, s_ent) and _evidence_names(ev, o_ent)):
             continue
@@ -1828,7 +2016,7 @@ async def _relationships_for_chunk(
     ]
     cap = _relationship_cap(len(kept))
     try:
-        r_sys, r_user = PROMPTS["relationship_extract"](
+        r_sys, r_user = _relationship_prompt(router)(
             txt, ents_for_prompt, pred_list, max_relationships=cap,
         )
         r_out = await router.chat(
@@ -1844,10 +2032,15 @@ async def _relationships_for_chunk(
 
     _by_norm = {_normalize_name(e["canonical_name"]): e for e in kept}
     for e in kept:
-        for form in (e.get("short_name"), *(e.get("aliases") or ())):
+        # Stored aliases already passed `_short_form_supported` when they
+        # were stored; this chunk's own short_name has not.
+        short = e.get("short_name")
+        if short and _short_form_supported(e["canonical_name"], short, txt):
+            _by_norm.setdefault(_normalize_name(short), e)
+        for form in (e.get("aliases") or ()):
             if form:
                 _by_norm.setdefault(_normalize_name(form), e)
-    hay = " ".join(txt.split()).lower()
+    hay = _evidence_norm(txt)
     rejects: list[dict[str, Any]] = []
     _pred_label = {p["iri"]: (p.get("label") or p["iri"]) for p in pred_list}
     _pred_index = _predicate_menu_index(pred_list)
@@ -1898,7 +2091,7 @@ async def _relationships_for_chunk(
                 _pred_by_iri.get(pred), s_cls, o_cls, pred_ancestors)
             # The model must QUOTE the text that asserts the claim...
             ev = " ".join((rel.get("evidence") or "").split())
-            if len(ev) < 12 or ev.lower() not in hay:
+            if len(ev) < 12 or _evidence_norm(ev) not in hay:
                 rel_drops["no_evidence"] += 1
                 continue
             if len(ev) > _MAX_EVIDENCE_CHARS:
@@ -1964,7 +2157,7 @@ async def _relationships_for_chunk(
 
     if gap_pass:
         try:
-            g_sys, g_user = PROMPTS["relationship_extract"](
+            g_sys, g_user = _relationship_prompt(router)(
                 txt, ents_for_prompt, pred_list, max_relationships=cap,
                 already_found=[_show(c) for c in rels],
             )
@@ -3022,7 +3215,18 @@ async def extract_entities(
                     _person_iris.add(origin)
             _person_iris |= _rootset
 
-    _alias_map, _n_alias = _resolve_canonical_forms(results, _person_iris)
+    _chunk_text = {cid: txt for cid, _ciri, txt, _emb, _did in chunks}
+    _pair_rejects: list[tuple[str, str]] = []
+    _alias_map, _n_alias = _resolve_canonical_forms(
+        results, _person_iris, chunk_text=_chunk_text, rejected=_pair_rejects)
+    if _pair_rejects:
+        _uniq = sorted(set(_pair_rejects))
+        print(
+            f"[extract-entities] short_name pairing refused for {len(_uniq)} "
+            f"pair(s) the chunk text does not support (kept as separate "
+            f"entities). e.g. "
+            + "; ".join(f"{s} -/-> {c}" for c, s in _uniq[:8])
+        )
     _renamed_from: dict[str, set[str]] = {}
     if _alias_map:
         # Display form for every normalised key: the longest RAW spelling seen
@@ -3104,7 +3308,10 @@ async def extract_entities(
         for e in (tup[3] or []):
             short = (e.get("short_name") or "").strip()
             name = (e.get("canonical_name") or "").strip()
-            if short and short != name:
+            # A refused pairing must not come back as a stored alias: later
+            # passes recognise stored entities in text by their aliases.
+            if short and short != name and _short_form_supported(
+                    name, short, _chunk_text.get(tup[0])):
                 _aliases_by_norm.setdefault(_normalize_name(name), set()).add(short)
 
     # Preload existing (normalized_name, class_id) -> id for O(1) exact match.
@@ -3264,6 +3471,7 @@ async def extract_entities(
     # in RAM (bounds peak memory), and retry transient pooler drops so one
     # dropped connection doesn't lose the whole run.
     embedder = Embedder()
+    await ensure_embedding_model(embedder)
     iri_to_id: dict[str, Any] = {}
     _conflicts = 0          # mints whose identifier the table already held
     _EBATCH = 200

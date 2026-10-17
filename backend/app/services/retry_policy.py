@@ -11,6 +11,8 @@ paths cannot drift apart.
 """
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import openai
 
@@ -39,6 +41,11 @@ def is_retryable(exc: BaseException) -> bool:
     every error that is transient.
     """
     if isinstance(exc, _NON_RETRYABLE_EXC):
+        return False
+    # Cancellation / Ctrl-C is the operator stopping the run. Retrying it kept
+    # an interrupted prune-expand alive (observed 2026-10-13: SIGINT surfaced
+    # as `retry ... attempt=2/5 err=CancelledError`).
+    if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
         return False
 
     # Anthropic and Groq raise their own SDK types. Rather than importing and

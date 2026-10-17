@@ -483,6 +483,16 @@ tasks:
     max_tokens: 2048
     response_format: json_object
 
+  # Stage 3b duplicate-class merge: OFF in this preset (enabled only in the
+  # deepinfra preset, which ships the model-specific judge prompt).
+  class_synonym_judge:
+    provider: anthropic
+    model: claude-haiku-4-5
+    enabled: false
+    timeout: 600
+    temperature: 0.0
+    max_tokens: 4096   # 60 decisions ~1.5k tokens
+
 defaults:
   retries:
     max_attempts: 5

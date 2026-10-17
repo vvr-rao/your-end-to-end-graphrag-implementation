@@ -1210,6 +1210,10 @@ def add_new_classes_from_match_not_found(
     created_iris: list[str] = []
 
     entries = list(match_results.get("MATCH NOT FOUND", []))
+    # A "new class" whose LABEL is an identifier is a reference to an existing
+    # class, never a new one; minting it creates an "http_..." junk class.
+    entries = [e for e in entries
+               if not (isinstance(e, dict) and looks_like_iri(e.get("LABEL")))]
     pending = entries[:]  # entries whose parent isn't yet resolved
     max_passes = max(len(entries) + 1, 2)
 
@@ -2243,7 +2247,21 @@ def _is_garbage_endpoint(text: str) -> bool:
         return True
     if split_disjunction_label(text):
         return True
+    if looks_like_iri(text):
+        return True
     return False
+
+
+def looks_like_iri(text: Any) -> bool:
+    """An identifier, not a name: a raw IRI or its slugged form.
+
+    Reaching an auto-mint with one means the referenced class is not in the
+    (pruned) ontology; minting it verbatim produced classes named
+    "http_purl_org_net_ocre_ocre_owl_ocre400015" -- 38 in one DeepSeek run,
+    1 in a Qwen run (2026-10-14). Never a legitimate new class name.
+    """
+    t = str(text or "").strip().lower()
+    return "://" in t or t.startswith(("http_", "https_", "urn:"))
 
 
 def _automint_endpoint_class(

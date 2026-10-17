@@ -76,6 +76,12 @@ deploy-ready. Bring up docker Postgres if needed, then migrate + verify. Can run
 concurrently with step 3 (prune-expand doesn't need the DB).
 
 ### 2b. Size the run ONCE, up front — rate limits + database → `concurrency:`
+> **DeepInfra/Qwen mode:** a dedicated deployment has no TPM/RPM, so `tpm_check.py`
+> does not size it. Use `uv run python scripts/deepinfra_sizing.py "<DOCS>"` instead
+> (corpus → GPU configuration → concurrency); the full order — size, approve the
+> hourly rate, deploy, `--probe`, `--apply`, delete when done — is in the
+> **choose-llm-mode** skill, "DeepInfra mode".
+
 Do this after steps 1 and 2 (it reads the active `models.yaml` and the DB
 settings) and before any paid step:
 ```

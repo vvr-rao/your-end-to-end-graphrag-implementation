@@ -77,7 +77,7 @@ STAGE_TASKS: dict[str, tuple[str, ...]] = {
     ),
     "chunk_classification": ("chunk_classification",),
     "class_proposal": ("class_proposal",),
-    "dedup": ("match_dedup",),
+    "dedup": ("match_dedup", "class_synonym_judge"),
     "table_mining": ("table_concept_grouping",),
     "entity_extraction": (
         "entity_extract", "concept_extract", "entity_validate",
@@ -193,6 +193,10 @@ async def probe(provider: str, model: str) -> dict:
             from anthropic import AsyncAnthropic
             client = AsyncAnthropic(api_key=s.anthropic_api_key, max_retries=0)
             row.update(await _probe_anthropic(client, model))
+        elif provider == "deepinfra":
+            # Dedicated deployments have no rate limit (GPUs are rented), and
+            # serverless sends no limit headers. Sized by deepinfra_sizing.py.
+            return {**row, "error": "no limit headers: use deepinfra_sizing.py"}
         else:
             return {**row, "error": f"unknown provider {provider!r}"}
     except Exception as exc:
@@ -647,6 +651,10 @@ async def main() -> int:
     do_apply = "--apply" in argv
 
     models = _models_in_use()
+    if any(p == "deepinfra" for p, _ in models):
+        print("This models.yaml routes to DeepInfra. A dedicated deployment is sized by")
+        print("GPU memory and throughput, not rate limits -- run instead:")
+        print("  uv run python scripts/deepinfra_sizing.py <docs-dir>\n")
     rows = await asyncio.gather(*[probe(p, m) for p, m in models])
     limits = {(r["provider"], r["model"]): r for r in rows}
 
