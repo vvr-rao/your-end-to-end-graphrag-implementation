@@ -12,7 +12,8 @@
 #      uv run python scripts/deepinfra_sizing.py <DOCS>
 #  - Relationship extraction: DeepSeek-V4.1-Flash on DeepInfra SERVERLESS
 #    (mixed mode; 27B's relationship recall was low and unstable).
-#  - Retrieval / QA: Qwen/Qwen3.8-27B on DeepInfra SERVERLESS (per token).
+#  - Retrieval / QA: DeepSeek-V4.1-Flash on DeepInfra SERVERLESS (per token);
+#    beat serverless Qwen3.8-27B head to head (see the Q&A block below).
 #  - Embeddings: Qwen/Qwen3-Embedding-4B @ 1024 (Matryoshka) on DeepInfra
 #    serverless (4B, not 8B: measured 2026-10-13, the 8B endpoint took 12-31 s
 #    per call whatever the batch size; 4B answers in ~0.3 s). Same vector(1024) schema, but NOT interchangeable with
@@ -64,8 +65,36 @@ tasks:
     # drop is caught in 5 min and retried. Output is identical.
     stream: true
     # Qwen-only prompt (backend/app/services/prompts_qwen.py): compact output
-    # contract so replies finish under 32k without capping concepts.
+    # contract; classes only for KINDS no existing class covers, tied to
+    # existing classes where relevant; declared LISTS whose items become
+    # instances (drugs, companies, trials, countries, facilities).
     prompt_set: qwen
+    # Hidden runaway guard, NOT a budget (the prompt states no class number).
+    # Web-search build 2026-10-17: 96 of 340 replies looped past 62 classes --
+    # OpenAI's largest reply on the same corpus -- ("AgriculturalShaving
+    # {Searching,Questing}Makers", "H7..H0") and carried 81% of 20,174
+    # proposals. Only a reply beyond 60 is cut, keeping its first entries.
+    max_new_classes: 60
+    max_instances_per_list: 40           # = prompts_qwen.QWEN_INSTANCES_PER_LIST
+    # What the model is shown of the existing ontology (pipeline_llm.
+    # _ontology_view), so it can check a class does not already exist: the
+    # WHOLE ontology when it has <= full_max_classes (the core merge: 375
+    # classes, ~25k tokens compact), else the Stage-1 roots' ancestors + full
+    # subtrees up to subtree_max_classes. Other presets keep the 1-hop slice,
+    # which hid 294 of 375 classes (anything 2+ levels below a root).
+    ontology_view:
+      full_max_classes: 600
+      subtree_max_classes: 600
+    # Adverse events are classes in ONE hierarchy (backend/app/services/
+    # adverse_event_taxonomy.py): Event > AdverseEvent > <System>AdverseEvent
+    # (19 types + GeneralAdverseEvent) > the specific event. The prompts list
+    # the names; Stage 3 maps variants (AdverseReaction, DrugSideEffect,
+    # GIAdverseReaction...) onto them before and after dedup.
+    adverse_event_taxonomy: true
+    # Junk filter (class_junk_filter): deterministic rules on each reply
+    # (numbers, URLs, Most/Least fragments, long phrases, loop families), then
+    # class_validity_judge on the distinct labels in pairwise Stage 3.
+    junk_filter: true
     # A reply cut off at max_tokens keeps its COMPLETE entries (deduped; matches
     # whose snippet is not in the chunk dropped) instead of being discarded.
     # Off by default in every other preset.
@@ -87,6 +116,41 @@ tasks:
     # (2026-10-13). Streamed, `timeout` is the gap BETWEEN tokens, so a
     # drop is caught in 5 min and retried. Output is identical.
     stream: true
+    # PAIRWISE dedup (deepinfra only; every other preset keeps the echo dedup
+    # above): staging store in the build database (DATABASE_URL, migration
+    # 0011) -> nearest-neighbour candidates -> class_pair_judge. The echo dedup
+    # removed nothing beyond identical labels at 20k proposals (13,828 distinct
+    # in, 13,844 out, 19 GPU-min); the replay of the same proposals needed ~110
+    # judge calls. No build database -> falls back to the echo dedup.
+    method: pairwise
+    t_hi: 0.97        # auto-merge; 0.95 still merged siblings (ExportRestriction~ExportBan)
+    t_lo: 0.80        # below: kept apart without a call
+    k: 10             # neighbours per label
+    judge_batch: 60
+    judge_concurrency: 8
+    max_group: 25     # union-find group cap: a chain cannot fuse unrelated concepts
+    audit: true       # dedup_audit.json / .csv next to the output
+    keep_staging: false
+
+  # Pair judge for pairwise dedup (Qwen's own prompt: prompts_qwen.qwen_class_pair_judge).
+  # Lists only the SAME pairs, so ~60 pairs cost ~0.3k output tokens.
+  class_pair_judge:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 300
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+
+  # Validity judge (prompts_qwen.qwen_class_validity_judge): category /
+  # named_thing / junk for each distinct label, 100 per call.
+  class_validity_judge:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 400
+    temperature: 0.0
+    max_tokens: 6144
+    response_format: json_object
 
   concept_grouping:
     provider: deepinfra
@@ -188,9 +252,17 @@ tasks:
     temperature: 0.2
     max_tokens: 8192
 
+  # ---- Q&A: every task the retrieval / answer path calls -------------------
+  # DeepSeek-V4.1-Flash, serverless, shared prompts. Measured 2026-10-17 on the
+  # same pharma graph against Qwen3.8-27B (gpt-4.1 judge): retrieval a tie
+  # (doc recall@10 0.683 vs 0.680, MRR 0.646 vs 0.645); audit expectation
+  # 0.973 vs 0.932; grounding simple 0.995 vs 0.936, deep 0.977 vs 0.964;
+  # ~40% faster (audit 39 s vs 67 s per question); $0.009 vs $0.012 per deep
+  # research question. Qwen kept 0 invalid citations (DeepSeek 3) and was
+  # slightly more comprehensive.
   qa_synthesis:
     provider: deepinfra
-    model: Qwen/Qwen3.8-27B
+    model: deepseek-ai/DeepSeek-V4.1-Flash
     timeout: 300
     temperature: 0.1
     max_tokens: 4096
@@ -341,7 +413,7 @@ tasks:
 
   question_parse:
     provider: deepinfra
-    model: Qwen/Qwen3.8-27B
+    model: deepseek-ai/DeepSeek-V4.1-Flash
     timeout: 90
     temperature: 0.0
     max_tokens: 1024
@@ -354,7 +426,7 @@ tasks:
   # into one, and one bad parse costs the whole walk. One call per query.
   question_relations:
     provider: deepinfra
-    model: Qwen/Qwen3.8-27B
+    model: deepseek-ai/DeepSeek-V4.1-Flash
     timeout: 90
     temperature: 0.0
     max_tokens: 1024
@@ -377,7 +449,7 @@ tasks:
 
   concept_expansion:
     provider: deepinfra
-    model: Qwen/Qwen3.8-27B
+    model: deepseek-ai/DeepSeek-V4.1-Flash
     timeout: 90
     temperature: 0.0
     max_tokens: 1024
@@ -385,7 +457,7 @@ tasks:
 
   query_decompose:
     provider: deepinfra
-    model: Qwen/Qwen3.8-27B
+    model: deepseek-ai/DeepSeek-V4.1-Flash
     timeout: 90
     temperature: 0.0
     max_tokens: 1024
@@ -401,7 +473,7 @@ tasks:
   # two-round retrieval silently never ran. Keep it present in ALL presets.
   retrieval_rounds_plan:
     provider: deepinfra
-    model: Qwen/Qwen3.8-27B
+    model: deepseek-ai/DeepSeek-V4.1-Flash
     timeout: 90
     temperature: 0.0
     max_tokens: 1024
@@ -409,7 +481,7 @@ tasks:
 
   entity_probes:
     provider: deepinfra
-    model: Qwen/Qwen3.8-27B
+    model: deepseek-ai/DeepSeek-V4.1-Flash
     timeout: 90
     temperature: 0.0
     max_tokens: 1024
@@ -417,7 +489,7 @@ tasks:
 
   chunk_relevance_filter:
     provider: deepinfra
-    model: Qwen/Qwen3.8-27B
+    model: deepseek-ai/DeepSeek-V4.1-Flash
     timeout: 300
     temperature: 0.0
     max_tokens: 4096
@@ -425,28 +497,28 @@ tasks:
 
   answer_simple_qa:
     provider: deepinfra
-    model: Qwen/Qwen3.8-27B
+    model: deepseek-ai/DeepSeek-V4.1-Flash
     timeout: 90
     temperature: 0.0
     max_tokens: 1024
 
   answer_deep_research:
     provider: deepinfra
-    model: Qwen/Qwen3.8-27B
+    model: deepseek-ai/DeepSeek-V4.1-Flash
     timeout: 600
     temperature: 0.1
     max_tokens: 8192          # 7-section deep_research answers over evidence-rich corpora exceed 4096
 
   follow_up_resolution:
     provider: deepinfra
-    model: Qwen/Qwen3.8-27B
+    model: deepseek-ai/DeepSeek-V4.1-Flash
     timeout: 90
     temperature: 0.0
     max_tokens: 512
 
   answer_conversation_turn:
     provider: deepinfra
-    model: Qwen/Qwen3.8-27B
+    model: deepseek-ai/DeepSeek-V4.1-Flash
     timeout: 150
     temperature: 0.1
     max_tokens: 2048

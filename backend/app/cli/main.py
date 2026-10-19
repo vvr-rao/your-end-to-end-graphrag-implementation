@@ -1694,6 +1694,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-deploy", action="store_true",
         help="Create services + env vars but skip the initial deploy trigger.",
     )
+    p_ri.add_argument(
+        "--llm-mode", default=None, choices=sorted(_RENDER_MODES),
+        help=("LLM mode the deployed backend runs (default: the last mode "
+              "select_llm_mode.py recorded, else groq-openai). Sets "
+              "MODELS_CONFIG_PATH and pushes only that mode's provider keys."),
+    )
     p_ri.set_defaults(func=_cmd_render_init)
 
     p_rs = sub.add_parser(
@@ -2787,6 +2793,55 @@ def _read_env_file(path: str = ".env") -> dict[str, str]:
     return out
 
 
+# LLM modes render-init can deploy -> (models preset the image loads, or None
+# for the default models.example.yaml; provider keys the mode needs; optional
+# extra keys pushed when present). The image ships only the *.example.yaml
+# presets, so a non-default mode is selected with MODELS_CONFIG_PATH.
+_RENDER_MODES: dict[str, tuple[str | None, tuple[str, ...], tuple[str, ...]]] = {
+    "groq-openai": (None, ("OPENAI_API_KEY",), ("GROQ_API_KEY",)),
+    "openai": ("config/models.openai.example.yaml", ("OPENAI_API_KEY",), ()),
+    "anthropic": ("config/models.anthropic.example.yaml", ("OPENAI_API_KEY", "ANTHROPIC_API_KEY"), ()),
+    # Q&A runs on serverless DeepSeek / Qwen embeddings: no GPU, no OpenAI key.
+    "deepinfra": ("config/models.deepinfra.example.yaml", ("DEEPINFRA_API_KEY",), ()),
+}
+
+
+def _tracked_llm_mode(repo_root) -> str | None:
+    """The last `llm-mode` the build tracker recorded (select_llm_mode.py)."""
+    import json
+
+    path = repo_root / ".build" / "state.jsonl"
+    mode = None
+    if path.exists():
+        for line in path.read_text().splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if row.get("step") == "llm-mode":
+                mode = (row.get("details") or {}).get("mode")
+    return mode
+
+
+def _render_backend_env(env_file: dict[str, str], mode: str, frontend_origin: str) -> list[dict]:
+    """The backend's COMPLETE env-var set for `mode` (Render's PUT replaces the
+    whole set, so a mode switch must send everything). Only the mode's own
+    provider keys are sent."""
+    preset, needed, optional = _RENDER_MODES[mode]
+    env = [
+        {"key": "DATABASE_URL",    "value": env_file["DATABASE_URL"]},
+        {"key": "BEARER_TOKEN",    "value": env_file["BEARER_TOKEN"]},
+        {"key": "FRONTEND_ORIGIN", "value": frontend_origin},
+        {"key": "LOG_LEVEL",       "value": "INFO"},
+        {"key": "ENV",             "value": "production"},
+    ]
+    env += [{"key": k, "value": env_file[k]} for k in needed]
+    env += [{"key": k, "value": env_file[k]} for k in optional if env_file.get(k)]
+    if preset:
+        env.append({"key": "MODELS_CONFIG_PATH", "value": preset})
+    return env
+
+
 def _cmd_render_init(args: argparse.Namespace) -> int:
     """Create backend + frontend services on Render from render.yaml +
     .env, no dashboard click-through. Idempotent: skips services that
@@ -2805,11 +2860,17 @@ def _cmd_render_init(args: argparse.Namespace) -> int:
         blueprint = yaml.safe_load(f) or {}
 
     env_file = _read_env_file(str(repo_root / ".env"))
-    required_secrets = ["DATABASE_URL", "OPENAI_API_KEY", "BEARER_TOKEN"]
+    mode = args.llm_mode or _tracked_llm_mode(repo_root) or "groq-openai"
+    if mode not in _RENDER_MODES:
+        print(f"ERROR: unknown LLM mode {mode!r}; pass --llm-mode {{{','.join(_RENDER_MODES)}}}")
+        return 1
+    required_secrets = ["DATABASE_URL", "BEARER_TOKEN", *_RENDER_MODES[mode][1]]
     missing = [k for k in required_secrets if not env_file.get(k)]
     if missing:
-        print(f"ERROR: missing required env vars in .env: {missing}")
+        print(f"ERROR: missing required env vars in .env for LLM mode {mode!r}: {missing}")
         return 1
+    print(f"→ LLM mode: {mode}" + (f" (MODELS_CONFIG_PATH={_RENDER_MODES[mode][0]})"
+                                    if _RENDER_MODES[mode][0] else ""))
 
     try:
         repo_url = args.repo or _git_remote_url()
@@ -2858,18 +2919,7 @@ def _cmd_render_init(args: argparse.Namespace) -> int:
             print(f"= backend already exists: {backend.get('id')}")
         else:
             bdef = svc_defs["backend"]
-            backend_env = [
-                {"key": "DATABASE_URL",    "value": env_file["DATABASE_URL"]},
-                {"key": "OPENAI_API_KEY",  "value": env_file["OPENAI_API_KEY"]},
-                {"key": "BEARER_TOKEN",    "value": env_file["BEARER_TOKEN"]},
-                {"key": "FRONTEND_ORIGIN", "value": "http://localhost:5173"},
-                {"key": "LOG_LEVEL",       "value": "INFO"},
-                {"key": "ENV",             "value": "production"},
-            ]
-            if env_file.get("GROQ_API_KEY"):
-                backend_env.append(
-                    {"key": "GROQ_API_KEY", "value": env_file["GROQ_API_KEY"]}
-                )
+            backend_env = _render_backend_env(env_file, mode, "http://localhost:5173")
             payload = {
                 "type": "web_service",
                 "name": "backend",
@@ -2940,27 +2990,14 @@ def _cmd_render_init(args: argparse.Namespace) -> int:
         )
         print(f"→ frontend URL: {frontend_url}")
 
-        # --- 3. cross-link FRONTEND_ORIGIN on backend ---
+        # --- 3. backend env: FRONTEND_ORIGIN cross-link + the LLM mode's keys ---
+        # Always pushed in full: an existing service may be switching modes
+        # (e.g. to deepinfra), and Render's PUT replaces the whole set.
         new_frontend_origin = f"http://localhost:5173,{frontend_url}"
-        if existing.get("backend") is None or env_file.get(
-            "FRONTEND_ORIGIN"
-        ) != new_frontend_origin:
-            print(
-                f"→ updating backend FRONTEND_ORIGIN -> {new_frontend_origin}"
-            )
-            backend_env_full = [
-                {"key": "DATABASE_URL",    "value": env_file["DATABASE_URL"]},
-                {"key": "OPENAI_API_KEY",  "value": env_file["OPENAI_API_KEY"]},
-                {"key": "BEARER_TOKEN",    "value": env_file["BEARER_TOKEN"]},
-                {"key": "FRONTEND_ORIGIN", "value": new_frontend_origin},
-                {"key": "LOG_LEVEL",       "value": "INFO"},
-                {"key": "ENV",             "value": "production"},
-            ]
-            if env_file.get("GROQ_API_KEY"):
-                backend_env_full.append(
-                    {"key": "GROQ_API_KEY", "value": env_file["GROQ_API_KEY"]}
-                )
-            await client.update_env_vars(backend["id"], backend_env_full)
+        print(f"→ setting backend env (FRONTEND_ORIGIN -> {new_frontend_origin}; "
+              f"LLM mode {mode}; values not shown)")
+        await client.update_env_vars(
+            backend["id"], _render_backend_env(env_file, mode, new_frontend_origin))
 
         # --- 4. optionally trigger first deploys ---
         if not args.no_deploy:

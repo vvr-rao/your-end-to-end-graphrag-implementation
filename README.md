@@ -54,7 +54,7 @@ A separate retrieval pipeline combines graph traversal with vector search to ans
 
 ## Platform support
 
-**LLMs Used** - Multi-LLM support via config presets: default (Groq + OpenAI), OpenAI-only, Anthropic-only chat, or DeepInfra/Qwen (dedicated Qwen3.8-Flash-Next for knowledge creation, serverless Qwen3.8-27B for retrieval, Qwen3-Embedding-4B). Provider/model per task is set in `config/models.yaml`. Embeddings run on OpenAI in every mode except DeepInfra.
+**LLMs Used** - Multi-LLM support via config presets: default (Groq + OpenAI), OpenAI-only, Anthropic-only chat, or DeepInfra/Qwen (dedicated Qwen3.8-27B for knowledge creation, serverless DeepSeek-V4.1-Flash for relationships and Q&A, Qwen3-Embedding-4B). Provider/model per task is set in `config/models.yaml`. Embeddings run on OpenAI in every mode except DeepInfra.
 
 **Database** - Postgres to hold the knowledge graph and Vectors. A cloud based Postgres DB (e.g. Supabase/AWS RDS) works. If none is provided, one is created in a local Docker for you. It needs to have pgvector enabled.
 

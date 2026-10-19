@@ -59,6 +59,11 @@ PRESETS = {
     # b2's ontology + summaries, re-extracted with the short_name merge guard
     # and evaluated with the "facts" prefix + rerank Qwen profile.
     "deepinfra-b3": ROOT / "config" / "models.deepinfra.example.yaml",
+    # The shipped deepinfra preset (Q&A on DeepSeek-V4.1-Flash) on the web-search
+    # corpus; this build is the one restored into Supabase for Render.
+    "deepinfra-ws": ROOT / "config" / "models.deepinfra.example.yaml",
+    # deepinfra-b3's graph, every Q&A task on DeepSeek-V4.1-Flash (QA_TASKS).
+    "deepinfra-b3-dsqa": ROOT / "config" / "models.deepinfra.example.yaml",
     # Embedding isolation: the OpenAI build's DB re-embedded with Qwen3-Embedding-4B,
     # OpenAI models for every chat task (scripts/bench/reembed_copy.py).
     "openai-qwenemb": ROOT / "config" / "models.openai.example.yaml",
@@ -80,6 +85,17 @@ TASK_PATCHES = {
         "class_proposal": {"thinking": True, "max_tokens": 49152},
         "match_dedup": {"thinking": True, "max_tokens": 49152, "batch_budget_tokens": 32768},
     },
+}
+# Every task the Q&A path calls (question parsing through answer synthesis).
+# In the deepinfra preset these all run on serverless Qwen3.8-27B with the
+# shared prompts -- there is no Qwen-only Q&A prompt set.
+QA_TASKS = ("qa_synthesis", "question_parse", "question_relations", "concept_expansion",
+            "query_decompose", "retrieval_rounds_plan", "entity_probes", "chunk_relevance_filter",
+            "answer_simple_qa", "answer_deep_research", "follow_up_resolution",
+            "answer_conversation_turn")
+# deepinfra-b3's graph (a template copy of its DB), Q&A on DeepSeek-V4.1-Flash.
+TASK_PATCHES["deepinfra-b3-dsqa"] = {
+    t: {"provider": "deepinfra", "model": "deepseek-ai/DeepSeek-V4.1-Flash"} for t in QA_TASKS
 }
 # ONE judge for every arm, so scores compare across modes. The deepinfra
 # preset judges with DeepSeek (it is DeepInfra-only); a benchmark must not let

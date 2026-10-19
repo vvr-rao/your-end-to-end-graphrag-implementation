@@ -16,21 +16,29 @@ has no rate limit -- you rent GPUs by the minute -- so the questions become:
   2. Which GPUs?                     every configuration that FITS the model
                                      within the account's 4-GPU limit, with
                                      KV-cache headroom, $/hour, projected wall
-                                     time and total cost; cheapest that meets
-                                     --deadline-hours wins.
-  3. How many requests at once?      KV-cache slots bound it from above; a
-                                     --probe load sweep on the live deployment
-                                     finds the throughput knee. That number,
-                                     not a rate limit, sets `concurrency:`.
+                                     time and total cost. The recommendation
+                                     follows PREFERRED_GPUS (2x B200, then
+                                     2x H200, then 2x H100); the others are the
+                                     fallback chain deepinfra_deploy.py walks
+                                     when a GPU type has no capacity.
+  3. How many requests at once?      per configuration, the concurrency that
+                                     maximises throughput within its KV cache
+                                     (model calibrated on the measured builds);
+                                     a --probe load sweep on the live
+                                     deployment refines it. That number, not a
+                                     rate limit, sets `concurrency:`.
 
 Step 2 is an A-PRIORI estimate (memory-bandwidth / FLOP model, roughly
-+-50%); it picks the hardware. Step 3 MEASURES, and is what --apply writes.
-Nothing is deployed here: scripts/deepinfra_deploy.py consumes the
-`sizing.json` this writes, and only after the user approves the spend.
++-50%); it picks the hardware. Step 3's a-priori values are written for every
+configuration in the chain, so whichever GPU deepinfra_deploy.py obtains gets
+its own; --probe MEASURES. Nothing is deployed here: deepinfra_deploy.py
+consumes the `sizing.json` this writes, and only after the user approves the
+spend.
 
-Retrieval runs on SERVERLESS Qwen3.8-27B (per token, no GPUs to size); its
-`evaluation` concurrency is bounded by DeepInfra's per-model concurrent
-request limit (--serverless-limit) and by the OpenAI judge models.
+The deployed model is Qwen3.8-27B (FP8, dense; --model flash-next sizes the
+original Qwen3.8-Flash-Next MoE). Q&A runs on SERVERLESS DeepSeek-V4.1-Flash
+(per token, no GPUs to size); its `evaluation` concurrency is bounded by
+DeepInfra's per-model concurrent request limit (--serverless-limit).
 
 Reads only whether keys are present; never prints key values.
 """
@@ -68,31 +76,67 @@ GPU_CATALOG: dict[str, dict] = {
 }
 MAX_GPUS_PER_ACCOUNT = 4  # DeepInfra default; support can raise it.
 
-# Checkpoint sizes from the Hugging Face safetensors index (2026-10-12).
-CHECKPOINTS: dict[str, dict] = {
-    "bf16": {"repo": "Qwen/Qwen3.8-Flash-Next", "weights_gb": 360.0},
-    "fp8": {"repo": "Qwen/Qwen3.8-Flash-Next-FP8", "weights_gb": 185.5},
-}
-ACTIVE_PARAMS = 6e9   # MoE active per token (125B total, 512 experts, top-10)
-N_EXPERTS, TOP_K = 512, 10
-DENSE_FRACTION = 0.08  # attention/shared/embeddings read on EVERY decode step
+# Preferred hosting, in order (user-set 2026-10-17). The first that fits is
+# recommended; the rest are the fallback chain for `no-gpu-available` / 409.
+PREFERRED_GPUS: tuple[tuple[str, int], ...] = (
+    ("B200-180GB", 2), ("H200-141GB", 2), ("H100-80GB", 2),
+)
 
-# Fallback architecture (Qwen3.8-Flash-Next config.json, 2026-10-12) used when
-# the live config cannot be fetched.
-FALLBACK_ARCH = {
-    "full_attention_layers": 13,  # 12 + 1 MTP layer
-    "linear_attention_layers": 36,
-    "num_key_value_heads": 2, "head_dim": 256,
-    "linear_num_value_heads": 48, "linear_key_head_dim": 128,
-    "linear_value_head_dim": 128,
+# Models that can be deployed. Checkpoint sizes from the Hugging Face
+# safetensors index; fallback architecture from config.json (both 2026-10-12/17),
+# used when the live config cannot be fetched.
+MODELS: dict[str, dict] = {
+    # What the deepinfra preset deploys. Dense 27B, but hybrid like Flash-Next:
+    # 16 full-attention (+1 MTP) layers carry per-token KV, 48 Gated-DeltaNet
+    # layers carry a fixed recurrent state.
+    "27b": {
+        "label": "Qwen3.8-27B", "dense": True, "active_params": 27e9,
+        "checkpoints": {"fp8": {"repo": "Qwen/Qwen3.8-27B-FP8", "weights_gb": 30.9}},
+        "fallback_arch": {
+            "full_attention_layers": 17, "linear_attention_layers": 48,
+            "num_key_value_heads": 4, "head_dim": 256,
+            "linear_num_value_heads": 48, "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+        },
+    },
+    "flash-next": {
+        "label": "Qwen3.8-Flash-Next", "dense": False,
+        "active_params": 6e9,  # MoE active per token (125B total, 512 experts, top-10)
+        "checkpoints": {
+            "bf16": {"repo": "Qwen/Qwen3.8-Flash-Next", "weights_gb": 360.0},
+            "fp8": {"repo": "Qwen/Qwen3.8-Flash-Next-FP8", "weights_gb": 185.5},
+        },
+        "fallback_arch": {
+            "full_attention_layers": 13,  # 12 + 1 MTP layer
+            "linear_attention_layers": 36,
+            "num_key_value_heads": 2, "head_dim": 256,
+            "linear_num_value_heads": 48, "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+        },
+    },
 }
+DEFAULT_MODEL = "27b"
+CHECKPOINTS = MODELS[DEFAULT_MODEL]["checkpoints"]
+FALLBACK_ARCH = MODELS[DEFAULT_MODEL]["fallback_arch"]
+ACTIVE_PARAMS = MODELS[DEFAULT_MODEL]["active_params"]
+N_EXPERTS, TOP_K = 512, 10          # Flash-Next routing
+DENSE_FRACTION = 0.08  # MoE: attention/shared/embeddings read on EVERY decode step
 
 GPU_MEMORY_UTILIZATION = 0.90   # vLLM default
 RUNTIME_OVERHEAD_GB_PER_GPU = 5  # activations, CUDA graphs, NCCL buffers
 TP_EFFICIENCY = 0.85             # tensor-parallel communication loss
 BW_EFFICIENCY = 0.60
-MFU = 0.35
+# Effective compute efficiency under the pipeline's real load (prefill-heavy:
+# extraction sends ~8 input tokens per output token). Fitted 2026-10-17 on the
+# dedicated-27B builds: 2x B200 generate-artifacts at 63 in flight = 3,760 out
+# + 7,600 in tok/s; 2x H100 extract-entities at 39 in flight = 850 out +
+# 6,800 in tok/s (0.07-0.15 across steps). Single-stream decode matched the
+# bandwidth model (B200 125, H200 ~115, H100 ~70 tok/s measured).
+MFU = 0.12
 STEP_OVERHEAD_S = 0.004
+# The deploy API accepted max_batch_size 128 in every run; higher is untested,
+# so a-priori concurrency stops here (a --probe sweep may justify more).
+MAX_BATCH = 128
 DEFAULT_SPINUP_MIN = 20          # pull ~185-360 GB + load; billed
 # GPU time billed while the pipeline is NOT calling the model: DB writes,
 # embedding, chunking, the gaps between CLI commands. Per document, plus a
@@ -201,8 +245,9 @@ def project_workload(total_tokens: int, ratios: dict[str, dict]) -> dict[str, di
 # 2. GPU configurations
 # --------------------------------------------------------------------------- #
 
-def fetch_arch(repo: str) -> dict:
-    """KV-relevant architecture from the HF config; FALLBACK_ARCH on failure."""
+def fetch_arch(repo: str, fallback: dict | None = None) -> dict:
+    """KV-relevant architecture from the HF config; `fallback` (default
+    FALLBACK_ARCH) on failure."""
     try:
         import urllib.request
 
@@ -220,7 +265,7 @@ def fetch_arch(repo: str) -> dict:
             "linear_value_head_dim": t["linear_value_head_dim"],
         }
     except Exception:
-        return dict(FALLBACK_ARCH)
+        return dict(fallback or FALLBACK_ARCH)
 
 
 def kv_bytes_per_token(arch: dict) -> float:
@@ -253,6 +298,8 @@ class GpuOption:
     kv_free_gb: float      # per instance
     usd_hr: float          # all instances
     note: str = ""
+    dense: bool = False    # every decode step reads ALL weights (no expert routing)
+    active_params: float = MODELS["flash-next"]["active_params"]
 
     @property
     def total_gpus(self) -> int:
@@ -263,10 +310,12 @@ class GpuOption:
         return f"{self.num_gpus}x {self.gpu} {self.precision}{inst}"
 
 
-def gpu_options(precision: str = "any", max_gpus: int = MAX_GPUS_PER_ACCOUNT) -> list[GpuOption]:
+def gpu_options(precision: str = "any", max_gpus: int = MAX_GPUS_PER_ACCOUNT,
+                model: str = DEFAULT_MODEL) -> list[GpuOption]:
     """Every (gpu, count, replicas, precision) whose weights fit with KV room."""
+    m = MODELS[model]
     out: list[GpuOption] = []
-    for prec, ck in CHECKPOINTS.items():
+    for prec, ck in m["checkpoints"].items():
         if precision not in ("any", prec):
             continue
         for gpu, g in GPU_CATALOG.items():
@@ -287,7 +336,7 @@ def gpu_options(precision: str = "any", max_gpus: int = MAX_GPUS_PER_ACCOUNT) ->
                         gpu=gpu, num_gpus=n, instances=inst, precision=prec,
                         repo=ck["repo"], weights_gb=ck["weights_gb"],
                         kv_free_gb=round(kv, 1), usd_hr=round(n * inst * g["usd_hr"], 2),
-                        note=note,
+                        note=note, dense=m["dense"], active_params=m["active_params"],
                     ))
     return out
 
@@ -297,23 +346,37 @@ def kv_slots(opt: GpuOption, arch: dict, ctx_tokens: float) -> int:
     return int(opt.kv_free_gb // seq_gb(arch, ctx_tokens)) * opt.instances
 
 
-def decode_tps(opt: GpuOption, batch: int) -> float:
-    """Aggregate output tokens/s of ONE instance at `batch` concurrent decodes.
+def _flops(opt: GpuOption) -> float:
+    g = GPU_CATALOG[opt.gpu]
+    return opt.num_gpus * (g["fp8"] if opt.precision == "fp8" and g["fp8"] else g["bf16"]) * 1e12
 
-    Decode is memory-bound: each step reads the dense weights plus every
-    expert ANY sequence in the batch routes to (1-(1-k/E)^b of them).
+
+def step_seconds(opt: GpuOption, batch: int, prefill_ratio: float = 0.0) -> float:
+    """One decode step of ONE instance with `batch` sequences in flight.
+
+    Weight reads (memory-bound): a dense model reads every weight each step;
+    a MoE reads the dense part plus every expert ANY sequence routes to
+    (1-(1-k/E)^b of them). Compute: each in-flight sequence's token, plus the
+    prefill work its request carries -- `prefill_ratio` input tokens per output
+    token, interleaved with decode (continuous batching). Under the pipeline's
+    prefill-heavy load the compute term is what saturates, not bandwidth.
     """
     g = GPU_CATALOG[opt.gpu]
-    touched = DENSE_FRACTION + (1 - DENSE_FRACTION) * (1 - (1 - TOP_K / N_EXPERTS) ** batch)
+    touched = 1.0 if opt.dense else (
+        DENSE_FRACTION + (1 - DENSE_FRACTION) * (1 - (1 - TOP_K / N_EXPERTS) ** batch))
     bytes_step = opt.weights_gb * 1e9 * touched
     bw = opt.num_gpus * g["bw"] * 1e12 * BW_EFFICIENCY * (TP_EFFICIENCY if opt.num_gpus > 1 else 1)
-    return batch / (bytes_step / bw + STEP_OVERHEAD_S)
+    compute = batch * (1 + prefill_ratio) * 2 * opt.active_params / (_flops(opt) * MFU)
+    return bytes_step / bw + compute + STEP_OVERHEAD_S
+
+
+def decode_tps(opt: GpuOption, batch: int, prefill_ratio: float = 0.0) -> float:
+    """Aggregate output tokens/s of ONE instance at `batch` concurrent requests."""
+    return batch / step_seconds(opt, batch, prefill_ratio)
 
 
 def prefill_tps(opt: GpuOption) -> float:
-    g = GPU_CATALOG[opt.gpu]
-    tf = (g["fp8"] if opt.precision == "fp8" and g["fp8"] else g["bf16"]) * 1e12
-    return opt.num_gpus * tf * MFU / (2 * ACTIVE_PARAMS)
+    return _flops(opt) * MFU / (2 * opt.active_params)
 
 
 def estimate_run(opt: GpuOption, arch: dict, stages: dict[str, dict],
@@ -332,10 +395,9 @@ def estimate_run(opt: GpuOption, arch: dict, stages: dict[str, dict],
         if st["calls"] < 0.5:
             continue
         slots = kv_slots(opt, arch, st["mean_ctx"]) // opt.instances
-        batch = max(1, min(slots, 128, math.ceil(st["calls"] / opt.instances)))
-        dec = decode_tps(opt, batch) * opt.instances
-        pre = prefill_tps(opt) * opt.instances
-        bulk = st["out_tokens"] / dec + st["in_tokens"] / pre
+        batch = max(1, min(slots, MAX_BATCH, math.ceil(st["calls"] / opt.instances)))
+        ratio = st["in_tokens"] / max(st["out_tokens"], 1.0)
+        bulk = st["out_tokens"] / (decode_tps(opt, batch, ratio) * opt.instances)
         tail = 2 * st["mean_out"] / single
         s = max(bulk, tail)
         per_stage[name] = {"seconds": round(s), "batch": batch, "tail_bound": tail > bulk}
@@ -345,11 +407,30 @@ def estimate_run(opt: GpuOption, arch: dict, stages: dict[str, dict],
             "llm_hours": round(seconds / 3600, 2), "stages": per_stage}
 
 
+def preferred_chain(rows: list[tuple[GpuOption, dict]], deadline_h: float | None,
+                    preferred: tuple[tuple[str, int], ...] = PREFERRED_GPUS) -> list[tuple[GpuOption, dict]]:
+    """The PREFERRED_GPUS configurations that fit (single instance, FP8 when
+    the model has it) and meet the deadline, in preference order."""
+    out = []
+    for gpu, n in preferred:
+        cands = [r for r in rows if r[0].gpu == gpu and r[0].num_gpus == n and r[0].instances == 1
+                 and (deadline_h is None or r[1]["hours"] <= deadline_h)]
+        cands.sort(key=lambda r: (r[0].precision != "fp8", r[1]["usd"]))
+        if cands:
+            out.append(cands[0])
+    return out
+
+
 def recommend(rows: list[tuple[GpuOption, dict]], deadline_h: float | None,
-              allow_noted: bool = False) -> tuple[GpuOption, dict] | None:
-    """Cheapest option meeting the deadline. Options carrying a caveat (A100
-    FP8 = an unproven weight-only kernel path for this architecture) are
-    listed but not recommended unless `allow_noted`."""
+              allow_noted: bool = False,
+              preferred: tuple[tuple[str, int], ...] = PREFERRED_GPUS) -> tuple[GpuOption, dict] | None:
+    """The first PREFERRED_GPUS configuration that fits and meets the deadline;
+    if none does, the cheapest option that does. Options carrying a caveat
+    (A100 FP8 = an unproven weight-only kernel path) are listed but not
+    recommended unless `allow_noted`."""
+    chain = preferred_chain(rows, deadline_h, preferred)
+    if chain:
+        return chain[0]
     ok = [r for r in rows
           if (deadline_h is None or r[1]["hours"] <= deadline_h)
           and (allow_noted or not r[0].note)]
@@ -362,15 +443,40 @@ def recommend(rows: list[tuple[GpuOption, dict]], deadline_h: float | None,
 # 3. Concurrency
 # --------------------------------------------------------------------------- #
 
-def a_priori_concurrency(opt: GpuOption, arch: dict, stages: dict[str, dict]) -> dict[str, int]:
-    """Per-stage concurrency from KV slots alone (before a probe)."""
+CONCURRENCY_LEVELS = (8, 16, 24, 32, 48, 64, 96, 128)
+
+
+def a_priori_concurrency(opt: GpuOption, arch: dict, stages: dict[str, dict],
+                         timeouts: dict[str, list[tuple[int, float]]] | None = None) -> dict[str, int]:
+    """Per-stage concurrency that maximises throughput before a probe.
+
+    The smallest level reaching 90% of the modeled peak (find_knee on the
+    step model at the stage's own input/output ratio), capped by the KV slots
+    the stage's context leaves and by MAX_BATCH. `timeouts` (from
+    nonstreamed_timeouts: per stage, (timeout, mean output) of each
+    non-streamed task, whose limit is the WHOLE call) also caps it so each
+    task's slow call (~2x its mean output) finishes inside half its timeout.
+
+    Measured on the 27B builds: at 64 in flight 2x B200 was still scaling
+    linearly, while prefill-heavy extraction on 2x H100 ran at ~1/3 of
+    single-stream speed per request -- so B200 gets KV-limited values and
+    H100 compute-limited ones.
+    """
     out: dict[str, int] = {}
     for name, st in stages.items():
         ctx = st["mean_ctx"]
         if name in LARGE_OUTPUT_STAGES:
             # A reply may run to the full budget; reserve for in + p95-ish out.
             ctx = st["in_tokens"] / max(st["calls"], 1e-9) + LARGE_OUTPUT_TOKENS / 2
-        out[name] = max(1, min(128, kv_slots(opt, arch, ctx)))
+        cap = min(MAX_BATCH, kv_slots(opt, arch, ctx) // opt.instances)
+        ratio = st["in_tokens"] / max(st["out_tokens"], 1.0)
+        levels = [c for c in CONCURRENCY_LEVELS if c <= cap] or [max(1, cap)]
+        curve = [{"concurrency": c, "tok_s": decode_tps(opt, c, ratio)} for c in levels]
+        c = find_knee(curve)
+        for limit, slow_out in (timeouts or {}).get(name, ()):
+            while c > 1 and slow_out * step_seconds(opt, c, ratio) > 0.5 * limit:
+                c = max(1, c // 2)
+        out[name] = max(1, c * opt.instances)
     return out
 
 
@@ -574,9 +680,13 @@ def report(docs_dir: str, argv: list[str]) -> int:
     print(f"   {n} document(s), {total:,} tokens (largest {max(per_doc):,})")
     non_llm = float(non_llm_arg) if non_llm_arg else DEFAULT_NON_LLM_MIN + NON_LLM_MIN_PER_DOC * n
 
+    model = _arg(argv, "--model", DEFAULT_MODEL)
+    if model not in MODELS:
+        print(f"unknown --model {model}; one of {', '.join(MODELS)}")
+        return 2
     ratios = load_ratios()
     stages = project_workload(total, ratios)
-    print("\n   Projected creation workload (Flash-Next, dedicated):")
+    print(f"\n   Projected creation workload ({MODELS[model]['label']}, dedicated):")
     print(f"   {'stage':<22} {'calls':>8} {'in tok':>12} {'out tok':>11} {'ctx/call':>9}")
     for name, st in sorted(stages.items(), key=lambda kv: -kv[1]["out_tokens"]):
         flag = "  (structural estimate)" if st["structural"] else ""
@@ -586,8 +696,9 @@ def report(docs_dir: str, argv: list[str]) -> int:
     tot_out = sum(s["out_tokens"] for s in stages.values())
     print(f"   {'TOTAL':<22} {'':>8} {tot_in:>12,.0f} {tot_out:>11,.0f}")
 
-    arch = fetch_arch(CHECKPOINTS["bf16"]["repo"])
-    print(f"\n2. GPU OPTIONS  (KV {kv_bytes_per_token(arch)/1024:.0f} KB/token + "
+    arch = fetch_arch(next(iter(MODELS[model]["checkpoints"].values()))["repo"],
+                      MODELS[model]["fallback_arch"])
+    print(f"\n2. GPU OPTIONS  {MODELS[model]['label']}  (KV {kv_bytes_per_token(arch)/1024:.0f} KB/token + "
           f"{state_bytes_per_seq(arch)/1e6:.0f} MB recurrent state per sequence; "
           f"{MAX_GPUS_PER_ACCOUNT}-GPU account limit)")
     print(f"   Billed beyond LLM time: spin-up {spinup:.0f} min + ~{non_llm:.0f} min of pipeline "
@@ -595,14 +706,17 @@ def report(docs_dir: str, argv: list[str]) -> int:
     # --gpu restricts to one GPU type (e.g. when DeepInfra has no capacity
     # for the cheapest one: deployments fail with `no-gpu-available`).
     only_gpu = _arg(argv, "--gpu")
-    rows = [(o, estimate_run(o, arch, stages, spinup, non_llm)) for o in gpu_options(precision)
+    rows = [(o, estimate_run(o, arch, stages, spinup, non_llm)) for o in gpu_options(precision, model=model)
             if not only_gpu or o.gpu == only_gpu]
-    rows.sort(key=lambda r: (r[1]["usd"], r[1]["hours"]))
-    print(f"   {'configuration':<34} {'$/hr':>6} {'KV GB':>7} {'slots@ctx':>9} {'LLM time':>9} {'billed':>8} {'est. $':>8}")
+    chain = preferred_chain(rows, deadline_h)
+    rank = {id(o): i + 1 for i, (o, _) in enumerate(chain)}
+    rows.sort(key=lambda r: (rank.get(id(r[0]), 99), r[1]["usd"], r[1]["hours"]))
+    print(f"   {'pref':<5}{'configuration':<30} {'$/hr':>6} {'KV GB':>7} {'slots@ctx':>9} {'LLM time':>9} {'billed':>8} {'est. $':>8}")
     for o, est in rows:
         slots = kv_slots(o, arch, stages.get("class_proposal", {}).get("mean_ctx", 26000))
         late = "  > deadline" if deadline_h and est["hours"] > deadline_h else ""
-        print(f"   {o.label():<34} {o.usd_hr:>6.2f} {o.kv_free_gb:>7.0f} {slots:>9} "
+        pref = f"#{rank[id(o)]}" if id(o) in rank else ""
+        print(f"   {pref:<5}{o.label():<30} {o.usd_hr:>6.2f} {o.kv_free_gb:>7.0f} {slots:>9} "
               f"{_fmt_h(est['llm_hours']):>9} {_fmt_h(est['hours']):>8} {est['usd']:>8.2f}{late}"
               + (f"  [{o.note}]" if o.note else ""))
     best = recommend(rows, deadline_h, allow_noted="--allow-a100-fp8" in argv)
@@ -613,6 +727,10 @@ def report(docs_dir: str, argv: list[str]) -> int:
     opt, est = best
     print(f"\n   RECOMMEND {opt.label()}  ~{_fmt_h(est['hours'])} billed, ~${est['usd']:.2f} "
           f"(a-priori estimate, +-50%; --probe measures the real curve)")
+    fallbacks = [r for r in chain if r[0] is not opt]
+    if fallbacks:
+        print("   Fallback chain if it has no capacity (deepinfra_deploy.py walks it): "
+              + " -> ".join(f"{o.label()} (${o.usd_hr:.2f}/h)" for o, _ in fallbacks))
     tails = [k for k, v in est["stages"].items() if v["tail_bound"]]
     if tails:
         print(f"   Long-tail bound (more GPUs would not shorten): {', '.join(tails)}")
@@ -623,14 +741,24 @@ def report(docs_dir: str, argv: list[str]) -> int:
         print("   Phase-2 stages use structural estimates until a benchmark run is calibrated "
               "(--calibrate).")
 
-    conc = a_priori_concurrency(opt, arch, stages)
-    print("\n3. CONCURRENCY (a priori, from KV-cache slots; --probe refines):")
-    _print_concurrency(conc)
+    timeouts = nonstreamed_timeouts(ratios)
+
+    def entry(o: GpuOption, e: dict) -> dict:
+        c = a_priori_concurrency(o, arch, stages, timeouts)
+        return {"option": {**asdict(o), "label": f"{o.label()} ({MODELS[model]['label']})"},
+                "estimate": e, "concurrency": c, "max_batch_size": max(8, min(MAX_BATCH, max(c.values())))}
+
+    primary = entry(opt, est)
+    print(f"\n3. CONCURRENCY for {opt.label()} (a priori: throughput knee within the KV cache; "
+          "--probe refines):")
+    _print_concurrency(primary["concurrency"])
+    chained = [entry(o, e) for o, e in fallbacks]
+    for fb in chained:
+        print(f"   {fb['option']['label']}: " + ", ".join(f"{k} {v}" for k, v in sorted(fb["concurrency"].items())))
     payload = {
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "docs_dir": docs_dir, "documents": n, "corpus_tokens": total,
-        "option": {**asdict(opt), "label": opt.label()},
-        "estimate": est, "concurrency": conc, "arch": arch,
+        "docs_dir": docs_dir, "documents": n, "corpus_tokens": total, "model": model,
+        **primary, "fallbacks": chained, "arch": arch,
         "stages": {k: {kk: vv for kk, vv in v.items() if kk != "tasks"} for k, v in stages.items()},
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -638,6 +766,32 @@ def report(docs_dir: str, argv: list[str]) -> int:
     print(f"\n   wrote {out_path.relative_to(ROOT) if out_path.is_relative_to(ROOT) else out_path}"
           " -> scripts/deepinfra_deploy.py create --from-sizing <it>  (needs your approval: paid)")
     return 0
+
+
+def nonstreamed_timeouts(ratios: dict[str, dict] | None = None) -> dict[str, list[tuple[int, float]]]:
+    """Per stage, (whole-call timeout, slow-call output tokens) for each of its
+    NON-streamed tasks that run on the dedicated deployment in the deepinfra
+    preset. Each task is checked against its OWN timeout and output length: a
+    stage-wide minimum let a 90 s short-reply task cap a stage of long merges.
+    Streamed tasks time out on the gap between tokens, and serverless tasks are
+    not on these GPUs, so neither sets a cap."""
+    import yaml
+    from tpm_check import STAGE_TASKS
+
+    ratios = ratios or load_ratios()
+    preset = ROOT / "config" / "models.deepinfra.example.yaml"
+    specs = (yaml.safe_load(preset.read_text()) or {}).get("tasks") or {}
+    out: dict[str, list[tuple[int, float]]] = {}
+    for stage, tasks in STAGE_TASKS.items():
+        for t in tasks:
+            s = specs.get(t) or {}
+            if (s.get("timeout") and not s.get("stream") and t in ratios
+                    and "__DEEPINFRA_FLASH_MODEL__" in str(s.get("model", ""))):
+                # The slow call: ~2x the mean output, but never past the task's own
+                # max_tokens (a 1,024-token summary cannot run to 3,000).
+                slow = min(2 * float(ratios[t]["out"]), float(s.get("max_tokens") or 1e9))
+                out.setdefault(stage, []).append((int(s["timeout"]), slow))
+    return out
 
 
 def _print_concurrency(conc: dict[str, int]) -> None:
@@ -670,7 +824,10 @@ async def probe_main(argv: list[str]) -> int:
 
     timeouts = {st: max(int((specs.get(t) or {}).get("timeout", 120)) for t in tasks)
                 for st, tasks in STAGE_TASKS.items()}
-    conc = probe_concurrency(curve, sizing["stages"], sizing["concurrency"], timeouts, probe_out)
+    # KV caps of the configuration actually running (deepinfra_deploy.py
+    # records it as `active` -- it may be a fallback, not the recommendation).
+    caps = (sizing.get("active") or sizing)["concurrency"]
+    conc = probe_concurrency(curve, sizing["stages"], caps, timeouts, probe_out)
     conc["evaluation"] = min(32, int(_arg(argv, "--serverless-limit", 200)) // 4)
     sizing.update({"probe": curve, "knee": find_knee(curve), "concurrency": conc})
     print(f"\n   knee: {sizing['knee']} concurrent requests")

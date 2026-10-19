@@ -473,6 +473,81 @@ def _slice_ontology(
     return out
 
 
+def _compact_class_entry(rec: dict[str, Any], classes: dict[str, Any], desc_words: int = 12) -> dict[str, Any]:
+    """One class as the `ontology_view` sends it: label, parent IRIs, a short
+    description. The 1-hop slice ships full superclass objects + raw comments
+    (~213 tokens/class on the 375-class core merge, 80k for the whole
+    ontology); this form is ~68 tokens/class (25k)."""
+    entry: dict[str, Any] = {"label": _first_label(rec) or rec.get("name") or ""}
+    parents = []
+    for s in rec.get("superclasses") or []:
+        p = s.get("iri") if isinstance(s, dict) else (s if isinstance(s, str) else None)
+        if p and p in classes and p not in _GENERIC_TOP_TYPES:
+            parents.append(p)
+    if parents:
+        entry["parents"] = parents
+    desc = rec.get("compact_description") or " ".join(
+        str(x) for x in (rec.get("descriptions") or []) + (rec.get("comments") or []))
+    desc = " ".join(str(desc).split()[:desc_words])
+    if desc:
+        entry["desc"] = desc
+    return entry
+
+
+def _ontology_view(
+    loaded_ontology: dict[str, Any],
+    detected_iris: list[str],
+    max_hops: int,
+    view: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """What Stage 2 is shown of the existing ontology (DATA_CLASSES).
+
+    Without `view` (every preset but deepinfra): the 1-hop `_slice_ontology`.
+    With it (user decision 2026-10-18) -- so the model can actually check
+    whether a class already exists before proposing one:
+      - `full_max_classes`: an ontology this small is sent WHOLE, to every
+        chunk. The 1-hop slice showed ~14-32 of 375 classes and hid every
+        class two levels below a Stage-1 root (294 of 375 in the core merge,
+        incl. the geography ontology's country classes), so the model
+        re-proposed classes that already existed.
+      - otherwise the Stage-1 roots + anchors, their ANCESTORS, and their full
+        subtrees added level by level until `subtree_max_classes`.
+    Entries use `_compact_class_entry`.
+    """
+    if not view:
+        return _slice_ontology(loaded_ontology, detected_iris, max_hops)
+    from backend.app.helpers.ontology_pruning import _build_isa_indexes
+
+    classes = loaded_ontology.get("classes_dict", {})
+    full_max = int(view.get("full_max_classes") or 0)
+    cap = int(view.get("subtree_max_classes") or 0) or full_max or 600
+    if full_max and len(classes) <= full_max:
+        keep = [i for i in classes if i not in _GENERIC_TOP_TYPES]
+    else:
+        parent_of, children_of = _build_isa_indexes(classes)
+        seeds = [i for i in list(detected_iris) + list(_UNIVERSAL_ANCHOR_IRIS) if i in classes]
+        if not seeds:
+            return {}
+        keep_set: set[str] = set(seeds)
+        stack = list(seeds)
+        while stack:                        # ancestors: where the seeds sit
+            for p in parent_of.get(stack.pop(), ()):
+                if p not in keep_set and p in classes:
+                    keep_set.add(p)
+                    stack.append(p)
+        level = list(seeds)
+        while level and len(keep_set) < cap:  # subtrees, breadth first
+            nxt = []
+            for i in level:
+                for c in sorted(children_of.get(i, ())):
+                    if c not in keep_set and len(keep_set) < cap:
+                        keep_set.add(c)
+                        nxt.append(c)
+            level = nxt
+        keep = [i for i in classes if i in keep_set]
+    return {i: _compact_class_entry(classes[i], classes) for i in keep}
+
+
 async def _propose_for_chunk(
     router: LLMRouter,
     loaded_ontology: dict[str, Any],
@@ -482,7 +557,11 @@ async def _propose_for_chunk(
     suggested_new_classes: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """Stage 2 for one chunk."""
-    ontology_slice = _slice_ontology(loaded_ontology, detected_iris, max_hops)
+    try:
+        view = router.task_spec("class_proposal").get("ontology_view")
+    except (AttributeError, KeyError):  # test doubles without a task map
+        view = None
+    ontology_slice = _ontology_view(loaded_ontology, detected_iris, max_hops, view)
     if not ontology_slice:
         # Nothing to match against — still try to surface MATCH NOT FOUND
         # proposals against a trivially-empty slice. The prompt still works.
@@ -496,6 +575,10 @@ async def _propose_for_chunk(
         from backend.app.services.prompts_qwen import qwen_class_proposal
 
         system, user = qwen_class_proposal(ontology_slice, chunk.text, suggested_new_classes=hint)
+    elif prompt_set == "deepseek":
+        from backend.app.services.prompts_deepseek import deepseek_class_proposal
+
+        system, user = deepseek_class_proposal(ontology_slice, chunk.text, suggested_new_classes=hint)
     else:
         system, user = PROMPTS["class_proposal"](ontology_slice, chunk.text, suggested_new_classes=hint)
     try:
@@ -514,7 +597,85 @@ async def _propose_for_chunk(
         )
         if _salvage_enabled(router):
             parsed = _salvage_class_proposal(result.text, chunk)
+    try:
+        spec = router.task_spec("class_proposal")
+    except (AttributeError, KeyError):
+        spec = {}
+    if parsed and spec.get("junk_filter"):
+        # Deterministic junk rules first (deepinfra preset), so loop output
+        # does not use up the guard below.
+        from backend.app.services.class_junk_filter import filter_reply
+
+        parsed, drops = filter_reply(parsed)
+        if drops:
+            reasons: dict[str, int] = {}
+            for d in drops:
+                reasons[d["reason"]] = reasons.get(d["reason"], 0) + 1
+            print(f"[stage2] chunk #{chunk.index} ({chunk.source_name}) junk rules dropped "
+                  f"{len(drops)}: " + ", ".join(f"{k}={v}" for k, v in sorted(reasons.items())))
+    return _apply_class_budget(parsed, spec, chunk)
+
+
+def _apply_class_budget(parsed: dict[str, Any] | None, spec: dict[str, Any],
+                        chunk: TextChunk) -> dict[str, Any] | None:
+    """Enforce the per-chunk class budget the prompt asks for (opt-in per task:
+    `max_new_classes`; off in every preset that does not set it).
+
+    Measured on the 27B web-search build (2026-10-17): 96 of 340 replies ran
+    past 62 new classes (OpenAI's largest on the same corpus) and carried 81%
+    of 20,174 proposals -- degenerate loops ("AgriculturalShaving{Searching,
+    Questing,...}Makers", "H7 ... H0", "Declining, Falling, Swimming").
+    The prompt now caps new classes at the budget unless the chunk holds a
+    declared LIST (`LISTS` section), whose items are mostly INSTANCES of one
+    kind; this keeps the first N entries -- the prompt orders them most
+    reusable first -- when the model overruns. A declared list raises the
+    class budget to `max_new_classes_with_lists` and allows
+    `max_instances_per_list` instances per list.
+    """
+    cap = spec.get("max_new_classes")
+    if not parsed or not cap:
+        return parsed
+    lists = [x for x in (parsed.get("LISTS") or []) if isinstance(x, dict)]
+    class_cap = int(spec.get("max_new_classes_with_lists", cap) if lists else cap)
+    inst_cap = int(spec.get("max_new_instances", 80)) + int(spec.get("max_instances_per_list", 40)) * len(lists)
+    notes = []
+    for key, limit in (("MATCH NOT FOUND", class_cap), ("MATCH NOT FOUND INSTANCES", inst_cap)):
+        items = parsed.get(key)
+        if isinstance(items, list) and len(items) > limit:
+            notes.append(f"{key} {len(items)} -> {limit}")
+            parsed[key] = items[:limit]
+    if notes:
+        listed = f"; lists declared: {len(lists)}" if lists else ""
+        print(f"[stage2] chunk #{chunk.index} ({chunk.source_name}) over budget, kept the first: "
+              + ", ".join(notes) + listed)
     return parsed
+
+
+def _apply_adverse_event_taxonomy(result: dict[str, Any], router: Any,
+                                  loaded_ontology: dict[str, Any], when: str) -> None:
+    """Map adverse-event classes onto the canonical hierarchy (see
+    adverse_event_taxonomy) when class_proposal sets `adverse_event_taxonomy:
+    true`. Dedup merges duplicates but never organises them: one pharma build
+    ended with 297 events flat under AdverseEvent, a parallel AdverseReaction
+    tree, and DrugSideEffect under EconomicConcept."""
+    try:
+        enabled = bool(router.task_spec("class_proposal").get("adverse_event_taxonomy"))
+    except (AttributeError, KeyError):
+        enabled = False
+    if not enabled or not result:
+        return
+    from backend.app.services import adverse_event_taxonomy as ae
+
+    existing = set()
+    for rec in (loaded_ontology.get("classes_dict") or {}).values():
+        existing.update(str(x) for x in (rec.get("labels") or []) if x)
+        if rec.get("name"):
+            existing.add(str(rec["name"]))
+    stats = ae.normalize(result, existing)
+    if any(stats.values()):
+        print(f"[stage3] adverse-event taxonomy ({when}): {stats['renamed']} class(es) renamed to the "
+              f"canonical names, {stats['references']} reference(s) rewritten, {stats['added']} "
+              f"type/root class(es) added")
 
 
 def _salvage_enabled(router: Any) -> bool:
@@ -3415,8 +3576,18 @@ async def _run_llm_stages(
         f"{len(merged.get('MATCH NOT FOUND', []))} new class proposals, "
         f"{len(merged.get('MATCH NOT FOUND RELATIONS', []))} new relation proposals"
     )
-    with timer.stage("stage3-dedup"):
-        deduped = await _dedup(router, merged, dedup_concurrency)
+    # Adverse-event hierarchy (opt-in per preset): before dedup so it sees the
+    # canonical names and folds same-named classes, and again after it.
+    _apply_adverse_event_taxonomy(merged, router, loaded_ontology, "before dedup")
+    pairwise = str((router.task_spec("match_dedup") or {}).get("method", "echo")).lower() == "pairwise"
+    deduped = None
+    if pairwise:
+        with timer.stage("stage3-pairwise"):
+            deduped = await _pairwise_stage3(router, merged, loaded_ontology, audit_path)
+    if deduped is None:                      # echo dedup: every other preset, or the fallback
+        with timer.stage("stage3-dedup"):
+            deduped = await _dedup(router, merged, dedup_concurrency)
+    _apply_adverse_event_taxonomy(deduped, router, loaded_ontology, "after dedup")
     # Canonical-label coercion: replace free-text "Person" / "Organization"
     # / "Role" / "Post" PARENT_LABELs and TYPE_LABELs with the actual FOAF/
     # ORG class IRIs from the merge, and route predicate LABELs like
@@ -3426,12 +3597,166 @@ async def _run_llm_stages(
     deduped = _coerce_canonical_labels(deduped, loaded_ontology)
     _append_audit(audit_path, -1, "match_dedup", None, deduped)
     # Stage 3b (opt-in per preset): merge synonym classes dedup left behind.
-    from backend.app.services.class_synonym_merge import semantic_class_merge
+    # Pairwise dedup already judged every near pair, so it is skipped there.
+    if not pairwise:
+        from backend.app.services.class_synonym_merge import semantic_class_merge
 
-    deduped, merges = await semantic_class_merge(router, deduped)
-    if merges:
-        _append_audit(audit_path, -1, "class_synonym_merge", None, {"merges": merges})
+        deduped, merges = await semantic_class_merge(router, deduped)
+        if merges:
+            _append_audit(audit_path, -1, "class_synonym_merge", None, {"merges": merges})
     return deduped
+
+
+async def _pairwise_stage3(router: Any, merged: dict[str, Any], loaded_ontology: dict[str, Any],
+                           audit_path: Path) -> dict[str, Any] | None:
+    """Stage 3 for `match_dedup.method: pairwise` (deepinfra preset): staging
+    store -> validity judge -> nearest-neighbour candidates + pair judge ->
+    audit. Returns the deduplicated proposal set, or None to fall back to the
+    echo dedup (no build database). See plan scalable-class-dedup-junk-
+    measurement and services/pairwise_dedup.py."""
+    from backend.app.services.class_junk_filter import run_validity_judge
+    from backend.app.services.dedup_audit import audit, export_csv
+    from backend.app.services.embeddings import Embedder
+    from backend.app.services.ontology_build_store import BuildStore, fold_key
+    from backend.app.services.pairwise_dedup import DedupConfig, router_judge, run_pairwise_dedup
+
+    spec = router.task_spec("match_dedup") or {}
+    try:
+        cp_spec = router.task_spec("class_proposal") or {}
+    except (AttributeError, KeyError):
+        cp_spec = {}
+    store = BuildStore(audit_path.parent.name)
+    try:
+        await store.clear()
+    except Exception as exc:
+        print(f"[stage3] pairwise dedup needs the build database (DATABASE_URL, migration 0011): "
+              f"{type(exc).__name__}: {exc} -- falling back to the echo dedup")
+        return None
+
+    classes = [x for x in merged.get("MATCH NOT FOUND") or [] if isinstance(x, dict) and x.get("LABEL")]
+    existing = loaded_ontology.get("classes_dict") or {}
+
+    # The cross-chunk merge turns values that differ between chunks into lists
+    # (PARENT_LABEL ['…#EconomicConcept', '…#Metric']). One parent per class:
+    # an existing-class IRI if any, else the most common value, first-seen wins ties.
+    def one_parent(v: Any) -> Any:
+        if not isinstance(v, list):
+            return v
+        vals = [str(p) for p in v if p and str(p).upper() != "NONE"]
+        if not vals:
+            return None
+        ranked = sorted(dict.fromkeys(vals), key=lambda p: (p not in existing, -vals.count(p), vals.index(p)))
+        return ranked[0]
+
+    def one_text(v: Any) -> Any:
+        return next((str(t) for t in v if t), None) if isinstance(v, list) else v
+
+    for i in range(0, len(classes), 1000):
+        await store.upsert("class", [{"label": one_text(x["LABEL"]), "parent": one_parent(x.get("PARENT_LABEL")),
+                                      "description": one_text(x.get("DESCRIPTION"))} for x in classes[i:i + 1000]])
+    ex_rows = [{"label": _first_label(rec) or iri, "iri": iri,
+                "description": rec.get("compact_description") or " ".join(
+                    str(c) for c in (rec.get("comments") or []) + (rec.get("descriptions") or []))[:300]}
+               for iri, rec in existing.items() if iri not in _GENERIC_TOP_TYPES]
+    for i in range(0, len(ex_rows), 1000):
+        await store.upsert("existing_class", ex_rows[i:i + 1000])
+    embedder = Embedder()
+    await store.embed_missing(embedder)
+    print(f"[stage3] pairwise: {len(classes)} class proposal(s) -> {await store.count('class', 'kept')} "
+          f"distinct; {len(ex_rows)} existing class(es) indexed; embedding ${embedder.total_cost_usd:.4f}")
+    if cp_spec.get("junk_filter"):
+        await run_validity_judge(store, router, batch=int(spec.get("validity_batch", 100)),
+                                 concurrency=int(spec.get("judge_concurrency", 8)))
+    cfg = DedupConfig(t_hi=float(spec.get("t_hi", 0.97)), t_lo=float(spec.get("t_lo", 0.80)),
+                      k=int(spec.get("k", 10)), judge_batch=int(spec.get("judge_batch", 60)),
+                      judge_concurrency=int(spec.get("judge_concurrency", 8)),
+                      max_group=int(spec.get("max_group", 25)))
+    judge = router_judge(router)
+    stats = await run_pairwise_dedup(store, judge, cfg)
+
+    # ---- rebuild the proposal set from the store ----
+    # fold_key(label) -> what a reference to it becomes: a surviving label, an
+    # existing class IRI, or (junk / demoted) the entry's own parent.
+    rename: dict[str, str] = {}
+    matches = list(merged.get("MATCHES FOUND") or [])
+    out_classes, demoted = [], []
+    async for rows in store.iter_rows("class", "merged", 500):
+        canon = await store.rows([r["merged_into"] for r in rows if r.get("merged_into")])
+        for r in rows:
+            c = canon.get(r.get("merged_into"))
+            if not c:
+                continue
+            if c["kind"] == "existing_class" and c.get("iri"):
+                rename[fold_key(r["label"])] = c["iri"]
+                matches.append({"IRI": c["iri"], "TEXT_SNIPPET": r["label"]})
+            else:
+                rename[fold_key(r["label"])] = c["label"]
+    for status in ("junk", "instance"):
+        async for rows in store.iter_rows("class", status, 500):
+            for r in rows:
+                rename[fold_key(r["label"])] = r.get("parent") or "NONE"
+                if status == "instance":
+                    demoted.append({"LABEL": r["label"], "TYPE_LABEL": r.get("parent") or "NONE",
+                                    "DESCRIPTION": r.get("description") or ""})
+
+    def fix(ref: Any) -> Any:
+        if not isinstance(ref, str):
+            return ref
+        seen = set()
+        while fold_key(ref) in rename and ref not in seen:   # follow chains (a -> junk -> its parent)
+            seen.add(ref)
+            ref = rename[fold_key(ref)]
+        return ref
+
+    async for rows in store.iter_rows("class", "kept", 500):
+        out_classes += [{"LABEL": r["label"], "DESCRIPTION": r.get("description") or "",
+                         "PARENT_LABEL": fix(r.get("parent") or "NONE")} for r in rows]
+
+    def fold_unique(items: list[dict[str, Any]], key) -> list[dict[str, Any]]:
+        seen: set[Any] = set()
+        out = []
+        for x in items:
+            k = key(x)
+            if k not in seen:
+                seen.add(k)
+                out.append(x)
+        return out
+
+    rels = []
+    for x in merged.get("MATCH NOT FOUND RELATIONS") or []:
+        if isinstance(x, dict):
+            rels.append({**x, "DOMAIN": fix(x.get("DOMAIN")), "RANGE": fix(x.get("RANGE"))})
+    insts = []
+    for x in list(merged.get("MATCH NOT FOUND INSTANCES") or []) + demoted:
+        if isinstance(x, dict):
+            insts.append({**x, "TYPE_LABEL": fix(x.get("TYPE_LABEL"))})
+    result = {
+        "MATCH NOT FOUND": out_classes,
+        "MATCH NOT FOUND RELATIONS": fold_unique(rels, lambda x: (fold_key(x.get("LABEL")), str(x.get("DOMAIN")),
+                                                                 str(x.get("RANGE")))),
+        "MATCH NOT FOUND INSTANCES": fold_unique(insts, lambda x: (fold_key(x.get("LABEL")), str(x.get("TYPE_LABEL")))),
+        "MATCHES FOUND": fold_unique(matches, lambda x: x.get("IRI")),
+    }
+    print(f"[stage3] pairwise DONE: {len(classes)} -> {len(out_classes)} classes "
+          f"({stats.merged_labels} merged, {stats.to_existing} onto existing classes, {len(demoted)} demoted "
+          f"to instances); judge calls ~{-(-stats.judged // max(1, cfg.judge_batch))}")
+
+    if spec.get("audit", True):
+        rep = await audit(store, judge, router if cp_spec.get("junk_filter") else None,
+                          label_sample=int(spec.get("audit_labels", 400)))
+        folder = audit_path.parent
+        import dataclasses
+
+        (folder / "dedup_audit.json").write_text(json.dumps(
+            {**{k: v for k, v in dataclasses.asdict(rep).items() if k != "samples"}, "dedup": stats.__dict__},
+            indent=1, default=str))
+        export_csv(rep, folder / "dedup_audit.csv")
+        print(f"[stage3] audit: est. {rep.est_leftover_duplicate_pairs} leftover duplicate pair(s) "
+              f"({rep.est_leftover_duplicate_rate:.2%} per class), over-merge {rep.over_merge.get('over_merge_rate')}, "
+              f"junk precision {rep.junk_precision.get('precision')} -> {folder / 'dedup_audit.json'}")
+    if not spec.get("keep_staging", False):
+        await store.clear()
+    return result
 
 
 def _append_audit(path: Path, chunk_idx: int, task: str, source: str | None, payload: dict[str, Any]) -> None:

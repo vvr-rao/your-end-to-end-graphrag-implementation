@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from backend.app.services import adverse_event_taxonomy as ae_taxonomy
 from backend.app.services.prompts import GENERIC_PREDICATE_IRIS
 
 # Shrinks the reply WITHOUT
@@ -25,6 +26,17 @@ from backend.app.services.prompts import GENERIC_PREDICATE_IRIS
 # MATCHES FOUND entries re-listed an IRI already in the same reply (only the
 # IRI is used downstream); instances were 53% of the output; repeated labels
 # drove the runaway replies that hit the 32k cap and were discarded.
+# v4 class rules (user decisions 2026-10-18, after the web-search build
+# proposed 20,174 classes vs OpenAI's 2,047 -- 81% from 96 replies that
+# looped): no class budget in the prompt; new classes are welcome but only
+# for KINDS, never when an existing class already covers the concept, and
+# tied to existing classes where relevant. Named things (drugs, companies,
+# organisations, people, clinical studies, places, facilities, documents,
+# events) are instances. Lists are declared and their items are instances.
+# The only number: instances per list, which bounds reply length (a 300-row
+# table). The preset's hidden `max_new_classes` guard only cuts loops.
+QWEN_INSTANCES_PER_LIST = 40
+
 QWEN_OUTPUT_RULES = (
     "\n\nOUTPUT RULES (these shorten the reply; they do NOT reduce "
     "coverage):\n"
@@ -45,29 +57,114 @@ QWEN_OUTPUT_RULES = (
     "  - MATCH NOT FOUND RELATIONS DESCRIPTION: at most 15 words.\n"
     "  - MATCH NOT FOUND INSTANCES: omit CANONICAL_FORM when it would equal "
     "LABEL; DESCRIPTION at most 12 words.\n"
-    "  - Write the sections in the order shown: new classes FIRST, then "
-    "relations, then instances, and MATCHES FOUND LAST.\n"
+    "  - Write the sections in the order shown: LISTS FIRST, then new classes, "
+    "then relations, then instances, and MATCHES FOUND LAST.\n"
     "  - When every distinct concept has been listed once, close the JSON and "
     "stop.\n\n"
+    "EXISTING CLASSES FIRST -- a new class is only for a concept the ontology "
+    "does not already have:\n"
+    "  - Before proposing ANY new class, look in DATA_CLASSES for the same "
+    "concept under another name: a synonym, an abbreviation, a plural or "
+    "spelling variant, or a class whose description covers it. If one "
+    "exists, MATCH it (MATCHES FOUND) -- do not propose a class. DATA_CLASSES "
+    "is the whole ontology, or for a very large one the part relevant to this "
+    "passage; each entry gives its label, parent IRIs and a short "
+    "description. Duplicates of existing classes are discarded later, so a "
+    "duplicate is wasted work.\n"
+    "  - New classes are welcome for genuine KINDS the ontology lacks -- "
+    "medical conditions, economic and policy concepts, kinds of product, "
+    "technology, material, facility, organisation, role, document or event.\n"
+    "  - Tie each new class into the existing ontology WHERE RELEVANT: give it "
+    "the most specific EXISTING class it is a kind of as PARENT_LABEL, and "
+    "propose RELATIONS that connect it to existing classes the TEXT relates "
+    "it to (a condition treated by a drug category, a shortage that affects "
+    "an industry). Use PARENT_LABEL='NONE' only when no existing class is a "
+    "sensible parent.\n"
+    "  - One concept, one class. Variants and aspects of a concept are NOT "
+    "separate classes: no near-variants, single adjectives or verbs, synonyms, "
+    "or numbered series (HeadingA/HeadingB, H1/H2, Item2024). An aspect such "
+    "as the price, supply, market, shutdown or expansion of something is a "
+    "relation between that thing and an existing aspect class (Price, Supply, "
+    "Market, Event) -- not a new '<Thing><Aspect>' class -- unless the "
+    "combination is itself an established concept (FoodSecurity, "
+    "SupplyChainDisruption).\n\n"
+    "LISTS:\n"
+    "  - BEFORE proposing classes, look for LISTS in the passage: an "
+    "enumeration of 5 or more items of the same kind (bullets, table rows, "
+    "or a comma series). Declare each one in LISTS, saying what the list is "
+    "and what KIND its items are.\n"
+    "  - The items of a list are almost always INSTANCES of one kind, not "
+    "classes: a list of countries -> class Country (if missing) + each country "
+    "an instance; a list of drugs -> class Drug or the drug category + each "
+    "drug an instance; a list of adverse reactions -> each reaction an "
+    "instance of its adverse-event TYPE; a list of companies, refineries, ports, trials or "
+    "reports -> their kind as the class + each item an instance. Propose a "
+    "list item as a CLASS only when the item is itself a kind of thing (a "
+    "list of fertilizer TYPES: Urea, Potash, DAP).\n"
+    f"  - Emit at most {QWEN_INSTANCES_PER_LIST} instances per list -- for a longer "
+    "list, the first ones, and give the full item count in ITEM_COUNT.\n\n"
     "CLASS OR INSTANCE? Apply this test literally to every concept: does the "
     "name pick out ONE specific thing, or a KIND of thing that many things "
     "can be?\n"
     "  - KINDS are CLASSES (MATCH NOT FOUND) -- even when the text mentions "
     "only one example. Kinds include: conditions, states and event types "
-    "(Recession, SupplyShortage, DataBreach, Hypoglycemia); properties, "
+    "(Recession, SupplyShortage, DataBreach, ChronicKidneyDisease); properties, "
     "measures and metrics (InterestRate, OperatingMargin, Latency, "
-    "BloodPressure); materials and substances (Lithium, Cholesterol, "
-    "Helium); categories of product, technology or service (ElectricVehicle, "
-    "CloudStorage, Antidepressant); roles and groups of people or "
+    "BloodPressure); raw materials and commodities (Lithium, Helium, Urea, "
+    "CrudeOil); categories of product, technology, service or medicine "
+    "(ElectricVehicle, CloudStorage, Antidepressant, GLP1ReceptorAgonist, "
+    "ACEInhibitor); roles and groups of people or "
     "organisations (Regulator, Supplier, Children, RetailInvestor); and kinds "
     "of document, rule, risk or program (AnnualReport, ExportControl, "
     "CreditRisk, LoyaltyProgram).\n"
-    "  - Specific NAMED things are INSTANCES (MATCH NOT FOUND INSTANCES): "
-    "named products and brands (iPhone 15, Model Y, Ozempic), named "
-    "organisations, people, places, documents, laws, events and dated "
-    "periods (Apple Inc, Jerome Powell, Strait of Hormuz, 2024 Form 10-K, "
-    "Inflation Reduction Act, Q3 2025). Give each a TYPE_LABEL naming its "
-    "kind -- propose that kind as a class if it is missing.\n"
+    "  - Specific NAMED things are INSTANCES (MATCH NOT FOUND INSTANCES), "
+    "NEVER classes: named products and brands (iPhone 15, Model Y), named "
+    "companies and other organisations (Apple Inc, Novo Nordisk, World Health "
+    "Organization), people (Jerome Powell), clinical studies and trials "
+    "(SUSTAIN 6, NCT01720446, SURPASS-2), countries and places (Saudi Arabia, "
+    "Strait of Hormuz), named facilities (Jamnagar Refinery), documents and "
+    "laws (2024 Form 10-K, Inflation Reduction Act), events and dated periods "
+    "(Q3 2025). Give each a TYPE_LABEL naming its kind -- an existing class "
+    "when one fits; propose the kind as a class only if none exists.\n"
+    "  - DRUGS ARE NEVER CLASSES. Every named medicine is an INSTANCE (MATCH "
+    "NOT FOUND INSTANCES) whose TYPE_LABEL is its drug category "
+    "(GLP1ReceptorAgonist, ACEInhibitor, ThiazideDiuretic) or Drug. This "
+    "covers generic names (semaglutide, tirzepatide, lisinopril, captopril, "
+    "metformin); brand names (Ozempic, Mounjaro, Contrave, Qsymia); "
+    "combination products (naltrexone/bupropion, lisinopril and "
+    "hydrochlorothiazide); named insulins (insulin glargine, insulin "
+    "degludec); EVERY item of a list of drugs, however long (a list of ACE "
+    "inhibitors -- captopril, enalapril, ramipril -- is instances of "
+    "ACEInhibitor); and anything named after a drug: its pen or device "
+    "(Mounjaro KwikPen), its formulation, or the patients who take it (never "
+    "'OzempicTreatedPatient'). Only drug CATEGORIES are classes: a "
+    "pharmacological class (GLP1ReceptorAgonist), a therapeutic class "
+    "(Antihypertensive), a dosage form (PrefilledPen).\n"
+    "  - A drug at the end of a RELATION stays an instance: use its category, "
+    "or Drug, as the relation's DOMAIN or RANGE. Never create a class just so "
+    "a drug can be a relation endpoint.\n"
+    "  - Before you close MATCH NOT FOUND, check every LABEL: if it is, or "
+    "contains, the name of a specific medicine or a combination of medicines, "
+    "move it to MATCH NOT FOUND INSTANCES.\n"
+    "  - ADVERSE EVENTS: only the hierarchy's CATEGORIES are classes -- "
+    "AdverseEvent (adverse events in general; PARENT_LABEL = the existing "
+    "'Event' class) and its event TYPES: " + ", ".join(t for t in ae_taxonomy.TYPES if t != ae_taxonomy.GENERAL) + ", "
+    "plus GeneralAdverseEvent for effects that fit no body system. Use these "
+    "exact names and never invent other types ('AdverseReaction', "
+    "'DrugSideEffect', 'GIAdverseReaction'). Propose a type, or AdverseEvent, "
+    "only when DATA_CLASSES lacks it.\n"
+    "  - A SPECIFIC adverse reaction, side effect or toxicity (nausea, "
+    "pruritus, pancreatitis, dizziness, injection-site reaction) is an "
+    "INSTANCE whose TYPE_LABEL is its type (nausea -> "
+    "GastrointestinalAdverseEvent; pruritus -> SkinAdverseEvent; fatigue -> "
+    "GeneralAdverseEvent) -- never a class. A list of adverse reactions has "
+    "ITEMS_ARE_KINDS false: its items are instances of their types.\n"
+    "  - A condition discussed in its own right (the disease a drug treats, a "
+    "comorbidity) may still be a class under the rules for kinds; the same "
+    "condition named as a SIDE EFFECT of a drug is an adverse-event instance.\n"
+    "  - A drug, drug category or trial relates to adverse events through a "
+    "RELATION whose RANGE is AdverseEvent or a type (hasAdverseEvent "
+    "[DOMAIN=Drug, RANGE=AdverseEvent]).\n"
     "  - When unsure, ask: could the text sensibly say 'a <name>' or "
     "'another <name>'? If yes ('a recession', 'another supplier'), it is a "
     "kind.\n"
@@ -148,15 +245,16 @@ def qwen_class_proposal(
         "  1. Identify every passage substring that maps to an existing class "
         "in DATA_CLASSES. The IRI you return MUST be an exact key of the "
         "DATA_CLASSES dict.\n"
-        "  2. For every distinct concept in the TEXT that has NO matching "
-        "existing class, propose a new class with a clear LABEL, DESCRIPTION, "
-        "and PARENT_LABEL (the most specific class in DATA_CLASSES that this "
-        "new class should be a kind of -- e.g. 'Country' for 'Washington', "
-        "'Manufacturer' for 'BMW', 'Chemical Element' for 'helium'). If no "
-        "suitable parent exists in DATA_CLASSES, you MUST propose the parent "
-        "as ANOTHER MATCH NOT FOUND entry in the same response (chain rule) "
-        "and use its LABEL as the PARENT_LABEL. Only use PARENT_LABEL='NONE' "
-        "if the concept genuinely has no natural parent.\n"
+        "  2. For a KIND of thing in the TEXT that no existing class covers "
+        "(see EXISTING CLASSES FIRST below), propose a new class with a clear "
+        "LABEL, DESCRIPTION, and PARENT_LABEL (the most specific EXISTING class "
+        "in DATA_CLASSES it is a kind of -- e.g. 'ChemicalElement' for "
+        "'helium', 'MetabolicDisorder' for 'insulin resistance', "
+        "'EconomicConcept' for 'stagflation'). Named things -- 'Washington', "
+        "'BMW', 'Ozempic', 'SUSTAIN 6' -- are never new classes: they are "
+        "INSTANCES typed by an existing class (step 4). If the right parent is "
+        "itself a missing KIND, you may propose it too and use its LABEL as "
+        "PARENT_LABEL; use 'NONE' only when no parent is relevant.\n"
         "     The LABEL of a MATCH NOT FOUND CLASS must be a category name "
         "(CarManufacturer, FertilizerProducer, RiskMonitoringDashboard, "
         "TradeAgreement) -- never a specific named individual. ACCEPT: "
@@ -263,12 +361,16 @@ def qwen_class_proposal(
         "NEVER place an organization under Material, Helium, "
         "ChemicalProcessSystem, ProcessUnit, Infrastructure, or any "
         "non-org class.\n"
-        "       - For a domain-specific subclass like 'MiningCompany', "
-        "'CarManufacturer', 'BankHolding', 'GovernmentAgency': emit the "
-        "subclass as MATCH NOT FOUND with PARENT_LABEL set to the "
-        "foaf:Organization (or org:Organization) IRI from DATA_CLASSES. "
-        "Then attach the individual company as a MATCH NOT FOUND "
-        "INSTANCES entry whose TYPE_LABEL is the subclass label.\n"
+        "       - A KIND of organisation ('MiningCompany', 'CarManufacturer', "
+        "'GovernmentAgency', 'FertilizerProducer') may be proposed as a class "
+        "ONLY when DATA_CLASSES has no class for it and other organisations "
+        "would share it; set PARENT_LABEL to the foaf:Organization (or "
+        "org:Organization) IRI or an existing subclass. Do not mint a kind for "
+        "every company you meet: when an existing organisation class fits, "
+        "type the company with it.\n"
+        "       - The individual company is always a MATCH NOT FOUND "
+        "INSTANCES entry whose TYPE_LABEL is that kind (or the existing "
+        "class).\n"
         "       - Examples: 'Samsung Electronics' -> instance of "
         "foaf:Organization. 'Air Products and Chemicals' -> instance of "
         "foaf:Organization. 'Saudi Aramco Total Refinery & Petrochemicals "
@@ -401,8 +503,9 @@ def qwen_class_proposal(
         "  - Every DOMAIN and RANGE label you use in MATCH NOT FOUND "
         "RELATIONS MUST appear either (a) as an exact label/IRI in "
         "DATA_CLASSES, OR (b) as a LABEL in your own MATCH NOT FOUND list. "
-        "If a relation references a concept that is not in DATA_CLASSES, "
-        "you MUST propose that concept as a MATCH NOT FOUND class first.\n"
+        "A relation never justifies a class on its own: if an endpoint is a "
+        "named thing, use its existing TYPE; if it is a missing KIND, propose "
+        "it under the rules above; otherwise drop the relation.\n"
         "  - RELATION DOMAIN/RANGE MUST BE AS GENERAL AS THE RELATION "
         "TRULY IS -- this is the single most common mistake. Pick the MOST "
         "ABSTRACT class for which the relation still holds, NOT the specific "
@@ -425,12 +528,11 @@ def qwen_class_proposal(
         "  - NEVER use a NAMED INDIVIDUAL as a DOMAIN or RANGE. 'Mozilla', "
         "'OpenAI' and 'Meta' are instances of Organization, not classes. If "
         "you need one as a relation endpoint, use its TYPE.\n"
-        "  - When the chunk introduces multiple concepts whose labels share "
-        "a common stem or topic (e.g. 'helium', 'helium market', 'helium "
-        "supply', 'helium price'; or 'BMW', 'Honda', 'Hyundai' as siblings "
-        "of 'CarManufacturer'), propose has-X / part-of / sibling-of "
-        "relations between them using the chunk text as evidence. Stay "
-        "grounded -- don't invent relations the text doesn't support.\n"
+        "  - Relate concepts the TEXT relates (has-X, part-of, causes, "
+        "affects), grounded in the text. Do NOT turn a shared stem into a "
+        "family of classes ('helium', 'helium market', 'helium supply', "
+        "'helium price' are ONE class, Helium, plus relations to the existing "
+        "Market / Supply / Price classes).\n"
         "  - When the text mentions a concept under multiple surface forms "
         "(e.g. 'Washington', 'Washington DC', 'Washington D.C.'), emit ONE "
         "MATCH NOT FOUND entry using the most canonical form. If two surface "
@@ -442,6 +544,12 @@ def qwen_class_proposal(
         "(which means you should have proposed it -- see self-consistency).\n\n"
         "Output strict JSON in the shape:\n"
         "{\n"
+        '  "LISTS": ['
+        '    {"WHAT": "<what the enumeration is, at most 10 words>",'
+        ' "ITEM_KIND": "<label of the class its items are instances of>",'
+        ' "ITEM_COUNT": <number of items in the passage>,'
+        ' "ITEMS_ARE_KINDS": <true only when each item is itself a kind of thing>}, ...'
+        "  ],  (an empty list when the passage has no enumeration of 5+ same-kind items)\n"
         '  "MATCH NOT FOUND": ['
         '    {"LABEL": "<short canonical label>", "DESCRIPTION": "<exactly one sentence>",'
         ' "PARENT_LABEL": "<label or IRI of most specific parent in DATA_CLASSES'
@@ -471,7 +579,7 @@ def qwen_class_proposal(
     user = (
         f"DATA_CLASSES:\n{ontology_repr}\n\n"
         f"TEXT TO EVALUATE:\n{text_chunk}\n\n"
-        'Return JSON in THIS key order: {"MATCH NOT FOUND": [...], '
+        'Return JSON in THIS key order: {"LISTS": [...], "MATCH NOT FOUND": [...], '
         '"MATCH NOT FOUND RELATIONS": [...], "MATCH NOT FOUND INSTANCES": [...], '
         '"MATCHES FOUND": [...]}'
     )
@@ -626,4 +734,89 @@ def qwen_relationship_extract(
         '"object": ..., "evidence": ..., "confidence": ..., '
         '"relation": ... (graphrag#relatedTo only)}]}'
     )
+    return system, user
+
+
+# --------------------------------------------------------------------------- #
+# Scalable cleanup judges (plan: scalable-class-dedup-junk-measurement).
+# Qwen's own versions; both see SHORT items in large batches, so a call costs
+# little and the total grows with the vocabulary, not the corpus.
+# --------------------------------------------------------------------------- #
+
+def qwen_class_pair_judge(pairs: list[dict[str, str]]) -> tuple[str, str]:
+    """Same concept or not, for nearest-neighbour candidate pairs.
+
+    `pairs`: [{"id", "a_label", "a_desc", "a_parent", "b_label", "b_desc",
+    "b_parent", "b_existing"}]; b_existing marks B as a class already in the
+    ontology. Returns JSON {"decisions": [{"id", "keep", "reason"}]} listing
+    ONLY the pairs judged the same (output is what costs GPU time; about 5x
+    less than a verdict per pair).
+    Similarity cannot tell synonyms from siblings or opposites
+    (BeforeBreakfast~AfterBreakfast 0.930 > Hypertension~HighBloodPressure
+    0.908), which is why this call exists.
+    """
+    system = (
+        "You review pairs of ontology CLASS names that an embedding search "
+        "flagged as possible duplicates. For each pair decide whether A and B "
+        "name the SAME concept, so one class can replace the other everywhere "
+        "without losing meaning. Return ONE JSON object and nothing else.\n\n"
+        "SAME (merge): synonyms, abbreviations, spelling or plural variants, "
+        "lay vs technical names for one thing (Hypertension / "
+        "HighBloodPressure, BMI / BodyMassIndex, Refinery / OilRefinery when "
+        "the text means the same plant, Tariff / ImportTariff when no other "
+        "kind of tariff is meant).\n"
+        "DIFFERENT (keep both): opposites (Import / Export, BeforeBreakfast / "
+        "AfterBreakfast), siblings (CleftLip / CleftPalate, Equity / Debt), a "
+        "broader vs a narrower class (Drug / Antidepressant, Disease / "
+        "HeartDisease), a thing vs an aspect or event of it (Refinery / "
+        "RefineryClosure), a part vs a whole.\n"
+        "When B is EXISTING (already in the ontology) and they are the same, "
+        "keep B: the existing class always wins.\n"
+        "When unsure, answer DIFFERENT: a wrong merge corrupts the ontology; "
+        "a missed merge only leaves a duplicate.\n\n"
+        "List ONLY the pairs that are the SAME -- every id you leave out is "
+        "taken as DIFFERENT. For each listed pair give: id (as given), keep "
+        "('A' or 'B'), reason (at most 8 words). Write the JSON on ONE line; "
+        "an empty list is a valid answer."
+    )
+    def side(p, x):
+        tag = " [EXISTING]" if x == "b" and p.get("b_existing") else ""
+        return (f'{x.upper()}="{p[f"{x}_label"]}"{tag} (parent: {str(p.get(f"{x}_parent") or "-")[:60]}; '
+                f'{str(p.get(f"{x}_desc") or "")[:140]})')
+    lines = "\n".join(f'{p["id"]}. {side(p, "a")} | {side(p, "b")}' for p in pairs)
+    user = (f"PAIRS:\n{lines}\n\n"
+            'Return JSON with only the SAME pairs: {"decisions": [{"id": ..., "keep": ..., "reason": ...}]}')
+    return system, user
+
+
+def qwen_class_validity_judge(labels: list[dict[str, str]]) -> tuple[str, str]:
+    """Is each proposed class a reusable CATEGORY, a named thing, or junk?
+
+    `labels`: [{"id", "label", "parent", "desc"}]. Returns JSON {"verdicts":
+    [{"id", "verdict": "category"|"named_thing"|"junk", "reason"}]}.
+    """
+    system = (
+        "You review proposed ontology CLASS names. A class must be a reusable "
+        "CATEGORY: a kind of thing that many specific things belong to "
+        "(Refinery, FoodSecurity, GLP1ReceptorAgonist, TradeTariff, "
+        "GastrointestinalAdverseEvent). For each name decide:\n"
+        "  category    -- a genuine, reusable kind. Keep it.\n"
+        "  named_thing -- ONE specific named thing: a drug or brand "
+        "(semaglutide, Ozempic), a company or organisation, a person, a "
+        "country or place, a named facility, trial, document, law, event or "
+        "period. It belongs as an instance, not a class.\n"
+        "  junk        -- not a usable class name at all: a sentence fragment, "
+        "an adjective or verb on its own (Declining, Flagship), a word with a "
+        "number or date tacked on, a near-meaningless combination "
+        "(RefineryAbout, AgriculturalShavingMakers), a website or e-mail, a "
+        "page artefact (TableOfContents, ClickHere).\n"
+        "Judge the NAME as a class for an ontology, not whether the topic "
+        "matters. When a name is a real kind but oddly specific, it is still "
+        "a category.\n\n"
+        "Return ONE JSON object on ONE line: {\"verdicts\": [{\"id\": ..., "
+        "\"verdict\": ..., \"reason\": \"<at most 8 words>\"}]}."
+    )
+    lines = "\n".join(f'{x["id"]}. "{x["label"]}" (parent: {str(x.get("parent") or "-")[:50]}; '
+                      f'{str(x.get("desc") or "")[:100]})' for x in labels)
+    user = f"NAMES:\n{lines}\n\nReturn the JSON verdicts for every id."
     return system, user

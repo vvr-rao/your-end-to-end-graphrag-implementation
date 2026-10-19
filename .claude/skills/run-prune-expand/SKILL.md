@@ -214,11 +214,17 @@ Notes:
 uv run python scripts/tpm_check.py "<DOCS>"
 ```
 
-> **DeepInfra/Qwen mode:** a dedicated deployment has no TPM/RPM, so `tpm_check.py`
-> does not size it. Use `uv run python scripts/deepinfra_sizing.py "<DOCS>"` instead
-> (corpus → GPU configuration → concurrency); the full order — size, approve the
-> hourly rate, deploy, `--probe`, `--apply`, delete when done — is in the
-> **choose-llm-mode** skill, "DeepInfra mode".
+> **DeepInfra mode:** a dedicated deployment has no TPM/RPM, so `tpm_check.py`
+> does not size it. Run `uv run python scripts/deepinfra_sizing.py "<DOCS>"` instead
+> and show the three preferred configurations — **2x B200, then 2x H200, then
+> 2x H100** — with their rates and estimates. With the user's approval of those
+> rates, `deepinfra_deploy.py create --from-sizing .build/sizing.json
+> --apply-concurrency --yes` rents the first that has capacity and writes THAT
+> GPU's concurrency (class_proposal 96 / 48 / 32 — prune-expand ran ~1 h at the
+> old 12 because only ~9 requests were in flight). Prune-expand must not start
+> until the deployment is `running` and `DEEPINFRA_FLASH_MODEL` points at it.
+> Keep the GPU for ingest-corpus if it follows immediately; otherwise delete it
+> when prune-expand ends. Full order: **choose-llm-mode** skill, "DeepInfra mode".
 
 If a PREVIOUS run already produced a selection.json for this corpus, point
 this at it so the numbers describe the subset rather than the whole corpus:

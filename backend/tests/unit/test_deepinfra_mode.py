@@ -163,11 +163,15 @@ async def test_thinking_kwarg_is_not_sent_to_tasks_that_do_not_set_it() -> None:
 # Preset
 # --------------------------------------------------------------------------- #
 
-def test_preset_routes_creation_to_dedicated_retrieval_to_27b() -> None:
+def test_preset_routes_creation_to_dedicated_qa_to_deepseek() -> None:
     tasks = yaml.safe_load(open(PRESET))["tasks"]
     assert tasks["class_proposal"]["model"] == "__DEEPINFRA_FLASH_MODEL__"
     assert tasks["entity_extract"]["provider"] == "deepinfra"
-    assert tasks["answer_simple_qa"]["model"] == "Qwen/Qwen3.8-27B"
+    # Q&A runs on serverless DeepSeek-V4.1-Flash (won the 2026-10-17 head to
+    # head against Qwen3.8-27B); no Q&A task may point at the dedicated GPU.
+    for t in ("answer_simple_qa", "answer_deep_research", "question_parse", "answer_conversation_turn"):
+        assert tasks[t]["model"] == "deepseek-ai/DeepSeek-V4.1-Flash", t
+    assert not any(v.get("model") == "Qwen/Qwen3.8-27B" for v in tasks.values())
     assert tasks["judge_consistency"]["model"] == "deepseek-ai/DeepSeek-V4.1-Flash"
     assert tasks["embeddings"] == {
         "provider": "deepinfra", "model": "Qwen/Qwen3-Embedding-4B", "dim": 1024, "batch_size": 100,
@@ -278,7 +282,7 @@ def test_workload_scales_linearly_with_corpus_tokens() -> None:
 
 
 def test_gpu_options_only_include_configurations_that_fit() -> None:
-    opts = sizing.gpu_options()
+    opts = sizing.gpu_options(model="flash-next")
     labels = {o.label() for o in opts}
     assert "2x H200-141GB fp8" in labels           # 185.5 GB fits in 2x141
     assert "1x H200-141GB fp8" not in labels       # does not
@@ -287,19 +291,71 @@ def test_gpu_options_only_include_configurations_that_fit() -> None:
     assert all(o.kv_free_gb >= 8 for o in opts)
 
 
+def test_default_model_is_the_deployed_dense_27b() -> None:
+    """The preset deploys Qwen3.8-27B-FP8 (30.9 GB): every preferred pair fits,
+    and decode reads ALL weights each step (dense), unlike Flash-Next."""
+    opts = {o.label(): o for o in sizing.gpu_options()}
+    for label in ("2x B200-180GB fp8", "2x H200-141GB fp8", "2x H100-80GB fp8"):
+        assert label in opts and opts[label].dense
+        assert opts[label].repo == "Qwen/Qwen3.8-27B-FP8"
+    arch = sizing.MODELS["27b"]["fallback_arch"]
+    assert sizing.kv_bytes_per_token(arch) == 17 * 2 * 4 * 256 * 2   # 16 full-attn + 1 MTP layer
+
+
 def test_recurrent_state_dominates_short_sequences() -> None:
     arch = sizing.FALLBACK_ARCH
     assert sizing.state_bytes_per_seq(arch) > sizing.kv_bytes_per_token(arch) * 2000
 
 
-def test_recommendation_is_cheapest_meeting_deadline_and_skips_caveats() -> None:
+def test_recommendation_follows_the_preferred_gpu_order() -> None:
+    """2x B200, then 2x H200, then 2x H100 -- whatever is cheaper."""
+    b = sizing.GpuOption("B200-180GB", 2, 1, "fp8", "r", 30.9, 283, 7.38)
+    h2 = sizing.GpuOption("H200-141GB", 2, 1, "fp8", "r", 30.9, 213, 5.38)
+    h1 = sizing.GpuOption("H100-80GB", 2, 1, "fp8", "r", 30.9, 103, 4.40)
+    cheap = sizing.GpuOption("H100-80GB", 1, 1, "fp8", "r", 30.9, 36, 2.20)
+    rows = [(cheap, {"hours": 2, "usd": 4.4}), (h1, {"hours": 1.3, "usd": 5.9}),
+            (h2, {"hours": 1.2, "usd": 6.9}), (b, {"hours": 1, "usd": 7.8})]
+    assert sizing.recommend(rows, None)[0] is b
+    assert [o for o, _ in sizing.preferred_chain(rows, None)] == [b, h2, h1]
+    # A deadline only B200 misses moves the recommendation down the chain.
+    assert sizing.recommend(rows, 1.25, preferred=(("H200-141GB", 2), ("H100-80GB", 2)))[0] is h2
+
+
+def test_recommendation_without_a_preferred_fit_is_cheapest_and_skips_caveats() -> None:
     a = sizing.GpuOption("A100-80GB", 4, 1, "fp8", "r", 185.5, 80, 3.56, note="caveat")
-    h = sizing.GpuOption("H200-141GB", 2, 1, "fp8", "r", 185.5, 58, 5.38)
-    b = sizing.GpuOption("B200-180GB", 2, 1, "fp8", "r", 185.5, 128, 7.38)
-    rows = [(a, {"hours": 1, "usd": 3.5}), (h, {"hours": 2, "usd": 10.8}), (b, {"hours": 1, "usd": 7.4})]
+    h = sizing.GpuOption("H200-141GB", 4, 1, "fp8", "r", 185.5, 58, 10.76)
+    b = sizing.GpuOption("B200-180GB", 4, 1, "fp8", "r", 185.5, 128, 14.76)
+    rows = [(a, {"hours": 1, "usd": 3.5}), (h, {"hours": 2, "usd": 21.5}), (b, {"hours": 1, "usd": 14.8})]
     assert sizing.recommend(rows, None)[0] is b
     assert sizing.recommend(rows, None, allow_noted=True)[0] is a
     assert sizing.recommend(rows, 0.5) is None
+
+
+def test_a_priori_concurrency_per_gpu_tracks_the_measured_builds() -> None:
+    """Prune-expand on 2x H100 ran ~9 requests in flight at class_proposal 12 /
+    dedup 8 and took ~1 h; the GPU had far more room. Each preferred GPU gets
+    its own values: class_proposal (32k-token replies) is KV-bound, so it
+    shrinks with the card's memory; nothing exceeds MAX_BATCH."""
+    stages = sizing.project_workload(500_000, sizing.DEFAULT_RATIOS)
+    arch = sizing.MODELS["27b"]["fallback_arch"]
+    opts = {o.label(): o for o in sizing.gpu_options()}
+    conc = {g: sizing.a_priori_concurrency(opts[g], arch, stages)
+            for g in ("2x B200-180GB fp8", "2x H200-141GB fp8", "2x H100-80GB fp8")}
+    cp = [conc[g]["class_proposal"] for g in conc]
+    assert cp == sorted(cp, reverse=True) and cp[-1] > 12
+    assert all(v <= sizing.MAX_BATCH for c in conc.values() for v in c.values())
+    assert conc["2x B200-180GB fp8"]["entity_extraction"] >= 64
+
+
+def test_timeout_cap_uses_each_tasks_own_limit() -> None:
+    """A short-timeout task caps concurrency only by ITS slow call."""
+    stages = sizing.project_workload(500_000, sizing.DEFAULT_RATIOS)
+    arch = sizing.MODELS["27b"]["fallback_arch"]
+    opt = {o.label(): o for o in sizing.gpu_options()}["2x H100-80GB fp8"]
+    free = sizing.a_priori_concurrency(opt, arch, stages)
+    tight = sizing.a_priori_concurrency(opt, arch, stages, {"artifact_generation": [(10, 4000.0)]})
+    assert tight["artifact_generation"] < free["artifact_generation"]
+    assert tight["entity_extraction"] == free["entity_extraction"]
 
 
 def test_knee_is_smallest_concurrency_near_peak_throughput() -> None:
@@ -326,6 +382,47 @@ def test_deploy_payload_matches_the_sized_option() -> None:
     assert p == {"model_name": "flash-next", "gpu": "H200-141GB", "num_gpus": 2, "max_batch_size": 96,
                  "hf": {"repo": "Qwen/Qwen3.8-Flash-Next-FP8"},
                  "settings": {"min_instances": 1, "max_instances": 1}}
+
+
+def test_create_walks_the_fallback_chain_until_one_runs(tmp_path, monkeypatch) -> None:
+    """B200: 409 unavailable. H200: accepted, then `no-gpu-available` -> deleted.
+    H100: runs -> recorded as `active`; its OWN concurrency is the one used."""
+    def entry(gpu, usd, cp):
+        return {"option": {"gpu": gpu, "num_gpus": 2, "instances": 1, "repo": "Qwen/Qwen3.8-27B-FP8",
+                           "usd_hr": usd, "label": f"2x {gpu} fp8"},
+                "estimate": {"hours": 1, "usd": usd}, "concurrency": {"class_proposal": cp}, "max_batch_size": cp}
+    sz = {**entry("B200-180GB", 7.38, 96), "fallbacks": [entry("H200-141GB", 5.38, 48), entry("H100-80GB", 4.4, 32)]}
+    sp = tmp_path / "sizing.json"
+    sp.write_text(json.dumps(sz))
+    calls = []
+
+    def fake_call(method, path, body=None):
+        calls.append((method, path, (body or {}).get("gpu")))
+        if method == "POST" and body["gpu"] == "B200-180GB":
+            raise deploy.DeployHTTPError(method, path, 409, '{"error":"GPU 2xB200-180GB is currently unavailable"}')
+        if method == "POST":
+            return {"deploy_id": "d-" + body["gpu"][:4]}
+        return {}
+
+    states = {"d-H200": ("failed", "no-gpu-available"), "d-H100": ("running", "")}
+    monkeypatch.setattr(deploy, "_call", fake_call)
+    monkeypatch.setattr(deploy, "wait_until_running", lambda did, minutes: states[did])
+    rc = deploy.main(["create", "--from-sizing", str(sp), "--yes", "--ledger", str(tmp_path / "l.jsonl")])
+    assert rc == 0
+    assert ("DELETE", "/deploy/d-H200", None) in calls
+    active = json.loads(sp.read_text())["active"]
+    assert active["deploy_id"] == "d-H100" and active["concurrency"] == {"class_proposal": 32}
+    assert active["model_name"].startswith("qwen27b-h100-")
+    posts = [c for c in calls if c[0] == "POST"]
+    assert [p[2] for p in posts] == ["B200-180GB", "H200-141GB", "H100-80GB"]
+
+
+def test_wait_until_running_stops_on_terminal_states() -> None:
+    seq = iter([("creating", ""), ("initializing", ""), ("running", "")])
+    assert deploy.wait_until_running("d", 10, poll_s=0, state=lambda d: next(seq), sleep=lambda s: None) == ("running", "")
+    assert deploy.wait_until_running("d", 10, state=lambda d: ("failed", "no-gpu-available"),
+                                     sleep=lambda s: None) == ("failed", "no-gpu-available")
+    assert deploy.wait_until_running("d", 0, state=lambda d: ("creating", ""), sleep=lambda s: None) == ("timeout", "")
 
 
 def test_gpu_ledger_pairs_create_and_delete(tmp_path) -> None:
@@ -764,3 +861,143 @@ def test_query_prefix_default_override_and_config(monkeypatch):
     q2 = em.Embedder(provider="deepinfra", model="Qwen/Qwen3-Embedding-4B", dim=1024, batch_size=10,
                      settings=s, query_prefix_override="Q: ")
     assert q2.query_prefix == "Q: "
+
+
+# --------------------------------------------------------------------------- #
+# render-init per LLM mode
+# --------------------------------------------------------------------------- #
+
+def test_render_env_for_deepinfra_mode_has_no_openai_key() -> None:
+    from backend.app.cli.main import _render_backend_env
+
+    env_file = {"DATABASE_URL": "postgresql://x", "BEARER_TOKEN": "t", "DEEPINFRA_API_KEY": "d",
+                "OPENAI_API_KEY": "o", "GROQ_API_KEY": "g"}
+    env = {e["key"]: e["value"] for e in _render_backend_env(env_file, "deepinfra", "https://f")}
+    assert env["MODELS_CONFIG_PATH"] == "config/models.deepinfra.example.yaml"
+    assert env["DEEPINFRA_API_KEY"] == "d" and env["FRONTEND_ORIGIN"] == "https://f"
+    assert "OPENAI_API_KEY" not in env and "GROQ_API_KEY" not in env
+
+
+def test_render_env_default_mode_is_unchanged() -> None:
+    from backend.app.cli.main import _render_backend_env
+
+    env_file = {"DATABASE_URL": "postgresql://x", "BEARER_TOKEN": "t", "OPENAI_API_KEY": "o", "GROQ_API_KEY": "g"}
+    keys = [e["key"] for e in _render_backend_env(env_file, "groq-openai", "https://f")]
+    assert set(keys) == {"DATABASE_URL", "BEARER_TOKEN", "FRONTEND_ORIGIN", "LOG_LEVEL", "ENV",
+                         "OPENAI_API_KEY", "GROQ_API_KEY"}
+
+
+def test_synonym_candidate_pairs_blockwise_match_the_full_matrix(monkeypatch) -> None:
+    """Row blocks + running trim (the full n x n product OOM-killed the 27B
+    web-search prune-expand at ~11k classes) return the same best pairs."""
+    import numpy as np
+
+    import backend.app.services.class_synonym_merge as csm
+
+    rng = np.random.default_rng(0)
+    m = rng.normal(size=(300, 16)).astype(np.float32)
+    m[:40] = m[40:80] + 0.01 * rng.normal(size=(40, 16))
+    m /= np.linalg.norm(m, axis=1, keepdims=True)
+    sims = m @ m.T
+    iu, ju = np.triu_indices(len(m), k=1)
+    vals = sims[iu, ju]
+    keep = np.nonzero(vals >= 0.9)[0]
+    want = keep[np.argsort(-vals[keep], kind="stable")][:25]
+    monkeypatch.setattr(csm, "_PAIR_BLOCK_ROWS", 7)
+    got = csm.candidate_pairs(m, 0.9, 25)
+    assert [(i, j) for i, j, _ in got] == [(int(iu[k]), int(ju[k])) for k in want]
+    assert all(i < j for i, j, _ in got)
+    assert csm.candidate_pairs(m[:1], 0.9, 25) == []
+
+
+# --------------------------------------------------------------------------- #
+# Qwen class budget + declared lists
+# --------------------------------------------------------------------------- #
+
+def test_class_rules_prompt_and_preset_guard() -> None:
+    """v4 (2026-10-18): no class number in the prompt; the preset keeps a
+    hidden runaway guard; the per-list instance bound matches the prompt."""
+    from backend.app.services import prompts_qwen as pq
+
+    spec = yaml.safe_load(open(PRESET))["tasks"]["class_proposal"]
+    assert spec["max_new_classes"] == 60 and "max_new_classes_with_lists" not in spec
+    assert spec["max_instances_per_list"] == pq.QWEN_INSTANCES_PER_LIST
+    system, user = pq.qwen_class_proposal({}, "text")
+    assert "AT MOST 25" not in system and "new classes in total" not in system
+    for rule in ("EXISTING CLASSES FIRST", "WHERE RELEVANT", "DRUGS ARE NEVER CLASSES", '"LISTS"',
+                 "clinical studies and trials"):
+        assert rule in system, rule
+    # The contradictory example (a class for 'Washington' / 'BMW') is gone.
+    assert "'Country' for 'Washington'" not in system
+    assert user.index('"LISTS"') < user.index('"MATCH NOT FOUND"')
+
+
+def _chunk():
+    from types import SimpleNamespace
+
+    return SimpleNamespace(index=0, source_name="doc.txt")
+
+
+def test_class_budget_keeps_the_first_entries() -> None:
+    from backend.app.services.pipeline_llm import _apply_class_budget
+
+    spec = {"max_new_classes": 25, "max_new_classes_with_lists": 40, "max_instances_per_list": 40}
+    parsed = {"MATCH NOT FOUND": [{"LABEL": f"C{i}"} for i in range(300)],
+              "MATCH NOT FOUND INSTANCES": [{"LABEL": f"I{i}"} for i in range(10)]}
+    out = _apply_class_budget(parsed, spec, _chunk())
+    assert [c["LABEL"] for c in out["MATCH NOT FOUND"]] == [f"C{i}" for i in range(25)]
+    assert len(out["MATCH NOT FOUND INSTANCES"]) == 10
+
+
+def test_a_declared_list_raises_the_budget_and_allows_its_instances() -> None:
+    from backend.app.services.pipeline_llm import _apply_class_budget
+
+    spec = {"max_new_classes": 25, "max_new_classes_with_lists": 40, "max_instances_per_list": 40,
+            "max_new_instances": 80}
+    parsed = {"LISTS": [{"WHAT": "oil refineries in Asia", "ITEM_KIND": "OilRefinery", "ITEM_COUNT": 300}],
+              "MATCH NOT FOUND": [{"LABEL": f"C{i}"} for i in range(60)],
+              "MATCH NOT FOUND INSTANCES": [{"LABEL": f"R{i}"} for i in range(300)]}
+    out = _apply_class_budget(parsed, spec, _chunk())
+    assert len(out["MATCH NOT FOUND"]) == 40
+    assert len(out["MATCH NOT FOUND INSTANCES"]) == 80 + 40
+
+
+def test_no_budget_configured_changes_nothing() -> None:
+    from backend.app.services.pipeline_llm import _apply_class_budget
+
+    parsed = {"MATCH NOT FOUND": [{"LABEL": f"C{i}"} for i in range(300)]}
+    assert len(_apply_class_budget(parsed, {}, _chunk())["MATCH NOT FOUND"]) == 300
+    assert _apply_class_budget(None, {"max_new_classes": 25}, _chunk()) is None
+
+
+def test_both_class_prompts_state_the_adverse_event_hierarchy() -> None:
+    from backend.app.services import adverse_event_taxonomy as ae
+    from backend.app.services.prompts_deepseek import deepseek_class_proposal
+    from backend.app.services.prompts_qwen import qwen_class_proposal
+
+    for fn in (qwen_class_proposal, deepseek_class_proposal):
+        system, _ = fn({}, "text")
+        assert "only the hierarchy's CATEGORIES are classes" in system
+        assert "never a class. A list of adverse reactions has ITEMS_ARE_KINDS false" in system
+        assert "DRUGS ARE NEVER CLASSES" in system and "relation endpoint" in system
+        assert all(t in system for t in ae.TYPES) and ae.ROOT in system
+    spec = yaml.safe_load(open(PRESET))["tasks"]["class_proposal"]
+    assert spec["adverse_event_taxonomy"] is True
+    assert spec["ontology_view"] == {"full_max_classes": 600, "subtree_max_classes": 600}
+
+
+def test_ontology_view_sends_whole_small_ontology_and_subtrees_of_a_large_one() -> None:
+    from backend.app.services.pipeline_llm import _ontology_view
+
+    def cls(name, parent=None):
+        return {"name": name, "labels": [name],
+                "superclasses": [{"iri": parent}] if parent else [], "comments": ["a " + name]}
+    C = {"r1": cls("Root1"), "a": cls("A", "r1"), "a1": cls("A1", "a"), "a2": cls("A2", "a1"),
+         "r2": cls("Root2"), "b": cls("B", "r2")}
+    onto = {"classes_dict": C}
+    full = _ontology_view(onto, ["r1"], 1, {"full_max_classes": 10})
+    assert set(full) == set(C) and full["a2"] == {"label": "A2", "parents": ["a1"], "desc": "a A2"}
+    sub = _ontology_view(onto, ["r1"], 1, {"full_max_classes": 3, "subtree_max_classes": 10})
+    assert set(sub) == {"r1", "a", "a1", "a2"}            # whole subtree, nothing from Root2
+    capped = _ontology_view(onto, ["r1"], 1, {"full_max_classes": 3, "subtree_max_classes": 2})
+    assert set(capped) == {"r1", "a"}

@@ -35,23 +35,48 @@ def _key(label: Any) -> str:
     return re.sub(r"[^a-z0-9]", "", str(label).lower())
 
 
-def candidate_pairs(vectors: list[list[float]], threshold: float, max_pairs: int) -> list[tuple[int, int, float]]:
-    """Index pairs with cosine >= threshold, most similar first (unit vectors).
+_PAIR_BLOCK_ROWS = 1024
 
-    One matrix product: the pure-Python double loop took many minutes at
-    ~2,800 classes (3.8M pairs, 2026-10-17 pharma benchmark).
+
+def candidate_pairs(vectors, threshold: float, max_pairs: int) -> list[tuple[int, int, float]]:
+    """Index pairs (i < j) with cosine >= threshold, most similar first (unit
+    vectors); ties keep row-major (i, j) order.
+
+    Matrix products, not a Python double loop (that took many minutes at
+    ~2,800 classes, 2026-10-17 pharma benchmark) -- but in ROW BLOCKS, not
+    one n x n product: the full matrix plus its triu index arrays is ~1.5 GB
+    at 11k classes, which OOM-killed the 27B web-search prune-expand on a
+    2.7 GB machine (2026-10-17). A block is _PAIR_BLOCK_ROWS x n floats, and
+    the running candidate list is trimmed to the best `max_pairs` as it goes.
     """
     import numpy as np
 
-    if len(vectors) < 2:
-        return []
     m = np.asarray(vectors, dtype=np.float32)
-    sims = m @ m.T
-    iu, ju = np.triu_indices(len(vectors), k=1)
-    vals = sims[iu, ju]
-    keep = np.nonzero(vals >= threshold)[0]
-    order = keep[np.argsort(-vals[keep], kind="stable")][:max_pairs]
-    return [(int(iu[k]), int(ju[k]), float(vals[k])) for k in order]
+    n = len(m)
+    if n < 2 or max_pairs <= 0:
+        return []
+    cols = np.arange(n)
+    acc_i = np.empty(0, dtype=np.int64)
+    acc_j = np.empty(0, dtype=np.int64)
+    acc_v = np.empty(0, dtype=np.float32)
+
+    def best(i, j, v):
+        order = np.lexsort((j, i, -v))[:max_pairs]      # -v first, then i, then j
+        return i[order], j[order], v[order]
+
+    for s in range(0, n, _PAIR_BLOCK_ROWS):
+        block = m[s:s + _PAIR_BLOCK_ROWS] @ m.T
+        rows = np.arange(s, s + len(block))[:, None]
+        r, c = np.nonzero((block >= threshold) & (cols[None, :] > rows))
+        if len(r):
+            acc_i = np.concatenate([acc_i, r + s])
+            acc_j = np.concatenate([acc_j, c])
+            acc_v = np.concatenate([acc_v, block[r, c]])
+            if len(acc_v) > 4 * max_pairs:
+                acc_i, acc_j, acc_v = best(acc_i, acc_j, acc_v)
+        del block
+    acc_i, acc_j, acc_v = best(acc_i, acc_j, acc_v)
+    return [(int(i), int(j), float(v)) for i, j, v in zip(acc_i, acc_j, acc_v, strict=True)]
 
 
 def merge_groups(n: int, confirmed: list[tuple[int, int, int]]) -> dict[int, int]:
@@ -155,7 +180,10 @@ async def semantic_class_merge(router: Any, payload: dict[str, Any], *, embedder
 
         embedder = Embedder()
     texts = [f"{_words(it['LABEL'])}: {it.get('DESCRIPTION', '')}" for it in items]
-    vectors = await embedder.embed(texts)
+    from backend.app.services.semantic_grouping import _embed_compact
+
+    # float32 array in slices: nested lists cost ~32 bytes per float.
+    vectors = await _embed_compact(embedder, texts)
     pairs = candidate_pairs(vectors, float(spec.get("threshold", 0.83)), int(spec.get("max_pairs", 150)))
     if not pairs:
         return payload, []

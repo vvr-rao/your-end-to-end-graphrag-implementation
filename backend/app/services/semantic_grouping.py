@@ -148,7 +148,7 @@ async def order_by_semantic_cluster(
         return _sorted_fallback(items, texts)
 
     try:
-        vectors = await (embedder or Embedder()).embed(list(texts))
+        vectors = await _embed_compact(embedder or Embedder(), texts)
     except Exception as exc:  # noqa: BLE001 -- degrade, never fail the run
         print(f"[dedup-cluster] embedding failed ({exc}); falling back to label sort")
         return _sorted_fallback(items, texts)
@@ -172,6 +172,34 @@ async def order_by_semantic_cluster(
             f"{n_multi} with >1 member (similar items will share a batch)"
         )
     return out
+
+
+_EMBED_SLICE = 2_000
+
+
+async def _embed_compact(embedder: Embedder, texts: Sequence[str]):
+    """Embed in slices straight into one float32 array.
+
+    `Embedder.embed` returns nested Python lists: ~32 bytes per float, so
+    17,499 class proposals x 1,024 dims held ~575 MB before the float64 copy
+    `_greedy_cluster` makes. On the 27B web-search build (2026-10-17) that,
+    plus the loaded ontology, OOM-killed prune-expand right after both
+    clustering passes on a 2.7 GB machine. As float32 the same vectors are
+    ~72 MB, and only one slice of lists is alive at a time.
+    """
+    import numpy as np
+
+    out: np.ndarray | None = None
+    for start in range(0, len(texts), _EMBED_SLICE):
+        chunk = list(texts[start:start + _EMBED_SLICE])
+        part = await embedder.embed(chunk)
+        if len(part) != len(chunk):
+            raise ValueError(f"embedder returned {len(part)} vectors for {len(chunk)} texts")
+        if out is None:
+            out = np.empty((len(texts), len(part[0]) if part else 0), dtype=np.float32)
+        out[start:start + len(part)] = np.asarray(part, dtype=np.float32)
+        del part
+    return out if out is not None else np.empty((0, 0), dtype=np.float32)
 
 
 def _sorted_fallback(items: Sequence[T], texts: Sequence[str]) -> list[T]:

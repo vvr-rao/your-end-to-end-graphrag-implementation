@@ -53,6 +53,19 @@ deploying (see **setup-database**).
 ```bash
 uv run python scripts/check_env.py DATABASE_URL OPENAI_API_KEY BEARER_TOKEN RENDER_API_KEY
 ```
+In **DeepInfra mode** check `DEEPINFRA_API_KEY` instead of `OPENAI_API_KEY`:
+```bash
+uv run python scripts/check_env.py DATABASE_URL DEEPINFRA_API_KEY BEARER_TOKEN RENDER_API_KEY
+```
+
+**(d) DeepInfra mode only — the backend needs two more env vars.** The image
+ships every preset but no `config/models.yaml`, so set on the backend service:
+`MODELS_CONFIG_PATH=config/models.deepinfra.example.yaml` and `DEEPINFRA_API_KEY`
+(both declared in `render.yaml`; `render-init` pushes them from `.env`). No GPU
+is needed in production: every Q&A task runs on serverless DeepSeek-V4.1-Flash
+and queries embed on serverless Qwen3-Embedding-4B. The database must be the
+one built in DeepInfra mode (Qwen vectors) — the embedding guard refuses an
+OpenAI-embedded database, so every query fails loudly until they match.
 
 ## Step 1 — BEARER_TOKEN (the app's own API auth)
 This token protects the deployed REST/MCP API and is later pasted into the UI. If

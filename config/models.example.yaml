@@ -643,6 +643,25 @@ tasks:
     max_tokens: 4096   # 60 decisions ~1.5k tokens
     response_format: json_object
 
+  # Pairwise-dedup judges. UNUSED in this preset: they run only when
+  # match_dedup sets `method: pairwise`, which only the deepinfra preset does
+  # (this mode keeps the echo dedup). Defined so every preset has one task set.
+  class_pair_judge:
+    provider: openai
+    model: gpt-4.1-mini
+    timeout: 300
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+
+  class_validity_judge:
+    provider: openai
+    model: gpt-4.1-mini
+    timeout: 400
+    temperature: 0.0
+    max_tokens: 6144
+    response_format: json_object
+
 defaults:
   retries:
     max_attempts: 5

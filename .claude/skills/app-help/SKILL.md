@@ -33,8 +33,12 @@ set of 7 **core** ontologies (VIAO, FOAF, ORG, geography, time, SKOS,
 domain_concepts) is ALWAYS merged in as well.
 
 ## The pipeline (order)
-1. **Choose LLM mode** — Groq+OpenAI (default) / OpenAI-only / Anthropic+OpenAI;
-   embeddings always OpenAI.
+1. **Choose LLM mode** — Groq+OpenAI (default) / OpenAI-only / Anthropic+OpenAI
+   (embeddings on OpenAI) / **DeepInfra** (Qwen3.8-27B on a rented dedicated GPU
+   for building; serverless DeepSeek-V4.1-Flash for relationships and Q&A;
+   Qwen3-Embedding-4B embeddings; no OpenAI key; ~10x cheaper Q&A; its own
+   database). DeepInfra GPUs are sized with `deepinfra_sizing.py` (preferred
+   2x B200 → 2x H200 → 2x H100), not `tpm_check.py`.
 2. **Database** — Supabase (prod) or local docker Postgres; `db-init` migrates.
 3. **Merge** ontologies (VIAO + 6 more core + a domain ontology) — deterministic, no LLM.
 3b. **summarize-descriptions** (optional but recommended, cents) — compacts each

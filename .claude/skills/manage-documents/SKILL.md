@@ -47,8 +47,17 @@ bring new edges, and an unembedded edge is invisible to the relation-matched
 walk -- silently, with no error. `extract-entities` embeds the edges it writes,
 but `enrich-geo`'s are new, so run it after.
 
+**DeepInfra mode: adding or updating documents rents a GPU.** Registering,
+extracting and generating artifacts call the dedicated Qwen3.8-27B deployment,
+which is normally deleted after a build. Size and create one as in the
+**choose-llm-mode** skill, "DeepInfra mode" (preferred 2x B200 → 2x H200 →
+2x H100; spin-up is billed, so batch several documents into one window), set
+`DEEPINFRA_FLASH_MODEL`, run the steps, then delete it. Deleting documents
+needs no GPU.
+
 **Size it first if the batch is large.** Before the paid steps on more than a
-handful of documents, run `uv run python scripts/tpm_check.py` and show the
+handful of documents, run `uv run python scripts/tpm_check.py` (OpenAI /
+Anthropic / Groq modes) and show the
 per-stage table (see **build-app** step 2b). If the tracker has a `sizing` step
 and the LLM mode has not changed since, the config is already right -- just
 confirm. Otherwise propose values and write the agreed ones with `--apply` /

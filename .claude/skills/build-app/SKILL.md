@@ -66,21 +66,33 @@ financial) and ask their preference, and run prune-expand. Walk it one step at a
 ## The sequence
 
 ### 1. LLM mode + keys  →  invoke skill **choose-llm-mode**
-Pick Groq+OpenAI / OpenAI-only / Anthropic+OpenAI, activate the preset, confirm
-required keys are present in `.env`. (Every mode needs `OPENAI_API_KEY` for
-embeddings.)
+Present all FOUR modes — Groq+OpenAI / OpenAI-only / Anthropic+OpenAI /
+**DeepInfra (Qwen + DeepSeek)** — activate the preset, confirm the required keys
+are present in `.env`. Every mode except DeepInfra needs `OPENAI_API_KEY`
+(embeddings); DeepInfra needs only `DEEPINFRA_API_KEY` (+ the non-secret
+`DEEPINFRA_FLASH_MODEL` once a GPU deployment exists). The mode decides the rest
+of the build: DeepInfra builds on rented GPUs (step 2b) and needs its own
+database (step 2).
 
 ### 2. Database  →  invoke skill **setup-database**
 Ask "have a Postgres DSN, or make a local one?" — warn that a local DB isn't
 deploy-ready. Bring up docker Postgres if needed, then migrate + verify. Can run
-concurrently with step 3 (prune-expand doesn't need the DB).
+concurrently with step 3 (prune-expand doesn't need the DB). **DeepInfra mode
+embeds with Qwen3-Embedding-4B**, whose vectors cannot mix with OpenAI's: use an
+empty or dedicated database — a guard refuses a database already embedded by
+another model.
 
 ### 2b. Size the run ONCE, up front — rate limits + database → `concurrency:`
-> **DeepInfra/Qwen mode:** a dedicated deployment has no TPM/RPM, so `tpm_check.py`
-> does not size it. Use `uv run python scripts/deepinfra_sizing.py "<DOCS>"` instead
-> (corpus → GPU configuration → concurrency); the full order — size, approve the
-> hourly rate, deploy, `--probe`, `--apply`, delete when done — is in the
-> **choose-llm-mode** skill, "DeepInfra mode".
+> **DeepInfra mode — size GPUs, not rate limits.** A dedicated deployment has no
+> TPM/RPM, so `tpm_check.py` does not size it. Follow the **choose-llm-mode**
+> skill, "DeepInfra mode": `deepinfra_sizing.py "<DOCS>"` (free) prints the GPU
+> options in the preferred order — **2x B200, then 2x H200, then 2x H100** — with
+> each one's hourly rate, estimated hours/cost and its own throughput-optimised
+> concurrency. With the user's approval of the rates, `deepinfra_deploy.py create
+> --apply-concurrency` takes the first that has capacity and writes THAT GPU's
+> concurrency. Plan steps 3–4 to run back to back inside ONE GPU window (spin-up
+> is billed every time), and delete the deployment the moment the last creation
+> step finishes. The rest of this step (tpm_check) does not apply.
 
 Do this after steps 1 and 2 (it reads the active `models.yaml` and the DB
 settings) and before any paid step:
@@ -144,6 +156,9 @@ Guides the user through forking the repo, setting `RENDER_API_KEY` + generating 
 `BEARER_TOKEN` in `.env`, `render-init` to create the backend + frontend services,
 monitoring the build, and the final manual UI token paste. Requires a **cloud**
 DB (not the local docker one). Records `deploy` (with URLs) to the tracker.
+In DeepInfra mode the deployed app needs NO GPU: Q&A runs on serverless
+DeepSeek-V4.1-Flash and queries embed on serverless Qwen; the deploy skill sets
+`MODELS_CONFIG_PATH` + `DEEPINFRA_API_KEY` on the backend.
 
 ## After the build — changing the corpus
 If the user later wants to **add, update, or delete documents** in an already-built
