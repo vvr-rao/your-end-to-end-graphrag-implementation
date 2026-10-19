@@ -321,6 +321,21 @@ def test_recommendation_follows_the_preferred_gpu_order() -> None:
     assert sizing.recommend(rows, 1.25, preferred=(("H200-141GB", 2), ("H100-80GB", 2)))[0] is h2
 
 
+def test_four_gpu_options_come_first_as_two_instances() -> None:
+    """2026-10-19 order: 4x B200, 4x H200 (each as 2 instances of 2 GPUs),
+    then 2x B200, 2x H200, 2x H100."""
+    assert sizing.PREFERRED_GPUS == (("B200-180GB", 2, 2), ("H200-141GB", 2, 2), ("B200-180GB", 2, 1),
+                                     ("H200-141GB", 2, 1), ("H100-80GB", 2, 1))
+    opts = {o.label(): o for o in sizing.gpu_options()}
+    chain_labels = ["2x B200-180GB fp8 x2 inst", "2x H200-141GB fp8 x2 inst",
+                    "2x B200-180GB fp8", "2x H200-141GB fp8", "2x H100-80GB fp8"]
+    assert all(lbl in opts for lbl in chain_labels)
+    rows = [(opts[lbl], {"hours": 1.0, "usd": 1.0}) for lbl in reversed(chain_labels)]
+    assert [o.label() for o, _ in sizing.preferred_chain(rows, None)] == chain_labels
+    assert sizing.recommend(rows, None)[0].instances == 2
+    assert opts["2x B200-180GB fp8 x2 inst"].total_gpus <= sizing.MAX_GPUS_PER_ACCOUNT
+
+
 def test_recommendation_without_a_preferred_fit_is_cheapest_and_skips_caveats() -> None:
     a = sizing.GpuOption("A100-80GB", 4, 1, "fp8", "r", 185.5, 80, 3.56, note="caveat")
     h = sizing.GpuOption("H200-141GB", 4, 1, "fp8", "r", 185.5, 58, 10.76)
@@ -1001,3 +1016,26 @@ def test_ontology_view_sends_whole_small_ontology_and_subtrees_of_a_large_one() 
     assert set(sub) == {"r1", "a", "a1", "a2"}            # whole subtree, nothing from Root2
     capped = _ontology_view(onto, ["r1"], 1, {"full_max_classes": 3, "subtree_max_classes": 2})
     assert set(capped) == {"r1", "a"}
+
+
+def test_concurrency_is_capped_by_local_memory() -> None:
+    """The GPUs set how many requests the deployment can serve; this machine
+    must also hold every in-flight prompt + reply (2026-10-19). A request is
+    ~0.6 MB even at a 30k-token context, so this only binds on small boxes
+    (on the 2.7 GB dev VM ~700 class proposals fit; the GPUs take 192)."""
+    stages = {"class_proposal": {"mean_ctx": 30000}, "entity_extraction": {"mean_ctx": 3000},
+              "dedup": {"mean_ctx": 24000}}
+    gpu = {"class_proposal": 192, "entity_extraction": 192, "dedup": 192}
+    small = sizing.local_memory((900, 1024))                      # a 1 GB box: 300 MB usable
+    big = sizing.local_memory((30000, 32768))
+    c_small, caps = sizing.memory_capped_concurrency(gpu, stages, small)
+    c_big, caps_big = sizing.memory_capped_concurrency(gpu, stages, big)
+    assert caps["class_proposal"] < 192 and c_small["class_proposal"] == caps["class_proposal"]
+    assert c_small["entity_extraction"] > c_small["class_proposal"]       # short contexts fit more
+    assert caps_big == {} and c_big["class_proposal"] == 192              # a big box keeps the GPU value
+    assert c_big["class_judges"] == sizing.CLASS_JUDGE_MAX                # judges: dedup, at most 64
+    assert 1 <= c_small["table_extraction"] <= c_big["table_extraction"] == 8
+    no_mem, none_caps = sizing.memory_capped_concurrency(gpu, stages, None)
+    assert none_caps == {} and "table_extraction" not in no_mem and no_mem["class_judges"] == 64
+    assert sizing.max_streaming_batch(small) < sizing.max_streaming_batch(big)
+    assert sizing.max_streaming_batch(None) is None

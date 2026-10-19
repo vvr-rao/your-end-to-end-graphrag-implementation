@@ -199,3 +199,17 @@ def test_set_rejects_an_unknown_stage():
     assert tpm._parse_sets(["--set", "dedup=8", "--set", "table_extraction=3"]) == {
         "dedup": 8, "table_extraction": 3,
     }
+
+
+def test_build_memory_check_projects_the_peak_against_this_machine() -> None:
+    """Stage 4 + OWL export hold the whole expanded ontology: projected from
+    the corpus (measured 2026-10-19), judged against this machine's RAM."""
+    from tpm_check import build_memory_check
+
+    small = build_memory_check(415_700, mem=(2200, 2700))         # web-search corpus on the dev VM
+    big = build_memory_check(10_000_000, mem=(2200, 2700))         # 10M tokens on the dev VM
+    assert small["verdict"] == "fits" and small["peak_mb"] < 400
+    assert big["verdict"] == "does_not_fit" and 2200 < big["peak_mb"] < 3000
+    assert big["needs_total_mb"] > big["peak_mb"]
+    assert build_memory_check(10_000_000, mem=(16000, 16384))["verdict"] == "fits"
+    assert build_memory_check(415_700, mem=(-1, -1))["verdict"] == "unknown"

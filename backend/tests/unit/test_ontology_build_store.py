@@ -65,7 +65,10 @@ def test_store_round_trip(monkeypatch) -> None:
         counts = await st.counts()
         assert counts["class:kept"] == 2 and counts["class:kept:occurrences"] == 3
         assert await st.embed_missing(_Emb()) == 3
-        pairs = [p async for batch in st.neighbours("class", "existing_class", k=3, min_cosine=0.5) for p in batch]
+        # Concurrent first use must create the run's index once (2026-10-19:
+        # neighbours' parallel lookups raced into a pg_class unique violation).
+        await asyncio.gather(*[st.ensure_index("existing_class") for _ in range(4)])
+        pairs =[p async for batch in st.neighbours("class", "existing_class", k=3, min_cosine=0.5) for p in batch]
         assert any(p.cosine > 0.9 for p in pairs)
         same = [p async for batch in st.neighbours("class", "class", k=3, min_cosine=-1) for p in batch]
         assert all(p.a_id < p.b_id for p in same)
@@ -83,3 +86,36 @@ def test_scalar_collapses_cross_chunk_lists():
     assert _scalar(["", "A#Metric", "A#EconomicConcept"]) == "A#Metric"
     assert _scalar("A#Metric") == "A#Metric"
     assert _scalar(None) is None and _scalar([]) is None
+
+
+def test_choose_parent_prefers_existing_then_most_voted() -> None:
+    from backend.app.services.ontology_build_store import choose_parent
+
+    row = {"parent": "Metric", "extra": {"parents": {"Metric": 3, "x#EconomicConcept": 1}}}
+    assert choose_parent(row, {"x#EconomicConcept"}) == "x#EconomicConcept"   # an existing class wins
+    assert choose_parent(row) == "Metric"                                     # else the most proposed
+    assert choose_parent({"parent": "B", "extra": {"parents": {"B": 1, "A": 1}}}) == "B"   # ties: first seen
+    assert choose_parent({"parent": "C", "extra": {"parents": {"B": 1, "A": 1}}}) == "A"   # then alphabetical
+    assert choose_parent({"parent": "Metric", "extra": {}}) == "Metric"        # no votes: stored parent
+    assert choose_parent({"parent": None, "extra": {"parents": {"NONE": 2}}}) is None
+
+
+@pytest.mark.skipif(not DSN, reason="set ONTOLOGY_BUILD_TEST_DSN to a migrated database")
+def test_upsert_counts_parent_votes(monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", DSN)
+    from backend.app.db.engine import reset_engine_cache
+
+    reset_engine_cache()
+
+    async def go():
+        st = BuildStore("pytest-votes")
+        await st.clear()
+        await st.upsert("class", [{"label": "Inflation", "parent": "Metric"}])
+        await st.upsert("class", [{"label": "Inflation", "parent": "EconomicConcept"}])
+        await st.upsert("class", [{"label": "inflation", "parent": "EconomicConcept"}])
+        await st.upsert("class", [{"label": "Inflation"}])                 # no parent: no vote
+        rows = [r async for batch in st.iter_rows("class", "kept", 10) for r in batch]
+        assert len(rows) == 1 and rows[0]["extra"]["parents"] == {"Metric": 1, "EconomicConcept": 2}
+        await st.clear()
+
+    asyncio.run(go())

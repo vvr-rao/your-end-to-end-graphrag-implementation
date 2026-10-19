@@ -77,10 +77,13 @@ def upgrade() -> None:
         f"ALTER TABLE {SCHEMA}.label_vectors ADD COLUMN emb256 vector(256) "
         f"GENERATED ALWAYS AS (subvector(embedding, 1, 256)::vector(256)) STORED"
     )
-    op.execute(
-        f"CREATE INDEX label_vectors_emb256_idx ON {SCHEMA}.label_vectors "
-        f"USING hnsw (emb256 vector_cosine_ops)"
-    )
+    # No table-wide vector index: HNSW maintenance on every embedding write
+    # was 77% of write time (10k rows: 67 s with the index, 7.9 s without;
+    # one bulk build afterwards 19 s). Each build creates its own partial
+    # index per kind once its vectors are in (BuildStore.ensure_index) and
+    # drops it in clear(). knn_batch therefore puts run and kind into the
+    # query as literals, so the planner can match that partial index.
+    #
     # Nearest neighbours for a whole batch of ids in ONE round trip. Measured
     # on the 2-CPU dev box (10k labels): the same lookup issued per id from
     # Python cost 15 ms (session + SET LOCALs + query); looped server-side it
@@ -91,22 +94,22 @@ def upgrade() -> None:
     op.execute(f"""
         CREATE FUNCTION {SCHEMA}.knn_batch(ids bigint[], p_run text, p_kind text, k int, over int, ef int)
         RETURNS TABLE(a_id bigint, b_id bigint, cos float8) LANGUAGE plpgsql AS $$
-        DECLARE a bigint; q vector; q256 vector(256);
+        DECLARE a bigint; q vector; q256 vector(256); sql text;
         BEGIN
           PERFORM set_config('hnsw.iterative_scan', 'relaxed_order', true);
           PERFORM set_config('hnsw.ef_search', ef::text, true);
+          sql := format(
+            'SELECT $3, c.id, 1 - (c.embedding <=> $1) AS cs FROM ('
+            '  SELECT b.id, b.embedding FROM {SCHEMA}.label_vectors b'
+            '  WHERE b.run_id = %L AND b.kind = %L AND b.status = %L'
+            '    AND b.id <> $3 AND b.embedding IS NOT NULL'
+            '  ORDER BY b.emb256 <=> $2 LIMIT %s) c '
+            'ORDER BY cs DESC LIMIT %s', p_run, p_kind, 'kept', over, k);
           FOREACH a IN ARRAY ids LOOP
             SELECT v.embedding, v.emb256 INTO q, q256
             FROM {SCHEMA}.label_vectors v WHERE v.id = a;
             CONTINUE WHEN q IS NULL;
-            RETURN QUERY
-              SELECT a, c.id, 1 - (c.embedding <=> q) AS cs FROM (
-                SELECT b.id, b.embedding FROM {SCHEMA}.label_vectors b
-                WHERE b.run_id = p_run AND b.kind = p_kind AND b.status = 'kept'
-                  AND b.id <> a AND b.embedding IS NOT NULL
-                ORDER BY b.emb256 <=> q256
-                LIMIT over) c
-              ORDER BY cs DESC LIMIT k;
+            RETURN QUERY EXECUTE sql USING q, q256, a;
           END LOOP;
         END $$
     """)

@@ -86,19 +86,36 @@ another model.
 > **DeepInfra mode — size GPUs, not rate limits.** A dedicated deployment has no
 > TPM/RPM, so `tpm_check.py` does not size it. Follow the **choose-llm-mode**
 > skill, "DeepInfra mode": `deepinfra_sizing.py "<DOCS>"` (free) prints the GPU
-> options in the preferred order — **2x B200, then 2x H200, then 2x H100** — with
-> each one's hourly rate, estimated hours/cost and its own throughput-optimised
-> concurrency. With the user's approval of the rates, `deepinfra_deploy.py create
-> --apply-concurrency` takes the first that has capacity and writes THAT GPU's
-> concurrency. Plan steps 3–4 to run back to back inside ONE GPU window (spin-up
-> is billed every time), and delete the deployment the moment the last creation
-> step finishes. The rest of this step (tpm_check) does not apply.
+> options in the preferred order — **4x B200, 4x H200 (each as two 2-GPU
+> instances), then 2x B200, 2x H200, 2x H100** — with each one's hourly rate,
+> estimated hours/cost and its own concurrency, sized from that GPU's memory AND
+> this machine's memory. With the user's approval of the rates,
+> `deepinfra_deploy.py create --apply-concurrency` takes the first that has
+> capacity and writes THAT configuration's concurrency. Qwen3.8-27B runs on those
+> GPUs; DeepSeek-V4.1-Flash always stays serverless. Plan steps 3–4 to run back
+> to back inside ONE GPU window (spin-up is billed every time), and delete the
+> deployment the moment the last creation step finishes. The rest of this step
+> (tpm_check) does not apply.
+>
+> **Verify this machine's memory first** (the one these skills and the detached
+> run use): the sizing prints `Local memory` and `Build memory ... FITS / TIGHT /
+> DOES NOT FIT` — the projected peak of Stage 4 + the OWL export for this corpus
+> against available RAM (Linux, macOS, Windows). On TIGHT tell the user to close
+> other apps; on DOES NOT FIT **stop and ask**: a bigger machine (it prints the
+> GB needed), or a subset (`--select-subset` / `--limit`). Never start the paid
+> run on DOES NOT FIT — a swapless box hard-kills the run mid-way.
 
 Do this after steps 1 and 2 (it reads the active `models.yaml` and the DB
 settings) and before any paid step:
 ```
 uv run python scripts/tpm_check.py "<DOCS>"
 ```
+
+**Read the `Build memory` line out in every mode.** It projects the peak memory
+of prune-expand's Stage 4 + OWL export for THIS corpus and checks it against
+the RAM of the machine the skills run on: FITS / TIGHT (close other apps) /
+DOES NOT FIT (**stop and ask**: a machine with the printed GB free, or a subset
+via `--select-subset` / `--limit`). Do not start a paid run on DOES NOT FIT.
 Costs ~nothing (one tiny probe per model, per provider — OpenAI, Anthropic
 and Groq alike). It prints a table of every concurrency knob with **now**,
 **suggest**, and the **binding task** — each stage is sized by the tightest

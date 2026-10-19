@@ -6,8 +6,9 @@ nothing merged beyond identical labels -- after 19 GPU-minutes. Here:
 
   1. candidates   each kept class's top-k neighbours (HNSW, staging store)
                   among the run's classes AND the existing ontology classes;
-  2. bands        cosine >= t_hi -> merge; [t_lo, t_hi) -> pair judge;
-                  < t_lo -> keep apart (not recorded);
+  2. bands        cosine >= t_lo -> pair judge (>= t_hi -> merge without a
+                  call, only when t_hi is set; off by default); < t_lo ->
+                  keep apart (not recorded);
   3. judge        `class_pair_judge` (Qwen, its own prompt), batched;
   4. union-find   over label ids, a group size cap so a chain cannot fuse
                   unrelated concepts; canonical = an existing class, else the
@@ -21,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -32,10 +34,16 @@ TASK = "class_pair_judge"
 
 @dataclass
 class DedupConfig:
-    # 0.95 still auto-merged siblings (ExportRestriction~ExportBan, 0.956) in
-    # the 2026-10-18 replay; 0.97 until the labelled calibration set sets it.
-    t_hi: float = 0.97
-    t_lo: float = 0.80
+    # Calibrated on 161 web-search pairs labelled by gpt-4.1 + Claude Sonnet
+    # 4.6 (95% agreement; benchmarks/2026-10-19/label_sheet), share truly
+    # duplicate by cosine: 0.80-0.85 3%, 0.85-0.90 13%, 0.90-0.95 65%,
+    # 0.95-0.97 85%, >=0.97 90%. So:
+    #   t_hi None -- no auto-merge: even >=0.97 was 1 in 10 wrong (Sea~Ocean,
+    #                ProductionCapacity~ManufacturingCapacity), and judging
+    #                that band is ~1% of calls. Exact folded labels still merge.
+    #   t_lo 0.85 -- 0.80-0.85 was 61% of judge calls for ~13% of duplicates.
+    t_hi: float | None = None
+    t_lo: float = 0.85
     k: int = 10
     judge_batch: int = 60
     judge_concurrency: int = 8
@@ -55,6 +63,7 @@ class DedupStats:
     already_joined: int = 0
     exact_to_existing: int = 0
     by_band: dict[str, int] = field(default_factory=dict)
+    seconds: dict[str, float] = field(default_factory=dict)   # wall time per phase
 
 
 class UnionFind:
@@ -102,7 +111,7 @@ def canonical(members: list[int], meta: dict[int, tuple[bool, int, str]]) -> int
 
 
 def band(cos: float, cfg: DedupConfig) -> str:
-    if cos >= cfg.t_hi:
+    if cfg.t_hi is not None and cos >= cfg.t_hi:
         return "auto"
     if cos >= cfg.t_lo:
         return "judge"
@@ -164,17 +173,46 @@ async def run_pairwise_dedup(store: BuildStore, judge: Judge | None, cfg: DedupC
         return [(p, str(n) in same, str(same.get(str(n), {}).get("reason") or "")[:200])
                 for n, (p, _a, _b) in enumerate(batch)]
 
+    def took(phase: str, t0: float) -> float:
+        now = time.monotonic()
+        st.seconds[phase] = round(st.seconds.get(phase, 0.0) + now - t0, 2)
+        return now
+
     # Exact folded-label match to an existing class: merge with no lookup.
+    t = time.monotonic()
     exact = await store.exact_existing_matches()
     await remember([i for pair in exact for i in pair])
     for cls_id, ex_id in exact:
         if uf.union(cls_id, ex_id):
             st.exact_to_existing += 1
+    t = took("exact", t)
+    # Judge calls run in the background while the next lookups proceed: the
+    # lookups are database work, the judge is GPU work, and done in turn the
+    # two simply added up. At most 2 x judge_concurrency batches wait at once
+    # (memory stays bounded). Union-find gives the same groups whatever order
+    # verdicts arrive in; a pair whose joining verdict is still pending is
+    # judged rather than skipped as already_joined, so a few more calls.
+    pending: set[asyncio.Task] = set()
+    tasks: list[asyncio.Task] = []
+
+    async def judge_and_apply(chunk: list[tuple[Pair, dict, dict]]) -> None:
+        decided: list[tuple[int, int, float, str, str | None]] = []
+        for p, same, why in await judge_batch(chunk):
+            st.judged += 1
+            if same:
+                st.judged_same += 1
+                if not uf.union(p.a_id, p.b_id):
+                    st.group_cap_refusals += 1
+            decided.append((p.a_id, p.b_id, p.cosine, "judged_same" if same else "judged_distinct", why))
+        await store.record(decided)
+
     for to_kind in ("existing_class", "class"):
         async for pairs in store.neighbours("class", to_kind, k=cfg.k, min_cosine=cfg.t_lo):
+            t = took(f"knn_{to_kind}", t)
             if not pairs:
                 continue
             rows = await remember([i for p in pairs for i in (p.a_id, p.b_id)])
+            t = took("fetch_rows", t)
             st.candidates += len(pairs)
             decisions: list[tuple[int, int, float, str, str | None]] = []
             to_judge: list[tuple[Pair, dict, dict]] = []
@@ -191,25 +229,28 @@ async def run_pairwise_dedup(store: BuildStore, judge: Judge | None, cfg: DedupC
                     decisions.append((p.a_id, p.b_id, p.cosine, "auto_merge", None))
                 elif judge is not None:
                     to_judge.append((p, rows[p.a_id], rows[p.b_id]))
-            if to_judge:
-                results = await asyncio.gather(*[judge_batch(to_judge[i:i + cfg.judge_batch])
-                                                 for i in range(0, len(to_judge), cfg.judge_batch)])
-                for res in results:
-                    for p, same, why in res:
-                        st.judged += 1
-                        if same:
-                            st.judged_same += 1
-                            if not uf.union(p.a_id, p.b_id):
-                                st.group_cap_refusals += 1
-                        decisions.append((p.a_id, p.b_id, p.cosine,
-                                          "judged_same" if same else "judged_distinct", why))
             await store.record(decisions)
+            t = took("band_bookkeeping", t)
+            for i in range(0, len(to_judge), cfg.judge_batch):
+                task = asyncio.create_task(judge_and_apply(to_judge[i:i + cfg.judge_batch]))
+                tasks.append(task)
+                pending.add(task)
+                task.add_done_callback(pending.discard)
+            while len(pending) >= 2 * cfg.judge_concurrency:      # backpressure
+                await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            t = took("judge_wait", t)
+    if tasks:
+        await asyncio.gather(*tasks)                              # drain; re-raises any failure
+    t = took("judge_drain", t)
+    merges: list[tuple[int, int]] = []
     for members in uf.groups().values():
         canon = canonical(members, meta)
         others = [m for m in members if m != canon and not meta[m][0]]   # never retire an existing class
         if meta[canon][0]:
             st.to_existing += len(others)
-        await store.set_status(others, "merged", "pairwise", merged_into=canon)
+        merges += [(m, canon) for m in others]
         st.merged_labels += len(others)
+    await store.set_merged(merges, "pairwise")
+    took("set_merged_status", t)
     log("[pairwise-dedup] " + json.dumps(st.__dict__))
     return st

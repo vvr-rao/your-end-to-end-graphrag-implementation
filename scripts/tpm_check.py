@@ -431,6 +431,59 @@ _TABLE_WORKER_MB = 200
 _RESERVE_MB = 600
 
 
+# --------------------------------------------------------------------------- #
+# Build memory: the PIPELINE's own peak on THIS machine (the one the skills
+# and the detached run use), projected from the corpus. Concurrency is a small
+# share of it; the peak is Stage 4 + the OWL export holding the whole expanded
+# ontology at once. Any mode -- the stages are the same.
+# Measured 2026-10-19: Qwen v5 on the 415.7k-token web-search corpus proposed
+# 11.9 distinct classes, 32.2 instances and 13.5 relations per 1k tokens; the
+# 30k-class / 90k-instance / 20k-relation export test peaked at 706 MB over a
+# ~112 MB base, 4.3 KB per item. Linear in tokens on purpose: vocabularies
+# saturate (fitted exponent 0.75-0.91), so a large corpus lands BELOW this.
+# --------------------------------------------------------------------------- #
+BUILD_ITEMS_PER_1K_TOKENS = {"classes": 11.9, "instances": 32.2, "relations": 13.5}
+BUILD_PEAK_KB_PER_ITEM = 4.4
+BUILD_BASE_MB = 120
+
+
+def build_memory_check(corpus_tokens: int, mem: tuple[int, int] | None = None) -> dict:
+    """Projected peak MB of a build of `corpus_tokens` vs this machine's RAM.
+    verdict: fits (<= 80% of usable), tight (<= usable), does_not_fit, or
+    unknown (memory unreadable). `mem` = (available, total) MB, for tests."""
+    k = corpus_tokens / 1000
+    items = {name: int(rate * k) for name, rate in BUILD_ITEMS_PER_1K_TOKENS.items()}
+    peak = int(BUILD_BASE_MB + sum(items.values()) * BUILD_PEAK_KB_PER_ITEM / 1024)
+    avail, total = mem if mem is not None else _mem_mb()
+    out = {"corpus_tokens": int(corpus_tokens), **items, "peak_mb": peak,
+           "available_mb": int(avail), "total_mb": int(total),
+           # RAM a machine needs for this to "fit": peak within 80% of usable.
+           "needs_total_mb": int(peak / 0.8 + _RESERVE_MB)}
+    if avail < 0:
+        out["verdict"] = "unknown"
+        return out
+    budget = max(0, avail - _RESERVE_MB)
+    out["budget_mb"] = budget
+    out["verdict"] = "fits" if peak <= 0.8 * budget else ("tight" if peak <= budget else "does_not_fit")
+    return out
+
+
+def print_build_memory(check: dict) -> None:
+    v = check["verdict"]
+    print(f"\n  Build memory (this machine): projected peak ~{check['peak_mb']:,} MB for "
+          f"{check['corpus_tokens']:,} tokens (~{check['classes']:,} classes, {check['instances']:,} "
+          f"instances, {check['relations']:,} relations -- an upper bound)")
+    if v == "unknown":
+        print("    Memory could not be read here; check it with the OS command before a large run.")
+        return
+    print(f"    available {check['available_mb']:,} MB, usable {check['budget_mb']:,} MB -> "
+          + {"fits": "FITS", "tight": "TIGHT -- close other apps before the run",
+             "does_not_fit": "DOES NOT FIT"}[v])
+    if v != "fits":
+        print(f"    For headroom use a machine with ~{check['needs_total_mb'] / 1024:.1f} GB free, or build a "
+              f"subset first (--select-subset / --limit).")
+
+
 def advise_memory(batch_size: int, table_conc: int) -> None:
     """Recommend memory-bound settings from what this machine actually has."""
     avail, total = _mem_mb()
@@ -528,6 +581,7 @@ def analyse_corpus(
         print("  no documents found.")
         return
     toks = [len(enc.encode(d.text)) for d in docs]
+    print_build_memory(build_memory_check(sum(toks)))
     wins = [max(1, -(-t // 11500)) for t in toks]   # 12k window - 500 overlap
     n, total_w = len(docs), sum(wins)
 

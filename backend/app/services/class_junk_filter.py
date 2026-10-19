@@ -21,6 +21,12 @@ corpus as a false-positive control):
   phrase      more than 6 words -- a sentence fragment, not a class name
   family      within ONE reply, more than FAMILY_MAX labels sharing their
               first word: the loop signature. The first FAMILY_KEEP are kept.
+              OFF by default (drop_family=False) since 2026-10-19: with the
+              v5 class prompts 7 of 8 sampled family drops were real
+              categories (RefineryConversion, RefineryClosure, ...; 850 drops
+              on web-search), because those replies are genuine lists, not
+              loops. The labels now stay and the validity judge reviews them;
+              a real loop is still capped by class_proposal.max_new_classes.
 """
 from __future__ import annotations
 
@@ -80,13 +86,14 @@ def first_word(label: Any) -> str:
     return w[0].lower() if w else ""
 
 
-def filter_reply(payload: dict[str, Any] | None) -> tuple[dict[str, Any] | None, list[dict[str, str]]]:
+def filter_reply(payload: dict[str, Any] | None, drop_family: bool = False
+                 ) -> tuple[dict[str, Any] | None, list[dict[str, str]]]:
     """Remove junk MATCH NOT FOUND entries from one class_proposal reply.
 
-    Returns (payload, drops) where each drop is {label, reason}. A family
-    beyond FAMILY_MAX members in this reply keeps its first FAMILY_KEEP (the
-    prompt asks for the most reusable first); the rest are dropped as
-    `family`. Relations and instances are left alone here.
+    Returns (payload, drops) where each drop is {label, reason}. With
+    `drop_family`, a family beyond FAMILY_MAX members in this reply keeps its
+    first FAMILY_KEEP and the rest are dropped as `family` (off by default:
+    see the module docstring). Relations and instances are left alone here.
     """
     if not payload:
         return payload, []
@@ -99,6 +106,9 @@ def filter_reply(payload: dict[str, Any] | None) -> tuple[dict[str, Any] | None,
             drops.append({"label": str(x.get("LABEL")), "reason": r})
         else:
             kept.append(x)
+    if not drop_family:
+        payload["MATCH NOT FOUND"] = kept
+        return payload, drops
     fam: dict[str, list[int]] = defaultdict(list)
     for i, x in enumerate(kept):
         fam[first_word(x.get("LABEL"))].append(i)

@@ -123,12 +123,18 @@ tasks:
     # in, 13,844 out, 19 GPU-min); the replay of the same proposals needed ~110
     # judge calls. No build database -> falls back to the echo dedup.
     method: pairwise
-    t_hi: 0.97        # auto-merge; 0.95 still merged siblings (ExportRestriction~ExportBan)
-    t_lo: 0.80        # below: kept apart without a call
+    # Bands calibrated on 161 labelled web-search pairs (2026-10-19; share
+    # truly duplicate): 0.80-0.85 3%, 0.85-0.90 13%, 0.90-0.95 65%,
+    # 0.95-0.97 85%, >=0.97 90%.
+    t_hi: null        # no auto-merge: >=0.97 was still 1 in 10 wrong (Sea~Ocean); exact labels still merge
+    t_lo: 0.85        # below: kept apart without a call (0.80-0.85 = 61% of calls, ~13% of duplicates)
     k: 10             # neighbours per label
     judge_batch: 60
-    judge_concurrency: 8
+    judge_concurrency: 24  # probe 2026-10-19, 2x H200: validity 18.5 -> 35 calls/min, pair 67 -> 88 (8 -> 24)
     max_group: 25     # union-find group cap: a chain cannot fuse unrelated concepts
+    embed_concurrency: 8        # embedding requests in flight while staging labels
+    index_build_mem_mb: 256     # maintenance_work_mem for the per-run HNSW build
+    index_build_workers: 0      # >0 needs a larger /dev/shm (Docker default 64 MB)
     audit: true       # dedup_audit.json / .csv next to the output
     keep_staging: false
 

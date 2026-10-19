@@ -1103,7 +1103,7 @@ The Stage 1 → Stage 2 narrowing is the whole reason this scales. Without it ev
 ### v3 — 2026-07-27 · Claude Code extension: build the whole app by chatting
 
 - **Claude Code skills** — clone the repo, open Claude Code, and build end-to-end conversationally (LLM mode → database → ontology merge → prune-expand → ingestion → deploy). See [Build it by chatting with Claude Code](#build-it-by-chatting-with-claude-code).
-- **Durable-run harness** — long, paid steps run detached (`scripts/run_detached.py`) so they survive a closed/killed session; monitor with `scripts/job_status.py`. Pure-Python (no `setsid`/bash), so it works on Linux and macOS alike; Windows via WSL2 (see [Platform support](#platform-support)).
+- **Durable-run harness** — long, paid steps run detached (`scripts/run_detached.py`) so they survive a closed/killed session; monitor with `scripts/job_status.py`. Pure-Python (no `setsid`/bash), so it works on Linux, macOS and native Windows (WSL2 is still the smoothest Windows path; see [Platform support](#platform-support)).
 - **Cross-session progress tracker** — completed steps are recorded to disk and resurfaced at the start of each session, so a restarted session knows what you did last ("what's the status" / "what did we do last").
 - **Verified ontology downloads** — FIBO downloads live from EDM Council; OCRe ships bundled (its upstream is gated); a small registry (`source_ontologies/fetch_ontology.py`) handles fetching with vendored fallbacks.
 - **Credential firewall** — Claude is blocked from reading `.env` / secret files; keys are only presence-checked, never shown in chat.

@@ -74,18 +74,28 @@ is created. The account needs a DeepInfra display name (username) first —
    `uv run python scripts/deepinfra_sizing.py "<DOCS>" [--deadline-hours H]`
    It prints the projected workload per stage and every GPU configuration that
    fits Qwen3.8-27B-FP8 within the 4-GPU account limit, ranked in the
-   **preferred hosting order: #1 2x B200, #2 2x H200, #3 2x H100** (then the
-   rest by cost), each with $/hour, estimated billed time and cost. It
-   recommends #1 and writes `.build/sizing.json` holding #1 AND its fallbacks
-   (#2, #3), each with **its own throughput-optimised concurrency** (the
-   per-stage throughput knee inside that GPU's KV cache, calibrated on measured
-   builds — e.g. class_proposal 96 / 48 / 32). Show the user the three
-   preferred rows and their rates. Several corpora: pass them comma-separated
-   to size ONE window (spin-up is billed per deployment).
-3. **Only with explicit approval of the hourly rates** (all three — the
+   **preferred hosting order: #1 4x B200, #2 4x H200, #3 2x B200, #4 2x H200,
+   #5 2x H100** (then the rest by cost), each with $/hour, estimated billed
+   time and cost. The 4-GPU options run as **two 2-GPU instances behind one
+   model id** (the model fits on two GPUs; two instances roughly halve the
+   GPU-bound stages for about the same total cost). It recommends #1 and writes
+   `.build/sizing.json` holding #1 AND its fallbacks (#2-#5), each with **its
+   own concurrency**, sized from two memories:
+   - **GPU memory** — the per-stage throughput knee inside that
+     configuration's KV cache (×2 for two instances), calibrated on measured
+     builds — e.g. class_proposal 192 on 4x B200, 48 on 2x H200;
+   - **this machine's memory** — every in-flight request's prompt and reply
+     must fit in RAM (Linux, macOS and Windows are read; a 600 MB reserve is
+     kept), which also sizes `table_extraction` workers and caps
+     `chunking.streaming_batch_size`. It adds `class_judges` (Stage-3 pair and
+     validity judges) from the GPU's dedup concurrency. Any value lowered by
+     local memory is printed as "capped by local memory".
+   Show the user the preferred rows and their rates. Several corpora: pass them
+   comma-separated to size ONE window (spin-up is billed per deployment).
+3. **Only with explicit approval of the hourly rates** (all of them — a
    fallback may be the one that runs):
    `uv run python scripts/deepinfra_deploy.py create --from-sizing .build/sizing.json --apply-concurrency --yes`
-   It tries 2x B200, then 2x H200, then 2x H100: a 409 "currently unavailable"
+   It tries 4x B200, 4x H200, 2x B200, 2x H200, then 2x H100: a 409 "currently unavailable"
    or a deployment that fails with `no-gpu-available` is deleted at once and the
    next is tried; it waits for `running` (weights load in ~4-8 min). It records
    the winner as `active` in the sizing file and writes **that GPU's**
@@ -106,8 +116,15 @@ is created. The account needs a DeepInfra display name (username) first —
    serverless DeepSeek-V4.1-Flash. `deepinfra_deploy.py status` shows billed
    hours per deployment and flags any still running.
 
+**Where each model runs (fixed by the preset, not by sizing):** Qwen3.8-27B on
+the dedicated GPUs for every knowledge-creation task (summaries, classification,
+class proposal, dedup and its judges, entities, artifacts); **DeepSeek-V4.1-Flash
+always on serverless** (relationships, repair, all Q&A, eval judges), as are
+the embeddings (Qwen3-Embedding-4B) and table vision (Qwen3-VL-30B). Never move
+DeepSeek onto the dedicated deployment.
+
 Concurrency note: `config/config.yaml` `concurrency:` is shared by every mode.
-DeepInfra's values (up to 96) would hit OpenAI/Anthropic rate limits — after
+DeepInfra's values (up to 192) would hit OpenAI/Anthropic rate limits — after
 switching back to another mode, re-size with `tpm_check.py`.
 
 ## Notes

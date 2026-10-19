@@ -17,8 +17,8 @@ has no rate limit -- you rent GPUs by the minute -- so the questions become:
                                      within the account's 4-GPU limit, with
                                      KV-cache headroom, $/hour, projected wall
                                      time and total cost. The recommendation
-                                     follows PREFERRED_GPUS (2x B200, then
-                                     2x H200, then 2x H100); the others are the
+                                     follows PREFERRED_GPUS (4x B200, 4x H200,
+                                     2x B200, 2x H200, 2x H100); the others are the
                                      fallback chain deepinfra_deploy.py walks
                                      when a GPU type has no capacity.
   3. How many requests at once?      per configuration, the concurrency that
@@ -76,10 +76,16 @@ GPU_CATALOG: dict[str, dict] = {
 }
 MAX_GPUS_PER_ACCOUNT = 4  # DeepInfra default; support can raise it.
 
-# Preferred hosting, in order (user-set 2026-10-17). The first that fits is
-# recommended; the rest are the fallback chain for `no-gpu-available` / 409.
-PREFERRED_GPUS: tuple[tuple[str, int], ...] = (
-    ("B200-180GB", 2), ("H200-141GB", 2), ("H100-80GB", 2),
+# Preferred hosting, in order (user-set 2026-10-19): 4x B200, 4x H200, 2x B200,
+# 2x H200, 2x H100. The first that fits is recommended; the rest are the
+# fallback chain for `no-gpu-available` / 409. Entries are (gpu, GPUs per
+# instance, instances): the 4-GPU options are TWO 2-GPU instances behind one
+# model id rather than one 4-GPU instance -- the 31 GB FP8 model fits on two
+# GPUs, so splitting it four ways buys communication, not capacity, and two
+# instances survive one failing. The account limit is 4 GPUs in total.
+PREFERRED_GPUS: tuple[tuple[str, int, int], ...] = (
+    ("B200-180GB", 2, 2), ("H200-141GB", 2, 2),
+    ("B200-180GB", 2, 1), ("H200-141GB", 2, 1), ("H100-80GB", 2, 1),
 )
 
 # Models that can be deployed. Checkpoint sizes from the Hugging Face
@@ -408,12 +414,14 @@ def estimate_run(opt: GpuOption, arch: dict, stages: dict[str, dict],
 
 
 def preferred_chain(rows: list[tuple[GpuOption, dict]], deadline_h: float | None,
-                    preferred: tuple[tuple[str, int], ...] = PREFERRED_GPUS) -> list[tuple[GpuOption, dict]]:
-    """The PREFERRED_GPUS configurations that fit (single instance, FP8 when
-    the model has it) and meet the deadline, in preference order."""
+                    preferred: tuple[tuple, ...] = PREFERRED_GPUS) -> list[tuple[GpuOption, dict]]:
+    """The PREFERRED_GPUS configurations that fit (FP8 when the model has it)
+    and meet the deadline, in preference order. An entry is (gpu, GPUs per
+    instance[, instances]); instances defaults to 1."""
     out = []
-    for gpu, n in preferred:
-        cands = [r for r in rows if r[0].gpu == gpu and r[0].num_gpus == n and r[0].instances == 1
+    for gpu, n, *rest in preferred:
+        inst = rest[0] if rest else 1
+        cands = [r for r in rows if r[0].gpu == gpu and r[0].num_gpus == n and r[0].instances == inst
                  and (deadline_h is None or r[1]["hours"] <= deadline_h)]
         cands.sort(key=lambda r: (r[0].precision != "fp8", r[1]["usd"]))
         if cands:
@@ -423,7 +431,7 @@ def preferred_chain(rows: list[tuple[GpuOption, dict]], deadline_h: float | None
 
 def recommend(rows: list[tuple[GpuOption, dict]], deadline_h: float | None,
               allow_noted: bool = False,
-              preferred: tuple[tuple[str, int], ...] = PREFERRED_GPUS) -> tuple[GpuOption, dict] | None:
+              preferred: tuple[tuple, ...] = PREFERRED_GPUS) -> tuple[GpuOption, dict] | None:
     """The first PREFERRED_GPUS configuration that fits and meets the deadline;
     if none does, the cheapest option that does. Options carrying a caveat
     (A100 FP8 = an unproven weight-only kernel path) are listed but not
@@ -478,6 +486,73 @@ def a_priori_concurrency(opt: GpuOption, arch: dict, stages: dict[str, dict],
                 c = max(1, c // 2)
         out[name] = max(1, c * opt.instances)
     return out
+
+
+# --------------------------------------------------------------------------- #
+# 3b. Local memory: what THIS machine can hold while those requests are in
+# flight. The GPU sets how many requests the deployment can serve; the box
+# running the pipeline must also hold every in-flight prompt + reply, the
+# documents of the current streaming batch and the table-extraction workers.
+# Same RAM reading and reserve as tpm_check (Linux, macOS, Windows).
+# --------------------------------------------------------------------------- #
+
+INFLIGHT_SHARE = 0.30      # of the usable budget, for in-flight LLM requests
+BYTES_PER_TOKEN = 4        # ~4 characters of text per token
+INFLIGHT_COPIES = 3        # prompt string + serialised request body + reply/parse
+REQUEST_OVERHEAD_MB = 0.25 # client, task and response objects per request
+DOC_TEXT_MB = 3.2          # one streamed document's text (~50 MB at 16 docs)
+CLASS_JUDGE_MAX = 64       # judge replies are short; past this they only queue
+
+
+def local_memory(mem: tuple[int, int] | None = None) -> dict | None:
+    """Available / total / usable MB and swap on this machine; None if the
+    platform's memory cannot be read. `mem` overrides the reading (tests)."""
+    from tpm_check import _RESERVE_MB, _has_swap, _mem_mb
+
+    avail, total = mem if mem is not None else _mem_mb()
+    if avail < 0:
+        return None
+    return {"available_mb": int(avail), "total_mb": int(total),
+            "budget_mb": max(0, int(avail) - _RESERVE_MB),
+            "swap": _has_swap() if mem is None else False}
+
+
+def memory_capped_concurrency(conc: dict[str, int], stages: dict[str, dict],
+                              mem: dict | None) -> tuple[dict[str, int], dict[str, int]]:
+    """GPU-sized concurrency capped by this machine's memory, plus the stages
+    memory sizes on its own. Returns (concurrency, caps_applied).
+
+    Each request in flight holds its context (mean in + out tokens of its
+    stage) about INFLIGHT_COPIES times; all of a stage's in-flight requests
+    may use INFLIGHT_SHARE of the budget. Adds:
+      class_judges      Stage-3 pair / validity judges (pipeline_llm reads
+                        it before the preset's judge_concurrency): the GPU's
+                        dedup concurrency, at most CLASS_JUDGE_MAX
+      table_extraction  one ~200 MB worker per PDF (tpm_check's rule)
+    """
+    from tpm_check import _TABLE_WORKER_MB
+
+    out = dict(conc)
+    out["class_judges"] = max(8, min(CLASS_JUDGE_MAX, conc.get("dedup", 8)))
+    caps: dict[str, int] = {}
+    if mem is None:
+        return out, caps
+    budget = mem["budget_mb"]
+    for stage in list(out):
+        ctx = (stages.get(stage) or {}).get("mean_ctx", 4000)
+        per_req = ctx * BYTES_PER_TOKEN * INFLIGHT_COPIES / 2**20 + REQUEST_OVERHEAD_MB
+        cap = max(1, int(budget * INFLIGHT_SHARE / per_req))
+        if out[stage] > cap:
+            caps[stage] = cap
+            out[stage] = cap
+    out["table_extraction"] = max(1, min(8, budget // _TABLE_WORKER_MB))
+    return out, caps
+
+
+def max_streaming_batch(mem: dict | None) -> int | None:
+    """Most documents one streaming batch may hold in memory (a quarter of
+    the budget); None when memory cannot be read."""
+    return None if mem is None else max(4, int(mem["budget_mb"] * 0.25 / DOC_TEXT_MB))
 
 
 def find_knee(curve: list[dict], frac: float = 0.90) -> int:
@@ -678,6 +753,10 @@ def report(docs_dir: str, argv: list[str]) -> int:
         print("   no documents found.")
         return 1
     print(f"   {n} document(s), {total:,} tokens (largest {max(per_doc):,})")
+    from tpm_check import build_memory_check, print_build_memory
+
+    build_mem = build_memory_check(total)
+    print_build_memory(build_mem)
     non_llm = float(non_llm_arg) if non_llm_arg else DEFAULT_NON_LLM_MIN + NON_LLM_MIN_PER_DOC * n
 
     model = _arg(argv, "--model", DEFAULT_MODEL)
@@ -742,23 +821,34 @@ def report(docs_dir: str, argv: list[str]) -> int:
               "(--calibrate).")
 
     timeouts = nonstreamed_timeouts(ratios)
+    mem = local_memory()
+    print("\n   Local memory: " + (
+        f"{mem['available_mb']:,} MB available of {mem['total_mb']:,} MB, usable {mem['budget_mb']:,} MB "
+        f"(swap: {'yes' if mem['swap'] else 'NONE'}) -- caps in-flight requests and batch sizes below"
+        if mem else "could not be read on this platform; concurrency is GPU-sized only"))
 
     def entry(o: GpuOption, e: dict) -> dict:
-        c = a_priori_concurrency(o, arch, stages, timeouts)
+        gpu_c = a_priori_concurrency(o, arch, stages, timeouts)
+        c, caps = memory_capped_concurrency(gpu_c, stages, mem)
         return {"option": {**asdict(o), "label": f"{o.label()} ({MODELS[model]['label']})"},
-                "estimate": e, "concurrency": c, "max_batch_size": max(8, min(MAX_BATCH, max(c.values())))}
+                "estimate": e, "concurrency": c, "memory_caps": caps,
+                "max_batch_size": max(8, min(MAX_BATCH, max(gpu_c.values())))}
 
     primary = entry(opt, est)
-    print(f"\n3. CONCURRENCY for {opt.label()} (a priori: throughput knee within the KV cache; "
-          "--probe refines):")
+    print(f"\n3. CONCURRENCY for {opt.label()} (a priori: throughput knee within the KV cache, "
+          "capped by this machine's memory; --probe refines):")
     _print_concurrency(primary["concurrency"])
+    for stage, cap in sorted(primary["memory_caps"].items()):
+        print(f"   ({stage} capped at {cap} by local memory; the GPUs could take more)")
+    if max_streaming_batch(mem):
+        print(f"   chunking.streaming_batch_size: at most {max_streaming_batch(mem)} on this machine's memory")
     chained = [entry(o, e) for o, e in fallbacks]
     for fb in chained:
         print(f"   {fb['option']['label']}: " + ", ".join(f"{k} {v}" for k, v in sorted(fb["concurrency"].items())))
     payload = {
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "docs_dir": docs_dir, "documents": n, "corpus_tokens": total, "model": model,
-        **primary, "fallbacks": chained, "arch": arch,
+        **primary, "fallbacks": chained, "arch": arch, "local_memory": mem, "build_memory": build_mem,
         "stages": {k: {kk: vv for kk, vv in v.items() if kk != "tasks"} for k, v in stages.items()},
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -828,6 +918,10 @@ async def probe_main(argv: list[str]) -> int:
     # records it as `active` -- it may be a fallback, not the recommendation).
     caps = (sizing.get("active") or sizing)["concurrency"]
     conc = probe_concurrency(curve, sizing["stages"], caps, timeouts, probe_out)
+    mem = local_memory()
+    conc, mem_caps = memory_capped_concurrency(conc, sizing["stages"], mem)
+    for stage, cap in sorted(mem_caps.items()):
+        print(f"   ({stage} capped at {cap} by local memory)")
     conc["evaluation"] = min(32, int(_arg(argv, "--serverless-limit", 200)) // 4)
     sizing.update({"probe": curve, "knee": find_knee(curve), "concurrency": conc})
     print(f"\n   knee: {sizing['knee']} concurrent requests")
@@ -837,6 +931,8 @@ async def probe_main(argv: list[str]) -> int:
     n, tok = sizing["documents"], sizing["corpus_tokens"]
     windows = max(1, tok // 11500)
     batch = max(4, min(n, math.ceil(conc.get("summarization", 8) * n / windows)))
+    if max_streaming_batch(mem):
+        batch = min(batch, max_streaming_batch(mem))
     print(f"   chunking.streaming_batch_size -> {batch} (so ~{windows} windows keep "
           f"{conc.get('summarization', 8)} slots busy)")
     sizing_path.write_text(json.dumps(sizing, indent=2))

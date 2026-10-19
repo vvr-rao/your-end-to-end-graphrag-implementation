@@ -148,7 +148,9 @@ async def audit(store: Any, pair_judge: Any, validity_router: Any | None = None,
 
 def export_csv(rep: AuditReport, path: Path) -> Path:
     """Every sampled item, one row each, with a blank `human` column."""
-    with path.open("w", newline="") as fh:
+    # utf-8 explicitly: on Windows the default is the ANSI code page, and a
+    # label like "Côte d'Ivoire" would crash the end of Stage 3.
+    with path.open("w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["sample", "a_or_label", "b_or_reason", "judge", "human"])
         for name, rows in rep.samples.items():

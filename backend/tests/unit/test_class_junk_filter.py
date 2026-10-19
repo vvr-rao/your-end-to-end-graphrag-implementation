@@ -38,11 +38,22 @@ def test_a_looping_family_keeps_its_first_members_only() -> None:
         "Shutdown Expansion Construction Upgrade Fire Restart Sale Dispute Tender Commissioning "
         "Maintenance Closure Conversion Bid Cabinet Cracking Testing").split()] + ["FoodSecurity"]
     payload = {"MATCH NOT FOUND": [{"LABEL": label} for label in labels]}
-    out, drops = filter_reply(payload)
+    out, drops = filter_reply(payload, drop_family=True)
     kept = [x["LABEL"] for x in out["MATCH NOT FOUND"]]
     assert kept[:FAMILY_KEEP] == labels[:FAMILY_KEEP] and "FoodSecurity" in kept
     assert len(kept) == FAMILY_KEEP + 1
     assert {d["reason"] for d in drops} == {"family"}
+
+
+def test_family_rule_is_off_by_default() -> None:
+    # 2026-10-19: with the v5 prompts 7 of 8 sampled family drops were real
+    # categories (a genuine list of refinery events, not a loop).
+    labels = [f"Refinery{w}" for w in (
+        "Shutdown Expansion Construction Upgrade Fire Restart Sale Dispute Tender Commissioning "
+        "Maintenance Closure Conversion Bid Cracking Testing").split()] + ["Refinery2024"]
+    out, drops = filter_reply({"MATCH NOT FOUND": [{"LABEL": label} for label in labels]})
+    assert len(out["MATCH NOT FOUND"]) == len(labels) - 1          # only the number rule fired
+    assert [d["reason"] for d in drops] == ["number"]
 
 
 def test_a_normal_reply_is_untouched() -> None:

@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from copy import deepcopy
 from collections import defaultdict, deque
+from itertools import combinations
 from pathlib import Path
 
 from datetime import datetime
@@ -1099,6 +1100,7 @@ def _fuzzy_lookup_class(
     classes_dict: dict,
     label_index: dict[str, str],
     token_index: dict[frozenset[str], str],
+    token_postings: tuple[dict, dict] | None = None,
 ) -> str | None:
     """Try to find an existing class IRI that matches `label`. Returns the
     matched IRI or None.
@@ -1128,6 +1130,8 @@ def _fuzzy_lookup_class(
             return hit
 
         # 3. Substring + same-parent containment.
+        if token_postings is not None and len(tokens) <= _SUBSET_ENUM_MAX_TOKENS:
+            return _containment_lookup(tokens, parent_iri, classes_dict, token_index, *token_postings)
         for existing_tokens, existing_iri in token_index.items():
             if not existing_tokens:
                 continue
@@ -1138,6 +1142,39 @@ def _fuzzy_lookup_class(
                 existing_parent = _first_super_iri(existing)
                 if existing_parent == parent_iri:
                     return existing_iri
+    return None
+
+
+# Step 3 above, indexed: the strict subsets of a label's token set are
+# enumerated (2^n - 2 lookups; labels are a few words), its strict supersets
+# are drawn from the posting list of its rarest token, and the matches are
+# taken in token_index insertion order -- so it returns exactly what the
+# full scan returns. The scan cost ~2 ms per call at 14k classes and made
+# Stage 4 quadratic; it remains for longer labels.
+_SUBSET_ENUM_MAX_TOKENS = 10
+
+
+def _containment_lookup(
+    tokens: frozenset[str],
+    parent_iri: str | None,
+    classes_dict: dict,
+    token_index: dict[frozenset[str], str],
+    position: dict[frozenset[str], int],
+    postings: dict[str, list[frozenset[str]]],
+) -> str | None:
+    found: set[frozenset[str]] = set()
+    toks = sorted(tokens)
+    for r in range(1, len(toks)):
+        for sub in combinations(toks, r):
+            k = frozenset(sub)
+            if k in token_index:
+                found.add(k)
+    rarest = min((postings.get(t, ()) for t in toks), key=len)
+    found.update(k for k in rarest if tokens < k)
+    for k in sorted(found, key=position.__getitem__):
+        existing_iri = token_index[k]
+        if _first_super_iri(classes_dict.get(existing_iri) or {}) == parent_iri:
+            return existing_iri
     return None
 
 
@@ -1153,37 +1190,130 @@ def _first_super_iri(class_record: dict) -> str | None:
     return None
 
 
+def _token_keys_of(iri: str, data: dict):
+    """One class's token sets, in the order the token index sees them."""
+    for label_source in (data.get("labels") or []):
+        text = None
+        if isinstance(label_source, str):
+            text = label_source
+        elif isinstance(label_source, dict):
+            v = label_source.get("value")
+            if isinstance(v, str):
+                text = v
+        if text:
+            toks = _tokenize_label(text)
+            if toks:
+                yield toks
+    name = data.get("name") or safe_name_from_iri(iri)
+    if isinstance(name, str):
+        toks = _tokenize_label(name)
+        if toks:
+            yield toks
+
+
+def _index_tokens_of(index: dict[frozenset[str], str], iri: str, data: dict) -> None:
+    """Add one class's token sets to a token index (first entry wins)."""
+    for toks in _token_keys_of(iri, data):
+        index.setdefault(toks, iri)
+
+
 def _build_token_index(classes_dict: dict) -> dict[frozenset[str], str]:
     """Build a token-set -> IRI index over current classes (FIRST entry
     wins on collisions). Companion to `_build_label_to_iri_index` for
     multi-word variant dedup."""
     index: dict[frozenset[str], str] = {}
     for iri, data in classes_dict.items():
-        for label_source in (data.get("labels") or []):
-            text = None
-            if isinstance(label_source, str):
-                text = label_source
-            elif isinstance(label_source, dict):
-                v = label_source.get("value")
-                if isinstance(v, str):
-                    text = v
-            if text:
-                toks = _tokenize_label(text)
-                if toks:
-                    index.setdefault(toks, iri)
-        name = data.get("name") or safe_name_from_iri(iri)
-        if isinstance(name, str):
-            toks = _tokenize_label(name)
-            if toks:
-                index.setdefault(toks, iri)
+        _index_tokens_of(index, iri, data)
     return index
+
+
+class _ClassIndexes:
+    """The label and token-set indexes over a classes_dict, kept current as
+    the caller adds classes instead of being rebuilt for every item.
+
+    Rebuilding them per proposal made Stage 4 quadratic: 7,069 full rebuilds
+    for 1,500 classes + 4,500 instances + 1,000 relations (197 s, ~99% of the
+    step); extrapolated, ~2 days at 100k classes (2026-10-19 export test).
+    The result is identical to a rebuild: new classes are appended to the
+    dict, and both indexes keep the FIRST entry per key, so indexing the new
+    class last is exactly what a rebuild would do. Call `added(iri)` right
+    after inserting a class; if the dict changes any other way (its size
+    differs from what this object saw) the indexes are rebuilt."""
+
+    def __init__(self, classes_dict: dict) -> None:
+        self._classes = classes_dict
+        self._label: dict[str, str] | None = None
+        self._token: dict[frozenset[str], str] | None = None
+        self._postings: tuple[dict, dict] | None = None   # (position, token -> keys)
+        self._count = len(classes_dict)
+
+    def _reset(self) -> None:
+        self._label = self._token = self._postings = None
+        self._count = len(self._classes)
+
+    def _check(self) -> None:
+        if len(self._classes) != self._count:          # changed behind our back
+            self._reset()
+
+    @property
+    def label(self) -> dict[str, str]:
+        self._check()
+        if self._label is None:
+            self._label = _build_label_to_iri_index(self._classes)
+        return self._label
+
+    @property
+    def token(self) -> dict[frozenset[str], str]:
+        self._check()
+        if self._token is None:
+            self._token = _build_token_index(self._classes)
+        return self._token
+
+    @property
+    def postings(self) -> tuple[dict, dict]:
+        """(insertion position of each token-index key, token -> keys holding
+        it) for _fuzzy_lookup_class's indexed containment step."""
+        token = self.token
+        if self._postings is None:
+            position: dict[frozenset[str], int] = {}
+            postings: dict[str, list[frozenset[str]]] = defaultdict(list)
+            for k in token:
+                self._register(k, position, postings)
+            self._postings = (position, postings)
+        return self._postings
+
+    @staticmethod
+    def _register(key: frozenset[str], position: dict, postings: dict) -> None:
+        position[key] = len(position)
+        for t in key:
+            postings[t].append(key)
+
+    def added(self, iri: str) -> None:
+        """Index the class just inserted under `iri` (no-op if it existed)."""
+        n = len(self._classes)
+        if n == self._count:
+            return
+        if n != self._count + 1 or iri not in self._classes:
+            self._reset()                                # not a single append: rebuild lazily
+            return
+        data = self._classes[iri]
+        if self._label is not None:
+            _index_labels_of(self._label, iri, data)
+        if self._token is not None:
+            for k in _token_keys_of(iri, data):
+                if k not in self._token:
+                    self._token[k] = iri
+                    if self._postings is not None:
+                        self._register(k, *self._postings)
+        self._count = n
 
 
 def add_new_classes_from_match_not_found(
     loaded_ontology: dict,
     match_results: dict,
     new_class_base_iri: str,
-    default_parent_iri: str | None = None
+    default_parent_iri: str | None = None,
+    inplace: bool = False,
 ) -> tuple[dict, list[str]]:
     """Add new proposed classes from MATCH NOT FOUND into classes_dict.
 
@@ -1205,7 +1335,7 @@ def add_new_classes_from_match_not_found(
     class in the same response). Convergence in at most `len(entries)`
     passes; in practice 2-3 passes suffice.
     """
-    result = deepcopy(loaded_ontology)
+    result = loaded_ontology if inplace else deepcopy(loaded_ontology)
     classes_dict = result.setdefault("classes_dict", {})
     created_iris: list[str] = []
 
@@ -1216,6 +1346,7 @@ def add_new_classes_from_match_not_found(
                if not (isinstance(e, dict) and looks_like_iri(e.get("LABEL")))]
     pending = entries[:]  # entries whose parent isn't yet resolved
     max_passes = max(len(entries) + 1, 2)
+    idx = _ClassIndexes(classes_dict)
 
     for _ in range(max_passes):
         if not pending:
@@ -1233,11 +1364,11 @@ def add_new_classes_from_match_not_found(
             if not label:
                 continue
 
-            # Build indexes per-item -- they need to reflect classes minted
-            # earlier in THIS pass (e.g. when "Washington" is minted first,
-            # then "Washington DC" needs to see it for fuzzy dedup).
-            label_index = _build_label_to_iri_index(classes_dict)
-            token_index = _build_token_index(classes_dict)
+            # The indexes reflect classes minted earlier in THIS pass (e.g.
+            # when "Washington" is minted first, "Washington DC" must see it
+            # for fuzzy dedup) -- `idx` adds each one as it is minted.
+            label_index = idx.label
+            token_index = idx.token
 
             # Resolve parent. "NONE", empty, or unresolved -> default_parent_iri.
             parent_iri = default_parent_iri
@@ -1262,7 +1393,7 @@ def add_new_classes_from_match_not_found(
 
             # Fuzzy dedup against existing classes.
             existing_iri = _fuzzy_lookup_class(
-                label, parent_iri, classes_dict, label_index, token_index
+                label, parent_iri, classes_dict, label_index, token_index, idx.postings
             )
             if existing_iri:
                 existing_rec = classes_dict[existing_iri]
@@ -1282,6 +1413,7 @@ def add_new_classes_from_match_not_found(
             )
             if new_iri not in classes_dict:
                 classes_dict[new_iri] = entry
+                idx.added(new_iri)
                 created_iris.append(new_iri)
                 progressed = True
 
@@ -1296,10 +1428,10 @@ def add_new_classes_from_match_not_found(
                 description = normalize_to_string(item.get("DESCRIPTION"))
                 if not label:
                     continue
-                label_index = _build_label_to_iri_index(classes_dict)
-                token_index = _build_token_index(classes_dict)
+                label_index = idx.label
+                token_index = idx.token
                 existing_iri = _fuzzy_lookup_class(
-                    label, default_parent_iri, classes_dict, label_index, token_index
+                    label, default_parent_iri, classes_dict, label_index, token_index, idx.postings
                 )
                 if existing_iri:
                     existing_rec = classes_dict[existing_iri]
@@ -1317,6 +1449,7 @@ def add_new_classes_from_match_not_found(
                 )
                 if new_iri not in classes_dict:
                     classes_dict[new_iri] = entry
+                    idx.added(new_iri)
                     created_iris.append(new_iri)
             break
 
@@ -1383,6 +1516,7 @@ def add_new_instances_from_match_results(
     match_results: dict,
     new_instance_base_iri: str,
     default_type_iri: str | None = None,
+    inplace: bool = False,
 ) -> tuple[dict, list[str]]:
     """Add LLM-proposed named individuals from MATCH NOT FOUND INSTANCES
     into instances_dict. Each entry is expected to look like:
@@ -1410,12 +1544,13 @@ def add_new_instances_from_match_results(
     Returns:
       (extended_ontology, created_instance_iris)
     """
-    result = deepcopy(loaded_ontology)
+    result = loaded_ontology if inplace else deepcopy(loaded_ontology)
     classes_dict = result.get("classes_dict", {})
     instances_dict = result.setdefault("instances_dict", {})
     created_iris: list[str] = []
 
     fallback_type = default_type_iri or _OWL_THING_IRI
+    idx = _ClassIndexes(classes_dict)
 
     for item in match_results.get("MATCH NOT FOUND INSTANCES", []):
         if not isinstance(item, dict):
@@ -1436,12 +1571,12 @@ def add_new_instances_from_match_results(
             if type_label in classes_dict:
                 type_iri = type_label
             else:
-                label_index = _build_label_to_iri_index(classes_dict)
+                label_index = idx.label
                 hit = label_index.get(type_label.strip().lower())
                 if not hit:
-                    token_index = _build_token_index(classes_dict)
+                    token_index = idx.token
                     hit = _fuzzy_lookup_class(
-                        type_label, None, classes_dict, label_index, token_index
+                        type_label, None, classes_dict, label_index, token_index, idx.postings
                     )
                 if hit:
                     type_iri = hit
@@ -1550,19 +1685,23 @@ def _build_label_to_iri_index(classes_dict: dict) -> dict[str, str]:
     """
     index: dict[str, str] = {}
     for iri, data in classes_dict.items():
-        # Index every label.
-        for lab in data.get("labels", []) or []:
-            if isinstance(lab, str) and lab.strip():
-                index.setdefault(lab.strip().lower(), iri)
-            elif isinstance(lab, dict):
-                v = lab.get("value")
-                if isinstance(v, str) and v.strip():
-                    index.setdefault(v.strip().lower(), iri)
-        # Index the local name (e.g. "Person" from "ex:Person").
-        name = data.get("name") or safe_name_from_iri(iri)
-        if isinstance(name, str) and name.strip():
-            index.setdefault(name.strip().lower(), iri)
+        _index_labels_of(index, iri, data)
     return index
+
+
+def _index_labels_of(index: dict[str, str], iri: str, data: dict) -> None:
+    """Add one class's labels and local name to a label index (first entry wins)."""
+    for lab in data.get("labels", []) or []:
+        if isinstance(lab, str) and lab.strip():
+            index.setdefault(lab.strip().lower(), iri)
+        elif isinstance(lab, dict):
+            v = lab.get("value")
+            if isinstance(v, str) and v.strip():
+                index.setdefault(v.strip().lower(), iri)
+    # Index the local name (e.g. "Person" from "ex:Person").
+    name = data.get("name") or safe_name_from_iri(iri)
+    if isinstance(name, str) and name.strip():
+        index.setdefault(name.strip().lower(), iri)
 
 
 _MAX_AUTOMINT_LABEL_LEN = 80
@@ -1617,15 +1756,20 @@ def infer_stem_relations(
     for ns, items in by_namespace.items():
         # Sort by slug length ascending — shorter slugs are likely prefixes.
         items.sort(key=lambda x: (len(x[0]), x[0]))
-        slug_to_iri = {s: i for s, i in items}
+        # long slugs grouped under each of their underscore prefixes, in
+        # `items` order: `long.startswith(short + "_")` holds exactly when
+        # `short` is one of long's underscore prefixes. Same pairs, same
+        # order as comparing every pair (which made this O(N^2) per
+        # namespace: ~65% of Stage 4 at 14k classes).
+        under: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        for long_slug, long_iri in items:
+            for k, ch in enumerate(long_slug):
+                if ch == "_" and k > 0:
+                    under[long_slug[:k]].append((long_slug, long_iri))
         for short_slug, short_iri in items:
-            # Find all (long_slug, long_iri) where long_slug starts with
-            # short_slug + "_".
             prefix = short_slug + "_"
-            for long_slug, long_iri in items:
+            for long_slug, long_iri in under.get(short_slug, ()):
                 if long_slug == short_slug:
-                    continue
-                if not long_slug.startswith(prefix):
                     continue
                 suffix = long_slug[len(prefix):]
                 if not suffix:
@@ -2313,6 +2457,7 @@ def add_new_relations_from_match_results(
     new_property_base_iri: str,
     default_parent_iri: str | None = None,
     new_class_base_iri: str | None = None,
+    inplace: bool = False,
 ) -> tuple[dict, list[str], list[dict], list[str]]:
     """Add LLM-proposed object properties from `MATCH NOT FOUND RELATIONS`
     into object_properties_dict. Each entry is expected to look like:
@@ -2346,7 +2491,7 @@ def add_new_relations_from_match_results(
       (extended_ontology, created_property_iris, skipped_relations,
        auto_minted_class_iris)
     """
-    result = deepcopy(loaded_ontology)
+    result = loaded_ontology if inplace else deepcopy(loaded_ontology)
     classes_dict = result.setdefault("classes_dict", {})
     obj_props_dict = result.setdefault("object_properties_dict", {})
 
@@ -2382,6 +2527,8 @@ def add_new_relations_from_match_results(
         if tail:
             existing_pred_label_index.setdefault(tail.strip().lower(), prop_iri)
 
+    idx = _ClassIndexes(classes_dict)
+
     def _try_resolve(value: Any) -> tuple[str | None, str | None, str | None]:
         """Return (resolved_iri, normalized_text, reason_if_unresolved).
         Uses both the exact label index and the fuzzy token-based lookup."""
@@ -2390,12 +2537,12 @@ def add_new_relations_from_match_results(
             return None, text, "empty"
         if text in classes_dict:
             return text, text, None
-        label_index = _build_label_to_iri_index(classes_dict)
+        label_index = idx.label
         hit = label_index.get(text.lower())
         if hit:
             return hit, text, None
-        token_index = _build_token_index(classes_dict)
-        hit = _fuzzy_lookup_class(text, None, classes_dict, label_index, token_index)
+        token_index = idx.token
+        hit = _fuzzy_lookup_class(text, None, classes_dict, label_index, token_index, idx.postings)
         if hit:
             return hit, text, None
         # Hedged endpoint ("Organization or AppStoreOperator"): resolve the
@@ -2430,12 +2577,12 @@ def add_new_relations_from_match_results(
             return None, text, "empty"
         if text in classes_dict:
             return text, text, None
-        label_index = _build_label_to_iri_index(classes_dict)
+        label_index = idx.label
         hit = label_index.get(text.lower())
         if hit:
             return hit, text, None
-        token_index = _build_token_index(classes_dict)
-        hit = _fuzzy_lookup_class(text, None, classes_dict, label_index, token_index)
+        token_index = idx.token
+        hit = _fuzzy_lookup_class(text, None, classes_dict, label_index, token_index, idx.postings)
         if hit:
             return hit, text, None
         return None, text, f"could not resolve '{text}' to a class IRI"
@@ -2502,6 +2649,7 @@ def add_new_relations_from_match_results(
                 new_class_base_iri=base_iri,
                 created_iris=auto_minted_classes,
             )
+            idx.added(d_iri)
 
         if r_iri is None:
             if _is_garbage_endpoint(r_text):
@@ -2522,6 +2670,7 @@ def add_new_relations_from_match_results(
                 new_class_base_iri=base_iri,
                 created_iris=auto_minted_classes,
             )
+            idx.added(r_iri)
 
         new_iri, entry = create_new_object_property_entry(
             label=label,

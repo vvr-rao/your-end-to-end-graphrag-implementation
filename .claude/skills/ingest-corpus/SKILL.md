@@ -93,10 +93,13 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
   > does not size it. If a deployment is still running from prune-expand, reuse
   > it (its concurrency is already written). Otherwise run `uv run python
   > scripts/deepinfra_sizing.py "<DOCS>"`, show the preferred configurations —
-  > **2x B200, then 2x H200, then 2x H100** — and with approval of their rates
-  > run `deepinfra_deploy.py create --from-sizing .build/sizing.json
-  > --apply-concurrency --yes` (takes the first with capacity, writes that GPU's
-  > concurrency). register-documents, extract-entities, enrich-time and
+  > **4x B200, 4x H200 (each as two 2-GPU instances), then 2x B200, 2x H200,
+  > 2x H100** — and with approval of their rates run `deepinfra_deploy.py
+  > create --from-sizing .build/sizing.json --apply-concurrency --yes` (takes
+  > the first with capacity, writes that configuration's concurrency, sized from
+  > its GPU memory and THIS machine's memory — the sizing's `Local memory` line;
+  > if it reports a value "capped by local memory", say so). DeepSeek-V4.1-Flash
+  > (relationships) stays serverless. register-documents, extract-entities, enrich-time and
   > generate-artifacts all call the GPU: run them back to back, then **delete the
   > deployment** (`deepinfra_deploy.py delete <deploy_id>`). Measured on 2x B200:
   > 11 documents took ~10 min of GPU time for extract + artifacts. Full order:
@@ -118,6 +121,13 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
   the tool edits only the `concurrency:` block and keeps every comment:
   `--apply` takes every suggestion, `--set stage=N` (repeatable) sets their
   own. Never `--apply` without their go-ahead.
+
+  **This machine's memory:** read out the `Machine memory` / `Local memory`
+  lines — they are measured on the machine the skills run on, and size the
+  memory-bound knobs (`table_extraction` workers, `streaming_batch_size`, and in
+  DeepInfra mode every in-flight request). The `Build memory` verdict is about
+  prune-expand's peak; if it says DOES NOT FIT here, prune-expand on this corpus
+  was already at risk on this machine — say so before ingesting.
 
   **Platform:** the rate-limit probe is a plain HTTPS call and behaves the same
   on Linux, macOS and Windows. Only the *memory* half is OS-specific

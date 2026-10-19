@@ -11,7 +11,8 @@ from backend.app.services.pairwise_dedup import DedupConfig, UnionFind, band, ca
 def test_bands() -> None:
     cfg = DedupConfig(t_hi=0.95, t_lo=0.80)
     assert [band(c, cfg) for c in (0.99, 0.95, 0.9, 0.80, 0.79)] == ["auto", "auto", "judge", "judge", "skip"]
-    assert band(0.96, DedupConfig()) == "judge"          # default t_hi 0.97 until calibrated
+    assert band(0.999, DedupConfig()) == "judge"         # no auto-merge band by default
+    assert band(0.84, DedupConfig()) == "skip"           # t_lo 0.85 (calibrated 2026-10-19)
 
 
 def test_union_find_caps_group_size() -> None:
@@ -50,6 +51,10 @@ class FakeStore:
         for i in ids:
             self.status[i] = (status, merged_into)
 
+    async def set_merged(self, pairs, reason=None):
+        for i, canon in pairs:
+            self.status[i] = ("merged", canon)
+
 
 def _row(i, label, kind="class", occ=1):
     return {"id": i, "kind": kind, "label": label, "parent": None, "description": None, "occurrences": occ}
@@ -65,7 +70,7 @@ def test_flow_merges_auto_and_judged_and_routes_to_existing() -> None:
     async def judge(batch):
         return [{"id": p["id"], "keep": "A"} for p in batch if p["a_label"] == "Hypertension"]
 
-    st = asyncio.run(run_pairwise_dedup(store, judge, DedupConfig(), log=lambda *_: None))
+    st = asyncio.run(run_pairwise_dedup(store, judge, DedupConfig(t_hi=0.97), log=lambda *_: None))
     assert store.status[1] == ("merged", 2)                     # routed onto the existing class
     assert 2 not in store.status                                # existing classes are never retired
     assert set(store.status) == {1, 3} or set(store.status) == {1, 4}

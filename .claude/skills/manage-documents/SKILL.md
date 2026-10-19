@@ -50,8 +50,9 @@ but `enrich-geo`'s are new, so run it after.
 **DeepInfra mode: adding or updating documents rents a GPU.** Registering,
 extracting and generating artifacts call the dedicated Qwen3.8-27B deployment,
 which is normally deleted after a build. Size and create one as in the
-**choose-llm-mode** skill, "DeepInfra mode" (preferred 2x B200 → 2x H200 →
-2x H100; spin-up is billed, so batch several documents into one window), set
+**choose-llm-mode** skill, "DeepInfra mode" (preferred 4x B200 → 4x H200 →
+2x B200 → 2x H200 → 2x H100, concurrency sized from the GPUs and this machine's
+memory; spin-up is billed, so batch several documents into one window), set
 `DEEPINFRA_FLASH_MODEL`, run the steps, then delete it. Deleting documents
 needs no GPU.
 

@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import resource
 import sys
 import time
 from collections import Counter
@@ -89,7 +88,12 @@ async def main_async(argv: list[str]) -> dict:
         report[f"examples_class_vs_{to_kind}"] = examples
     report["seconds"] = {"load_and_filter": round(t_load), "embed": round(t_emb),
                          "total": round(time.monotonic() - t0)}
-    report["peak_rss_mb"] = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)
+    try:                                   # `resource` is POSIX-only
+        import resource
+
+        report["peak_rss_mb"] = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)
+    except ImportError:
+        report["peak_rss_mb"] = None
     return report
 
 
