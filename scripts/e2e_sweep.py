@@ -101,6 +101,9 @@ def main() -> int:
     results.append(run("extract-entities",
                        ["extract-entities", "--max-cost-usd", "5.0"], timeout=3600))
     results.append(run("enrich-time", ["enrich-time"], timeout=1800))
+    # ingest-corpus Step 4b: the relation-matched graph walk needs both.
+    results.append(run("enrich-geo", ["enrich-geo"], timeout=1800))
+    results.append(run("embed-relationships", ["embed-relationships"], timeout=1800))
     results.append(run("generate-artifacts",
                        ["generate-artifacts", "--max-cost-usd", "5.0"], timeout=3600))
 

@@ -677,6 +677,16 @@ async def retrieve_and_answer(
         if verbose:
             print(f"[query] temporal expansion: {len(seed_time_ids)} seed "
                   f"period(s) -> {len(expanded_time_ids)} period(s)")
+    # Persisted in retrieval_plan (below), so how the walk went is visible per
+    # run in an eval -- the verbose line alone cannot be attributed to a
+    # question when several run concurrently.
+    parsed["graph_walk"] = {
+        "seeding": _tier if _cascade else "legacy",
+        "seed_entities": len(seed_entity_ids),
+        "stage": rel_stage,
+        "relation_matched_edges": len(_rel_edges),
+        "nodes": len(bfs_nodes),
+    }
     if verbose:
         print(
             f"[query] graph expansion ({rel_stage}) yielded {len(bfs_nodes)} "
@@ -2594,6 +2604,8 @@ async def _persist_run(
                     "intent": result.parsed.get("intent", ""),
                     "aliases": result.parsed.get("aliases", {}),
                     "time_terms": result.parsed.get("time_terms", []),
+                    "relations": [_relation_text(r) for r in result.parsed.get("relations") or []],
+                    "graph_walk": result.parsed.get("graph_walk"),
                     # Persisted so citation quality is trendable across runs
                     # rather than only visible in a log line.
                     "invalid_citations": result.invalid_citations,

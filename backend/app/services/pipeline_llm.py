@@ -3680,6 +3680,12 @@ class _Stage2Sink:
         self.replies = 0
         self.class_rows = 0
         self._ae = _ae_existing_labels(loaded_ontology) if _ae_enabled(router) else None
+        # One write at a time. Replies to the same corpus share labels, so
+        # concurrent upserts queued on each other's row locks: at 96 replies
+        # in flight they held the whole connection pool (10 + 2) past its 60 s
+        # timeout and Stage 2 crashed (2026-10-19). A write is ~0.1 s against
+        # minutes per reply, so serialising costs nothing.
+        self._lock = asyncio.Lock()
 
     @classmethod
     async def open(cls, router: Any, loaded_ontology: dict[str, Any], audit_path: Path) -> _Stage2Sink | None:
@@ -3706,7 +3712,8 @@ class _Stage2Sink:
             ae.normalize(payload, self._ae)
         rows = [{"label": x.get("LABEL"), "parent": x.get("PARENT_LABEL"), "description": x.get("DESCRIPTION")}
                 for x in payload.get("MATCH NOT FOUND") or [] if isinstance(x, dict) and x.get("LABEL")]
-        self.class_rows += await self.store.upsert("class", rows, chunk_ref=chunk_idx if chunk_idx >= 0 else None)
+        async with self._lock:
+            self.class_rows += await self.store.upsert("class", rows, chunk_ref=chunk_idx if chunk_idx >= 0 else None)
         self.replies += 1
 
 

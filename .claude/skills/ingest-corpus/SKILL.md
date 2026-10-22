@@ -99,9 +99,13 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
   > the first with capacity, writes that configuration's concurrency, sized from
   > its GPU memory and THIS machine's memory — the sizing's `Local memory` line;
   > if it reports a value "capped by local memory", say so). DeepSeek-V4.1-Flash
-  > (relationships) stays serverless. register-documents, extract-entities, enrich-time and
-  > generate-artifacts all call the GPU: run them back to back, then **delete the
-  > deployment** (`deepinfra_deploy.py delete <deploy_id>`). Measured on 2x B200:
+  > (relationships) stays serverless. register-documents, extract-entities, enrich-time,
+  > **enrich-geo** (its `geographic_containment` task is on the dedicated model) and
+  > generate-artifacts all call the GPU: run them back to back -- Step 4b included --
+  > then **delete the deployment** (`deepinfra_deploy.py delete <deploy_id>`). If the
+  > deployment is already gone when Step 4b runs, point `geographic_containment` at
+  > serverless `Qwen/Qwen3.8-27B` (same weights, ~19 tok/s: 19 calls took ~25 min on
+  > a 66-document corpus) rather than skipping the step. Measured on 2x B200:
   > 11 documents took ~10 min of GPU time for extract + artifacts. Full order:
   > **choose-llm-mode** skill, "DeepInfra mode".
 
@@ -423,9 +427,12 @@ uv run python -m backend.app.cli enrich-time            # chunk kind follows the
 uv run python scripts/build_state.py record enrich-time instances=<n>
 ```
 
-## Step 4b — enrich-geo + embed-relationships (short, ~cents)
-Two small steps that the relationship-aware retrieval depends on. Both are cheap
-and fast; run them in the foreground.
+## Step 4b — enrich-geo + embed-relationships (short, ~cents) — ALWAYS RUN
+Two small steps that the relationship-aware retrieval depends on. **Run both on
+every build, right after Step 4, without waiting to be asked** -- the user does
+not have to know they exist. They are cheap and fast; run them in the foreground.
+(2026-10-19: a benchmark build that skipped them gave a graph with 1,764 entity
+edges and no place containment; enrich-geo then added 664 edges for $0.05.)
 
 **`enrich-geo`** mints geographic containment (`Bangalore -> Republic of India`)
 between places the corpus ALREADY names. Prose never states these, so extraction
@@ -457,7 +464,8 @@ Costs embeddings only: a few cents per 100k edges.
 
 **Both are required for the graph to be walkable by relation.** Skip them and
 retrieval still works, but it falls back to the broad neighbourhood walk and
-loses the relation-matched hop -- silently, with no error.
+loses the relation-matched hop -- silently, with no error. So a build is not
+finished until both have run: Step 6 checks it.
 
 ## Step 5 — generate-artifacts (Claims/Findings/… ; long, paid)
 Per-chunk `Claim`/`Finding`/`Observation`/`Event` + per-doc `Summary`. Opt-in
@@ -477,7 +485,16 @@ Report what's now queryable (documents, entities, artifacts), the final `db-size
 and total cost. The corpus is now a knowledge graph — the user can `query` /
 `conversation`, or proceed to the **deploy** skill (which needs a **cloud** DB).
 
-Before handing back, confirm synonyms are populated — Step 2 does this
+Before handing back, confirm Step 4b ran -- both commands are silent when
+skipped. `build_state.py` must show an `enrich-geo` record for this build, and
+every entity-to-entity edge must be embedded:
+```
+uv run python scripts/build_state.py show            # expect: enrich-geo edges=<n>
+uv run python -m backend.app.cli embed-relationships --dry-run   # expect: 0 to embed
+```
+If either is missing, run Step 4b now, then report.
+
+Also confirm synonyms are populated — Step 2 does this
 automatically, but a skipped or failed refresh is invisible until a query
 silently under-retrieves:
 ```

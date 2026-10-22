@@ -62,6 +62,9 @@ PRESETS = {
     # The shipped deepinfra preset (Q&A on DeepSeek-V4.1-Flash) on the web-search
     # corpus; this build is the one restored into Supabase for Render.
     "deepinfra-ws": ROOT / "config" / "models.deepinfra.example.yaml",
+    # 2026-10-19: the same preset after the Stage 2-4 scaling work, built on
+    # 4x H200 (two 2-GPU instances); the build pushed to Supabase for Render.
+    "deepinfra-ws2": ROOT / "config" / "models.deepinfra.example.yaml",
     # deepinfra-b3's graph, every Q&A task on DeepSeek-V4.1-Flash (QA_TASKS).
     "deepinfra-b3-dsqa": ROOT / "config" / "models.deepinfra.example.yaml",
     # Embedding isolation: the OpenAI build's DB re-embedded with Qwen3-Embedding-4B,
@@ -230,7 +233,8 @@ def main(argv: list[str]) -> int:
     cap = _arg(argv, "--max-cost-usd", "15")
     out = Path(_arg(argv, "--out", str(ROOT / "benchmarks" / time.strftime("%Y-%m-%d")))) / arm_slug(arm) / corpus
     plan = ["db-migrate", "prune-expand", "db-init(replace)", "register-documents",
-            "extract-entities", "enrich-time", "generate-artifacts", "db-size"]
+            "extract-entities", "enrich-time", "enrich-geo", "embed-relationships",
+            "generate-artifacts", "db-size"]
     print(f"arm={arm} corpus={corpus} docs={docs} limit={limit or 'ALL'} cap=${cap}/step\n"
           f"steps: {' -> '.join(plan)}\nout: {out}")
     if "--go" not in argv:
@@ -273,6 +277,11 @@ def main(argv: list[str]) -> int:
         ("register-documents", ["register-documents", "--input", docs, "--tables"], 4 * 3600),
         ("extract-entities", ["extract-entities", "--max-cost-usd", cap], 4 * 3600),
         ("enrich-time", ["enrich-time"], 3600),
+        # Step 4b of the ingest-corpus skill: place containment edges, then the
+        # embeddings the relation-matched hop needs for them. Builds before
+        # 2026-10-19 skipped both, so their retrieval fell back silently.
+        ("enrich-geo", ["enrich-geo"], 3600),
+        ("embed-relationships", ["embed-relationships"], 3600),
         ("generate-artifacts", ["generate-artifacts", "--max-cost-usd", cap], 4 * 3600),
         ("db-size", ["db-size"], 300),
     ]

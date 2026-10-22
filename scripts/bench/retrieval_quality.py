@@ -111,14 +111,15 @@ def load_runs(bench: Path, arm: str, corpus: str, sub: str = "eval") -> list[dic
                 r = json.loads(line)
                 runs.append({"set": "audit", "qid": str(r["id"]), "question": r["question"], "mode": "deep_research",
                              "run": 0, "items": [{"iri": i} for i in r["evidence_iris"] if i]})
+    # One file per question set and mode, <set>_<mode>.json; the set name keys
+    # the gold file (pharma_test, test_questions_websearch_corpus, ...).
     for mode in ("simple_qa", "deep_research"):
-        f = ev / f"pharma_test_{mode}.json"
-        if not f.exists():
-            continue
-        for q in json.loads(f.read_text())["results"]:
-            for n, run in enumerate(q["runs"]):
-                items = sorted(run.get("evidence") or [], key=lambda e: int(e.get("rank") or 10 ** 6))
-                runs.append({"set": "pharma_test", "qid": q["question"], "question": q["question"], "mode": mode,
+        for f in sorted(ev.glob(f"*_{mode}.json")):
+            qset = f.name[: -len(f"_{mode}.json")]
+            for q in json.loads(f.read_text())["results"]:
+                for n, run in enumerate(q["runs"]):
+                    items = sorted(run.get("evidence") or [], key=lambda e: int(e.get("rank") or 10 ** 6))
+                    runs.append({"set": qset, "qid": q["question"], "question": q["question"], "mode": mode,
                              "run": n, "items": [{"iri": e.get("iri"), "kind": e.get("kind"), "text": e.get("text"),
                                                   "doc_title": e.get("document_title")} for e in items if e.get("iri")]})
     return runs
@@ -255,7 +256,7 @@ def main(argv: list[str]) -> int:
     for arm, runs in data.items():
         rows: dict[str, list[dict]] = {}
         for r in runs:
-            gold = gold_all[r["set"]].get(r["qid"]) or {}
+            gold = gold_all.get(r["set"], {}).get(r["qid"]) or {}
             chunks = [it for it in r["items"] if it.get("kind") == "chunk"]
             m: dict = {}
             if gold:

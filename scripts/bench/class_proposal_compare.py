@@ -128,6 +128,7 @@ def main(argv: list[str]) -> int:
 
     pl._classify_chunk = classify
     pl._dedup = stop
+    pl._pairwise_stage3 = stop   # the deepinfra preset's Stage 3
     from backend.app.cli.main import main as cli
 
     try:

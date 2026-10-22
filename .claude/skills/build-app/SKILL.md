@@ -164,7 +164,10 @@ capture the resulting `v*-prune-expand/` folder. Note the edit-and-resubmit gotc
 ### 4. Load ontology + ingest the corpus  →  invoke skill **ingest-corpus**
 The corpus half, symmetric with run-prune-expand: it loads the prune-expand
 ontology into the DB (`db-init --input`), then chunks+embeds the documents,
-extracts entities, enriches time, and generates intelligence artifacts — the long
+extracts entities, enriches time, **adds geographic containment and embeds every
+relationship (`enrich-geo` + `embed-relationships`, Step 4b — always run, the
+relationship-aware graph walk depends on them)**, and generates intelligence
+artifacts — the long
 paid steps run detached and monitored via the same harness, with `--limit`
 smoke-tests, the 500 MB DB-size guardrail, and a tracker record per step.
 
