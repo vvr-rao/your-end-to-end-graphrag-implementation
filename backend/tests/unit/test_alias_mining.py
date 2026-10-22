@@ -23,7 +23,6 @@ from backend.app.services.alias_mining import (
 )
 from backend.app.services.db_entity_extract import _normalize_name
 
-
 # --------------------------------------------------------------------------
 # normalize_term must not drift from the ingest-time normalizer
 # --------------------------------------------------------------------------
@@ -448,3 +447,22 @@ def test_occurrences_accumulate_across_mentions() -> None:
         _merge(acc, mine_text("MOUNJARO (tirzepatide) injection"))
     (pair,) = acc.values()
     assert pair.occurrences == 3
+
+
+def test_pair_order_is_byte_order_as_the_check_constraint() -> None:
+    # make_pair orders with Python `<` (code points); migration 0012 makes the
+    # term_aliases CHECK compare COLLATE "C" (byte order) to match. Under the
+    # en_US collation this pair was out of order and one such row rolled back
+    # a whole alias refresh (2026-10-19 web-search build).
+    p = make_pair("DaxOil", "Dax Oil Refinery", "parenthetical")
+    assert p is not None
+    assert (p.term_a, p.term_b) == ("dax oil refinery", "daxoil")
+    assert p.term_a.encode() < p.term_b.encode()
+
+
+def test_migration_0012_compares_byte_wise() -> None:
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2] / "app" / "db" / "migrations" / "versions"
+           / "0012_term_aliases_byte_order.py").read_text()
+    assert 'term_a COLLATE "C" < term_b COLLATE "C"' in src

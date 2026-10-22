@@ -93,7 +93,7 @@ A `git clone` gets you everything in the repo — the skills, config templates, 
 
 **Provide** (your own inputs — the skills create `.env` from the template; you fill in the secrets, never in chat):
 
-- **API keys** in `.env`: `OPENAI_API_KEY` (always — embeddings run on OpenAI), plus `GROQ_API_KEY` / `ANTHROPIC_API_KEY` for those modes, and `RENDER_API_KEY` if you deploy.
+- **API keys** in `.env`: `OPENAI_API_KEY` (every mode except DeepInfra), or `DEEPINFRA_API_KEY` for DeepInfra mode, plus `GROQ_API_KEY` / `ANTHROPIC_API_KEY` for those modes, and `RENDER_API_KEY` if you deploy.
 - **A database**: a Supabase (or any Postgres) connection string, or let the skill spin up a local docker-compose Postgres.
 
 **Do you need Docker?** Only for a local DB:
@@ -118,7 +118,7 @@ uv sync            # one-time dependency install
 
 Claude then walks you through, one step at a time:
 
-1. **Pick an LLM mode** — Groq+OpenAI, OpenAI-only, or Anthropic+OpenAI — and activate the matching config preset.
+1. **Pick an LLM mode** — Groq+OpenAI, OpenAI-only, Anthropic+OpenAI, or DeepInfra/Qwen — and activate the matching config preset.
 2. **Set up the database** — paste your own Postgres/Supabase connection string, or let Claude bring up a local docker-compose Postgres automatically.
 3. **Merge the ontology** — choose a supported domain (Pharma → OCRe, Finance → FIBO, Manufacturing / Supply-chain → OntoCAPE), bring your own `.owl` / `.rdf`, or use just the core ontologies. Claude fetches the domain ontology and merges it with the core set, then asks you to eyeball the result in Protégé.
 4. **prune-expand → ingest → enrich → generate artifacts** — the long, paid steps run **detached** (they survive a closed session) and Claude monitors them, reporting progress and cost.
@@ -495,7 +495,7 @@ Fill `.env` with:
 | `GROQ_API_KEY` | optional | Only needed for the default preset's Groq-backed Stage 1 in ontology expansion |
 | `ANTHROPIC_API_KEY` | optional | Only needed for the anthropic-only chat preset (`config/models.anthropic.example.yaml`). That preset still needs `OPENAI_API_KEY` for embeddings |
 | `DEEPINFRA_API_KEY` | optional | Only for the DeepInfra/Qwen preset (`config/models.deepinfra.example.yaml`): chat and embeddings |
-| `DEEPINFRA_FLASH_MODEL` | optional | Not a secret: the dedicated Qwen3.8-Flash-Next deployment's model id, printed by `scripts/deepinfra_deploy.py create` |
+| `DEEPINFRA_FLASH_MODEL` | optional | Not a secret: the dedicated deployment's model id (Qwen3.8-27B by default), printed by `scripts/deepinfra_deploy.py create` |
 | `RENDER_API_KEY` | optional | Only needed for Render deploy — https://dashboard.render.com/u/settings#api-keys |
 
 `pgvector` must be enabled in Supabase: Dashboard → Database → Extensions → toggle on **vector**.
@@ -998,6 +998,19 @@ cp config/models.openai.example.yaml config/models.yaml
 ```
 
 That's the whole switch — no code changes. Every subcommand behaves identically; only the provider behind each task changes. (Groq stays available in the default preset because it's ~10× cheaper and fast for the high-volume Stage-1 tagging.)
+
+#### DeepInfra / Qwen mode
+
+Runs the whole pipeline on DeepInfra with one key (`DEEPINFRA_API_KEY`); no OpenAI, Groq or Anthropic key is needed. Activate it with `uv run python scripts/select_llm_mode.py deepinfra`. Default models:
+
+| Work | Model | Hosting |
+|---|---|---|
+| Knowledge creation (prune-expand, summaries, entities, artifacts, geo) | `Qwen/Qwen3.8-27B` (FP8) | Dedicated GPUs, billed per GPU-hour |
+| Relationship extraction, Q&A, query parsing, judges | `deepseek-ai/DeepSeek-V4.1-Flash` | Serverless, per token |
+| Embeddings | `Qwen/Qwen3-Embedding-4B` @ 1024 dim | Serverless |
+| Table images | `Qwen/Qwen3-VL-30B-A3B-Instruct` | Serverless |
+
+Size and create the dedicated deployment with `scripts/deepinfra_sizing.py` and `scripts/deepinfra_deploy.py create` (preferred: 4×B200 → 4×H200 → 2×B200 → 2×H200 → 2×H100), and delete it after the build. Querying and the deployed app need only the serverless models. On the 415k-token web-search corpus, a full build on 4×H200 took 1.1 h and cost $12.
 
 ### Full-text vs summary chunks
 

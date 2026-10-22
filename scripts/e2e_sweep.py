@@ -106,6 +106,7 @@ def main() -> int:
     results.append(run("embed-relationships", ["embed-relationships"], timeout=1800))
     results.append(run("generate-artifacts",
                        ["generate-artifacts", "--max-cost-usd", "5.0"], timeout=3600))
+    results.append(run("mine-aliases", ["mine-aliases"], timeout=1800))
 
     # --- retrieval ---------------------------------------------------------
     q = "Which GLP-1 drugs are described and what are their main side effects?"

@@ -273,8 +273,16 @@ whole corpus, so:
   wasted work.
 - **Never pass it on the real run.** Skipping it leaves the alias table stale for
   exactly the documents you just added, and nothing at query time says so.
-- If the step reports a WARNING (e.g. migration `0006_term_aliases` not applied),
-  the ingest still succeeded — apply migrations and run `mine-aliases` by hand.
+- **A failed refresh does NOT fail the command.** register-documents prints
+  `[ingest] alias refresh failed (...)` and still exits 0, so check the log for
+  that line on every real run -- and if it is there, apply migrations
+  (`db-migrate`) and run `mine-aliases` by hand before moving on. (2026-10-19:
+  one pair the database ordered differently from Python rolled back the whole
+  refresh -- fixed in migration 0012 -- and the web-search graph shipped with an
+  empty alias table; the exit code was 0.)
+  ```
+  grep -n "alias refresh failed" <the register-documents log>
+  ```
 - Look at the pair count it prints. Zero pairs on a real corpus means the guards
   are rejecting everything; run `mine-aliases --dry-run --show 40` to inspect.
 
@@ -494,14 +502,18 @@ uv run python -m backend.app.cli embed-relationships --dry-run   # expect: 0 to 
 ```
 If either is missing, run Step 4b now, then report.
 
-Also confirm synonyms are populated — Step 2 does this
-automatically, but a skipped or failed refresh is invisible until a query
-silently under-retrieves:
+**Always finish by running `mine-aliases` for real** -- not `--dry-run`. Step 2
+normally does it, but a skipped or failed refresh is invisible until a query
+silently under-retrieves, and `--dry-run` reports the pairs FOUND in the text,
+not the pairs STORED: on the 2026-10-19 build it printed 624 while the table
+held 0. The real run is free ($0, no LLM), takes seconds to minutes, is
+idempotent, and exits non-zero if the write fails:
 ```
-uv run python -m backend.app.cli mine-aliases --dry-run --show 15
+uv run python -m backend.app.cli mine-aliases --show 15
+uv run python scripts/build_state.py record mine-aliases pairs=<n>
 ```
-If the printed pair count is 0, or far below what the corpus should yield, say so
-rather than reporting a clean finish.
+If it fails, or the pair count is 0 on a real corpus, say so rather than
+reporting a clean finish.
 
 ## Notes
 - **Scale ceiling:** at very large corpora both `extract-entities` and
