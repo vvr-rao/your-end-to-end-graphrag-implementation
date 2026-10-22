@@ -70,7 +70,10 @@ class _FakeSettings:
 
 def _embedder(fail_on=None) -> tuple[Embedder, _FakeClient]:
     client = _FakeClient(fail_on)
-    e = Embedder(settings=_FakeSettings())  # type: ignore[arg-type]
+    e = Embedder(
+        settings=_FakeSettings(),  # type: ignore[arg-type]
+        provider="openai", model="text-embedding-3-small", dim=1024, batch_size=100,
+    )
     e._client = client  # type: ignore[assignment]
     return e, client
 

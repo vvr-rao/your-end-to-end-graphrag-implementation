@@ -119,6 +119,18 @@ def _hash_pdf_streaming(path: Path) -> tuple[str, str]:
 # MB per call until GC ran, contributing to OOM on 1000+-call runs.
 _VISION_CLIENT: Any = None
 _ANTHROPIC_VISION_CLIENT: Any = None
+_DEEPINFRA_VISION_CLIENT: Any = None
+
+# Providers the vision route can call. Anything else is a config error: it
+# used to fall through to the OpenAI client with a non-OpenAI model id, every
+# call failed, and the tables were silently dropped (2026-10-17 deepinfra
+# benchmark lost all 35 vision tables).
+_VISION_PROVIDERS = ("openai", "anthropic", "deepinfra")
+
+
+class VisionCallError(Exception):
+    """The vision request itself failed (transport, auth, unknown model) --
+    as opposed to the model answering that the crop holds no table."""
 
 
 def _get_vision_client() -> Any:
@@ -132,6 +144,24 @@ def _get_vision_client() -> Any:
 
         _VISION_CLIENT = AsyncOpenAI(api_key=settings.openai_api_key)
     return _VISION_CLIENT
+
+
+def _get_deepinfra_vision_client() -> Any:
+    """Return the shared DeepInfra client (OpenAI-compatible endpoint) for
+    the vision route, creating it on first use."""
+    global _DEEPINFRA_VISION_CLIENT
+    if _DEEPINFRA_VISION_CLIENT is None:
+        settings = get_settings()
+        if not settings.deepinfra_api_key:
+            return None
+        from openai import AsyncOpenAI
+
+        from backend.app.services.llm_router import DEEPINFRA_BASE_URL
+
+        _DEEPINFRA_VISION_CLIENT = AsyncOpenAI(
+            api_key=settings.deepinfra_api_key, base_url=DEEPINFRA_BASE_URL,
+        )
+    return _DEEPINFRA_VISION_CLIENT
 
 
 def _get_anthropic_vision_client() -> Any:
@@ -154,10 +184,12 @@ async def close_vision_client() -> None:
     references. Call this once after all table extraction work is done so
     the connection pool + TLS contexts get released before downstream
     phases (LLM stages) start consuming memory."""
-    global _VISION_CLIENT, _ANTHROPIC_VISION_CLIENT
-    clients = [c for c in (_VISION_CLIENT, _ANTHROPIC_VISION_CLIENT) if c is not None]
+    global _VISION_CLIENT, _ANTHROPIC_VISION_CLIENT, _DEEPINFRA_VISION_CLIENT
+    clients = [c for c in (_VISION_CLIENT, _ANTHROPIC_VISION_CLIENT, _DEEPINFRA_VISION_CLIENT)
+               if c is not None]
     _VISION_CLIENT = None
     _ANTHROPIC_VISION_CLIENT = None
+    _DEEPINFRA_VISION_CLIENT = None
     for client in clients:
         try:
             # AsyncOpenAI / AsyncAnthropic both expose an async close().
@@ -707,11 +739,14 @@ async def _vision_call_openai(
     timeout: int,
     temperature: float,
     max_tokens: int,
+    provider: str = "openai",
 ) -> tuple[str | None, float]:
-    """OpenAI vision call. Returns (json_text, cost_usd) or (None, 0.0)."""
-    client = _get_vision_client()
+    """OpenAI-compatible vision call (OpenAI, or DeepInfra's endpoint).
+    Returns (json_text, cost_usd); raises VisionCallError when the request
+    fails."""
+    client = _get_deepinfra_vision_client() if provider == "deepinfra" else _get_vision_client()
     if client is None:
-        return None, 0.0
+        raise VisionCallError(f"no API key for vision provider {provider!r}")
     try:
         resp = await client.chat.completions.create(
             model=model,
@@ -733,9 +768,17 @@ async def _vision_call_openai(
             timeout=timeout,
             response_format={"type": "json_object"},
         )
-    except Exception:
-        return None, 0.0
+    except Exception as exc:
+        raise VisionCallError(f"{type(exc).__name__}: {exc}") from exc
     text = (resp.choices[0].message.content or "").strip()
+    if provider == "deepinfra":
+        usage = getattr(resp, "usage", None)
+        cost = _estimate_cost_by_model(
+            model,
+            getattr(usage, "prompt_tokens", None) if usage else None,
+            getattr(usage, "completion_tokens", None) if usage else None,
+        ) or 0.0
+        return _strip_json_fences(text), cost
     return text, _estimate_cost(resp)
 
 
@@ -755,7 +798,7 @@ async def _vision_call_anthropic(
     prompt and strip any ```json fences before returning."""
     client = _get_anthropic_vision_client()
     if client is None:
-        return None, 0.0
+        raise VisionCallError("no API key for vision provider 'anthropic'")
     sys_prompt = (
         f"{system}\n\nOutput only a single valid JSON object. "
         "Do not include any prose, explanation, or markdown code fences."
@@ -787,8 +830,8 @@ async def _vision_call_anthropic(
         kwargs["temperature"] = temperature
     try:
         resp = await client.messages.create(**kwargs)
-    except Exception:
-        return None, 0.0
+    except Exception as exc:
+        raise VisionCallError(f"{type(exc).__name__}: {exc}") from exc
     text = "".join(
         b.text for b in resp.content if getattr(b, "type", None) == "text"
     ).strip()
@@ -810,9 +853,11 @@ async def _extract_table_via_vision(
     caption_hint: str | None,
     router: LLMRouter,
 ) -> tuple[dict[str, Any] | None, float]:
-    """Render the table region to PNG, send to gpt-4o-mini vision, parse
-    JSON back into a StructuredTable payload. Returns (payload, cost_usd)
-    or (None, 0.0) on any failure (caller logs + drops)."""
+    """Render the table region to PNG, send it to the configured vision
+    model, parse JSON back into a StructuredTable payload. Returns
+    (payload, cost_usd); (None, cost) when the crop holds no usable table.
+    Raises VisionCallError when the request itself fails, so the caller can
+    keep a failed extraction out of the cache."""
     settings = get_settings()
 
     spec = settings.models_config.get("tasks", {}).get("table_extract_vision", {})
@@ -821,6 +866,11 @@ async def _extract_table_via_vision(
     timeout = int(spec.get("timeout", _DEFAULT_VISION_TIMEOUT))
     temperature = float(spec.get("temperature", _DEFAULT_VISION_TEMP))
     max_tokens = int(spec.get("max_tokens", _DEFAULT_VISION_MAX_TOKENS))
+    if provider not in _VISION_PROVIDERS:
+        raise ValueError(
+            f"table_extract_vision.provider={provider!r} is not supported "
+            f"(use one of {', '.join(_VISION_PROVIDERS)})"
+        )
 
     # Render the cropped region to PNG bytes (shared across providers).
     try:
@@ -846,7 +896,7 @@ async def _extract_table_via_vision(
     else:
         text, cost = await _vision_call_openai(
             system, user, png_b64, model=model, timeout=timeout,
-            temperature=temperature, max_tokens=max_tokens,
+            temperature=temperature, max_tokens=max_tokens, provider=provider,
         )
     if text is None:
         return None, 0.0
@@ -1099,6 +1149,7 @@ async def extract_tables_async(
     n_pdfplumber = 0
     n_vision = 0
     n_dropped = 0
+    n_vision_errors = 0
     cost_usd = 0.0
     table_index = 0
     pages_processed = 0
@@ -1207,15 +1258,22 @@ async def extract_tables_async(
                         )
                         n_pdfplumber += 1
                     elif use_vision:
-                        payload, vision_cost = await _extract_table_via_vision(
-                            page,
-                            bbox,
-                            doc_sha=doc_sha,
-                            table_index=table_index,
-                            page_number=page_no,
-                            caption_hint=caption,
-                            router=router,
-                        )
+                        try:
+                            payload, vision_cost = await _extract_table_via_vision(
+                                page,
+                                bbox,
+                                doc_sha=doc_sha,
+                                table_index=table_index,
+                                page_number=page_no,
+                                caption_hint=caption,
+                                router=router,
+                            )
+                        except VisionCallError as exc:
+                            payload, vision_cost = None, 0.0
+                            n_vision_errors += 1
+                            if n_vision_errors == 1:
+                                print(f"[tables] {p.name}: vision call FAILED ({exc}); "
+                                      f"this PDF will not be cached", flush=True)
                         cost_usd += vision_cost
                         if payload is not None:
                             n_vision += 1
@@ -1300,6 +1358,7 @@ async def extract_tables_async(
         "n_pdfplumber": n_pdfplumber,
         "n_vision_llm": n_vision,
         "n_dropped": n_dropped,
+        "n_vision_errors": n_vision_errors,
         "n_skipped_filter": n_skipped_filter,
         "n_merged": n_merged,
         "n_headers_recovered": n_headers_recovered,
@@ -1318,8 +1377,10 @@ async def extract_tables_async(
         flush=True,
     )
 
-    # Persist to both cache tiers (run cache + user cache).
-    for tier_dir in (run_cache_dir, user_cache_dir):
+    # Persist to both cache tiers (run cache + user cache) -- unless a
+    # vision call failed: caching that result would freeze the missing
+    # tables in, and every later run would hit the cache and never retry.
+    for tier_dir in ((run_cache_dir, user_cache_dir) if not n_vision_errors else ()):
         if tier_dir is not None:
             try:
                 table_cache.save(

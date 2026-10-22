@@ -213,6 +213,30 @@ Notes:
 ```
 uv run python scripts/tpm_check.py "<DOCS>"
 ```
+
+> **DeepInfra mode:** a dedicated deployment has no TPM/RPM, so `tpm_check.py`
+> does not size it. Run `uv run python scripts/deepinfra_sizing.py "<DOCS>"` instead
+> and show the preferred configurations — **4x B200, 4x H200 (each as two
+> 2-GPU instances), then 2x B200, 2x H200, 2x H100** — with their rates and
+> estimates. With the user's approval of those rates, `deepinfra_deploy.py
+> create --from-sizing .build/sizing.json --apply-concurrency --yes` rents the
+> first that has capacity and writes THAT configuration's concurrency, sized
+> from its GPU memory and this machine's memory (class_proposal 192 on 4x B200,
+> 48 on 2x H200 — prune-expand ran ~1 h at the old 12 because only ~9 requests
+> were in flight). DeepSeek-V4.1-Flash stays serverless.
+>
+> **Verify this machine's memory first** (the one these skills and the detached
+> run use): the sizing prints `Local memory` and `Build memory ... FITS / TIGHT /
+> DOES NOT FIT` — the projected peak of Stage 4 + the OWL export for this corpus
+> against available RAM (Linux, macOS, Windows). On TIGHT tell the user to close
+> other apps; on DOES NOT FIT **stop and ask**: a bigger machine (it prints the
+> GB needed), or a subset (`--select-subset` / `--limit`). Never start the paid
+> run on DOES NOT FIT — a swapless box hard-kills the run mid-way.
+> Prune-expand must not start
+> until the deployment is `running` and `DEEPINFRA_FLASH_MODEL` points at it.
+> Keep the GPU for ingest-corpus if it follows immediately; otherwise delete it
+> when prune-expand ends. Full order: **choose-llm-mode** skill, "DeepInfra mode".
+
 If a PREVIOUS run already produced a selection.json for this corpus, point
 this at it so the numbers describe the subset rather than the whole corpus:
 ```
@@ -245,6 +269,15 @@ Cost is one tiny probe per model.
 `--set <stage>=N` (repeatable, their own values). It edits only the
 `concurrency:` block and keeps every comment. Never `--apply` without their
 go-ahead. Per-run flags below still override config for a single run.
+
+**Build memory (every mode):** with a corpus argument, `tpm_check.py` (and
+`deepinfra_sizing.py`) print `Build memory (this machine): projected peak ~N MB
+... FITS / TIGHT / DOES NOT FIT` — the peak of Stage 4 + the OWL export for THIS
+corpus against the RAM of the machine the skills are running on. Always read it
+out. TIGHT: ask the user to close other apps before the run. DOES NOT FIT:
+**stop and ask** — a machine with the printed GB free, or a subset first
+(`--select-subset` / `--limit`). It is an upper bound (class vocabularies
+saturate), but on a swapless box exceeding RAM is a hard kill mid-run.
 
 **Platform:** the rate-limit half is a plain HTTPS call, so it behaves
 identically on Linux, macOS and Windows. Only the *memory* half is

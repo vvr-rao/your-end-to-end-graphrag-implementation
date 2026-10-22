@@ -133,3 +133,29 @@ def test_threshold_controls_grouping_strictness() -> None:
         )
     )
     assert sorted(ordered) == sorted(items)
+
+
+def test_embedding_in_slices_gives_the_same_order(monkeypatch) -> None:
+    """Vectors are fetched in slices into one float32 array (the 27B web-search
+    build OOM-killed prune-expand holding 17.5k proposals as nested lists).
+    Slicing must not change the clustering."""
+    import backend.app.services.semantic_grouping as sg
+
+    items = [f"{w} {i}" for i in range(7) for w in ("apple", "pear", "plum")]
+    tags = {"apple": 1, "pear": 2, "plum": 3}
+    whole, _ = _run(items, tags)
+    monkeypatch.setattr(sg, "_EMBED_SLICE", 4)
+    emb = _FakeEmbedder(tags)
+    sliced = asyncio.run(order_by_semantic_cluster(items, render=lambda s: s, embedder=emb))
+    assert sliced == whole
+    assert emb.calls == -(-len(items) // 4)
+
+
+def test_a_short_embedding_slice_falls_back_to_label_sort() -> None:
+    class _Short(_FakeEmbedder):
+        async def embed(self, texts):
+            return (await super().embed(texts))[:-1]
+
+    items = ["b x", "a y", "c z"]
+    out = asyncio.run(order_by_semantic_cluster(items, render=lambda s: s, embedder=_Short({})))
+    assert out == sorted(items)

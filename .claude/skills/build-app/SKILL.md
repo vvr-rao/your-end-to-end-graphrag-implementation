@@ -66,21 +66,56 @@ financial) and ask their preference, and run prune-expand. Walk it one step at a
 ## The sequence
 
 ### 1. LLM mode + keys  →  invoke skill **choose-llm-mode**
-Pick Groq+OpenAI / OpenAI-only / Anthropic+OpenAI, activate the preset, confirm
-required keys are present in `.env`. (Every mode needs `OPENAI_API_KEY` for
-embeddings.)
+Present all FOUR modes — Groq+OpenAI / OpenAI-only / Anthropic+OpenAI /
+**DeepInfra (Qwen + DeepSeek)** — activate the preset, confirm the required keys
+are present in `.env`. Every mode except DeepInfra needs `OPENAI_API_KEY`
+(embeddings); DeepInfra needs only `DEEPINFRA_API_KEY` (+ the non-secret
+`DEEPINFRA_FLASH_MODEL` once a GPU deployment exists). The mode decides the rest
+of the build: DeepInfra builds on rented GPUs (step 2b) and needs its own
+database (step 2).
 
 ### 2. Database  →  invoke skill **setup-database**
 Ask "have a Postgres DSN, or make a local one?" — warn that a local DB isn't
 deploy-ready. Bring up docker Postgres if needed, then migrate + verify. Can run
-concurrently with step 3 (prune-expand doesn't need the DB).
+concurrently with step 3 (prune-expand doesn't need the DB). **DeepInfra mode
+embeds with Qwen3-Embedding-4B**, whose vectors cannot mix with OpenAI's: use an
+empty or dedicated database — a guard refuses a database already embedded by
+another model.
 
 ### 2b. Size the run ONCE, up front — rate limits + database → `concurrency:`
+> **DeepInfra mode — size GPUs, not rate limits.** A dedicated deployment has no
+> TPM/RPM, so `tpm_check.py` does not size it. Follow the **choose-llm-mode**
+> skill, "DeepInfra mode": `deepinfra_sizing.py "<DOCS>"` (free) prints the GPU
+> options in the preferred order — **4x B200, 4x H200 (each as two 2-GPU
+> instances), then 2x B200, 2x H200, 2x H100** — with each one's hourly rate,
+> estimated hours/cost and its own concurrency, sized from that GPU's memory AND
+> this machine's memory. With the user's approval of the rates,
+> `deepinfra_deploy.py create --apply-concurrency` takes the first that has
+> capacity and writes THAT configuration's concurrency. Qwen3.8-27B runs on those
+> GPUs; DeepSeek-V4.1-Flash always stays serverless. Plan steps 3–4 to run back
+> to back inside ONE GPU window (spin-up is billed every time), and delete the
+> deployment the moment the last creation step finishes. The rest of this step
+> (tpm_check) does not apply.
+>
+> **Verify this machine's memory first** (the one these skills and the detached
+> run use): the sizing prints `Local memory` and `Build memory ... FITS / TIGHT /
+> DOES NOT FIT` — the projected peak of Stage 4 + the OWL export for this corpus
+> against available RAM (Linux, macOS, Windows). On TIGHT tell the user to close
+> other apps; on DOES NOT FIT **stop and ask**: a bigger machine (it prints the
+> GB needed), or a subset (`--select-subset` / `--limit`). Never start the paid
+> run on DOES NOT FIT — a swapless box hard-kills the run mid-way.
+
 Do this after steps 1 and 2 (it reads the active `models.yaml` and the DB
 settings) and before any paid step:
 ```
 uv run python scripts/tpm_check.py "<DOCS>"
 ```
+
+**Read the `Build memory` line out in every mode.** It projects the peak memory
+of prune-expand's Stage 4 + OWL export for THIS corpus and checks it against
+the RAM of the machine the skills run on: FITS / TIGHT (close other apps) /
+DOES NOT FIT (**stop and ask**: a machine with the printed GB free, or a subset
+via `--select-subset` / `--limit`). Do not start a paid run on DOES NOT FIT.
 Costs ~nothing (one tiny probe per model, per provider — OpenAI, Anthropic
 and Groq alike). It prints a table of every concurrency knob with **now**,
 **suggest**, and the **binding task** — each stage is sized by the tightest
@@ -129,7 +164,10 @@ capture the resulting `v*-prune-expand/` folder. Note the edit-and-resubmit gotc
 ### 4. Load ontology + ingest the corpus  →  invoke skill **ingest-corpus**
 The corpus half, symmetric with run-prune-expand: it loads the prune-expand
 ontology into the DB (`db-init --input`), then chunks+embeds the documents,
-extracts entities, enriches time, and generates intelligence artifacts — the long
+extracts entities, enriches time, **adds geographic containment and embeds every
+relationship (`enrich-geo` + `embed-relationships`, Step 4b — always run, the
+relationship-aware graph walk depends on them)**, and generates intelligence
+artifacts — the long
 paid steps run detached and monitored via the same harness, with `--limit`
 smoke-tests, the 500 MB DB-size guardrail, and a tracker record per step.
 
@@ -138,6 +176,9 @@ Guides the user through forking the repo, setting `RENDER_API_KEY` + generating 
 `BEARER_TOKEN` in `.env`, `render-init` to create the backend + frontend services,
 monitoring the build, and the final manual UI token paste. Requires a **cloud**
 DB (not the local docker one). Records `deploy` (with URLs) to the tracker.
+In DeepInfra mode the deployed app needs NO GPU: Q&A runs on serverless
+DeepSeek-V4.1-Flash and queries embed on serverless Qwen; the deploy skill sets
+`MODELS_CONFIG_PATH` + `DEEPINFRA_API_KEY` on the backend.
 
 ## After the build — changing the corpus
 If the user later wants to **add, update, or delete documents** in an already-built

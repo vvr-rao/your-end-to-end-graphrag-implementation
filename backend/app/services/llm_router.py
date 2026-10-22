@@ -8,9 +8,15 @@ one line in PROVIDERS — no service-code changes elsewhere.
 
 from __future__ import annotations
 
+import atexit
+import json
 import logging
+import os
+import re
+import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 import tenacity
@@ -106,6 +112,24 @@ _PRICING_PER_1K = {
     "claude-opus-4-8": (0.005, 0.025),
     "claude-sonnet-4-6": (0.003, 0.015),
     "claude-haiku-4-5": (0.001, 0.005),
+    # DeepInfra serverless ($0.15 in / $1.875 out per 1M; cached in $0.038).
+    # The listing shows $0.20 / $2.50 with a 25% discount -- these are the
+    # discounted, billed rates (re-checked 2026-10-17).
+    # A DEDICATED deployment's model id ("<account>/<deploy-name>") is billed
+    # per GPU-hour, not per token, so it is deliberately absent -> $0 here and
+    # the GPU-hour cost is accounted outside the router.
+    "Qwen/Qwen3.8-27B": (0.00015, 0.001875),
+    # DeepInfra serverless, 2026-10-13 (api.deepinfra.com/models/<id> pricing).
+    "zai-org/GLM-5.3": (0.0009, 0.004),
+    "zai-org/GLM-5.3-Flash": (0.00015, 0.0005),
+    "mistralai/Mistral-Small-3.2-24B-Instruct-2506": (0.000075, 0.0002),
+    "moonshotai/Kimi-K3": (0.00285, 0.01425),
+    "moonshotai/Kimi-K2.6": (0.00075, 0.0035),
+    "deepseek-ai/DeepSeek-V4.1-Flash": (0.0002, 0.0006),
+    "deepseek-ai/DeepSeek-V4-Pro-0813": (0.0013, 0.0026),
+    "deepseek-ai/DeepSeek-V4-Pro": (0.0013, 0.0026),
+    # DeepInfra serverless vision (table_extract_vision), 2026-10-17.
+    "Qwen/Qwen3-VL-30B-A3B-Instruct": (0.00015, 0.0006),
 }
 
 
@@ -155,6 +179,17 @@ _MODEL_CONTEXT_WINDOW = {
     "claude-opus-4-8": 200_000,
     "claude-sonnet-4-6": 200_000,
     "claude-haiku-4-5": 200_000,
+    "Qwen/Qwen3.8-27B": 262_144,
+    "Qwen/Qwen3.8-Flash-Next": 262_144,
+    "zai-org/GLM-5.3": 1_048_576,
+    "zai-org/GLM-5.3-Flash": 1_048_576,
+    "mistralai/Mistral-Small-3.2-24B-Instruct-2506": 128_000,
+    "moonshotai/Kimi-K3": 1_048_576,
+    "moonshotai/Kimi-K2.6": 262_144,
+    "deepseek-ai/DeepSeek-V4.1-Flash": 1_048_576,
+    "deepseek-ai/DeepSeek-V4-Pro-0813": 1_048_576,
+    "deepseek-ai/DeepSeek-V4-Pro": 1_048_576,
+    "Qwen/Qwen3-VL-30B-A3B-Instruct": 262_144,
 }
 _DEFAULT_CONTEXT_WINDOW = 128_000
 
@@ -205,6 +240,9 @@ async def _consume_openai_stream(stream: Any) -> tuple[str, Any, str | None]:
 
 
 class OpenAIProvider:
+    provider_name = "openai"
+    cache_read_mult = 0.5  # OpenAI cached input is billed at 0.5x
+
     def __init__(self, api_key: str) -> None:
         # max_retries=0: the SDK defaults to 2 internal retries, which nest
         # inside tenacity's 5 for up to 15 HTTP attempts per logical call. At a
@@ -225,6 +263,7 @@ class OpenAIProvider:
         response_format: str | None,
         cache_prefix: str | None = None,
         stream: bool = False,
+        thinking: bool | None = None,
     ) -> ChatResult:
         # Tier A -- source-first ordering. OpenAI AUTOMATICALLY caches identical
         # leading prefixes (>=1024 tokens); putting the large stable source before
@@ -245,8 +284,9 @@ class OpenAIProvider:
         else:
             kwargs["temperature"] = temperature
             kwargs["max_tokens"] = max_tokens
-        if response_format == "json_object":
+        if response_format == "json_object" and self._json_mode_allowed(thinking):
             kwargs["response_format"] = {"type": "json_object"}
+        kwargs.update(self._extra_kwargs(thinking, model))
 
         if stream:
             # Streaming turns the timeout from a whole-request deadline into a
@@ -269,6 +309,7 @@ class OpenAIProvider:
             text = choice.message.content or ""
             usage = resp.usage
             finish = getattr(choice, "finish_reason", None)
+        text = self._clean_text(text, response_format)
 
         prompt_tokens = getattr(usage, "prompt_tokens", None) if usage else None
         completion_tokens = getattr(usage, "completion_tokens", None) if usage else None
@@ -279,18 +320,27 @@ class OpenAIProvider:
             finish_reason=finish,
             text=text,
             model=model,
-            provider="openai",
+            provider=self.provider_name,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             cache_read_tokens=cached,
             cache_write_tokens=0,
-            # OpenAI cached input is billed at 0.5x, no write premium.
+            # Cached input is billed at cache_read_mult, no write premium.
             cost_usd=_estimate_cost(
                 model, uncached, completion_tokens,
-                cache_read_tokens=cached, cache_read_mult=0.5,
+                cache_read_tokens=cached, cache_read_mult=self.cache_read_mult,
                 cache_write_tokens=0, cache_write_mult=1.0,
             ),
         )
+
+    def _extra_kwargs(self, thinking: bool | None, model: str = "") -> dict[str, Any]:
+        return {}
+
+    def _json_mode_allowed(self, thinking: bool | None) -> bool:
+        return True
+
+    def _clean_text(self, text: str, response_format: str | None) -> str:
+        return text
 
 
 class GroqProvider:
@@ -481,6 +531,71 @@ class AnthropicProvider:
         )
 
 
+DEEPINFRA_BASE_URL = "https://api.deepinfra.com/v1/openai"
+
+_THINK_BLOCK = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+
+
+def _strip_thinking(text: str) -> str:
+    """Drop Qwen `<think>...</think>` reasoning from a reply.
+
+    With thinking disabled the server should emit none, but a reply truncated
+    mid-reasoning or a template that ignores the flag would otherwise hand a
+    strict `json.loads` caller a reasoning trace. An unterminated `<think>`
+    (reply cut off while still reasoning) leaves no answer at all -> "".
+    """
+    s = _THINK_BLOCK.sub("", text)
+    # Qwen chat templates OPEN the think block inside the prompt, so a
+    # thinking reply carries only the closing tag: "<reasoning>\n</think>\n\n<answer>".
+    if "</think>" in s:
+        s = s.rsplit("</think>", 1)[1]
+    if "<think>" in s:
+        s = s.split("<think>", 1)[0]
+    return s.strip()
+
+
+class DeepInfraProvider(OpenAIProvider):
+    """DeepInfra's OpenAI-compatible endpoint -- serverless models and
+    dedicated deployments alike (a deployment is addressed by its model id).
+
+    Qwen3.8 models think by default. Every structured task here expects a
+    bare answer, so thinking is OFF unless the task sets `thinking: true`;
+    reasoning tokens would otherwise be billed (serverless) or burn GPU time
+    (dedicated) and can leak into the content.
+    """
+
+    provider_name = "deepinfra"
+    # Serverless cached input: $0.038 vs $0.15 per 1M.
+    cache_read_mult = 0.25
+
+    def __init__(self, api_key: str) -> None:
+        self._client = AsyncOpenAI(
+            api_key=api_key, base_url=DEEPINFRA_BASE_URL, max_retries=0,
+        )
+
+    def _extra_kwargs(self, thinking: bool | None, model: str = "") -> dict[str, Any]:
+        if model.startswith("zai-org/GLM") and not thinking:
+            # GLM always reasons. Sent ALONE, `thinking: disabled` moves that
+            # reasoning to the separate reasoning_content field (streamed or
+            # not), leaving `content` clean. Combined with chat_template_kwargs
+            # enable_thinking=false, GLM writes the reasoning INTO `content` as
+            # untagged prose (measured 2026-10-13) -- so never send both.
+            return {"extra_body": {"thinking": {"type": "disabled"}}}
+        return {"extra_body": {"chat_template_kwargs": {"enable_thinking": bool(thinking)}}}
+
+    def _json_mode_allowed(self, thinking: bool | None) -> bool:
+        # Measured 2026-10-13: JSON mode constrains decoding from the first
+        # token, so a thinking request returns NO reasoning at all. With
+        # thinking on, rely on the prompt's JSON instruction + fence stripping.
+        return not thinking
+
+    def _clean_text(self, text: str, response_format: str | None) -> str:
+        text = _strip_thinking(text)
+        if response_format == "json_object":
+            text = _strip_json_fences(text)
+        return text
+
+
 def _build_providers(settings: Settings) -> dict[str, Provider]:
     providers: dict[str, Provider] = {}
     if settings.openai_api_key:
@@ -489,7 +604,35 @@ def _build_providers(settings: Settings) -> dict[str, Provider]:
         providers["groq"] = GroqProvider(api_key=settings.groq_api_key)
     if settings.anthropic_api_key:
         providers["anthropic"] = AnthropicProvider(api_key=settings.anthropic_api_key)
+    if settings.deepinfra_api_key:
+        providers["deepinfra"] = DeepInfraProvider(api_key=settings.deepinfra_api_key)
     return providers
+
+
+# GRAPHRAG_COST_REPORT_DIR: when set, every router's cost_report() is written
+# there at process exit. Prune-expand already persists cost.json; the Phase-2
+# commands (register/extract/artifacts/query) otherwise print a total and
+# forget the per-task split, which benchmarking and GPU sizing both need.
+_live_routers: list[LLMRouter] = []
+
+
+def _register_for_cost_dump(router: LLMRouter) -> None:
+    if not os.environ.get("GRAPHRAG_COST_REPORT_DIR"):
+        return
+    if not _live_routers:
+        atexit.register(_dump_cost_reports)
+    _live_routers.append(router)
+
+
+def _dump_cost_reports() -> None:
+    out = Path(os.environ["GRAPHRAG_COST_REPORT_DIR"]).expanduser()
+    out.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%dT%H%M%S")
+    cmd = next((a for a in sys.argv[1:] if not a.startswith("-")), "run")
+    for i, r in enumerate(_live_routers):
+        rep = r.cost_report()
+        if rep["total_calls"]:
+            (out / f"{stamp}-{os.getpid()}-{cmd}-{i}.json").write_text(json.dumps(rep, indent=2))
 
 
 class LLMRouter:
@@ -505,6 +648,8 @@ class LLMRouter:
         self._retry = mc.get("defaults", {}).get("retries", {})
         self.reset_counters()
         self._validate_stream_support()
+        self._validate_thinking()
+        _register_for_cost_dump(self)
 
     def reset_counters(self) -> None:
         """Initialise every per-run accumulator.
@@ -532,6 +677,11 @@ class LLMRouter:
         # per preset ended up on a timeout that assumed a decode rate nobody had
         # measured. Recording it makes the next sizing pass evidence-based.
         self._out_tokens_by_task: dict[str, list[int]] = {}
+        # Input tokens and wall seconds per task. A dedicated (GPU-hour)
+        # deployment reports $0 per call, so tokens and time are the only
+        # record of where its capacity went -- and what sizing projects from.
+        self._in_tokens_by_task: dict[str, int] = {}
+        self._seconds_by_task: dict[str, float] = {}
 
     def _validate_stream_support(self) -> None:
         """Fail at config load, not mid-run, on an unsupportable `stream: true`.
@@ -553,6 +703,19 @@ class LLMRouter:
                 "these tasks to openai/anthropic or drop `stream`."
             )
 
+    def _validate_thinking(self) -> None:
+        """`thinking` is a Qwen chat-template switch; only deepinfra reads it."""
+        bad = [
+            name
+            for name, spec in self._tasks.items()
+            if "thinking" in spec and spec.get("provider") != "deepinfra"
+        ]
+        if bad:
+            raise ValueError(
+                f"tasks {sorted(bad)} set `thinking` but are not routed to "
+                "provider 'deepinfra' -- only DeepInfra/Qwen supports it."
+            )
+
     @property
     def total_cost_usd(self) -> float:
         return self._total_cost_usd
@@ -570,6 +733,9 @@ class LLMRouter:
     def cost_report(self) -> dict[str, Any]:
         """Serializable spend summary for persisting alongside a run's outputs."""
         by_task = self.cost_by_task
+        # Zero-cost tasks (dedicated deployments) still belong in the report.
+        for t in self._calls_by_task:
+            by_task.setdefault(t, 0.0)
         return {
             "total_cost_usd": round(self._total_cost_usd, 6),
             "total_calls": sum(self._calls_by_task.values()),
@@ -586,6 +752,9 @@ class LLMRouter:
                     "calls": self._calls_by_task.get(t, 0),
                     "model": self._tasks.get(t, {}).get("model"),
                     "provider": self._tasks.get(t, {}).get("provider"),
+                    "in_tokens": self._in_tokens_by_task.get(t, 0),
+                    "out_tokens": sum(self._out_tokens_by_task.get(t, [])),
+                    "call_seconds": round(self._seconds_by_task.get(t, 0.0), 1),
                     **self._output_stats(t),
                 }
                 for t, c in by_task.items()
@@ -674,6 +843,9 @@ class LLMRouter:
                     response_format=spec.get("response_format"),
                     cache_prefix=cache_prefix,
                     stream=bool(spec.get("stream", False)),
+                    # Only sent when the task sets it, so non-deepinfra calls
+                    # are unchanged (_validate_thinking rejects it elsewhere).
+                    **({"thinking": bool(spec["thinking"])} if "thinking" in spec else {}),
                 )
                 elapsed = time.monotonic() - started
                 # A call sitting near its deadline is the signal that precedes a
@@ -689,6 +861,10 @@ class LLMRouter:
                     self._total_cost_usd += result.cost_usd
                     self._cost_by_task[task] = self._cost_by_task.get(task, 0.0) + result.cost_usd
                 self._calls_by_task[task] = self._calls_by_task.get(task, 0) + 1
+                self._in_tokens_by_task[task] = (
+                    self._in_tokens_by_task.get(task, 0) + (result.prompt_tokens or 0)
+                )
+                self._seconds_by_task[task] = self._seconds_by_task.get(task, 0.0) + elapsed
                 if result.completion_tokens:
                     self._out_tokens_by_task.setdefault(task, []).append(
                         result.completion_tokens
@@ -698,7 +874,8 @@ class LLMRouter:
                 read = result.cache_read_tokens or 0
                 write = result.cache_write_tokens or 0
                 prompt = result.prompt_tokens or 0
-                full = (prompt - read) if result.provider == "openai" else prompt
+                # DeepInfra is OpenAI-compatible: prompt_tokens includes cached.
+                full = (prompt - read) if result.provider in ("openai", "deepinfra") else prompt
                 self._cache_read_tokens += read
                 self._cache_write_tokens += write
                 self._input_full_tokens += max(0, full)

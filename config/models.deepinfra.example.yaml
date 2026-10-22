@@ -1,0 +1,682 @@
+# =============================================================================
+# models.deepinfra.example.yaml  —  DEEPINFRA / QWEN PRESET
+#
+# Activate with:  uv run python scripts/select_llm_mode.py deepinfra
+# (the script substitutes __DEEPINFRA_FLASH_MODEL__ from .env; copying this
+# file by hand leaves the placeholder in and every creation task 404s).
+#
+#  - Knowledge creation (prune-expand, summarization, entity/relationship
+#    extraction, geo, artifacts): Qwen3.8-27B (FP8) on a DEDICATED DeepInfra
+#    deployment, billed per GPU-hour. Its model id is "<account>/<deploy-name>"
+#    -> DEEPINFRA_FLASH_MODEL in .env. Size the GPU + concurrency first:
+#      uv run python scripts/deepinfra_sizing.py <DOCS>
+#  - Relationship extraction: DeepSeek-V4.1-Flash on DeepInfra SERVERLESS
+#    (mixed mode; 27B's relationship recall was low and unstable).
+#  - Retrieval / QA: DeepSeek-V4.1-Flash on DeepInfra SERVERLESS (per token);
+#    beat serverless Qwen3.8-27B head to head (see the Q&A block below).
+#  - Embeddings: Qwen/Qwen3-Embedding-4B @ 1024 (Matryoshka) on DeepInfra
+#    serverless (4B, not 8B: measured 2026-10-13, the 8B endpoint took 12-31 s
+#    per call whatever the batch size; 4B answers in ~0.3 s). Same vector(1024) schema, but NOT interchangeable with
+#    text-embedding-3-small vectors: use a separate or wiped database (the
+#    embedding-model guard refuses a mixed one). Retrieval thresholds are
+#    calibrated per embedding model -- see `embedding_profiles` in config.yaml.
+#  - Table vision: Qwen/Qwen3-VL-30B-A3B-Instruct (serverless).
+#  - judge_* (evaluate-queries) and relationship_repair: DeepSeek-V4.1-Flash
+#    with its own prompts. The mode is DeepInfra-ONLY: no OpenAI or Anthropic
+#    key is needed. (Cross-mode benchmarks pin one judge for every arm.)
+#
+# Qwen3.8 thinks by default; the DeepInfra provider turns it OFF unless a task
+# sets `thinking: true` (reasoning tokens cost money/GPU time and can leak
+# into JSON answers).
+# =============================================================================
+
+tasks:
+  # OpenAI Stage-1 classifier. Notes:
+  #  - gpt-4o-mini is the cheap default and fine for SMALL/MEDIUM ontologies.
+  #  - It needs a longer timeout + lower concurrency
+  #    (expansion.max_concurrent_llm_calls: 3-4 in config.yaml) or it times out.
+  #  - On LARGE, FLAT ontologies (e.g. pharma DRON/HP, ~256 top-level branches)
+  #    gpt-4o-mini ignores the "<=50 IRIs" rule and dumps 200-400+ IRIs: the JSON
+  #    truncates ("salvaged N IRIs") AND the downstream hard-cap then keeps an
+  #    ARBITRARY 50, degrading Stage 2. For those corpora switch to gpt-4.1
+  #    (better instruction-following, 32k output ceiling) — it's one call per
+  #    source chunk so the cost is modest:
+  #      model: gpt-4.1
+  #      max_tokens: 16384
+  # json_object mode is safe here (the prompt already requests JSON).
+  chunk_classification:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 600
+    temperature: 0.0
+    max_tokens: 8192
+    response_format: json_object
+
+  class_proposal:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 300
+    temperature: 0.0
+    max_tokens: 32768
+    response_format: json_object
+    # Stream on DeepInfra: a long NON-streamed reply was silently dropped
+    # (connection open, no bytes) and hung to the 40-min timeout
+    # (2026-10-13). Streamed, `timeout` is the gap BETWEEN tokens, so a
+    # drop is caught in 5 min and retried. Output is identical.
+    stream: true
+    # Qwen-only prompt (backend/app/services/prompts_qwen.py): compact output
+    # contract; classes only for KINDS no existing class covers, tied to
+    # existing classes where relevant; declared LISTS whose items become
+    # instances (drugs, companies, trials, countries, facilities).
+    prompt_set: qwen
+    # Hidden runaway guard, NOT a budget (the prompt states no class number).
+    # Web-search build 2026-10-17: 96 of 340 replies looped past 62 classes --
+    # OpenAI's largest reply on the same corpus -- ("AgriculturalShaving
+    # {Searching,Questing}Makers", "H7..H0") and carried 81% of 20,174
+    # proposals. Only a reply beyond 60 is cut, keeping its first entries.
+    max_new_classes: 60
+    max_instances_per_list: 40           # = prompts_qwen.QWEN_INSTANCES_PER_LIST
+    # What the model is shown of the existing ontology (pipeline_llm.
+    # _ontology_view), so it can check a class does not already exist: the
+    # WHOLE ontology when it has <= full_max_classes (the core merge: 375
+    # classes, ~25k tokens compact), else the Stage-1 roots' ancestors + full
+    # subtrees up to subtree_max_classes. Other presets keep the 1-hop slice,
+    # which hid 294 of 375 classes (anything 2+ levels below a root).
+    ontology_view:
+      full_max_classes: 600
+      subtree_max_classes: 600
+    # Adverse events are classes in ONE hierarchy (backend/app/services/
+    # adverse_event_taxonomy.py): Event > AdverseEvent > <System>AdverseEvent
+    # (19 types + GeneralAdverseEvent) > the specific event. The prompts list
+    # the names; Stage 3 maps variants (AdverseReaction, DrugSideEffect,
+    # GIAdverseReaction...) onto them before and after dedup.
+    adverse_event_taxonomy: true
+    # Junk filter (class_junk_filter): deterministic rules on each reply
+    # (numbers, URLs, Most/Least fragments, long phrases, loop families), then
+    # class_validity_judge on the distinct labels in pairwise Stage 3.
+    junk_filter: true
+    # A reply cut off at max_tokens keeps its COMPLETE entries (deduped; matches
+    # whose snippet is not in the chunk dropped) instead of being discarded.
+    # Off by default in every other preset.
+    salvage_truncated: true
+
+  match_dedup:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 300
+    temperature: 0.0
+    # Dedup echoes the whole deduplicated batch back, so output size tracks
+    # input size. At 4096 the JSON truncated mid-object, the parse returned
+    # nothing, and the stage silently passed its input through undeduplicated.
+    # pipeline_llm._dedup sizes its batches against this value.
+    max_tokens: 32768
+    response_format: json_object
+    # Stream on DeepInfra: a long NON-streamed reply was silently dropped
+    # (connection open, no bytes) and hung to the 40-min timeout
+    # (2026-10-13). Streamed, `timeout` is the gap BETWEEN tokens, so a
+    # drop is caught in 5 min and retried. Output is identical.
+    stream: true
+    # PAIRWISE dedup (deepinfra only; every other preset keeps the echo dedup
+    # above): staging store in the build database (DATABASE_URL, migration
+    # 0011) -> nearest-neighbour candidates -> class_pair_judge. The echo dedup
+    # removed nothing beyond identical labels at 20k proposals (13,828 distinct
+    # in, 13,844 out, 19 GPU-min); the replay of the same proposals needed ~110
+    # judge calls. No build database -> falls back to the echo dedup.
+    method: pairwise
+    # Bands calibrated on 161 labelled web-search pairs (2026-10-19; share
+    # truly duplicate): 0.80-0.85 3%, 0.85-0.90 13%, 0.90-0.95 65%,
+    # 0.95-0.97 85%, >=0.97 90%.
+    t_hi: null        # no auto-merge: >=0.97 was still 1 in 10 wrong (Sea~Ocean); exact labels still merge
+    t_lo: 0.85        # below: kept apart without a call (0.80-0.85 = 61% of calls, ~13% of duplicates)
+    k: 10             # neighbours per label
+    judge_batch: 60
+    judge_concurrency: 24  # probe 2026-10-19, 2x H200: validity 18.5 -> 35 calls/min, pair 67 -> 88 (8 -> 24)
+    max_group: 25     # union-find group cap: a chain cannot fuse unrelated concepts
+    embed_concurrency: 8        # embedding requests in flight while staging labels
+    index_build_mem_mb: 256     # maintenance_work_mem for the per-run HNSW build
+    index_build_workers: 0      # >0 needs a larger /dev/shm (Docker default 64 MB)
+    audit: true       # dedup_audit.json / .csv next to the output
+    keep_staging: false
+
+  # Pair judge for pairwise dedup (Qwen's own prompt: prompts_qwen.qwen_class_pair_judge).
+  # Lists only the SAME pairs, so ~60 pairs cost ~0.3k output tokens.
+  class_pair_judge:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 300
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+
+  # Validity judge (prompts_qwen.qwen_class_validity_judge): category /
+  # named_thing / junk for each distinct label, 100 per call.
+  class_validity_judge:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 400
+    temperature: 0.0
+    max_tokens: 6144
+    response_format: json_object
+
+  concept_grouping:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 600
+    temperature: 0.0
+    max_tokens: 8192
+    response_format: json_object
+
+  compact_description:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 150
+    temperature: 0.0
+    max_tokens: 2048
+    response_format: json_object
+
+  # RECOMMENDATION: use gpt-4.1 for summarization, not gpt-4o-mini. Mini ignores
+  # the "preserve entities/lists/numbers, keep 20-50%" instructions and
+  # over-compresses to ~5% of the source, which starves downstream entity/
+  # artifact extraction. gpt-4.1 follows them -> fuller, more faithful summaries.
+  # Combined with segment-wise summarization (docs >4k tokens are split; see
+  # pipeline_llm), a large doc gets several proportional summaries near the 20%
+  # floor. Cost is one-time + cached (~$2 for a ~500k-token corpus).
+  #   model: gpt-4.1  ;  max_tokens: 8192  ;  timeout: 180
+  document_summarize:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 600
+    temperature: 0.0
+    max_tokens: 8192
+    stream: true
+
+  # Evaluated (near-lossless) document summarizer -- new default ingestion path
+  # (summarize -> question-gen -> evaluate -> revise). OpenAI-only preset: gpt-4.1.
+  evaluated_summary_chunk:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 600
+    temperature: 0.0
+    max_tokens: 8192
+    stream: true
+  summary_question_gen:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 300
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+  summary_evaluate:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 300
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+  summary_revise:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 600
+    temperature: 0.0
+    max_tokens: 8192
+    stream: true
+
+  classification_audit:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 300
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+
+  class_summarization:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 90
+    temperature: 0.2
+    max_tokens: 1024
+  # Corpus selection (prune-expand --select-subset): name each document's TYPE
+  # so every type is guaranteed a document in the subset. One call per
+  # document, so it MUST stay on a cheap model -- routing it through
+  # `document_summarize` (gpt-4.1) made labelling 70% of a selection run.
+  document_type_label:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 60
+    temperature: 0.0
+    max_tokens: 256
+  # Corpus selection: shrink an oversize document summary to fit the embedding
+  # model's input cap. max_tokens MUST comfortably exceed
+  # corpus_selection.embed_target_tokens -- a small cap silently truncates the
+  # compression instead of the embedder truncating the input, which is the
+  # same data loss one step earlier (a 32,614-token summary once collapsed to
+  # 260 tokens through a 256-token task).
+  embed_compress:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 600
+    temperature: 0.2
+    max_tokens: 8192
+
+  # ---- Q&A: every task the retrieval / answer path calls -------------------
+  # DeepSeek-V4.1-Flash, serverless, shared prompts. Measured 2026-10-17 on the
+  # same pharma graph against Qwen3.8-27B (gpt-4.1 judge): retrieval a tie
+  # (doc recall@10 0.683 vs 0.680, MRR 0.646 vs 0.645); audit expectation
+  # 0.973 vs 0.932; grounding simple 0.995 vs 0.936, deep 0.977 vs 0.964;
+  # ~40% faster (audit 39 s vs 67 s per question); $0.009 vs $0.012 per deep
+  # research question. Qwen kept 0 invalid citations (DeepSeek 3) and was
+  # slightly more comprehensive.
+  qa_synthesis:
+    provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4.1-Flash
+    timeout: 300
+    temperature: 0.1
+    max_tokens: 4096
+
+  embeddings:
+    provider: deepinfra
+    model: Qwen/Qwen3-Embedding-4B
+    dim: 1024
+    batch_size: 100
+    # Instruction prepended to retrieval QUERIES only (stored passages are
+    # embedded bare). Beat the generic default on the pharma lever test
+    # (on/off-topic gap 0.46 vs 0.39). config.yaml `embedding_profiles` holds
+    # thresholds calibrated FOR THIS PREFIX -- recalibrate if you change it.
+    query_prefix: "Instruct: Given a question about a document collection, retrieve the passages that contain the facts needed to answer it\nQuery: "
+
+  artifact_chunk_extract:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 600
+    temperature: 0.0
+    max_tokens: 8192          # entity-grounded artifact JSON on dense chunks exceeds 2048 -> truncation
+    response_format: json_object
+
+  artifact_chunk_extract_with_entities:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 600
+    temperature: 0.0
+    max_tokens: 8192          # entity-grounded artifact JSON on dense chunks exceeds 2048 -> truncation
+    response_format: json_object
+
+  # gpt-4.1-mini, NOT gpt-4o-mini. Measured on mhrag_doc_023 (fulltext,
+  # 3 validation rounds, n=3 per model): gpt-4o-mini hit 22/30 on the six
+  # people the passage names, gpt-4.1-mini 17/18. Ramon Fernandez -- the CFO
+  # who speaks the article's central quote -- went 2/5 to 3/3.
+  #
+  # The reason is convergence, and it is what makes the switch pay for itself.
+  # With gpt-4o-mini the review loop NEVER settled: 0 clean rounds across
+  # three runs, all 6 rounds re-extracting, 5-10 class rewrites per run.
+  # With gpt-4.1-mini: 1-2 clean rounds, 1-3 re-extractions, 0-1 rewrites --
+  # it gets the class right the first time. So despite 2.7x the token price,
+  # measured cost per document FELL ($0.0197 -> $0.0146) because the loop
+  # stops instead of thrashing.
+  #
+  # Caveat: that cost win needs --validate-entities ON. Without the loop this
+  # task is a straight 2.7x (~$0.17 -> $0.47 over a 245-chunk summary run;
+  # scale accordingly for --from-fulltext).
+  entity_extract:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 600
+    temperature: 0.0
+    max_tokens: 8192          # dense chunks w/ many entities (50 candidate classes) exceed 2048 -> truncation
+    response_format: json_object
+  # Second extraction pass over the SAME chunk, asking only for the CONCEPTS
+  # the passage develops (freight rates, consolidation, overcapacity) rather
+  # than the named things it mentions. Runs only with --concept-pass.
+  # Same model as entity_extract and entity_validate. This is
+  # menu-constrained selection, not synthesis, so the cheap tier was the
+  # starting point -- but gpt-4o-mini's instability on the entity pass
+  # (see the entity_extract note) is a property of the model, not of that
+  # prompt, and the concept pass reads the same chunk against the same
+  # kind of menu. Kept aligned rather than split across tiers.
+  concept_extract:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 600
+    temperature: 0.0
+    max_tokens: 4096          # <=5 concepts per chunk; far smaller than entity_extract
+    response_format: json_object
+  # Review pass over what entity_extract just produced: is each entity real,
+  # and is its class the right KIND of thing? Only runs with
+  # --validate-entities (off by default).
+  #
+  # DELIBERATELY a different, stronger model than entity_extract. A model
+  # reviewing its own output rubber-stamps it, and the errors being hunted are
+  # exactly the ones it produced: it picked ChollaUnit4 because the menu
+  # offered it and the prompt said "pick ONE", so re-asking the same weights
+  # over the same menu reproduces the same reasoning. gpt-4.1-mini is the
+  # cheapest model that reliably holds a 50-item menu and refuses off-menu
+  # answers; gpt-4.1 is ~6x the price for a multiple-choice task.
+  entity_validate:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 300
+    temperature: 0.0
+    max_tokens: 4096          # a verdict per entity + missing_entities + note
+    response_format: json_object
+  # Second pass of Milestone C: relationships between entities already
+  # extracted from a chunk. Separate from entity_extract so the predicate menu
+  # can be narrowed to the entities' ACTUAL classes -- see
+  # db_entity_extract._candidate_predicates. gpt-4.1-mini, not gpt-4o-mini:
+  # measured 2026-09-13 on multihop-rag-subset, 4o-mini broke the "quote must
+  # NAME BOTH ends" rule on 182 of 515 claims, ~63% of them outright false
+  # ("iPad Pro --awarded--> Brenda Stolyar"). Same model as entity_extract.
+  # MIXED MODE (2026-10-14): relationship extraction runs on SERVERLESS
+  # DeepSeek-V4.1-Flash, not the dedicated Qwen deployment. On identical chunks
+  # 27B proposed 65 / 5 / 12 relationships across runs (2 kept with the best
+  # prompt); DeepSeek proposed 432 and 78 passed the evidence/type/verifier
+  # gates (OpenAI baseline: 54) for ~$0.05. DeepSeek has its OWN prompt
+  # (backend/app/services/prompts_deepseek.py, cloned from the Qwen one).
+  relationship_extract:
+    provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4.1-Flash
+    timeout: 900
+    temperature: 0.0
+    max_tokens: 16384   # up to one relationship per entity (ceiling 100) per chunk, each with a quote
+    prompt_set: deepseek
+  # Third pass: does each relationship's quoted evidence actually SUPPORT the
+  # claim, in the stated direction? The structural checks verify a quote occurs
+  # in the chunk and names both ends; they cannot tell that "lawsuits filed
+  # against A by B" does not mean A sued B. Judgement over a short quote, so
+  # a mini model is the right tier -- but it decides what enters the graph,
+  # so give it room to answer for every claim in a chunk. gpt-4.1-mini to
+  # match relationship_extract: a weaker model must not judge a stronger one.
+  relationship_verify:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 420
+    temperature: 0.0
+    max_tokens: 8192   # a verdict per claim; up to ~100 claims per dense chunk
+  # Orphan check: after both relationship passes, the chunk's entities that
+  # still have no relationship are listed and the model either returns a
+  # relationship the passage states for each or flags why there is none
+  # (only_listed / no_partner / implied_only / not_an_entity). Its claims face
+  # the same evidence gates and the verifier. gpt-4.1: measured 2026-09-13 with
+  # everything else replayed from one recording, it wrote 515 edges vs 480 on
+  # gpt-4.1-mini and its unique edges were ~84% correct vs ~75%. The VERIFIER
+  # stays on gpt-4.1-mini -- on gpt-4.1 it removed ~80 correct edges (team
+  # lineups, accessories) to catch ~12 wrong ones.
+  relationship_orphan_check:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 420
+    temperature: 0.0
+    max_tokens: 8192   # relationships for up to ~100 orphans, plus a flag per unlinked one
+  # Rescue pass: re-home relationship claims whose evidence is sound but whose
+  # predicate failed the domain/range check, using a WIDER predicate menu. The
+  # strict menu offered a median of 8 of 620 predicates on the news corpus, so
+  # real relationships were being forced onto wrong predicates and dropped.
+  relationship_repair:
+    provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4.1-Flash   # same model as relationship_extract
+    prompt_set: deepseek                     # prompts_deepseek.deepseek_relationship_repair
+    timeout: 120
+    temperature: 0.0
+    max_tokens: 2048
+
+  question_parse:
+    provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4.1-Flash
+    timeout: 90
+    temperature: 0.0
+    max_tokens: 1024
+    response_format: json_object
+
+  # Parses the RELATIONSHIPS a question implies, for relationship-aware
+  # graph traversal ("which company in Germany" -> company is in a place,
+  # that place is in Germany). gpt-4.1-mini rather than gpt-4o-mini: the
+  # multi-step decomposition is where mini-class models collapse two hops
+  # into one, and one bad parse costs the whole walk. One call per query.
+  question_relations:
+    provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4.1-Flash
+    timeout: 90
+    temperature: 0.0
+    max_tokens: 1024
+    response_format: json_object
+
+  # enrich-geo: which named places contain which other named places. Closed
+  # list, one call per 40 places -- but gpt-4o-mini got it wrong in both
+  # directions on a 46-place list: it returned NOTHING when the list was
+  # grouped by class, and when it did answer it produced "Canada is in United
+  # States". These edges are world knowledge with no document behind them, so
+  # a wrong one is unfalsifiable from the corpus. A level guard rejects the
+  # impossible ones; gpt-4.1-mini is what makes the rest trustworthy.
+  geographic_containment:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 240
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+
+  concept_expansion:
+    provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4.1-Flash
+    timeout: 90
+    temperature: 0.0
+    max_tokens: 1024
+    response_format: json_object
+
+  query_decompose:
+    provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4.1-Flash
+    timeout: 90
+    temperature: 0.0
+    max_tokens: 1024
+    response_format: json_object
+
+  # Iterative-retrieval planner: decides whether a question needs a second,
+  # DEPENDENT round (e.g. "compare X to its competitors" must discover the
+  # competitor list before it can retrieve their attributes). Sized like its
+  # sibling query_decompose -- a short JSON object of two sub-questions.
+  #
+  # This task was called by retrieval.py but defined in NO preset, so every
+  # lookup raised KeyError, was swallowed by the caller's fail-safe, and
+  # two-round retrieval silently never ran. Keep it present in ALL presets.
+  retrieval_rounds_plan:
+    provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4.1-Flash
+    timeout: 90
+    temperature: 0.0
+    max_tokens: 1024
+    response_format: json_object
+
+  entity_probes:
+    provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4.1-Flash
+    timeout: 90
+    temperature: 0.0
+    max_tokens: 1024
+    response_format: json_object
+
+  chunk_relevance_filter:
+    provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4.1-Flash
+    timeout: 300
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+
+  answer_simple_qa:
+    provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4.1-Flash
+    timeout: 90
+    temperature: 0.0
+    max_tokens: 1024
+
+  answer_deep_research:
+    provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4.1-Flash
+    timeout: 600
+    temperature: 0.1
+    max_tokens: 8192          # 7-section deep_research answers over evidence-rich corpora exceed 4096
+
+  follow_up_resolution:
+    provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4.1-Flash
+    timeout: 90
+    temperature: 0.0
+    max_tokens: 512
+
+  answer_conversation_turn:
+    provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4.1-Flash
+    timeout: 150
+    temperature: 0.1
+    max_tokens: 2048
+
+  insight_gen:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 150
+    temperature: 0.2
+    max_tokens: 2048
+    response_format: json_object
+
+  recommendation_gen:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 150
+    temperature: 0.2
+    max_tokens: 2048
+    response_format: json_object
+
+  # Artifact rollup (clustered merge) + lossless evaluate->revise loop.
+  artifact_merge:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 600
+    temperature: 0.2
+    max_tokens: 8192
+    response_format: json_object
+  artifact_merge_evaluate:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 300
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+  artifact_merge_revise:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 600
+    temperature: 0.2
+    max_tokens: 8192
+    response_format: json_object
+
+  # Summary rollup uses a MORE CAPABLE model than the short-artifact merge:
+  # gpt-5.4 gives measurably higher retention on the 9-section Summary,
+  # while Claim/Finding/Observation/Event merges are handled perfectly by
+  # the cheaper artifact_merge* (gpt-4.1) -- so no premium is paid there.
+  summary_merge:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 1200
+    temperature: 0.2
+    max_tokens: 16384
+    response_format: json_object
+  summary_merge_evaluate:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 600
+    temperature: 0.0
+    max_tokens: 8192
+    response_format: json_object
+  summary_merge_revise:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 1200
+    temperature: 0.2
+    max_tokens: 16384
+    response_format: json_object
+  # Answer-quality judges (evaluate-queries): DeepSeek with its own judge
+  # prompts, so this mode needs no OpenAI key. A cross-mode benchmark should
+  # pin ONE judge for every arm (scripts/bench overrides these to gpt-4.1).
+  judge_comprehensiveness:
+    provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4.1-Flash
+    prompt_set: deepseek
+    timeout: 90
+    temperature: 0.0
+    max_tokens: 1024
+    response_format: json_object
+
+  judge_no_hallucination:
+    provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4.1-Flash
+    prompt_set: deepseek
+    timeout: 90
+    temperature: 0.0
+    max_tokens: 1024
+    response_format: json_object
+
+  judge_gap_detection:
+    provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4.1-Flash
+    prompt_set: deepseek
+    timeout: 90
+    temperature: 0.0
+    max_tokens: 1024
+    response_format: json_object
+
+  judge_consistency:
+    provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4.1-Flash
+    prompt_set: deepseek
+    timeout: 150
+    temperature: 0.0
+    max_tokens: 2048
+    response_format: json_object
+
+  artifact_document_summary:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 90
+    temperature: 0.2
+    max_tokens: 1024
+
+  # Serverless vision model (OCR-tagged, $0.15 / $0.60 per 1M). The
+  # dedicated text deployment is not used here: whether it serves images is
+  # untested, and a failed vision call drops the table.
+  table_extract_vision:
+    provider: deepinfra
+    model: Qwen/Qwen3-VL-30B-A3B-Instruct
+    timeout: 300
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+
+  table_concept_grouping:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 150
+    temperature: 0.0
+    max_tokens: 2048
+    response_format: json_object
+
+  # Stage 3b (2026-10-14): embedding similarity proposes duplicate-class pairs,
+  # this judge confirms them (synonyms merge; opposites/siblings stay apart).
+  # DeepSeek-specific prompt (prompts_deepseek.py). Serverless, ~$0.01/run.
+  class_synonym_judge:
+    provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4.1-Flash
+    prompt_set: deepseek
+    enabled: true
+    threshold: 0.83      # candidate cosine; the judge decides
+    max_pairs: 1500     # 150 was hit on a 100-doc corpus (2026-10-17); ~$0.001 per 60 pairs
+    pairs_per_call: 60
+    timeout: 600
+    temperature: 0.0
+    max_tokens: 4096   # 60 decisions ~1.5k tokens
+    response_format: json_object
+
+defaults:
+  retries:
+    max_attempts: 5
+    initial_wait_seconds: 1
+    max_wait_seconds: 30
+    retry_on_status: [429, 500, 502, 503, 504]

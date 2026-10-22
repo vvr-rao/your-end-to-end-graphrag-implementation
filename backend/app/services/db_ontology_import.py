@@ -27,6 +27,7 @@ from typing import Any
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from backend.app.db.embedding_guard import ensure_embedding_model
 from backend.app.db.graph_version import bump_version, current_version
 from backend.app.db.models.graph import GraphRelationship
 from backend.app.db.models.ontology import (
@@ -178,6 +179,7 @@ async def import_ontology_folder(
         return summary
 
     embedder = Embedder()
+    await ensure_embedding_model(embedder)
 
     # Batch size for the multi-row UPSERTs. 100 keeps the SQL string +
     # parameter list well under any pooler limit and bounds each

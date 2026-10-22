@@ -63,3 +63,23 @@ jobs:
 
       - name: Test skill helpers + durable harness (cross-platform)
         run: uv run --python 3.12 pytest backend/tests/unit/test_skill_helpers.py -v
+
+      # The ontology-build units the DeepInfra/scaling work added (junk rules,
+      # pairwise dedup, audit, Stage-4 class indexes, concept-grouping batches,
+      # GPU + memory sizing) are pure Python, so they must pass on every OS the
+      # skills support. The staging-store and Stage-2 streaming round trips
+      # need Postgres (ONTOLOGY_BUILD_TEST_DSN) and skip here.
+      - name: Test ontology-build units (cross-platform)
+        run: >-
+          uv run --python 3.12 pytest -v
+          backend/tests/unit/test_class_junk_filter.py
+          backend/tests/unit/test_pairwise_dedup.py
+          backend/tests/unit/test_dedup_audit.py
+          backend/tests/unit/test_adverse_event_taxonomy.py
+          backend/tests/unit/test_concept_grouping_batches.py
+          backend/tests/unit/test_class_indexes.py
+          backend/tests/unit/test_ontology_build_store.py
+          backend/tests/unit/test_stage2_streaming.py
+          backend/tests/unit/test_semantic_grouping.py
+          backend/tests/unit/test_deepinfra_mode.py
+          backend/tests/unit/test_tpm_check.py

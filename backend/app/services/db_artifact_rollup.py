@@ -39,6 +39,7 @@ from sqlalchemy import select
 from sqlalchemy import text as sql_text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from backend.app.db.embedding_guard import ensure_embedding_model
 from backend.app.db.graph_version import bump_version, current_version
 from backend.app.db.models.artifacts import IntelligenceArtifact
 from backend.app.db.models.graph import GraphRelationship
@@ -249,6 +250,7 @@ async def generate_rollups(
     router = LLMRouter()
     cost_before = router.total_cost_usd
     embedder = Embedder()
+    await ensure_embedding_model(embedder)
 
     async with session_scope() as session:
         gv = await current_version(session)

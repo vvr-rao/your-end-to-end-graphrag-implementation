@@ -50,6 +50,7 @@ from sqlalchemy import select, text as sql_text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.db.embedding_guard import ensure_embedding_model
 from backend.app.core.config import get_settings
 from backend.app.db.graph_version import current_version
 from backend.app.db.models.documents import Chunk, Document
@@ -561,7 +562,8 @@ async def retrieve_and_answer(
 
     # -------- step 4: ontology match --------
     embedder = Embedder()
-    qvec = (await embedder.embed([resolved_query]))[0]
+    await ensure_embedding_model(embedder)
+    qvec = (await embedder.embed_query([resolved_query]))[0]
     rel_probes = (
         await embedder.embed([_relation_text(r) for r in question_relations])
         if question_relations else []
@@ -675,6 +677,16 @@ async def retrieve_and_answer(
         if verbose:
             print(f"[query] temporal expansion: {len(seed_time_ids)} seed "
                   f"period(s) -> {len(expanded_time_ids)} period(s)")
+    # Persisted in retrieval_plan (below), so how the walk went is visible per
+    # run in an eval -- the verbose line alone cannot be attributed to a
+    # question when several run concurrently.
+    parsed["graph_walk"] = {
+        "seeding": _tier if _cascade else "legacy",
+        "seed_entities": len(seed_entity_ids),
+        "stage": rel_stage,
+        "relation_matched_edges": len(_rel_edges),
+        "nodes": len(bfs_nodes),
+    }
     if verbose:
         print(
             f"[query] graph expansion ({rel_stage}) yielded {len(bfs_nodes)} "
@@ -1072,7 +1084,7 @@ async def retrieve_and_answer(
     if verbose:
         print(f"[query] probes ({len(probes)}): {probes}")
 
-    probe_vecs = await embedder.embed(probes)
+    probe_vecs = await embedder.embed_query(probes)
 
     # Rerank all probes on ONE session so the per-connection query-plan cache /
     # warm pgvector state is reused (first rerank ~cold, the rest are ~5x faster).
@@ -2592,6 +2604,8 @@ async def _persist_run(
                     "intent": result.parsed.get("intent", ""),
                     "aliases": result.parsed.get("aliases", {}),
                     "time_terms": result.parsed.get("time_terms", []),
+                    "relations": [_relation_text(r) for r in result.parsed.get("relations") or []],
+                    "graph_walk": result.parsed.get("graph_walk"),
                     # Persisted so citation quality is trendable across runs
                     # rather than only visible in a log line.
                     "invalid_citations": result.invalid_citations,

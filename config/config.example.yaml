@@ -971,3 +971,41 @@ storage:
 geo_enrichment:
   batch_size: 15
   max_containers: 60
+
+# -----------------------------------------------------------------------------
+# embedding_profiles -- per-embedding-model threshold overrides.
+# Every distance threshold above (probe_dist_floor/ceiling, relationship
+# hop floor, relation_class_seed_similarity, max_candidate_l2) was measured on
+# text-embedding-3-small. A different embedder has a different distance
+# distribution, so its calibrated values go here, keyed by the model named in
+# models.yaml `embeddings:`. Dotted keys replace the matching setting only
+# while that model is active; no entry -> the values above apply unchanged.
+# -----------------------------------------------------------------------------
+embedding_profiles:
+  # Qwen3-Embedding-4B @1024 (deepinfra mode). Calibrated 2026-10-17 with
+  # scripts/bench/calibrate_embedding.py on two copies of the SAME pharma graph
+  # (OpenAI vectors vs Qwen vectors): each value keeps the role the base value
+  # has on text-embedding-3-small. On-topic best-chunk L2 p50/p95: base
+  # 0.89/1.05, Qwen 0.73/0.96; off-topic p05/p50: base 1.25/1.31, Qwen
+  # 1.06/1.12 (nonsense: Qwen 1.07 -- the base 1.25 ceiling rejected nothing).
+  # Relation cosines: base 0.55 admits the top 2.3% of probe x edge pairs,
+  # 0.40 the top 11%; on Qwen 0.55 admitted ~half of ALL edges.
+  #
+  # The probe values belong to the "facts" query prefix set in
+  # models.deepinfra.example.yaml (`embeddings.query_prefix`): the prefix moves
+  # every query's distances (on/off-topic medians 0.73/1.12 with the default
+  # prefix, 0.78/1.24 with "facts"). Change the prefix -> re-run
+  # calibrate_embedding.py --query-prefix. Relation probes embed WITHOUT the
+  # prefix, so the two relation thresholds do not move with it.
+  # Lever test on the pharma graph (81 ranked lists, LLM calls replayed):
+  # "facts" prefix + rerank_after_fusion took doc recall@10 0.674 -> 0.734,
+  # nDCG@10 0.761 -> 0.818, chunk precision@10 0.748 -> 0.879 (MRR 0.712 ->
+  # 0.692). The prefix alone ranks better but finds less (recall@10 0.632);
+  # the rerank wins the recall back. rrf_weight_graph_walk 2.0 HURT on Qwen.
+  Qwen/Qwen3-Embedding-4B:
+    qa.probe_dist_floor: 0.971              # base 1.05 = on-topic p95
+    qa.probe_dist_ceiling: 1.172            # base 1.25 = off-topic p05
+    qa.probe_rel_band: 0.109                # base 0.10, scaled by the on/off gap
+    qa.relationship_similarity: 0.77        # base 0.55 = top 2.3% of pairs
+    qa.relation_class_seed_similarity: 0.68 # base 0.40 = top 11% of pairs
+    qa.rerank_after_fusion: true            # base false; see lever test above

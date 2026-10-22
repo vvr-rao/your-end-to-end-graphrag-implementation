@@ -29,6 +29,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from backend.app.core.config import get_settings
+from backend.app.db.embedding_guard import ensure_embedding_model
 from backend.app.db.graph_version import bump_version, current_version
 from backend.app.db.models.artifacts import IntelligenceArtifact
 from backend.app.db.models.documents import Chunk, Document
@@ -289,6 +290,7 @@ async def ingest_documents_folder(
     )
 
     embedder = Embedder()
+    await ensure_embedding_model(embedder)
     chunk_vectors = await embedder.embed(all_chunk_texts)
 
     # Doc-level embedding inputs: if any summary exceeds the 8K cap,
@@ -578,6 +580,7 @@ async def _ingest_fulltext_chunks_for_docs(
         f"{len(fresh_docs)} doc(s); embedding ..."
     )
     embedder = Embedder()
+    await ensure_embedding_model(embedder)
     vectors = await embedder.embed(all_texts)
     summary.embedding_cost_usd += embedder.total_cost_usd
 
@@ -773,6 +776,7 @@ async def _ingest_tables_for_docs(
         return
 
     embedder = Embedder()
+    await ensure_embedding_model(embedder)
     vectors = await embedder.embed(embed_texts)
     summary.embedding_cost_usd += embedder.total_cost_usd
 

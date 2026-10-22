@@ -37,6 +37,7 @@ from typing import Any
 
 import tiktoken
 
+from backend.app.core.config import cache_root
 from backend.app.services.chunking import TextChunk, chunk_documents
 from backend.app.services.db_artifact_gen import _extract_json
 from backend.app.services.document_io import LoadedDocument
@@ -290,7 +291,7 @@ async def _summarize_chunk_with_eval(
 # Cache (per-document JSON of chunk summaries).
 # --------------------------------------------------------------------------- #
 def _cache_dir() -> Path:
-    root = Path.home() / ".cache" / "your-end-to-end-graphrag-implementation" / "eval_summaries"
+    root = cache_root() / "eval_summaries"
     root.mkdir(parents=True, exist_ok=True)
     return root
 

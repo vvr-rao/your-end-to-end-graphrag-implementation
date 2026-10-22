@@ -34,6 +34,12 @@ services:
         sync: false
       - key: GROQ_API_KEY
         sync: false
+      # DeepInfra mode (render-init --llm-mode deepinfra sets both and drops
+      # OPENAI_API_KEY): Q&A on serverless DeepSeek, Qwen query embeddings.
+      - key: DEEPINFRA_API_KEY
+        sync: false
+      - key: MODELS_CONFIG_PATH
+        sync: false                          # e.g. config/models.deepinfra.example.yaml
       - key: BEARER_TOKEN
         generateValue: true
       - key: FRONTEND_ORIGIN

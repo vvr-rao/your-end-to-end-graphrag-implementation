@@ -76,6 +76,20 @@ def parse_question_file(path: Path) -> list[tuple[str, bool]]:
     return out
 
 
+def _judge_prompt(router: Any, task_name: str) -> Any:
+    """`prompt_set: deepseek` on the judge task selects DeepSeek's own judge
+    prompt (prompts_deepseek.py); otherwise the shared one."""
+    try:
+        prompt_set = router.task_spec(task_name).get("prompt_set")
+    except (AttributeError, KeyError):  # test doubles without a task map
+        prompt_set = None
+    if prompt_set == "deepseek":
+        from backend.app.services.prompts_deepseek import DEEPSEEK_JUDGES
+
+        return DEEPSEEK_JUDGES[task_name]
+    return PROMPTS[task_name]
+
+
 async def _judge(
     router: LLMRouter,
     task_name: str,
@@ -84,7 +98,7 @@ async def _judge(
     """One judge call. Returns {score, justification} (or {score=None,
     justification=error message} on failure)."""
     try:
-        system, user = PROMPTS[task_name](*prompt_args)
+        system, user = _judge_prompt(router, task_name)(*prompt_args)
     except Exception as exc:
         return {"score": None, "justification": f"prompt builder error: {exc}"}
     try:

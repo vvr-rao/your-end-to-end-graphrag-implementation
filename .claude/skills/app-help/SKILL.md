@@ -33,8 +33,15 @@ set of 7 **core** ontologies (VIAO, FOAF, ORG, geography, time, SKOS,
 domain_concepts) is ALWAYS merged in as well.
 
 ## The pipeline (order)
-1. **Choose LLM mode** — Groq+OpenAI (default) / OpenAI-only / Anthropic+OpenAI;
-   embeddings always OpenAI.
+1. **Choose LLM mode** — Groq+OpenAI (default) / OpenAI-only / Anthropic+OpenAI
+   (embeddings on OpenAI) / **DeepInfra** (Qwen3.8-27B on a rented dedicated GPU
+   for building; serverless DeepSeek-V4.1-Flash for relationships and Q&A;
+   Qwen3-Embedding-4B embeddings; no OpenAI key; ~10x cheaper Q&A; its own
+   database). DeepInfra GPUs are sized with `deepinfra_sizing.py` (preferred
+   4x B200 → 4x H200, each as two 2-GPU instances, then 2x B200 → 2x H200 →
+   2x H100; concurrency from the GPUs' memory and the local machine's), not
+   `tpm_check.py`. DeepSeek always runs serverless. Both sizing tools also check
+   that THIS machine's RAM fits the build's projected peak.
 2. **Database** — Supabase (prod) or local docker Postgres; `db-init` migrates.
 3. **Merge** ontologies (VIAO + 6 more core + a domain ontology) — deterministic, no LLM.
 3b. **summarize-descriptions** (optional but recommended, cents) — compacts each
@@ -404,7 +411,8 @@ Other things worth knowing:
   plans often cap around 500 MB, so watch headroom as the corpus grows.
 - Long steps run **detached** (`scripts/run_detached.py`) so they survive a
   killed session; monitor with `scripts/job_status.py`. The harness is pure
-  Python, so it works on **Linux and macOS**; on **Windows use WSL2**.
+  Python, so it works on **Linux, macOS and Windows** (it detaches with each
+  OS's own process-session mechanism; no WSL needed).
 - Some steps have known caveats worth mentioning: garbled/unreadable PDFs are
   flagged by a preflight check before paid work; structured-table extraction is
   opt-in (`--tables`).

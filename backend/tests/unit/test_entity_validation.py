@@ -575,6 +575,93 @@ def test_resolution_survives_empty_and_malformed_input() -> None:
     assert _resolve_canonical_forms([(None, None, None, [], None)]) == ({}, 0)
 
 
+
+# --------------------------------------------------------------------------- #
+# short_name pairing guard (2026-10-17, 27B pharma builds)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_short_form_naming_a_different_drug_is_not_merged() -> None:
+    """Build 2 paired canonical `Tirzepatide` with short `Trulicity` in one
+    chunk; the collapse then rewrote every Trulicity mention in the run, and
+    35 edges carried Trulicity's label facts on Tirzepatide."""
+    text = "Mounjaro (tirzepatide) vs Trulicity (dulaglutide): both weekly injections."
+    alias, _ = _resolve_canonical_forms(
+        [("c1", None, None, [
+            {"canonical_name": "Tirzepatide", "short_name": "Trulicity"},
+            {"canonical_name": "Trulicity", "short_name": "Trulicity"},
+        ], None)], chunk_text={"c1": text})
+    assert _norm("Trulicity") not in alias
+
+
+def test_a_drug_is_not_merged_into_its_class_name() -> None:
+    """`Ozempic`/`semaglutide` became `GLP-1 receptor agonists` in build 2.
+    A parenthesised EXAMPLE LIST is not an alias statement."""
+    text = "GLP-1 receptor agonists (semaglutide, liraglutide) slow gastric emptying."
+    rejected: list[tuple[str, str]] = []
+    alias, _ = _resolve_canonical_forms(
+        [("c1", None, None, [
+            {"canonical_name": "GLP-1 receptor agonists", "short_name": "semaglutide"},
+            {"canonical_name": "GLP-1 receptor agonists", "short_name": "Ozempic"},
+        ], None)], chunk_text={"c1": text}, rejected=rejected)
+    assert alias == {}
+    assert len(rejected) == 2
+
+
+@pytest.mark.parametrize("canon,short", [
+    ("CardiovascularAdverseEvent", "Hypotension"),
+    ("GastrointestinalAdverseEvent", "Nausea"),
+    ("DermatologicalAdverseEvent", "Rash"),
+    ("DryCough", "Cough"),
+])
+def test_a_class_style_canonical_never_absorbs_its_members(canon, short) -> None:
+    """Build 1 used CamelCase class labels as entity names and paired specific
+    events with them as 'short forms'."""
+    text = f"{canon} ({short}) was reported."   # even if the text pairs them
+    alias, _ = _resolve_canonical_forms(
+        [("c1", None, None, [{"canonical_name": canon, "short_name": short}], None)],
+        chunk_text={"c1": text})
+    assert alias == {}
+
+
+@pytest.mark.parametrize("canon,short", [
+    ("U.S. Food and Drug Administration", "FDA"),
+    ("United States Food and Drug Administration", "FDA"),
+    ("Angiotensin-converting enzyme inhibitor", "ACE inhibitors"),
+    ("Nonsteroidal anti-inflammatory drug", "NSAIDs"),
+    ("sodium-glucose co-transporter-2 inhibitors", "SGLT2i"),
+    ("exenatide extended release", "exenatide ER"),
+    ("Non-fatal Myocardial Infarction", "Non-fatal MI"),
+    ("Anti-dulaglutide antibodies", "Anti-dulaglutide antibody"),
+    ("Valine-Proline-Proline", "Val-Pro-Pro"),
+    ("A.P. Moller-Maersk A/S", "Maersk"),
+])
+def test_genuine_short_forms_still_merge_without_any_text(canon, short) -> None:
+    """Abbreviations, plurals and word subsets prove themselves by shape, so
+    they merge even when the chunk spells out only one of the two."""
+    alias, _ = _resolve_canonical_forms(
+        [("c1", None, None, [
+            {"canonical_name": canon, "short_name": short},
+            {"canonical_name": short, "short_name": short},
+        ], None)], chunk_text={"c1": "unrelated text"})
+    assert alias.get(_norm(short)) == _norm(canon)
+
+
+def test_a_brand_name_merges_when_the_chunk_states_it() -> None:
+    """`Mounjaro (tirzepatide)` is the text asserting the alias; without such
+    a statement the brand and the generic stay separate entities."""
+    rows = [{"canonical_name": "Tirzepatide", "short_name": "Mounjaro"},
+            {"canonical_name": "Mounjaro", "short_name": "Mounjaro"}]
+    stated, _ = _resolve_canonical_forms(
+        [("c1", None, None, rows, None)],
+        chunk_text={"c1": "**MOUNJARO** (tirzepatide) injection, for subcutaneous use"})
+    assert stated.get(_norm("Mounjaro")) == _norm("Tirzepatide")
+    unstated, _ = _resolve_canonical_forms(
+        [("c1", None, None, rows, None)],
+        chunk_text={"c1": "Mounjaro, Trulicity and Rybelsus are alternatives to tirzepatide."})
+    assert _norm("Mounjaro") not in unstated
+
+
 _P = "http://ex#Person"
 _TEAM = "http://ex#CollegeFootballTeam"
 _PROJ = "http://ex#OfficeProject"

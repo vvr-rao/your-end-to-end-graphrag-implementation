@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 
 from sqlalchemy import text as sql_text
 
+from backend.app.db.embedding_guard import ensure_embedding_model
 from backend.app.db.session import session_scope
 from backend.app.services.embeddings import Embedder
 
@@ -117,6 +118,7 @@ async def embed_relationships(
     """
     summary = RelationshipEmbedSummary()
     emb = embedder or Embedder()
+    await ensure_embedding_model(emb)
     sql = _SELECT_SQL.format(
         missing="AND g.embedding IS NULL" if only_missing else "",
         limit=f"LIMIT {int(limit)}" if limit else "",

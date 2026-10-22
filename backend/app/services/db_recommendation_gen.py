@@ -28,6 +28,7 @@ from typing import Any
 from sqlalchemy import select, text as sql_text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from backend.app.db.embedding_guard import ensure_embedding_model
 from backend.app.db.graph_version import bump_version, current_version
 from backend.app.db.models.artifacts import IntelligenceArtifact
 from backend.app.db.models.graph import GraphRelationship
@@ -41,6 +42,14 @@ from backend.app.services.prompts import PROMPTS
 
 _VIAO_NS = "https://veerla-ramrao.ai/ontology/intelligence-artifact"
 
+
+
+def _task_model(router, task: str) -> str | None:
+    """The model the router runs `task` on (recorded on each artifact)."""
+    try:
+        return router.task_spec(task).get("model")
+    except (AttributeError, KeyError):
+        return None
 
 @dataclass
 class RecommendationGenSummary:
@@ -155,7 +164,7 @@ async def generate_recommendations(
             "title": theme_label,
             "text": rec["text"],
             "confidence": rec["confidence"],
-            "model_name": "gpt-4.1",
+            "model_name": _task_model(router, "recommendation_gen"),
             "prompt_version": "recommendation_gen@v1",
             "status": "ACTIVE",
             "graph_version": gv,
@@ -164,6 +173,7 @@ async def generate_recommendations(
         embed_texts.append(rec["text"])
 
     embedder = Embedder()
+    await ensure_embedding_model(embedder)
     embeds = await embedder.embed(embed_texts) if embed_texts else []
     summary.embedding_cost_usd = embedder.total_cost_usd
     for p, vec in zip(artifact_payloads, embeds, strict=False):

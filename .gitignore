@@ -117,3 +117,6 @@ docs/
 
 # Session scratch dir if one is created at the repo root
 .scratchpad/
+
+# Benchmark runs (scripts/bench/): per-arm logs, caches, cost dumps, reports
+benchmarks/

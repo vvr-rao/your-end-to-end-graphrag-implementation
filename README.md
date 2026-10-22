@@ -54,7 +54,7 @@ A separate retrieval pipeline combines graph traversal with vector search to ans
 
 ## Platform support
 
-**LLMs Used** - Multi-LLM support via config presets: default (Groq + OpenAI), OpenAI-only, or Anthropic-only chat. Provider/model per task is set in `config/models.yaml`. Embeddings always run on OpenAI (Anthropic has no embeddings API).
+**LLMs Used** - Multi-LLM support via config presets: default (Groq + OpenAI), OpenAI-only, Anthropic-only chat, or DeepInfra/Qwen (dedicated Qwen3.8-27B for knowledge creation, serverless DeepSeek-V4.1-Flash for relationships and Q&A, Qwen3-Embedding-4B). Provider/model per task is set in `config/models.yaml`. Embeddings run on OpenAI in every mode except DeepInfra.
 
 **Database** - Postgres to hold the knowledge graph and Vectors. A cloud based Postgres DB (e.g. Supabase/AWS RDS) works. If none is provided, one is created in a local Docker for you. It needs to have pgvector enabled.
 
@@ -494,6 +494,8 @@ Fill `.env` with:
 | `BEARER_TOKEN` | yes | `python -c "import secrets; print(secrets.token_urlsafe(32))"` |
 | `GROQ_API_KEY` | optional | Only needed for the default preset's Groq-backed Stage 1 in ontology expansion |
 | `ANTHROPIC_API_KEY` | optional | Only needed for the anthropic-only chat preset (`config/models.anthropic.example.yaml`). That preset still needs `OPENAI_API_KEY` for embeddings |
+| `DEEPINFRA_API_KEY` | optional | Only for the DeepInfra/Qwen preset (`config/models.deepinfra.example.yaml`): chat and embeddings |
+| `DEEPINFRA_FLASH_MODEL` | optional | Not a secret: the dedicated Qwen3.8-Flash-Next deployment's model id, printed by `scripts/deepinfra_deploy.py create` |
 | `RENDER_API_KEY` | optional | Only needed for Render deploy — https://dashboard.render.com/u/settings#api-keys |
 
 `pgvector` must be enabled in Supabase: Dashboard → Database → Extensions → toggle on **vector**.
@@ -982,8 +984,9 @@ The task → provider map is fully config-driven, so you can run the whole pipel
 | **Default** (Groq + OpenAI) | `cp config/models.example.yaml config/models.yaml` | `OPENAI_API_KEY` + `GROQ_API_KEY` |
 | **OpenAI-only** | `cp config/models.openai.example.yaml config/models.yaml` | `OPENAI_API_KEY` |
 | **Anthropic-only (chat)** | `cp config/models.anthropic.example.yaml config/models.yaml` | `ANTHROPIC_API_KEY` + `OPENAI_API_KEY` |
+| **DeepInfra / Qwen** | `uv run python scripts/select_llm_mode.py deepinfra` (substitutes the deployment id) | `DEEPINFRA_API_KEY` + `DEEPINFRA_FLASH_MODEL` (DeepInfra-only: no OpenAI or Anthropic key) |
 
-**Embeddings always run on OpenAI** (`text-embedding-3-small` @ 1024 dim) in every preset — Anthropic has no embeddings API — so the Anthropic-only preset still requires `OPENAI_API_KEY`. Edit the model names in any preset to taste; the provider abstraction lives in `backend/app/services/llm_router.py`.
+**Embeddings run on OpenAI** (`text-embedding-3-small` @ 1024 dim) in every preset except DeepInfra — Anthropic has no embeddings API — so the Anthropic-only preset still requires `OPENAI_API_KEY`. The DeepInfra preset embeds with `Qwen/Qwen3-Embedding-4B` at 1024 dims (same schema), but its vectors are not comparable with OpenAI's: build it in its own database. The database records which model wrote its vectors (migration 0010) and refuses a mismatched one. Similarity thresholds are calibrated per embedding model via `embedding_profiles` in `config.yaml`. Size the dedicated GPUs with `scripts/deepinfra_sizing.py <docs-dir>` before deploying. Edit the model names in any preset to taste; the provider abstraction lives in `backend/app/services/llm_router.py`.
 
 #### OpenAI-only mode (no Groq / no Anthropic key)
 
@@ -1100,7 +1103,7 @@ The Stage 1 → Stage 2 narrowing is the whole reason this scales. Without it ev
 ### v3 — 2026-07-27 · Claude Code extension: build the whole app by chatting
 
 - **Claude Code skills** — clone the repo, open Claude Code, and build end-to-end conversationally (LLM mode → database → ontology merge → prune-expand → ingestion → deploy). See [Build it by chatting with Claude Code](#build-it-by-chatting-with-claude-code).
-- **Durable-run harness** — long, paid steps run detached (`scripts/run_detached.py`) so they survive a closed/killed session; monitor with `scripts/job_status.py`. Pure-Python (no `setsid`/bash), so it works on Linux and macOS alike; Windows via WSL2 (see [Platform support](#platform-support)).
+- **Durable-run harness** — long, paid steps run detached (`scripts/run_detached.py`) so they survive a closed/killed session; monitor with `scripts/job_status.py`. Pure-Python (no `setsid`/bash), so it works on Linux, macOS and native Windows (WSL2 is still the smoothest Windows path; see [Platform support](#platform-support)).
 - **Cross-session progress tracker** — completed steps are recorded to disk and resurfaced at the start of each session, so a restarted session knows what you did last ("what's the status" / "what did we do last").
 - **Verified ontology downloads** — FIBO downloads live from EDM Council; OCRe ships bundled (its upstream is gated); a small registry (`source_ontologies/fetch_ontology.py`) handles fetching with vendored fallbacks.
 - **Credential firewall** — Claude is blocked from reading `.env` / secret files; keys are only presence-checked, never shown in chat.
