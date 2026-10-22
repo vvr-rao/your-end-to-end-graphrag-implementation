@@ -234,7 +234,7 @@ def main(argv: list[str]) -> int:
     out = Path(_arg(argv, "--out", str(ROOT / "benchmarks" / time.strftime("%Y-%m-%d")))) / arm_slug(arm) / corpus
     plan = ["db-migrate", "prune-expand", "db-init(replace)", "register-documents",
             "extract-entities", "enrich-time", "enrich-geo", "embed-relationships",
-            "generate-artifacts", "db-size"]
+            "generate-artifacts", "mine-aliases", "db-size"]
     print(f"arm={arm} corpus={corpus} docs={docs} limit={limit or 'ALL'} cap=${cap}/step\n"
           f"steps: {' -> '.join(plan)}\nout: {out}")
     if "--go" not in argv:
@@ -283,6 +283,9 @@ def main(argv: list[str]) -> int:
         ("enrich-geo", ["enrich-geo"], 3600),
         ("embed-relationships", ["embed-relationships"], 3600),
         ("generate-artifacts", ["generate-artifacts", "--max-cost-usd", cap], 4 * 3600),
+        # register-documents refreshes aliases itself but only WARNS on failure
+        # (exit 0); an explicit run fails loudly. Free and idempotent.
+        ("mine-aliases", ["mine-aliases"], 1800),
         ("db-size", ["db-size"], 300),
     ]
     if resume:

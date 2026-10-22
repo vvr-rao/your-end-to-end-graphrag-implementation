@@ -151,9 +151,13 @@ replaces the table, so pairs whose supporting text is gone are pruned.
 You only need to think about it in three cases:
 - **`--limit` smoke tests:** pass `--no-mine-aliases` to skip the full rescan.
   Remember to drop the flag for the real run.
-- **A WARNING in the output** (e.g. migration `0006_term_aliases` not applied):
-  the document operation still succeeded — fix the cause, then run
-  `mine-aliases` by hand.
+- **A WARNING in the output** (e.g. migration `0006_term_aliases` not applied,
+  or `[ingest] alias refresh failed (...)`): the document operation still
+  succeeded and the command still exits 0 — so look for it every time. Fix the
+  cause (`db-migrate` first), then run `mine-aliases` by hand.
+- **Finish every add/update/delete with a real `mine-aliases`** (not
+  `--dry-run`, which counts pairs found in the text, not pairs stored). It is
+  free, idempotent, and exits non-zero if the write fails.
 - **You skipped it earlier:** the staleness is invisible at query time, so check
   with `mine-aliases --dry-run --show 20` if you're unsure.
 
