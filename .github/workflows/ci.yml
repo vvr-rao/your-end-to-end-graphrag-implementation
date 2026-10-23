@@ -64,10 +64,16 @@ jobs:
       - name: Test skill helpers + durable harness (cross-platform)
         run: uv run --python 3.12 pytest backend/tests/unit/test_skill_helpers.py -v
 
+      # Every skill command must run unchanged in bash, zsh and PowerShell --
+      # the 2026-08-01 audit (2424ef2) as a test, after three bash-only
+      # commands crept back in by 2026-10-22.
+      - name: Test skill commands are shell-neutral
+        run: uv run --python 3.12 pytest backend/tests/unit/test_skills_shell_neutral.py -v
+
       # The ontology-build units the DeepInfra/scaling work added (junk rules,
       # pairwise dedup, audit, Stage-4 class indexes, concept-grouping batches,
-      # GPU + memory sizing) are pure Python, so they must pass on every OS the
-      # skills support. The staging-store and Stage-2 streaming round trips
+      # GPU + memory sizing, the alias miner + LLM judge) are pure Python, so
+      # they must pass on every OS the skills support. The staging-store and Stage-2 streaming round trips
       # need Postgres (ONTOLOGY_BUILD_TEST_DSN) and skip here.
       - name: Test ontology-build units (cross-platform)
         run: >-
@@ -83,3 +89,5 @@ jobs:
           backend/tests/unit/test_semantic_grouping.py
           backend/tests/unit/test_deepinfra_mode.py
           backend/tests/unit/test_tpm_check.py
+          backend/tests/unit/test_alias_mining.py
+          backend/tests/unit/test_alias_judge.py

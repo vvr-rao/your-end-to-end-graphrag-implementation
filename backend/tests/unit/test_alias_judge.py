@@ -120,7 +120,7 @@ def test_prompts_carry_every_pair_and_the_contract(prompt_set):
     ("config/models.deepinfra.example.yaml", "deepinfra", "__DEEPINFRA_FLASH_MODEL__", "qwen"),
 ])
 def test_every_preset_defines_the_judge(path, provider, model, prompt_set):
-    spec = yaml.safe_load((ROOT / path).read_text())["tasks"]["alias_judge"]
+    spec = yaml.safe_load((ROOT / path).read_text(encoding="utf-8"))["tasks"]["alias_judge"]
     assert (spec["provider"], spec["model"], spec.get("prompt_set")) == (provider, model, prompt_set)
     assert spec.get("enabled", True) is True
     if provider == "deepinfra":
