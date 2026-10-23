@@ -109,7 +109,8 @@ is created. The account needs a DeepInfra display name (username) first —
    measures the real throughput knee on the running deployment; `--apply`
    writes it. Worth it for a long build; skip for a short one.
 6. Run the creation steps back to back (prune-expand, register-documents,
-   extract-entities, enrich-time, generate-artifacts) — the GPU bills while idle.
+   extract-entities, enrich-time, enrich-geo, generate-artifacts, and the final
+   real `mine-aliases`) — the GPU bills while idle.
 7. **Delete the deployment as soon as the last creation step finishes**:
    `uv run python scripts/deepinfra_deploy.py delete <deploy_id>` (the id is in
    the sizing file's `active`). Q&A keeps working with no GPU — it runs on
@@ -122,6 +123,13 @@ class proposal, dedup and its judges, entities, artifacts); **DeepSeek-V4.1-Flas
 always on serverless** (relationships, repair, all Q&A, eval judges), as are
 the embeddings (Qwen3-Embedding-4B) and table vision (Qwen3-VL-30B). Never move
 DeepSeek onto the dedicated deployment.
+
+**One task can use either:** `alias_judge` (mine-aliases) runs on the dedicated
+deployment while it is `running` and falls back to serverless `Qwen/Qwen3.8-27B`
+by itself otherwise (`fallback_model` in the preset; verdicts are shared). For a
+stand-alone alias refresh with many new pairs, a single GPU is enough:
+`config/deepinfra_1gpu.sizing.example.json` (1x H100 -> 1x H200 -> 1x B200) --
+see **ingest-corpus**, "Alias judge". No capacity (exit 3) -> run on serverless.
 
 Concurrency note: `config/config.yaml` `concurrency:` is shared by every mode.
 DeepInfra's values (up to 192) would hit OpenAI/Anthropic rate limits — after

@@ -22,6 +22,7 @@ _REPORT_ORDER = [
     "retrieval_runs",
     "retrieval_evidence",
     "term_aliases",
+    "term_alias_judgements",
 ]
 
 

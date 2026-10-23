@@ -3834,3 +3834,62 @@ PROMPTS = {
     "judge_gap_detection": judge_gap_detection,
     "judge_consistency": judge_consistency,
 }
+
+
+def alias_judge(pairs: list[dict[str, str]]) -> tuple[str, str]:
+    """Keep or drop corpus-mined synonym pairs (task `alias_judge`).
+
+    The miner reads "NAME (other name)" and "X, also known as Y" off the
+    text. In FDA labels that is a fixed brand/generic convention, but in
+    scraped web text the bracket as often names an owner, a place or a note:
+    on the 2026-10-19 web-search build ~440 of 614 judged pairs were false
+    (`Germu\\nRefinery (PetroChina)` -> Refinery <-> PetroChina, `Department
+    of Energy (DoE)` -> Energy <-> DoE, `China (PepsiCo Foods)`).
+
+    `pairs`: [{"id", "a", "b", "context"}] -- context is the passage the
+    pair was mined from. Returns JSON {"same": [ids], "different": [ids]};
+    an id in neither list counts as unjudged and is asked again next run.
+    Ids only, no reasons: one verdict costs ~3 output tokens.
+    """
+    system = (
+        "You audit a synonym table that a search engine uses to rewrite "
+        "queries: a question that mentions A will also search for B, and the "
+        "answer model is told A and B are the same thing. Each pair was "
+        "mined automatically from the passage shown, usually from a "
+        "parenthesis such as \"NAME (other name)\", and many are wrong.\n\n"
+        "Answer SAME only when A and B are two names for ONE real-world "
+        "thing, so the swap is safe in ANY question:\n"
+        "  - an acronym and its full expansion (WHO / World Health "
+        "Organization, SEC / Securities and Exchange Commission);\n"
+        "  - a brand and its generic or active ingredient (Mounjaro / "
+        "tirzepatide);\n"
+        "  - a short and a legal name of the same organisation (Aramco / "
+        "Saudi Aramco), a former and a current name, a spelling, "
+        "translation or transliteration variant.\n\n"
+        "Answer DIFFERENT for everything else, including:\n"
+        "  - a facility, product, brand line or subsidiary vs its owner, "
+        "operator or parent (Germu Refinery / PetroChina);\n"
+        "  - a place vs something located there, or vice versa (Hanoi / "
+        "Quang Minh Industrial Park, China / PepsiCo Foods);\n"
+        "  - a category or common noun vs one member (Refinery / Shell, "
+        "Deposit / CDs);\n"
+        "  - a FRAGMENT of a name vs the acronym of the whole name (Energy / "
+        "DoE, where the passage says Department of Energy (DoE); Things / "
+        "IIoT) -- judge the two strings exactly as written;\n"
+        "  - a person vs a role or title, two different people or "
+        "companies, a value or a unit, web-page text (Download PDF, Show "
+        "more, Live).\n"
+        "When unsure, answer DIFFERENT: a wrong pair corrupts every query "
+        "that mentions either name, a missing pair only loses some recall.\n\n"
+        "Put every id in exactly one of the two lists. Return ONE JSON "
+        "object on ONE line and nothing else."
+    )
+    lines = "\n".join(
+        f'{p["id"]}. A="{p["a"]}" | B="{p["b"]}" | passage: "{p.get("context") or "-"}"'
+        for p in pairs
+    )
+    user = (
+        f"PAIRS:\n{lines}\n\n"
+        'Return JSON: {"same": [ids], "different": [ids]}'
+    )
+    return system, user

@@ -1447,11 +1447,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_ma = sub.add_parser(
         "mine-aliases",
         help=(
-            "Extract synonym pairs from the corpus deterministically -- "
-            "parenthetical apposition ('MOUNJARO (tirzepatide) injection'), "
-            "explicit alias phrases, and the skos:altLabel annotations already "
-            "imported with the ontology. No LLM, no embeddings, $0. Populates "
-            "graphrag.term_aliases, which retrieval uses to expand query terms."
+            "Extract synonym pairs from the corpus -- parenthetical "
+            "apposition ('MOUNJARO (tirzepatide) injection'), explicit alias "
+            "phrases, and the skos:altLabel annotations already imported with "
+            "the ontology -- then have the LLM mode's `alias_judge` model drop "
+            "pairs that are not two names for one thing (verdicts cached; "
+            "~$0.17-0.26 per 600 new pairs). Populates graphrag.term_aliases, "
+            "which retrieval uses to expand query terms."
         ),
     )
     p_ma.add_argument(
@@ -1473,6 +1475,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_ma.add_argument(
         "--show", type=int, default=40,
         help="How many pairs to print (default 40).",
+    )
+    p_ma.add_argument(
+        "--no-judge", dest="judge", action="store_false", default=True,
+        help="Skip the LLM judge and write every mined pair (the pre-0013 "
+             "behaviour). Not for real corpora: about 70% of pairs mined "
+             "from web text were false on the 2026-10-19 build.",
     )
     p_ma.add_argument("--verbose", action="store_true", help="Per-page progress.")
     p_ma.set_defaults(func=_cmd_mine_aliases)
@@ -2465,22 +2473,41 @@ def _cmd_regenerate_stale_artifacts(args: argparse.Namespace) -> int:
 
 
 def _cmd_mine_aliases(args: argparse.Namespace) -> int:
+    from backend.app.services.alias_judge import (
+        AliasJudgeIncompleteError,
+        AliasJudgeNotConfiguredError,
+    )
     from backend.app.services.alias_mining import mine_aliases
 
-    summary = asyncio.run(
-        mine_aliases(
-            dry_run=args.dry_run,
-            limit=args.limit,
-            min_occurrences=args.min_occurrences,
-            verbose=args.verbose,
+    try:
+        summary = asyncio.run(
+            mine_aliases(
+                dry_run=args.dry_run,
+                limit=args.limit,
+                min_occurrences=args.min_occurrences,
+                verbose=args.verbose,
+                judge=args.judge,
+            )
         )
-    )
+    except (AliasJudgeIncompleteError, AliasJudgeNotConfiguredError) as exc:
+        print(f"[mine-aliases] ERROR: {exc}", file=sys.stderr)
+        return 1
 
     print("=" * 72)
     print("MINE-ALIASES" + ("  (DRY RUN -- nothing written)" if args.dry_run else ""))
     print("=" * 72)
     print(f"chunks scanned:   {summary.chunks_scanned:,}")
     print(f"classes scanned:  {summary.classes_scanned:,}")
+    j = summary.judge
+    if j is not None and j.enabled:
+        print(f"pairs mined:      {summary.pairs_mined:,}")
+        print(f"judge ({j.model}): {j.judged_new:,} new verdict(s), {j.cached:,} cached, "
+              f"{j.exempt:,} exempt (ontology), ${j.cost_usd:.4f}")
+        print(f"    rejected      {j.rejected:,}")
+        if j.unjudged:
+            print(f"    unjudged      {j.unjudged:,} (dry run: no LLM calls; listed below as mined)")
+    elif not args.judge:
+        print("judge:            SKIPPED (--no-judge) -- pairs are unverified")
     print(f"pairs found:      {summary.pairs_found:,}")
     if summary.by_kind:
         for kind, n in sorted(summary.by_kind.items(), key=lambda kv: -kv[1]):
@@ -2508,6 +2535,12 @@ def _cmd_mine_aliases(args: argparse.Namespace) -> int:
             "Check that the corpus actually appositions its synonyms, e.g.\n"
             "  SELECT text FROM graphrag.chunks WHERE text ILIKE '%(tirzepatide)%' LIMIT 3;"
         )
+
+    if j is not None and j.rejected_samples:
+        print()
+        print(f"rejected by the judge (first {min(args.show, len(j.rejected_samples))}):")
+        for a, b in j.rejected_samples[: args.show]:
+            print(f"  {a:<28} <-> {b}")
 
     if args.dry_run and summary.pairs_found:
         print()

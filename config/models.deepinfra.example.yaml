@@ -658,6 +658,36 @@ tasks:
     max_tokens: 2048
     response_format: json_object
 
+  # mine-aliases judge (alias_judge.py, migration 0013): drops mined synonym
+  # pairs that are not two names for one thing -- on the 2026-10-19 web-search
+  # build ~440 of 614 judged pairs were false (Refinery <-> PetroChina, Energy <-> DoE).
+  # Verdicts are cached per model, so a pair is paid for once.
+  # `enabled: false` writes pairs unjudged.
+  # Model measured 2026-10-22 on the 614 web-search pairs: gpt-4.1-mini kept
+  # ~85 wrong pairs (76 refinery <-> owner) of 264; gpt-4.1 ~5 of 185 ($0.17),
+  # claude-sonnet-4-6 ~5 of 184 ($0.26), Qwen3.8-27B ~5 of 187. Do not use a
+  # small model here.
+  # Qwen3.8-27B on the DEDICATED deployment while it is running, else the
+  # serverless 27B (fallback_model): delete-document and a stand-alone
+  # mine-aliases refresh aliases with no GPU up. Serverless 27B decodes ~20
+  # tok/s, so a large refresh is worth a 1-GPU deployment (skills: ingest-
+  # corpus / manage-documents). Same weights either way -> one verdict cache
+  # (verdict_key). Qwen-specific prompt (prompts_qwen.qwen_alias_judge).
+  alias_judge:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    fallback_model: Qwen/Qwen3.8-27B
+    verdict_key: Qwen/Qwen3.8-27B
+    prompt_set: qwen
+    enabled: true
+    pairs_per_call: 40
+    concurrency: 32            # dedicated
+    fallback_concurrency: 8    # serverless
+    timeout: 300
+    temperature: 0.0
+    max_tokens: 2048   # 40 ids ~200 tokens
+    response_format: json_object
+
   # Stage 3b (2026-10-14): embedding similarity proposes duplicate-class pairs,
   # this judge confirms them (synonyms merge; opposites/siblings stay apart).
   # DeepSeek-specific prompt (prompts_deepseek.py). Serverless, ~$0.01/run.

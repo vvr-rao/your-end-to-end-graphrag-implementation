@@ -521,6 +521,26 @@ tasks:
     max_tokens: 2048
     response_format: json_object
 
+  # mine-aliases judge (alias_judge.py, migration 0013): drops mined synonym
+  # pairs that are not two names for one thing -- on the 2026-10-19 web-search
+  # build ~440 of 614 judged pairs were false (Refinery <-> PetroChina, Energy <-> DoE).
+  # Verdicts are cached per model, so a pair is paid for once.
+  # `enabled: false` writes pairs unjudged.
+  # Model measured 2026-10-22 on the 614 web-search pairs: gpt-4.1-mini kept
+  # ~85 wrong pairs (76 refinery <-> owner) of 264; gpt-4.1 ~5 of 185 ($0.17),
+  # claude-sonnet-4-6 ~5 of 184 ($0.26), Qwen3.8-27B ~5 of 187. Do not use a
+  # small model here.
+  alias_judge:
+    provider: openai
+    model: gpt-4.1   # ~$0.17 per 600 new pairs
+    enabled: true
+    pairs_per_call: 40
+    concurrency: 8
+    timeout: 300
+    temperature: 0.0
+    max_tokens: 2048   # 40 ids ~200 tokens
+    response_format: json_object
+
   # Stage 3b duplicate-class merge: OFF in this preset (enabled only in the
   # deepinfra preset, which ships the model-specific judge prompt).
   class_synonym_judge:

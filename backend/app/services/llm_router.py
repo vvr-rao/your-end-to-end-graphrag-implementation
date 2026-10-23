@@ -810,8 +810,12 @@ class LLMRouter:
         return self._tasks[task]
 
     async def chat(
-        self, task: str, *, system: str, user: str, cache_prefix: str | None = None
+        self, task: str, *, system: str, user: str, cache_prefix: str | None = None,
+        model: str | None = None,
     ) -> ChatResult:
+        """`model` overrides the task's model for this call only (same
+        provider and settings) -- e.g. a dedicated deployment with a
+        serverless fallback, chosen by the caller at run time."""
         spec = self.task_spec(task)
         provider_name = spec["provider"]
         if provider_name not in self._providers:
@@ -820,7 +824,7 @@ class LLMRouter:
                 f"Check that {provider_name.upper()}_API_KEY is set."
             )
         provider = self._providers[provider_name]
-        model = spec["model"]
+        model = model or spec["model"]
         max_tokens = int(spec.get("max_tokens", 4096))
         timeout = int(spec.get("timeout", 120))
         retryer = self._make_retryer(task, provider_name, model)

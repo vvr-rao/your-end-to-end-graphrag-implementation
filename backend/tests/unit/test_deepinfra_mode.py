@@ -172,6 +172,9 @@ def test_preset_routes_creation_to_dedicated_qa_to_deepseek() -> None:
     for t in ("answer_simple_qa", "answer_deep_research", "question_parse", "answer_conversation_turn"):
         assert tasks[t]["model"] == "deepseek-ai/DeepSeek-V4.1-Flash", t
     assert not any(v.get("model") == "Qwen/Qwen3.8-27B" for v in tasks.values())
+    # Serverless 27B only as the alias judge's fallback (user decision
+    # 2026-10-22): delete-document refreshes aliases with no GPU up.
+    assert [t for t, v in tasks.items() if v.get("fallback_model") == "Qwen/Qwen3.8-27B"] == ["alias_judge"]
     assert tasks["judge_consistency"]["model"] == "deepseek-ai/DeepSeek-V4.1-Flash"
     assert tasks["embeddings"] == {
         "provider": "deepinfra", "model": "Qwen/Qwen3-Embedding-4B", "dim": 1024, "batch_size": 100,
@@ -531,7 +534,7 @@ def test_preset_selects_qwen_prompt_only_for_class_proposal() -> None:
     assert tasks["relationship_extract"]["prompt_set"] == "deepseek"
     assert tasks["relationship_extract"]["model"] == "deepseek-ai/DeepSeek-V4.1-Flash"
     assert sorted(t for t, v in tasks.items() if v.get("prompt_set")) == [
-        "class_proposal", "class_synonym_judge", "judge_comprehensiveness", "judge_consistency",
+        "alias_judge", "class_proposal", "class_synonym_judge", "judge_comprehensiveness", "judge_consistency",
         "judge_gap_detection", "judge_no_hallucination", "relationship_extract", "relationship_repair"]
 
 

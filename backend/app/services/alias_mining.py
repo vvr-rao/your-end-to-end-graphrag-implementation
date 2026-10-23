@@ -797,13 +797,15 @@ def _merge(acc: dict[tuple[str, str, str], MinedPair], pairs: Iterable[MinedPair
 class MineSummary:
     chunks_scanned: int = 0
     classes_scanned: int = 0
-    pairs_found: int = 0
+    pairs_mined: int = 0          # before the judge
+    pairs_found: int = 0          # after the judge -- what gets written
     pairs_written: int = 0
     pairs_pruned: int = 0
     by_kind: dict[str, int] = field(default_factory=dict)
     wall_seconds: float = 0.0
     dry_run: bool = False
     samples: list[MinedPair] = field(default_factory=list)
+    judge: Any = None             # alias_judge.JudgeReport, when it ran
 
 
 # Prefer verbatim full-text chunks; fall back to summary chunks only for
@@ -863,6 +865,8 @@ async def mine_aliases(
     limit: int | None = None,
     min_occurrences: int = 1,
     verbose: bool = False,
+    judge: bool = True,
+    router: Any = None,
 ) -> MineSummary:
     """Scan the corpus + ontology and upsert every mined synonym pair.
 
@@ -927,12 +931,23 @@ async def mine_aliases(
     # ---- filter + report ----
     kept = [p for p in acc.values() if p.occurrences >= min_occurrences]
     kept.sort(key=lambda p: (-p.occurrences, p.term_a, p.term_b))
+    summary.pairs_mined = len(kept)
+    # ---- judge: drop pairs that are not two names for one thing ----
+    # Raises (AliasJudgeIncompleteError / NotConfigured) before anything is
+    # written, so a failed judge leaves term_aliases exactly as it was.
+    if judge and kept:
+        from backend.app.services.alias_judge import judge_mined_pairs
+
+        kept, summary.judge = await judge_mined_pairs(
+            kept, router=router, dry_run=dry_run,
+            log=print if verbose else (lambda _m: None),
+        )
     summary.pairs_found = len(kept)
     for p in kept:
         summary.by_kind[p.evidence_kind] = summary.by_kind.get(p.evidence_kind, 0) + 1
     summary.samples = kept[:50]
 
-    if dry_run or not kept:
+    if dry_run or not summary.pairs_mined:
         summary.wall_seconds = time.time() - t0
         return summary
 
