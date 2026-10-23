@@ -169,6 +169,12 @@ You only need to think about it in three cases:
   "Alias judge": offer the single-GPU deployment
   (`config/deepinfra_1gpu.sizing.example.json`), and if no GPU has capacity
   (exit 3) run `mine-aliases` on serverless anyway.
+- **Review what the judge did** on every real run -- rejected / written /
+  pruned counts, model and route, a sample of rejected and kept pairs -- as in
+  **ingest-corpus**, "Verify the judge's output" (also how to correct a wrong
+  verdict). A graph built before migration 0013 needs a one-off `db-migrate` +
+  real `mine-aliases` first (**ingest-corpus**, "Upgrading a graph built before
+  the judge").
 - **You skipped it earlier:** the staleness is invisible at query time, so check
   with `mine-aliases --dry-run --show 20` if you're unsure.
 

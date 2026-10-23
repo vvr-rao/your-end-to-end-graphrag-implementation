@@ -299,7 +299,7 @@ gpt-4.1-mini kept ~85 wrong pairs of 264 on the web-search corpus, the three
 above ~5 each (2026-10-22). In DeepInfra mode it
 uses the **dedicated deployment while one is running** and otherwise falls back
 to serverless `Qwen/Qwen3.8-27B` on its own (it checks the deployment's status
-first and prints which route it took). Serverless 27B decodes ~20 tok/s, so:
+first; the report's `judge (...)` line names the route). Serverless 27B decodes ~20 tok/s, so:
 - **During a build:** run the final `mine-aliases` (Step 6) BEFORE deleting the
   deployment -- it is the cheapest moment, the GPU is already paid for.
 - **Stand-alone refresh with many new pairs** (`mine-aliases --dry-run` shows the
@@ -318,6 +318,50 @@ first and prints which route it took). Serverless 27B decodes ~20 tok/s, so:
   capacity), just run `mine-aliases` normally** -- it falls back to serverless by
   itself; it is slower, not wrong.
 - A handful of new pairs: skip the GPU, serverless is fine.
+
+### Upgrading a graph built before the judge (migration 0013)
+A database populated before 0013 (e.g. the Supabase graph behind a Render
+deploy) still holds UNJUDGED pairs, and retrieval uses every one of them. Fix it
+once, after pulling the code:
+```
+uv run python -m backend.app.cli db-migrate          # applies 0013_term_alias_judgements
+uv run python -m backend.app.cli mine-aliases --dry-run --show 5   # "unjudged N" = pairs to judge
+uv run python -m backend.app.cli mine-aliases --show 15            # judges all, prunes the false ones
+```
+The first real run judges every pair (DeepInfra: offer the single GPU above if N
+is large), writes only the true ones and prunes the rest (`pairs pruned:` in the
+report). Production DB: confirm with the user before running it -- it rewrites
+the live alias table. Switching LLM mode later re-judges with the new mode's
+model on the next refresh (verdicts are cached per model), at the cost above.
+
+### Verify the judge's output -- every real run
+Report from the `mine-aliases` output: **pairs mined, rejected, written,
+pruned**, and the `judge (<model>, <dedicated|serverless>): ...` line -- model,
+route (DeepInfra only) and cost. Then show the user ~10 of the
+"rejected by the judge" lines it prints and ~10 kept pairs (`--show`), and flag
+anything that looks wrong. What to expect (web-search corpus, 2026-10-22): about
+70% rejected, almost all "facility (owner)", "company (country)", acronym vs a
+fragment of its name (`Energy <-> DoE`) and page text; each strong judge lost ~5
+true acronyms and kept ~5 doubtful pairs. A rejection rate far from the corpus's
+usual, or rejected pairs that are obviously true synonyms, is a finding -- say so.
+
+Inspect verdicts with their source passage (read-only):
+```
+SELECT surface_a, surface_b, same, left(context, 160)
+  FROM graphrag.term_alias_judgements
+ WHERE judge_model = '<model or verdict_key, e.g. Qwen/Qwen3.8-27B>'
+ ORDER BY same, surface_a LIMIT 50;
+```
+**Correcting a verdict** (only with the user's OK -- it changes what retrieval
+expands): flip it, then re-run so `term_aliases` follows. The verdict cache is
+per model, so the fix holds until the mode changes; for a pair that must always
+exist, add a `manual` row instead (README "Identity Layer"; manual rows are
+never judged or pruned).
+```
+UPDATE graphrag.term_alias_judgements SET same = <true|false>
+ WHERE judge_model = '<model>' AND term_a = '<normalized a>' AND term_b = '<normalized b>';
+-- then: uv run python -m backend.app.cli mine-aliases
+```
 
 ## Step 3 — extract-entities (entities + relationships; long, paid)
 Mints entities/relationships per chunk — **no new ontology classes**. **If Step 2
@@ -545,10 +589,11 @@ judge left pairs unjudged. **DeepInfra mode: run it before deleting the GPU**
 (see "Alias judge" above):
 ```
 uv run python -m backend.app.cli mine-aliases --show 15
-uv run python scripts/build_state.py record mine-aliases pairs=<n>
+uv run python scripts/build_state.py record mine-aliases pairs=<written> rejected=<n> judge=<model>
 ```
-If it fails, or the pair count is 0 on a real corpus, say so rather than
-reporting a clean finish.
+Then review the output as in "Verify the judge's output" above. If it fails,
+or the pair count is 0 on a real corpus, say so rather than reporting a clean
+finish.
 
 ## Notes
 - **Scale ceiling:** at very large corpora both `extract-entities` and

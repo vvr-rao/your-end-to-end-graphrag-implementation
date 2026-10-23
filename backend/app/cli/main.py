@@ -1479,7 +1479,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ma.add_argument(
         "--no-judge", dest="judge", action="store_false", default=True,
         help="Skip the LLM judge and write every mined pair (the pre-0013 "
-             "behaviour). Not for real corpora: about 70% of pairs mined "
+             "behaviour). Not for real corpora: about 7 in 10 pairs mined "
              "from web text were false on the 2026-10-19 build.",
     )
     p_ma.add_argument("--verbose", action="store_true", help="Per-page progress.")
@@ -2501,7 +2501,8 @@ def _cmd_mine_aliases(args: argparse.Namespace) -> int:
     j = summary.judge
     if j is not None and j.enabled:
         print(f"pairs mined:      {summary.pairs_mined:,}")
-        print(f"judge ({j.model}): {j.judged_new:,} new verdict(s), {j.cached:,} cached, "
+        route = f", {j.hosting}" if j.hosting else ""
+        print(f"judge ({j.model}{route}): {j.judged_new:,} new verdict(s), {j.cached:,} cached, "
               f"{j.exempt:,} exempt (ontology), ${j.cost_usd:.4f}")
         print(f"    rejected      {j.rejected:,}")
         if j.unjudged:
