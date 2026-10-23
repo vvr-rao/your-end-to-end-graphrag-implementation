@@ -283,9 +283,11 @@ rescans the whole corpus, so:
   one pair the database ordered differently from Python rolled back the whole
   refresh -- fixed in migration 0012 -- and the web-search graph shipped with an
   empty alias table; the exit code was 0.)
+  Read the log's tail (Claude reads it directly; shell-neutral):
   ```
-  grep -n "alias refresh failed" <the register-documents log>
+  uv run python scripts/job_status.py <RUN_ID> 400
   ```
+  and look for a line containing `alias refresh failed`.
 - Look at the pair count it prints. Zero pairs on a real corpus means the guards
   are rejecting everything; run `mine-aliases --dry-run --show 40` to inspect.
 - `[ingest] alias refresh failed (AliasJudgeIncompleteError ...)` means the judge
@@ -310,10 +312,13 @@ first; the report's `judge (...)` line names the route). Serverless 27B decodes 
   uv run python scripts/deepinfra_deploy.py create --from-sizing .build/sizing_1gpu.json --name qwen27b-alias --yes
   ```
   It tries 1x H100 ($2.20/h) -> 1x H200 ($2.69/h) -> 1x B200 ($3.69/h) and loads in
-  ~5-8 min. Point the run at it without editing .env: copy
-  `config/models.deepinfra.example.yaml` to a scratch file with
-  `__DEEPINFRA_FLASH_MODEL__` replaced by the printed model id, and run
-  `MODELS_CONFIG_PATH=<that file> uv run python -m backend.app.cli mine-aliases`.
+  ~5-8 min. Ask the user to put the printed model id in `.env` as
+  `DEEPINFRA_FLASH_MODEL` (an identifier, not a secret -- they edit `.env`, you
+  never read it), then activate it and run the refresh:
+  ```
+  uv run python scripts/select_llm_mode.py deepinfra
+  uv run python -m backend.app.cli mine-aliases --show 15
+  ```
   Delete the deployment as soon as it finishes. **If `create` exits 3 (no GPU had
   capacity), just run `mine-aliases` normally** -- it falls back to serverless by
   itself; it is slower, not wrong.
@@ -447,8 +452,7 @@ same 66-doc run routed **15.2% (178 of 1,173)** to relatedTo, with
 step print a one-line notice and quietly do less -- easy to miss in a long log,
 because the run still looks successful:
 ```
-uv run python -c "import yaml;t=yaml.safe_load(open('config/models.yaml'))['tasks'];\
-print({k:(k in t) for k in ('relationship_extract','relationship_verify','relationship_repair')})"
+uv run python -c "import yaml;t=yaml.safe_load(open('config/models.yaml'))['tasks'];print({k:(k in t) for k in ('relationship_extract','relationship_verify','relationship_repair')})"
 ```
 Any False: run **choose-llm-mode** to refresh the preset, or copy the missing
 blocks from `config/models.example.yaml`. What each one costs you if absent:

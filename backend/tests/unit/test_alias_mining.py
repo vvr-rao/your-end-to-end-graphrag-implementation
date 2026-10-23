@@ -464,5 +464,5 @@ def test_migration_0012_compares_byte_wise() -> None:
     from pathlib import Path
 
     src = (Path(__file__).resolve().parents[2] / "app" / "db" / "migrations" / "versions"
-           / "0012_term_aliases_byte_order.py").read_text()
+           / "0012_term_aliases_byte_order.py").read_text(encoding="utf-8")
     assert 'term_a COLLATE "C" < term_b COLLATE "C"' in src
