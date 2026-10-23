@@ -820,3 +820,44 @@ def qwen_class_validity_judge(labels: list[dict[str, str]]) -> tuple[str, str]:
                       f'{str(x.get("desc") or "")[:100]})' for x in labels)
     user = f"NAMES:\n{lines}\n\nReturn the JSON verdicts for every id."
     return system, user
+
+
+def qwen_alias_judge(pairs: list[dict[str, str]]) -> tuple[str, str]:
+    """Qwen3.8-27B wording of `prompts.alias_judge` (same contract).
+
+    `pairs`: [{"id", "a", "b", "context"}]. Returns JSON
+    {"same": [ids], "different": [ids]}; an id in neither list is unjudged.
+    The rules are shorter and the output contract repeated at the end:
+    the 27B follows a terse, enumerated rule list more reliably than prose.
+    """
+    system = (
+        "You check a synonym table used to rewrite search queries. If a pair "
+        "is kept, every question that mentions A also searches for B, and A "
+        "and B are treated as the same thing. Each pair was mined "
+        "automatically from the passage shown, and many are wrong.\n\n"
+        "SAME only if A and B are two names for ONE real-world thing:\n"
+        "  1. acronym and full expansion (WHO / World Health Organization);\n"
+        "  2. brand and generic drug name (Mounjaro / tirzepatide);\n"
+        "  3. short and legal name of one organisation (Aramco / Saudi "
+        "Aramco), former and current name, spelling or translation variant.\n\n"
+        "DIFFERENT for everything else, for example:\n"
+        "  - facility, product or subsidiary vs its owner or operator "
+        "(Germu Refinery / PetroChina);\n"
+        "  - place vs something located there (Hanoi / Quang Minh Industrial "
+        "Park; China / PepsiCo Foods);\n"
+        "  - category word vs one member (Refinery / Shell; Deposit / CDs);\n"
+        "  - part of a name vs the acronym of the whole name (Energy / DoE "
+        "from \"Department of Energy (DoE)\"; Things / IIoT). Judge the two "
+        "strings exactly as written;\n"
+        "  - person vs role, two different organisations, values, units, "
+        "web-page text (Download PDF, Show more, Live).\n"
+        "If unsure: DIFFERENT.\n\n"
+        "OUTPUT: one JSON object on ONE line, no markdown, no explanation. "
+        "Every id goes in exactly one list."
+    )
+    lines = "\n".join(
+        f'{p["id"]}. A="{p["a"]}" | B="{p["b"]}" | passage: "{p.get("context") or "-"}"'
+        for p in pairs
+    )
+    user = f'PAIRS:\n{lines}\n\nReturn: {{"same":[ids],"different":[ids]}}'
+    return system, user

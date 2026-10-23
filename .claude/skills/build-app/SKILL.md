@@ -167,7 +167,7 @@ ontology into the DB (`db-init --input`), then chunks+embeds the documents,
 extracts entities, enriches time, **adds geographic containment and embeds every
 relationship (`enrich-geo` + `embed-relationships`, Step 4b — always run, the
 relationship-aware graph walk depends on them)**, generates intelligence
-artifacts, and **finishes with a real `mine-aliases`** (corpus synonyms; free; the
+artifacts, and **finishes with a real `mine-aliases`** (corpus synonyms, checked by an LLM judge that pays only for new pairs; the
 automatic refresh inside register-documents only warns on failure) — the long
 paid steps run detached and monitored via the same harness, with `--limit`
 smoke-tests, the 500 MB DB-size guardrail, and a tracker record per step.

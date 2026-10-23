@@ -145,7 +145,10 @@ question asking "tirzepatide" still reaches chunks that only ever say "MOUNJARO"
 
 **Every command on this page refreshes it automatically** — `register-documents`,
 `update-document` (it routes through the same ingest path) and `delete-document`
-(when it affected chunks). It's free ($0, no LLM) and idempotent: a full scan
+(when it affected chunks). It costs little -- an LLM judge (`alias_judge` task:
+gpt-4.1 / claude-sonnet-4-6 / Qwen3.8-27B by mode) checks only NEW pairs, about
+$0.17-0.26 per 600; verdicts are cached --
+and it is idempotent: a full scan
 replaces the table, so pairs whose supporting text is gone are pruned.
 
 You only need to think about it in three cases:
@@ -157,7 +160,21 @@ You only need to think about it in three cases:
   cause (`db-migrate` first), then run `mine-aliases` by hand.
 - **Finish every add/update/delete with a real `mine-aliases`** (not
   `--dry-run`, which counts pairs found in the text, not pairs stored). It is
-  free, idempotent, and exits non-zero if the write fails.
+  cheap, idempotent, and exits non-zero if the write fails or the judge left
+  pairs unjudged (then the table is unchanged -- just re-run it).
+- **DeepInfra mode:** the judge runs on the dedicated Qwen deployment while
+  one is up (do the add/update and its `mine-aliases` inside the same GPU
+  window) and falls back to serverless 27B by itself when none is. After a
+  DELETE (no GPU needed) or when many pairs are new, follow **ingest-corpus**,
+  "Alias judge": offer the single-GPU deployment
+  (`config/deepinfra_1gpu.sizing.example.json`), and if no GPU has capacity
+  (exit 3) run `mine-aliases` on serverless anyway.
+- **Review what the judge did** on every real run -- rejected / written /
+  pruned counts, model and route, a sample of rejected and kept pairs -- as in
+  **ingest-corpus**, "Verify the judge's output" (also how to correct a wrong
+  verdict). A graph built before migration 0013 needs a one-off `db-migrate` +
+  real `mine-aliases` first (**ingest-corpus**, "Upgrading a graph built before
+  the judge").
 - **You skipped it earlier:** the staleness is invisible at query time, so check
   with `mine-aliases --dry-run --show 20` if you're unsure.
 

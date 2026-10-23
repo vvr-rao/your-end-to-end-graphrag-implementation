@@ -49,6 +49,14 @@ Supabase Session Pooler URL) in `.env`; and if the ontology/corpus was built
 against the local DB, the pipeline must be re-run against the cloud DB before
 deploying (see **setup-database**).
 
+**(b2) Alias table judged.** If the cloud database was built before migration
+0013, its `term_aliases` holds unjudged pairs (on the web-search build ~70%
+were false) and the deployed app will expand queries with them. Check with
+`DATABASE_URL` pointing at it: `uv run python -m backend.app.cli db-status`
+(revision at head) and `mine-aliases --dry-run --show 3` (no `unjudged` line in its report). If not,
+follow **ingest-corpus**, "Upgrading a graph built before the judge", with the
+user's OK -- it rewrites the live alias table.
+
 **(c) Required secrets present** (presence-check only — never print a value):
 ```bash
 uv run python scripts/check_env.py DATABASE_URL OPENAI_API_KEY BEARER_TOKEN RENDER_API_KEY

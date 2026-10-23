@@ -1,0 +1,60 @@
+{
+  "_comment": "Single-GPU Qwen3.8-27B deployment for short jobs (mine-aliases judge, a few added documents). FP8 weights are 30.9 GB, so one 80 GB GPU is enough. Copy to .build/ before use: deepinfra_deploy.py create writes the running option back into the file. Rates are DeepInfra list prices per GPU-hour (2026-10).",
+  "option": {
+    "gpu": "H100-80GB",
+    "num_gpus": 1,
+    "instances": 1,
+    "precision": "fp8",
+    "repo": "Qwen/Qwen3.8-27B-FP8",
+    "usd_hr": 2.2,
+    "label": "1x H100-80GB fp8 (Qwen3.8-27B)"
+  },
+  "estimate": {
+    "hours": 0.25,
+    "usd": 0.55
+  },
+  "concurrency": {
+    "alias_judge": 32
+  },
+  "max_batch_size": 32,
+  "fallbacks": [
+    {
+      "option": {
+        "gpu": "H200-141GB",
+        "num_gpus": 1,
+        "instances": 1,
+        "precision": "fp8",
+        "repo": "Qwen/Qwen3.8-27B-FP8",
+        "usd_hr": 2.69,
+        "label": "1x H200-141GB fp8 (Qwen3.8-27B)"
+      },
+      "estimate": {
+        "hours": 0.25,
+        "usd": 0.67
+      },
+      "concurrency": {
+        "alias_judge": 32
+      },
+      "max_batch_size": 32
+    },
+    {
+      "option": {
+        "gpu": "B200-180GB",
+        "num_gpus": 1,
+        "instances": 1,
+        "precision": "fp8",
+        "repo": "Qwen/Qwen3.8-27B-FP8",
+        "usd_hr": 3.69,
+        "label": "1x B200-180GB fp8 (Qwen3.8-27B)"
+      },
+      "estimate": {
+        "hours": 0.25,
+        "usd": 0.92
+      },
+      "concurrency": {
+        "alias_judge": 32
+      },
+      "max_batch_size": 32
+    }
+  ]
+}

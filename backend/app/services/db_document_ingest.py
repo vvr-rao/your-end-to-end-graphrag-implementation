@@ -531,7 +531,7 @@ async def _refresh_aliases(tag: str) -> None:
         log.warning(
             "[%s] alias refresh failed (%s: %s). The operation itself "
             "succeeded; run `mine-aliases` to refresh synonym expansion. "
-            "Has migration 0006_term_aliases been applied?",
+            "Has `db-migrate` been run (0006 / 0013)?",
             tag, type(exc).__name__, exc,
         )
         return
@@ -539,6 +539,8 @@ async def _refresh_aliases(tag: str) -> None:
         f"[{tag}] aliases refreshed: {s.pairs_written:,} pair(s) across "
         f"{s.chunks_scanned:,} chunk(s)"
         + (f", {s.pairs_pruned:,} pruned" if s.pairs_pruned else "")
+        + (f"; judge {s.judge.model} rejected {s.judge.rejected:,} "
+           f"(${s.judge.cost_usd:.4f})" if s.judge is not None and s.judge.enabled else "")
     )
 
 

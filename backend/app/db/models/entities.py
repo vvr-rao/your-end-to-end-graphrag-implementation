@@ -18,7 +18,7 @@ from datetime import date, datetime
 from typing import Any
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import CheckConstraint, Date, ForeignKey, Integer, Text, UniqueConstraint
+from sqlalchemy import Boolean, CheckConstraint, Date, ForeignKey, Integer, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -115,7 +115,7 @@ class TermAlias(Base):
             "evidence_kind IN ('parenthetical','phrase','ontology','manual')",
             name="term_aliases_kind_check",
         ),
-        CheckConstraint("term_a < term_b", name="term_aliases_order_check"),
+        CheckConstraint('term_a COLLATE "C" < term_b COLLATE "C"', name="term_aliases_order_check"),
         UniqueConstraint(
             "term_a", "term_b", "evidence_kind", name="term_aliases_pair_uq"
         ),
@@ -136,3 +136,25 @@ class TermAlias(Base):
     )
     extra_metadata: Mapped[dict[str, Any]] = metadata_jsonb_column()
     created_at: Mapped[datetime] = timestamp_column()
+
+
+class TermAliasJudgement(Base):
+    """A judge model's verdict on one mined pair (migration 0013).
+
+    Separate from `term_aliases` because every `mine-aliases` run rebuilds
+    that table; the verdicts must survive it so a pair is paid for once per
+    (judge_model, judge_version). Only pairs judged `same` are written to
+    `term_aliases` -- see `alias_judge.py`.
+    """
+
+    __tablename__ = "term_alias_judgements"
+
+    term_a: Mapped[str] = mapped_column(Text, primary_key=True)
+    term_b: Mapped[str] = mapped_column(Text, primary_key=True)
+    judge_model: Mapped[str] = mapped_column(Text, primary_key=True)
+    judge_version: Mapped[str] = mapped_column(Text, primary_key=True)
+    same: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    surface_a: Mapped[str] = mapped_column(Text, nullable=False)
+    surface_b: Mapped[str] = mapped_column(Text, nullable=False)
+    context: Mapped[str | None] = mapped_column(Text)
+    judged_at: Mapped[datetime] = timestamp_column()
