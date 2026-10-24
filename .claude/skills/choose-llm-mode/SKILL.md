@@ -31,6 +31,16 @@ Present these four options (AskUserQuestion). Embeddings run on OpenAI
 `Qwen/Qwen3-Embedding-4B`. **Every mode except DeepInfra requires `OPENAI_API_KEY`**;
 DeepInfra mode is DeepInfra-only (judges and table vision included).
 
+**Rule: DeepInfra mode uses ONLY DeepInfra models, and the user is assumed to
+hold no other key.** Every task in `config/models.deepinfra.example.yaml` —
+creation, description compaction, alias judge, Q&A, eval judges, table vision,
+embeddings — is `provider: deepinfra`, and `select_llm_mode.py deepinfra` asks
+for `DEEPINFRA_API_KEY` alone (plus the non-secret `DEEPINFRA_FLASH_MODEL`).
+Never suggest an OpenAI/Anthropic/Groq model or key as a fix or fallback in
+this mode, and never run a DeepInfra-mode step under another mode's
+`config/models.yaml` (e.g. a standalone `summarize-descriptions` while the
+active preset is OpenAI). `test_deepinfra_mode_uses_only_deepinfra` enforces it.
+
 | Mode | `<mode>` arg | Keys required in `.env` | Notes |
 |---|---|---|---|
 | **Groq + OpenAI** (default) | `groq-openai` | `OPENAI_API_KEY`, `GROQ_API_KEY` | Groq runs chunk_classification (best disambiguation); OpenAI everything else. |

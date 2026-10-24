@@ -67,8 +67,9 @@ def test_source_is_sampled_before_the_worker_runs() -> None:
 
     # The public entrypoint is a thin wrapper; the worker loop lives here.
     src = inspect.getsource(table_extract._drive_subprocess_workers)
-    pre = src.index("was_cached = table_cache.two_tier_load(")
-    spawn = src.index("create_subprocess_exec")
+    body = src[src.index("async def _one("):]
+    pre = body.index("pre_hit = table_cache.two_tier_load(")
+    spawn = body.index("_spawn_worker(p)")
     assert pre < spawn, "cache presence must be sampled before spawning the worker"
 
 

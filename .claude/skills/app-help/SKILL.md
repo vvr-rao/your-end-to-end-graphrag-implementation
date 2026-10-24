@@ -44,9 +44,11 @@ domain_concepts) is ALWAYS merged in as well.
    that THIS machine's RAM fits the build's projected peak.
 2. **Database** — Supabase (prod) or local docker Postgres; `db-init` migrates.
 3. **Merge** ontologies (VIAO + 6 more core + a domain ontology) — deterministic, no LLM.
-3b. **summarize-descriptions** (optional but recommended, cents) — compacts each
+3b. **summarize-descriptions** (DEFAULT, cents) — compacts each
    class's verbose descriptions into one line, which Stage 2 of prune-expand then
-   ships instead. Measured: 78% fewer description tokens, prune-expand $1.79 →
+   ships instead. prune-expand / expand / build run it automatically on their
+   input unless `--no-summarize-descriptions`; the standalone command does the
+   same thing ahead of time. Measured: 78% fewer description tokens, prune-expand $1.79 →
    $1.44. Idempotent; edits the merge folder in place.
 4. **prune-expand** — the paid, multi-hour ontology-building step (summarize →
    classify → propose → dedup → prune/extend). Caches summaries + tables on disk.

@@ -3,7 +3,8 @@
 
     uv run python scripts/bench/run_arm.py --arm openai|qwen|qwen27b|qwen27b-ded|qwen27b-think|qwen27b-fast --corpus pharma \
         --docs source_documents/pharma-30-identity-test --merge output_ontologies/<v>-merge \
-        [--limit N] [--out benchmarks/<date>] [--max-cost-usd 15] [--go]
+        [--limit N] [--out benchmarks/<date>] [--max-cost-usd 15] [--table-mining]
+        [--app-config <config.yaml with this arm's concurrency>] [--go]
 
 Without --go it prints the plan and exits: every step here is PAID.
 
@@ -65,6 +66,8 @@ PRESETS = {
     # 2026-10-19: the same preset after the Stage 2-4 scaling work, built on
     # 4x H200 (two 2-GPU instances); the build pushed to Supabase for Render.
     "deepinfra-ws2": ROOT / "config" / "models.deepinfra.example.yaml",
+    # The shipped DeepInfra preset, unpatched (DeepInfra models only).
+    "deepinfra": ROOT / "config" / "models.deepinfra.example.yaml",
     # deepinfra-b3's graph, every Q&A task on DeepSeek-V4.1-Flash (QA_TASKS).
     "deepinfra-b3-dsqa": ROOT / "config" / "models.deepinfra.example.yaml",
     # Embedding isolation: the OpenAI build's DB re-embedded with Qwen3-Embedding-4B,
@@ -176,7 +179,7 @@ def models_file(arm: str, out: Path) -> Path:
     return dst
 
 
-def arm_env(arm: str, corpus: str, out: Path) -> dict:
+def arm_env(arm: str, corpus: str, out: Path, app_config: str | None = None) -> dict:
     """Environment that points every CLI command at this arm's isolated state."""
     import bench_db
 
@@ -192,6 +195,9 @@ def arm_env(arm: str, corpus: str, out: Path) -> dict:
         "MODELS_CONFIG_PATH": str(models_file(arm, out)),
         "GRAPHRAG_CACHE_ROOT": str(ROOT / "benchmarks" / "cache" / arm_slug(arm)),
         "GRAPHRAG_COST_REPORT_DIR": str(costs),
+        # Per-arm concurrency (e.g. sized for the dedicated GPUs) without
+        # touching config/config.yaml, which the other arm still reads.
+        **({"APP_CONFIG_PATH": str(Path(app_config).resolve())} if app_config else {}),
     }
 
 
@@ -235,7 +241,9 @@ def main(argv: list[str]) -> int:
     plan = ["db-migrate", "prune-expand", "db-init(replace)", "register-documents",
             "extract-entities", "enrich-time", "enrich-geo", "embed-relationships",
             "generate-artifacts", "mine-aliases", "db-size"]
-    print(f"arm={arm} corpus={corpus} docs={docs} limit={limit or 'ALL'} cap=${cap}/step\n"
+    table_mining = ["--table-mining"] if "--table-mining" in argv else []
+    print(f"arm={arm} corpus={corpus} docs={docs} limit={limit or 'ALL'} cap=${cap}/step"
+          f"{' table-mining' if table_mining else ''} app-config={_arg(argv, '--app-config') or 'default'}\n"
           f"steps: {' -> '.join(plan)}\nout: {out}")
     if "--go" not in argv:
         print("\n(dry run -- add --go to execute; PAID)")
@@ -245,7 +253,7 @@ def main(argv: list[str]) -> int:
 
     out.mkdir(parents=True, exist_ok=True)
     (out / "logs").mkdir(exist_ok=True)
-    env = arm_env(arm, corpus, out)
+    env = arm_env(arm, corpus, out, _arg(argv, "--app-config"))
     if limit:
         # prune-expand has no --limit, so a smoke run gets a folder of the
         # first N documents (symlinks) for EVERY step -- otherwise the
@@ -264,7 +272,8 @@ def main(argv: list[str]) -> int:
         pe_parent = out / "prune_expand"
         pe_parent.mkdir(exist_ok=True)
         rows.append(step("prune-expand", ["prune-expand", "--input", merge, "--documents", docs,
-                                          "--max-cost-usd", cap, "--tables", "--output-dir", str(pe_parent)],
+                                          "--max-cost-usd", cap, "--tables", *table_mining,
+                                          "--output-dir", str(pe_parent)],
                          env, out / "logs", 4 * 3600))
         made = sorted(d for d in pe_parent.glob("v*-prune-expand") if (d / "merged.json").exists())
         pe_dir = str(made[-1]) if made else ""

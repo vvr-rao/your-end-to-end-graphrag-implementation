@@ -1042,3 +1042,18 @@ def test_concurrency_is_capped_by_local_memory() -> None:
     assert none_caps == {} and "table_extraction" not in no_mem and no_mem["class_judges"] == 64
     assert sizing.max_streaming_batch(small) < sizing.max_streaming_batch(big)
     assert sizing.max_streaming_batch(None) is None
+
+
+def test_deepinfra_mode_uses_only_deepinfra() -> None:
+    """DeepInfra mode assumes the user holds NO other key: every task (judges,
+    compaction, table vision, embeddings) and every fallback is DeepInfra, and
+    selecting the mode asks for no other provider's key."""
+    root = Path(__file__).resolve().parents[3]
+    doc = yaml.safe_load((root / "config" / "models.deepinfra.example.yaml").read_text(encoding="utf-8"))
+    off = {name: spec.get("provider") for name, spec in doc["tasks"].items()
+           if spec.get("provider") != "deepinfra" or spec.get("fallback_provider", "deepinfra") != "deepinfra"}
+    assert not off, f"non-DeepInfra task(s) in DeepInfra mode: {off}"
+    import select_llm_mode
+
+    keys = select_llm_mode.MODES["deepinfra"][1]
+    assert not [k for k in keys if k.split("_")[0] in {"OPENAI", "ANTHROPIC", "GROQ"}], keys
