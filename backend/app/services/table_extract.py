@@ -843,6 +843,51 @@ async def _vision_call_anthropic(
     return text, cost
 
 
+def _vision_spec(task: str, fallback: str | None = None) -> dict[str, Any]:
+    """Provider/model/limits for a vision task from models.yaml (`fallback`
+    is read when `task` is absent, so older configs keep working)."""
+    tasks = get_settings().models_config.get("tasks", {}) or {}
+    spec = tasks.get(task) or (tasks.get(fallback) if fallback else None) or {}
+    provider = str(spec.get("provider", "openai")).lower()
+    if provider not in _VISION_PROVIDERS:
+        raise ValueError(
+            f"{task}.provider={provider!r} is not supported "
+            f"(use one of {', '.join(_VISION_PROVIDERS)})"
+        )
+    return {
+        "provider": provider,
+        "model": spec.get("model", _DEFAULT_VISION_MODEL),
+        "timeout": int(spec.get("timeout", _DEFAULT_VISION_TIMEOUT)),
+        "temperature": float(spec.get("temperature", _DEFAULT_VISION_TEMP)),
+        "max_tokens": int(spec.get("max_tokens", _DEFAULT_VISION_MAX_TOKENS)),
+    }
+
+
+def _render_png_b64(page: Any, bbox: tuple[float, float, float, float] | None) -> str | None:
+    """`bbox` region (whole page when None) as a base64 PNG, or None."""
+    try:
+        region = page if bbox is None else page.crop(bbox)
+        img = region.to_image(resolution=_RENDER_DPI)
+        png_buf = io.BytesIO()
+        img.save(png_buf, format="PNG")
+        return base64.b64encode(png_buf.getvalue()).decode("ascii")
+    except Exception:
+        return None
+
+
+async def _call_vision(
+    spec: dict[str, Any], system: str, user: str, png_b64: str,
+) -> tuple[str | None, float]:
+    """Dispatch to the provider configured in models.yaml. Both helpers
+    return (json_text, cost_usd) or raise VisionCallError. The anthropic path
+    keeps table extraction fully OpenAI-free."""
+    kw = {"model": spec["model"], "timeout": spec["timeout"],
+          "temperature": spec["temperature"], "max_tokens": spec["max_tokens"]}
+    if spec["provider"] == "anthropic":
+        return await _vision_call_anthropic(system, user, png_b64, **kw)
+    return await _vision_call_openai(system, user, png_b64, provider=spec["provider"], **kw)
+
+
 async def _extract_table_via_vision(
     page: Any,
     bbox: tuple[float, float, float, float],
@@ -858,46 +903,17 @@ async def _extract_table_via_vision(
     (payload, cost_usd); (None, cost) when the crop holds no usable table.
     Raises VisionCallError when the request itself fails, so the caller can
     keep a failed extraction out of the cache."""
-    settings = get_settings()
-
-    spec = settings.models_config.get("tasks", {}).get("table_extract_vision", {})
-    provider = str(spec.get("provider", "openai")).lower()
-    model = spec.get("model", _DEFAULT_VISION_MODEL)
-    timeout = int(spec.get("timeout", _DEFAULT_VISION_TIMEOUT))
-    temperature = float(spec.get("temperature", _DEFAULT_VISION_TEMP))
-    max_tokens = int(spec.get("max_tokens", _DEFAULT_VISION_MAX_TOKENS))
-    if provider not in _VISION_PROVIDERS:
-        raise ValueError(
-            f"table_extract_vision.provider={provider!r} is not supported "
-            f"(use one of {', '.join(_VISION_PROVIDERS)})"
-        )
+    spec = _vision_spec("table_extract_vision")
 
     # Render the cropped region to PNG bytes (shared across providers).
-    try:
-        img = page.crop(bbox).to_image(resolution=_RENDER_DPI)
-        png_buf = io.BytesIO()
-        img.save(png_buf, format="PNG")
-        png_b64 = base64.b64encode(png_buf.getvalue()).decode("ascii")
-    except Exception:
+    png_b64 = _render_png_b64(page, bbox)
+    if png_b64 is None:
         return None, 0.0
 
     system, user = PROMPTS["table_extract_vision"](
         page_number=page_number, caption_hint=caption_hint,
     )
-
-    # Dispatch to the provider configured in models.yaml. Both helpers
-    # return (json_text, cost_usd) or (None, 0.0) on any failure. The
-    # anthropic path keeps table extraction fully OpenAI-free.
-    if provider == "anthropic":
-        text, cost = await _vision_call_anthropic(
-            system, user, png_b64, model=model, timeout=timeout,
-            temperature=temperature, max_tokens=max_tokens,
-        )
-    else:
-        text, cost = await _vision_call_openai(
-            system, user, png_b64, model=model, timeout=timeout,
-            temperature=temperature, max_tokens=max_tokens, provider=provider,
-        )
+    text, cost = await _call_vision(spec, system, user, png_b64)
     if text is None:
         return None, 0.0
 
@@ -1040,6 +1056,157 @@ def _vision_body_to_jsonld(
     return payload
 
 
+# ---------- Whole-page vision: borderless financial statements ---------------
+# Audited statements draw no grid lines, so find_tables() keeps only the ruled
+# header strip above each statement. Measured 2026-10-23 on fin-gen-subset:
+# all 37 "tables" of one A$ filing were 1-4 row strips like
+# ['', 'Note', "A$'000", '', "A$'000"] (no labels, no figures), and the LGES
+# (58 pp) and SDI (99 pp) audit reports yielded none at all. A page that is
+# dense with figures but produced no real table is sent WHOLE to the vision
+# model, and every figure it returns must appear in the page's text layer.
+
+# A figure as printed in a statement: thousands-grouped or decimal, optional
+# parentheses/sign. Bare integers ("2025", note numbers) do not count.
+_FIGURE_RE = re.compile(r"\(?-?\d{1,3}(?:,\d{3})+(?:\.\d+)?\)?|\(?-?\d+\.\d+\)?")
+# Any number, separators included ("1,158,885", "3.97", "3,5,6").
+_NUMBER_RE = re.compile(r"\d[\d,.]*")
+# pdfplumber's word-gap threshold (points) for the page-vision text layer.
+_PAGE_TEXT_X_TOLERANCE = 1
+
+
+def _data_row_count(grid: list[list[Any]]) -> int:
+    """Rows holding a text label AND at least one numeric value."""
+    n = 0
+    for row in grid:
+        cells = [c.strip() for c in row if isinstance(c, str) and c.strip()]
+        if any(_looks_numeric(c) for c in cells) and any(not _looks_numeric(c) for c in cells):
+            n += 1
+    return n
+
+
+def _payload_grid(payload: dict[str, Any]) -> list[list[str]]:
+    """A StructuredTable payload as plain rows: [rowLabel, cell, cell, ...]."""
+    return [
+        [str(r.get("rowLabel") or "")]
+        + [str(c.get("cellValue") or "") for c in r.get("cells", []) or []]
+        for r in payload.get("rows", []) or []
+    ]
+
+
+def _is_header_only(grid: list[list[Any]]) -> bool:
+    """A detected 'table' that is only a column-header strip: fewer than two
+    rows pairing a label with a value (years and units alone don't count)."""
+    return _data_row_count(grid) < 2
+
+
+def _figure_lines(text: str) -> int:
+    """How many lines of page text carry two or more figures."""
+    return sum(1 for ln in text.splitlines() if len(_FIGURE_RE.findall(ln)) >= 2)
+
+
+def _digits(s: str) -> str:
+    return re.sub(r"\D", "", s)
+
+
+def _printed_numbers(page_text: str) -> set[str]:
+    """Digit strings of every number printed on the page."""
+    # Compare NUMBERS, not cells: the model writes "₩ (2,700)" and
+    # "3.00% – 3.97%", which a whole-cell numeric test skipped -- 34 of 35
+    # LGES rejections (2026-10-23) were real tables scored as having no
+    # figures at all. A Notes cell "3,5,7,29" is one number, "35729".
+    printed = {_digits(m) for m in _NUMBER_RE.findall(page_text)}
+    printed |= {_digits(t) for t in page_text.split()}
+    return printed
+
+
+def _ungrounded_share(payload: dict[str, Any], page_text: str) -> float:
+    """Share of the table's numbers whose digits do not occur in the
+    page's text layer (0.0 = every figure is printed on the page)."""
+    printed = _printed_numbers(page_text)
+    nums = [
+        _digits(m)
+        for r in payload.get("rows", []) or []
+        for c in r.get("cells", []) or []
+        for m in _NUMBER_RE.findall(str(c.get("cellValue") or ""))
+    ]
+    if not nums:
+        return 1.0
+    return sum(1 for d in nums if d not in printed) / len(nums)
+
+
+def _blank_ungrounded_cells(payload: dict[str, Any], page_text: str) -> int:
+    """Empty every cell holding a number the page does not print; returns how
+    many. A kept table may still carry misreads under the ungrounded limit
+    (SDI 2024 revenue read as ...884,368, printed ...884,388: 1-4% of figures
+    in the 2026-10-23 smoke) -- a gap is better than a citable wrong figure."""
+    printed = _printed_numbers(page_text)
+    n = 0
+    for r in payload.get("rows", []) or []:
+        for c in r.get("cells", []) or []:
+            nums = _NUMBER_RE.findall(str(c.get("cellValue") or ""))
+            if any(_digits(m) not in printed for m in nums):
+                c["cellValue"] = ""
+                n += 1
+    return n
+
+
+def page_vision_settings() -> dict[str, Any]:
+    """tables.page_vision* from config.yaml, with defaults."""
+    t = (get_settings().app_config.get("tables", {}) or {})
+    return {
+        "enabled": bool(t.get("page_vision", True)),
+        "min_figure_lines": int(t.get("page_vision_min_figure_lines", 8)),
+        "max_pages": int(t.get("page_vision_max_pages_per_doc", 80)),
+        "max_ungrounded": float(t.get("page_vision_max_ungrounded", 0.1)),
+    }
+
+
+async def _extract_page_tables_via_vision(
+    page: Any,
+    *,
+    page_text: str,
+    doc_sha: str,
+    first_table_index: int,
+    page_number: int,
+    max_ungrounded: float,
+) -> tuple[list[dict[str, Any]], float, int, int]:
+    """Render the whole page, ask the vision model for every table on it, and
+    keep the ones whose figures are printed on the page, with any cell whose
+    number is not printed blanked. Returns (payloads, cost_usd,
+    n_rejected_ungrounded, n_cells_blanked); raises VisionCallError on a
+    failed request so the caller keeps the PDF out of the cache."""
+    spec = _vision_spec("table_extract_page_vision", fallback="table_extract_vision")
+    png_b64 = _render_png_b64(page, None)
+    if png_b64 is None:
+        return [], 0.0, 0, 0
+    system, user = PROMPTS["table_extract_page_vision"](page_number=page_number)
+    text, cost = await _call_vision(spec, system, user, png_b64)
+    if text is None:
+        return [], cost, 0, 0
+    try:
+        body = json.loads(text)
+    except json.JSONDecodeError:
+        return [], cost, 0, 0
+    if not isinstance(body, dict) or body.get("no_table") is True:
+        return [], cost, 0, 0
+    out: list[dict[str, Any]] = []
+    rejected = 0
+    blanked = 0
+    for raw in body.get("tables") or []:
+        payload = _vision_body_to_jsonld(
+            raw, doc_sha=doc_sha, table_index=first_table_index + len(out) + rejected,
+            page_number=page_number, caption_hint=None,
+        )
+        if payload is None or not payload.get("rows"):
+            continue
+        if _looks_fabricated(payload) or _ungrounded_share(payload, page_text) > max_ungrounded:
+            rejected += 1
+            continue
+        blanked += _blank_ungrounded_cells(payload, page_text)
+        out.append(payload)
+    return out, cost, rejected, blanked
+
+
 def _estimate_cost(resp: Any) -> float:
     """Best-effort cost estimate for the vision call from the OpenAI
     response object. Mirrors the routing in `llm_router._estimate_cost`
@@ -1053,6 +1220,22 @@ def _estimate_cost(resp: Any) -> float:
 
 
 # ---------- Top-level entry point --------------------------------------------
+
+
+def _mirror_to_run_cache(run_cache_dir: Path | None, cache_key: str, hit: Any, pdf: Path) -> None:
+    """Copy a user-cache hit into the run cache (if configured and absent)."""
+    if run_cache_dir is None or (Path(run_cache_dir) / f"{cache_key}.jsonld").exists():
+        return
+    try:
+        table_cache.save(
+            run_cache_dir, cache_key,
+            doc_sha=hit.doc_sha,
+            doc_path=str(pdf),
+            tables=hit.tables,
+            manifest=hit.manifest,
+        )
+    except Exception:
+        pass
 
 
 async def extract_tables_async(
@@ -1115,20 +1298,7 @@ async def extract_tables_async(
         # find a complete record of every PDF processed by this run.
         # Skipped silently if the run-cache file already exists or write
         # fails (cache writes are always best-effort).
-        if run_cache_dir is not None:
-            from pathlib import Path as _Path
-            run_file = _Path(run_cache_dir) / f"{cache_key}.jsonld"
-            if not run_file.exists():
-                try:
-                    table_cache.save(
-                        run_cache_dir, cache_key,
-                        doc_sha=hit.doc_sha,
-                        doc_path=str(p),
-                        tables=hit.tables,
-                        manifest=hit.manifest,
-                    )
-                except Exception:
-                    pass
+        _mirror_to_run_cache(run_cache_dir, cache_key, hit, p)
         return TableExtractionResult(
             tables=hit.tables,
             manifest={**hit.manifest, "source": "cache", "doc_sha": hit.doc_sha},
@@ -1159,6 +1329,12 @@ async def extract_tables_async(
     n_merged = 0          # tables assembled from >1 detected fragment
     n_headers_recovered = 0
     skip_reasons: dict[str, int] = {}
+    pv = page_vision_settings() if use_vision else {"enabled": False}
+    n_page_vision_pages = 0
+    n_page_vision_tables = 0
+    n_page_vision_ungrounded = 0
+    n_page_vision_cells_blanked = 0
+    n_header_only_dropped = 0
 
     try:
         with pdfplumber.open(str(p)) as pdf:
@@ -1185,6 +1361,20 @@ async def extract_tables_async(
                     tables = []
                 page_kept_before = len(payloads)
                 page_skipped_filter = 0
+                # Page vision needs the text layer: to spot figure-dense pages
+                # and to check every figure the model returns. x_tolerance=1:
+                # at the default 3 pt, 44 of 148 tightly set FinQA pages ran
+                # words together ("Devonhasaccessto$5.0billion"); fin-gen
+                # text is unchanged and no words split apart (2026-10-23).
+                page_text = ""
+                figure_dense = False
+                if pv["enabled"]:
+                    try:
+                        page_text = page.extract_text(x_tolerance=_PAGE_TEXT_X_TOLERANCE) or ""
+                    except Exception:
+                        page_text = ""
+                    figure_dense = _figure_lines(page_text) >= pv["min_figure_lines"]
+                header_only: list[dict[str, Any]] = []
                 # Reassemble row-per-candidate fragments BEFORE any filter --
                 # each fragment is individually thin enough to be dropped by
                 # the bbox guard, while the table they form is not.
@@ -1292,8 +1482,58 @@ async def extract_tables_async(
                         table_index += 1
                         continue
 
+                    if figure_dense and _is_header_only(_payload_grid(payload)):
+                        # A header strip above a borderless statement; page
+                        # vision below replaces it with the real table.
+                        header_only.append(payload)
+                        table_index += 1
+                        continue
+
                     payloads.append(payload)
                     table_index += 1
+
+                # Whole-page vision for a figure-dense page that produced no
+                # real table (see _extract_page_tables_via_vision).
+                if header_only or figure_dense:
+                    vision_page = (
+                        figure_dense
+                        and len(payloads) == page_kept_before
+                        and n_page_vision_pages < pv["max_pages"]
+                        and table_index < _MAX_TABLES_PER_DOC
+                    )
+                    replaced = False
+                    if vision_page:
+                        n_page_vision_pages += 1
+                        try:
+                            found, page_cost, rejected, blanked = await _extract_page_tables_via_vision(
+                                page, page_text=page_text, doc_sha=doc_sha,
+                                first_table_index=table_index, page_number=page_no,
+                                max_ungrounded=pv["max_ungrounded"],
+                            )
+                        except VisionCallError as exc:
+                            n_vision_errors += 1
+                            if n_vision_errors == 1:
+                                print(f"[tables] {p.name}: page vision FAILED ({exc}); "
+                                      f"this PDF will not be cached", flush=True)
+                        else:
+                            # Strips are dropped only when vision returned the
+                            # statement; a "no table" answer keeps them.
+                            replaced = bool(found)
+                            cost_usd += page_cost
+                            n_page_vision_ungrounded += rejected
+                            n_page_vision_cells_blanked += blanked
+                            table_index += len(found) + rejected
+                            for t in found:
+                                if not table_jsonld.validate_table_jsonld(t):
+                                    payloads.append(t)
+                                    n_page_vision_tables += 1
+                                    n_vision += 1
+                    if replaced:
+                        n_header_only_dropped += len(header_only)
+                    else:
+                        # Not sent (cap reached, or the page has real tables)
+                        # or the request failed: keep the fragments as before.
+                        payloads.extend(header_only)
 
                 # Per-page memory release. pdfplumber caches a lot of
                 # geometric primitives on each Page; without an explicit
@@ -1363,6 +1603,11 @@ async def extract_tables_async(
         "n_merged": n_merged,
         "n_headers_recovered": n_headers_recovered,
         "skip_reasons": skip_reasons,
+        "n_page_vision_pages": n_page_vision_pages,
+        "n_page_vision_tables": n_page_vision_tables,
+        "n_page_vision_ungrounded": n_page_vision_ungrounded,
+        "n_page_vision_cells_blanked": n_page_vision_cells_blanked,
+        "n_header_only_dropped": n_header_only_dropped,
         "cost_usd": round(cost_usd, 5),
         "wall_seconds": wall,
         "pages_processed": pages_processed,
@@ -1372,7 +1617,9 @@ async def extract_tables_async(
         f"[tables] {p.name}: DONE -- {len(payloads)} kept "
         f"(pdfplumber={n_pdfplumber}, vision={n_vision}, "
         f"merged={n_merged}, headers-recovered={n_headers_recovered}, "
-        f"filter-skip={n_skipped_filter}, vision-drop={n_dropped}) "
+        f"filter-skip={n_skipped_filter}, vision-drop={n_dropped}, "
+        f"page-vision={n_page_vision_tables} from {n_page_vision_pages} page(s), "
+        f"ungrounded={n_page_vision_ungrounded}, cells-blanked={n_page_vision_cells_blanked}, header-only-dropped={n_header_only_dropped}) "
         f"over {pages_processed} pages in {wall:.1f}s, cost=${cost_usd:.4f}",
         flush=True,
     )
@@ -1411,6 +1658,83 @@ def table_extraction_concurrency() -> int:
 
     cfg = get_settings().app_config
     return max(1, int((cfg.get("concurrency", {}) or {}).get("table_extraction", 1)))
+
+
+# A worker's stdout is read until EOF and then its exit status awaited, both
+# with no deadline. On 2026-10-23 a register-documents run sat for 25 minutes
+# (dedicated GPU billing) after its third worker had exited: the parent never
+# saw EOF/exit, no child process existed, and the worker had already written
+# its cache entry. Not reproduced in 40 isolated cached runs, so instead of
+# trusting EOF the pump polls: on every quiet interval it checks whether the
+# worker is still alive, and a live worker silent for too long is killed.
+# Either way the caller then reads the cache, which recovers that case.
+_WORKER_POLL_S = 30.0
+_WORKER_EXIT_WAIT_S = 30.0
+_DEFAULT_WORKER_MAX_SILENT_S = 1800.0
+
+
+def _worker_max_silent_s() -> float:
+    """tables.worker_max_silent_seconds: kill a worker that is alive but has
+    printed nothing for this long (it prints at least every 20 s per page
+    unless a vision call is outstanding, and those time out at 300 s)."""
+    cfg = get_settings().app_config
+    tables = cfg.get("tables", {}) or {}
+    return float(tables.get("worker_max_silent_seconds", _DEFAULT_WORKER_MAX_SILENT_S))
+
+
+def _worker_gone(proc: Any) -> bool:
+    """True when the worker has exited, even if asyncio has not noticed.
+    Linux reads /proc (a zombie counts as gone); elsewhere only the
+    returncode asyncio recorded is trusted -- os.kill(pid, 0) would
+    terminate the process on Windows."""
+    if proc.returncode is not None:
+        return True
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        with open(f"/proc/{proc.pid}/stat", "rb") as fh:
+            state = fh.read().rsplit(b")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return True
+    return state in (b"Z", b"X")
+
+
+async def _pump_worker(proc: Any, pdf: Path, *, max_silent_s: float) -> int:
+    """Forward the worker's output and return its exit code (-1 if unknown,
+    -9 if it was killed). Never blocks forever: see the note above."""
+    assert proc.stdout is not None
+    silent = 0.0
+    while True:
+        try:
+            line = await asyncio.wait_for(proc.stdout.readline(), timeout=_WORKER_POLL_S)
+        except asyncio.TimeoutError:
+            silent += _WORKER_POLL_S
+            if _worker_gone(proc):
+                print(f"[tables/worker] {pdf.name}: worker exited without closing its "
+                      f"output; reading its result from the cache", flush=True)
+                break
+            if silent >= max_silent_s:
+                print(f"[tables/worker] {pdf.name}: no output for {silent:.0f}s; "
+                      f"killing the worker", flush=True)
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                break
+            continue
+        if not line:
+            break
+        silent = 0.0
+        # The worker prefixes its own lines with [tables] / [worker]; pass
+        # through verbatim.
+        sys.stdout.write(line.decode("utf-8", errors="replace"))
+        sys.stdout.flush()
+    try:
+        return await asyncio.wait_for(proc.wait(), timeout=_WORKER_EXIT_WAIT_S)
+    except asyncio.TimeoutError:
+        print(f"[tables/worker] {pdf.name}: exit status never arrived; "
+              f"treating it as unknown", flush=True)
+        return -1 if proc.returncode is None else proc.returncode
 
 
 def _find_pdfs(folder: Path) -> list[Path]:
@@ -1537,6 +1861,30 @@ async def _drive_subprocess_workers(
     cmd_base = [sys.executable, "-u", "-m",
                 "backend.app.services.table_extract_worker"]
 
+    spawn_error: dict[Path, str] = {}
+
+    async def _spawn_worker(p: Path) -> int | None:
+        """Run the extraction worker for one PDF; its exit code, or None when
+        it could not be started (reason in `spawn_error`)."""
+        cmd = list(cmd_base) + ["--pdf", str(p.resolve())]
+        if run_cache_dir is not None:
+            cmd += ["--run-cache-dir", str(Path(run_cache_dir).resolve())]
+        if not use_vision:
+            cmd += ["--no-vision"]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+        except Exception as exc:  # noqa: BLE001
+            spawn_error[p] = f"{type(exc).__name__}: {exc}"
+            print(f"[tables/worker] spawn failed for {p.name}: {spawn_error[p]}", flush=True)
+            return None
+        # Stream worker output through to parent stdout so the user
+        # still sees per-PDF progress lines from the worker.
+        return await _pump_worker(proc, p, max_silent_s=_worker_max_silent_s())
+
     async def _one(p: Path) -> tuple[str, dict[str, Any]]:
         nonlocal done
         async with sem:
@@ -1545,49 +1893,27 @@ async def _drive_subprocess_workers(
             # this run paid for it.
             was_cached = False
             try:
-                from backend.app.services import table_cache  # local import
                 _, _pre_key = _hash_pdf_streaming(p)
-                was_cached = table_cache.two_tier_load(
+                pre_hit = table_cache.two_tier_load(
                     run_cache_dir, table_cache.user_cache_dir(), _pre_key,
-                ) is not None
+                )
+                was_cached = pre_hit is not None
             except Exception:  # noqa: BLE001 -- accounting only, never fatal
                 was_cached = False
 
-            cmd = list(cmd_base) + ["--pdf", str(p.resolve())]
-            if run_cache_dir is not None:
-                cmd += ["--run-cache-dir", str(Path(run_cache_dir).resolve())]
-            if not use_vision:
-                cmd += ["--no-vision"]
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                )
-            except Exception as exc:  # noqa: BLE001
-                done += 1
-                summary_stats["n_failed"] += 1
-                print(
-                    f"[tables/worker] spawn failed for {p.name}: "
-                    f"{type(exc).__name__}: {exc}",
-                    flush=True,
-                )
-                return str(p), {
-                    "source": "spawn-failed",
-                    "reason": f"{type(exc).__name__}: {exc}",
-                }
-            # Stream worker output through to parent stdout so the user
-            # still sees per-PDF progress lines from the worker.
-            assert proc.stdout is not None
-            while True:
-                line = await proc.stdout.readline()
-                if not line:
-                    break
-                # The worker prefixes its own lines with [tables] /
-                # [worker]; pass through verbatim.
-                sys.stdout.write(line.decode("utf-8", errors="replace"))
-                sys.stdout.flush()
-            rc = await proc.wait()
+            if was_cached:
+                # A cache hit needs no worker: the worker would only copy
+                # the entry into the run cache. Spawning one per PDF anyway
+                # cost 632 of register-documents' 670 s on 148 cached FinQA
+                # PDFs (2026-10-23) -- about 10 min of paid GPU clock.
+                _mirror_to_run_cache(run_cache_dir, _pre_key, pre_hit, p)
+                rc = 0
+            else:
+                rc = await _spawn_worker(p)
+                if rc is None:
+                    done += 1
+                    summary_stats["n_failed"] += 1
+                    return str(p), {"source": "spawn-failed", "reason": spawn_error[p]}
             done += 1
 
             # Look up the just-written manifest from the user-cache. We
@@ -1600,7 +1926,6 @@ async def _drive_subprocess_workers(
 
             manifest: dict[str, Any] = {"exit_code": rc}
             if cache_key is not None:
-                from backend.app.services import table_cache  # local import
                 hit = table_cache.two_tier_load(
                     run_cache_dir, table_cache.user_cache_dir(), cache_key,
                 )

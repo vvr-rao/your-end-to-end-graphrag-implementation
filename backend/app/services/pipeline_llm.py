@@ -3975,6 +3975,7 @@ async def prune_only_async(
     dry_run: bool,
     use_owl: bool = False,
     suggested_new_classes: Path | None = None,
+    compact_descriptions: bool = True,
 ) -> Path:
     return await _run(
         "prune",
@@ -3985,6 +3986,7 @@ async def prune_only_async(
         max_cost_usd,
         dry_run,
         suggestions_path=suggested_new_classes,
+        compact_descriptions=compact_descriptions,
     )
 
 
@@ -3998,6 +4000,7 @@ async def expand_only_async(
     dry_run: bool,
     use_owl: bool = False,
     suggested_new_classes: Path | None = None,
+    compact_descriptions: bool = True,
 ) -> Path:
     return await _run(
         "expand",
@@ -4008,6 +4011,7 @@ async def expand_only_async(
         max_cost_usd,
         dry_run,
         suggestions_path=suggested_new_classes,
+        compact_descriptions=compact_descriptions,
     )
 
 
@@ -4036,6 +4040,7 @@ async def prune_and_expand_async(
     classification_concurrency: int | None = None,
     proposal_concurrency: int | None = None,
     dedup_concurrency: int | None = None,
+    compact_descriptions: bool = True,
 ) -> Path:
     return await _run(
         "prune-expand",
@@ -4061,6 +4066,7 @@ async def prune_and_expand_async(
         classification_concurrency=classification_concurrency,
         proposal_concurrency=proposal_concurrency,
         dedup_concurrency=dedup_concurrency,
+        compact_descriptions=compact_descriptions,
     )
 
 
@@ -4088,6 +4094,7 @@ async def build_async(
     classification_concurrency: int | None = None,
     proposal_concurrency: int | None = None,
     dedup_concurrency: int | None = None,
+    compact_descriptions: bool = True,
 ) -> Path:
     # build = merge + prune-expand chained. Merge first (sync), then drive the
     # async LLM pipeline against the just-written version folder.
@@ -4118,6 +4125,7 @@ async def build_async(
         classification_concurrency=classification_concurrency,
         proposal_concurrency=proposal_concurrency,
         dedup_concurrency=dedup_concurrency,
+        compact_descriptions=compact_descriptions,
     )
 
 
@@ -4146,6 +4154,7 @@ async def _run(
     classification_concurrency: int | None = None,
     proposal_concurrency: int | None = None,
     dedup_concurrency: int | None = None,
+    compact_descriptions: bool = True,
 ) -> Path:
     settings = get_settings()
     app_cfg = settings.app_config
@@ -4180,7 +4189,25 @@ async def _run(
     if documents_dir.exists():
         document_io.preflight_documents(documents_dir)
 
-    # Corpus selection: build the ontology from a representative SUBSET.
+    # Compact class descriptions (default ON; --no-summarize-descriptions skips).
+    # Stage 2 ships `compact_description` instead of the verbose text when it
+    # exists: 78% fewer description tokens on the pharma merge, for cents. The
+    # result is written back into the INPUT folder so later runs on the same
+    # merge skip it -- the same in-place write `summarize-descriptions` does.
+    # Done before anything mutates `loaded`, so only the new field lands there.
+    if compact_descriptions and not dry_run:
+        compact = await summarize_class_descriptions_async(
+            classes_dict=loaded.get("classes_dict", {}),
+            router=router,
+            max_cost_usd=min(5.0, effective_cost_cap),
+        )
+        if compact["classes_summarized"]:
+            folder_io.write_merged_json(input_folder, loaded)
+            ontology_export.write_owl(loaded, input_folder / folder_io.MERGED_OWL)
+            print(
+                f"[{operation}] compacted {compact['classes_summarized']} class "
+                f"description(s) (${compact['cost_usd']:.4f}); saved to {input_folder}"
+            )
     #
     # Runs BEFORE table extraction so a run never pays vision costs for
     # documents the ontology will never see. Summarization here writes to the

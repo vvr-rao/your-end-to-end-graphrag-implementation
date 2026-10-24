@@ -59,7 +59,9 @@ After the merge, give them the output location and ask them to verify `merged.ow
 in a third-party tool (Protégé) before the paid prune-expand. Between the merge
 and prune-expand, run `summarize-descriptions` on the merge folder — it costs
 cents, is idempotent, and cut prune-expand from $1.79 to $1.44 in testing by
-shrinking Stage 2's prompts by 78%. THEN ask for the
+shrinking Stage 2's prompts by 78%. It is the DEFAULT: prune-expand runs it
+itself on an uncompacted input (skip only with `--no-summarize-descriptions`);
+running it first just lets the user see its cost separately. THEN ask for the
 corpus, mention the `--tables` option (plus `--table-mining` if the corpus is
 financial) and ask their preference, and run prune-expand. Walk it one step at a time; never race ahead to a paid step.
 

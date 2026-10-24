@@ -3395,6 +3395,61 @@ def table_extract_vision(
     return system, user
 
 
+def table_extract_page_vision(page_number: int | None = None) -> tuple[str, str]:
+    """Phase 2a vision prompt for a WHOLE PDF page whose tables the line-based
+    detector missed (borderless financial statements, where it keeps only the
+    ruled header strip). A page can hold several tables, so the reply is a
+    list; each entry has the single-table shape of `table_extract_vision`.
+    Every figure is later checked against the page's own text layer."""
+    system = (
+        "You transcribe the TABLES on an image of one full PDF page. Financial "
+        "statements and notes often draw no grid lines: a table is any block of "
+        "rows where a label on the left is followed by values aligned in "
+        "columns (years, periods, currencies, segments). Ignore running prose, "
+        "page headers and footers, and page numbers.\n\n"
+        "If the page holds no table you can read with confidence, return "
+        'exactly {"no_table": true}. That is a correct, expected answer. NEVER '
+        "invent rows, columns or values, and never emit placeholder data. "
+        "Every value must be legible on the page.\n\n"
+        "Otherwise return strictly valid JSON:\n"
+        "{\n"
+        '  "tables": [\n'
+        "    {\n"
+        '      "caption": "<the table\'s title/heading on the page, or null>",\n'
+        '      "columns": [{"columnIndex": 0, "columnLabel": "<header text>"}, ...],\n'
+        '      "rows": [\n'
+        '        {"rowIndex": 0, "rowLabel": "<the row\'s label>", "isHeaderRow": false,\n'
+        '         "cells": [{"columnIndex": 0, "cellValue": "<value as printed>"}, ...]},\n'
+        "        ...\n"
+        "      ]\n"
+        "    },\n"
+        "    ...\n"
+        "  ]\n"
+        "}\n\n"
+        "Rules:\n"
+        "  1. One entry per distinct table, top to bottom.\n"
+        "  2. Copy values EXACTLY as printed: thousands separators, parentheses "
+        "for negatives, dashes for nil, currency symbols. Do NOT reformat or "
+        "compute anything.\n"
+        "  3. Put the row's label (e.g. 'Cash and cash equivalents') in rowLabel "
+        "and NOT in cells; columns describe the value columns only. A 'Note' "
+        "reference column is a normal column.\n"
+        "  4. Multi-line headers: join them into one columnLabel per column "
+        "(e.g. 'March 31, 2025 (Unaudited)').\n"
+        "  5. Section and subtotal lines ('Current assets', 'Total assets') are "
+        "rows; leave a cell \"\" when it is blank on the page.\n"
+        "  6. Every cell's columnIndex must reference a column in that table.\n"
+        "  7. JSON only: no prose, no markdown."
+    )
+    user = (
+        "Transcribe every table on the attached page as JSON per the rules. "
+        'If there is none, return {"no_table": true}.\n'
+        + (f"page_number: {int(page_number)}\n\n" if page_number is not None else "\n")
+        + "Return the JSON object only."
+    )
+    return system, user
+
+
 def table_concept_grouping(
     caption: str | None,
     columns: list[dict[str, Any]],
@@ -3796,6 +3851,7 @@ PROMPTS = {
     "relationship_repair": relationship_repair,
     # Phase 2a — table extraction (vision)
     "table_extract_vision": table_extract_vision,
+    "table_extract_page_vision": table_extract_page_vision,
     # Phase 2a follow-up — table → KG anchor-bucket grouping
     "table_concept_grouping": table_concept_grouping,
     # Milestone F

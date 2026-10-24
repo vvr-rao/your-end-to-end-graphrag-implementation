@@ -964,6 +964,23 @@ storage:
   backend: local   # local | s3 (Phase 3+)
   # Override via STORAGE_DIR env var.
 
+# ---- Table extraction (--tables). Each PDF runs in its own worker process.
+tables:
+  # A worker that is alive but prints nothing for this long is killed and the
+  # parent moves on (reading whatever the worker cached). It prints at least
+  # every 20 s per page; a vision call times out at 300 s (whole page: 420 s).
+  worker_max_silent_seconds: 1800
+  # Whole-page vision: pdfplumber finds tables by ruling lines, so borderless
+  # financial statements come back as 1-4-row header strips (2026-10-23,
+  # fin-gen). A page with >= min_figure_lines lines carrying >= 2 numbers and
+  # no real table kept goes to the table_extract_page_vision model; header
+  # strips on it are dropped when vision succeeds. A returned table whose
+  # numbers are mostly absent from the page's text is rejected as invented.
+  page_vision: true
+  page_vision_min_figure_lines: 8
+  page_vision_max_pages_per_doc: 80
+  page_vision_max_ungrounded: 0.1
+
 # ---- enrich-geo. Contained places per LLM call, and how many containers
 # ride along in every call. Small on purpose: at ~109 places per call the
 # pass left 58% of cities with no containment edge, the same

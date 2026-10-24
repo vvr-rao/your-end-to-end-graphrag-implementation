@@ -492,7 +492,7 @@ Fill `.env` with:
 | Var | Required | How to get it |
 |---|---|---|
 | `DATABASE_URL` | yes | Supabase → Project Settings → Database → **Session pooler** URL (don't use the direct `db.*.supabase.co` URL — IPv6-only) |
-| `OPENAI_API_KEY` | yes | https://platform.openai.com/api-keys |
+| `OPENAI_API_KEY` | yes, except in DeepInfra mode | https://platform.openai.com/api-keys |
 | `BEARER_TOKEN` | yes | `python -c "import secrets; print(secrets.token_urlsafe(32))"` |
 | `GROQ_API_KEY` | optional | Only needed for the default preset's Groq-backed Stage 1 in ontology expansion |
 | `ANTHROPIC_API_KEY` | optional | Only needed for the anthropic-only chat preset (`config/models.anthropic.example.yaml`). That preset still needs `OPENAI_API_KEY` for embeddings |
@@ -690,8 +690,8 @@ uv run python -m backend.app.cli merge \
   --ontology source_ontologies/core_ontologies/domain_concepts.owl \
   --ontology source_ontologies/manufacturing_supplychain_ontologies/OntoCAPE_domain+ontology.zip
 
-#Summarize Descriptions in the merged ontology
-#OPTIONAL reduces context size
+#Summarize Descriptions in the merged ontology (DEFAULT: prune-expand also
+#does this itself on an uncompacted input; --no-summarize-descriptions skips it)
 uv run python -m backend.app.cli summarize-descriptions \
   --input output_ontologies/v<TS>-merge
 
@@ -975,7 +975,7 @@ Task → provider/model map lives in `config/models.yaml`. Defaults:
 | `answer_deep_research`, `insight_gen`, `recommendation_gen` | OpenAI | `gpt-4.1` |
 | `embeddings` | OpenAI | `text-embedding-3-small` @ 1024 dim |
 
-`OPENAI_API_KEY` is required; `GROQ_API_KEY` is only needed if you use the Groq-backed Stage 1 in ontology expansion.
+`OPENAI_API_KEY` is required in every mode except DeepInfra (which needs only `DEEPINFRA_API_KEY` and uses DeepInfra models for every task); `GROQ_API_KEY` is only needed if you use the Groq-backed Stage 1 in ontology expansion.
 
 ### Provider presets (modes)
 

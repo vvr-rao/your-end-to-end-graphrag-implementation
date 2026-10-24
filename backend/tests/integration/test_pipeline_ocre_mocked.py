@@ -7,6 +7,7 @@ The router is monkey-patched to return deterministic JSON for each task.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -43,6 +44,9 @@ def _stub_chat_factory():
             }
         elif task == "match_dedup":
             payload = json.loads(user.split("INPUT:\n", 1)[1].split("\n\nReturn", 1)[0])
+        elif task == "compact_description":
+            iris = re.findall(r'"iri": "([^"]+)"', user)
+            payload = {"results": [{"iri": i, "compact_description": "Mock short text."} for i in iris]}
         else:
             payload = {}
         return ChatResult(
@@ -123,3 +127,36 @@ async def test_build_pipeline_mocked(tmp_path: Path, monkeypatch: pytest.MonkeyP
     range_iris = {r.get("iri") for r in rel["range"]}
     assert domain_iris & set(mocked_class_iris)
     assert range_iris & set(mocked_class_iris)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not OCRE_ZIP.exists(), reason="OCRe.zip not available")
+@pytest.mark.parametrize("compact", [True, False])
+async def test_prune_expand_compacts_the_input_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, compact: bool,
+) -> None:
+    """summarize-descriptions is a default step of prune-expand: the input
+    merge gains compact_description fields (saved in place, so the next run
+    skips them); --no-summarize-descriptions leaves the input untouched."""
+    from backend.app.services.llm_router import LLMRouter
+
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "sample.txt").write_text("Clinical trials evaluate intervention safety and efficacy.")
+    monkeypatch.setattr(LLMRouter, "chat", _stub_chat_factory())
+    out_root = tmp_path / "out"
+    out_root.mkdir()
+    merged_dir = run_merge(input_ontologies=[OCRE_ZIP], output_root=out_root)
+    before = (merged_dir / "merged.json").read_text()
+
+    await pipeline_llm.prune_and_expand_async(
+        input_folder=merged_dir, documents_dir=docs_dir, output_root=out_root,
+        max_hops=1, max_cost_usd=10.0, dry_run=False, compact_descriptions=compact,
+    )
+
+    classes = json.loads((merged_dir / "merged.json").read_text())["classes_dict"]
+    compacted = [c for c in classes.values() if c.get("compact_description")]
+    if compact:
+        assert compacted and all(c["compact_description"] == "Mock short text." for c in compacted)
+    else:
+        assert not compacted and (merged_dir / "merged.json").read_text() == before

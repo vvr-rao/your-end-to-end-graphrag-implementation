@@ -398,6 +398,16 @@ def _add_llm_flags(p: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Force re-parsing the prior merged.owl instead of using the fast merged.json path",
     )
+    p.add_argument(
+        "--no-summarize-descriptions",
+        dest="compact_descriptions", action="store_false", default=True,
+        help=(
+            "Skip compacting the input's class descriptions. By default each "
+            "class without a compact_description gets one (as "
+            "summarize-descriptions does: cents, saved into the input folder, "
+            "so later runs skip it), and Stage 2 ships the short text."
+        ),
+    )
 
 
 def _add_suggestions_flag(p: argparse.ArgumentParser) -> None:
@@ -1818,6 +1828,7 @@ def _cmd_prune(args: argparse.Namespace) -> int:
             max_hops=args.max_hops,
             max_cost_usd=args.max_cost_usd,
             dry_run=args.dry_run,
+            compact_descriptions=args.compact_descriptions,
         )
     )
     print(f"\nPRUNED ontology written to: {version_dir}")
@@ -1835,6 +1846,7 @@ def _cmd_expand(args: argparse.Namespace) -> int:
             max_hops=args.max_hops,
             max_cost_usd=args.max_cost_usd,
             dry_run=args.dry_run,
+            compact_descriptions=args.compact_descriptions,
             suggested_new_classes=args.suggested_new_classes,
         )
     )
@@ -1853,6 +1865,7 @@ def _cmd_prune_expand(args: argparse.Namespace) -> int:
             max_hops=args.max_hops,
             max_cost_usd=args.max_cost_usd,
             dry_run=args.dry_run,
+            compact_descriptions=args.compact_descriptions,
             suggested_new_classes=args.suggested_new_classes,
             extract_tables=getattr(args, "tables", False),
             mine_table_concepts=getattr(args, "table_mining", False),
@@ -1886,6 +1899,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
             max_hops=args.max_hops,
             max_cost_usd=args.max_cost_usd,
             dry_run=args.dry_run,
+            compact_descriptions=args.compact_descriptions,
             suggested_new_classes=args.suggested_new_classes,
             extract_tables=getattr(args, "tables", False),
             mine_table_concepts=getattr(args, "table_mining", False),

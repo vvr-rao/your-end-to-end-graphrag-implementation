@@ -611,6 +611,16 @@ tasks:
     temperature: 0.0
     max_tokens: 4096
     response_format: json_object
+  # Whole-page vision (--tables): a figure-dense page whose tables the
+  # line-based detector missed (borderless financial statements). Same
+  # model as table_extract_vision; a full statement page runs 3-6k tokens.
+  table_extract_page_vision:
+    provider: openai
+    model: gpt-4o-mini
+    timeout: 420
+    temperature: 0.0
+    max_tokens: 8192
+    response_format: json_object
 
   # ---------------------------------------------------------------------------
   # Phase 2a follow-up: per-extracted-table classification into the 6 anchor

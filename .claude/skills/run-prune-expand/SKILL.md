@@ -174,8 +174,13 @@ Retrieval does NOT need this flag — StructuredTable artifacts reach Phase 2 fr
 `--tables` alone.
 
 ## Step 2b — Compact the class descriptions first (cheap; cuts the big step)
-**Always run this before prune-expand.** It is fast, costs cents, and lowers the
-most expensive stage that follows:
+**This is a default step.** prune-expand (and expand / build) compacts any
+class in its input that has no `compact_description` yet, writes the result
+back into the input folder, and only then starts Stage 1; pass
+`--no-summarize-descriptions` to skip it. Running it on its own first, as
+below, is still recommended so its cost shows up separately (prune-expand then
+finds nothing left to do). It is fast, costs cents, and lowers the most
+expensive stage that follows:
 
 ```
 uv run python -m backend.app.cli summarize-descriptions --input "<MERGE_DIR>" --max-cost-usd 2.0
@@ -197,7 +202,9 @@ Notes:
   so re-running is free. Safe to run even if you are unsure.
 - It **modifies the merge folder in place** (merged.json + merged.owl). If the
   user wants the original preserved, copy the folder first.
-- Skip only if the user explicitly wants the verbose descriptions in Stage 2.
+- Skip only if the user explicitly wants the verbose descriptions in Stage 2:
+  then pass `--no-summarize-descriptions` to prune-expand as well, or it
+  compacts them anyway.
 
 
 ## Step 2c — MANDATORY GATE: size the run against THIS machine

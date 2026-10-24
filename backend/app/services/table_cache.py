@@ -50,7 +50,10 @@ from backend.app.core.config import cache_root
 # backstop. Without this bump, cached p2a-1 payloads (which contain fabricated
 # tables invented from single-header-cell crops) would keep being served and the
 # fix would never run.
-EXTRACTOR_VERSION = "p2a-4"
+# p2a-5 (2026-10-23): figure-dense pages with no real table go to whole-page
+# vision, and their header-only strips are dropped (borderless financial
+# statements). Bumped so cached p2a-4 strips are re-extracted.
+EXTRACTOR_VERSION = "p2a-5"
 
 
 @dataclass
