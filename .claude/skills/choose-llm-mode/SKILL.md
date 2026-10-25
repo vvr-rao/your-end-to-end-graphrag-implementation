@@ -46,7 +46,7 @@ active preset is OpenAI). `test_deepinfra_mode_uses_only_deepinfra` enforces it.
 | **Groq + OpenAI** (default) | `groq-openai` | `OPENAI_API_KEY`, `GROQ_API_KEY` | Groq runs chunk_classification (best disambiguation); OpenAI everything else. |
 | **OpenAI only** | `openai` | `OPENAI_API_KEY` | Simplest; one provider. chunk_classification → `gpt-4.1-mini`. |
 | **Anthropic + OpenAI** | `anthropic` | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` | Claude for chat (haiku cheap tasks / sonnet synthesis); OpenAI for embeddings only. |
-| **DeepInfra (Qwen + DeepSeek)** | `deepinfra` | `DEEPINFRA_API_KEY`, `DEEPINFRA_FLASH_MODEL` | Knowledge creation on a **dedicated** Qwen3.8-27B deployment (rented GPUs, billed per GPU-hour while it exists); relationships, repair, judges and **all Q&A** on serverless DeepSeek-V4.1-Flash; table vision `Qwen3-VL-30B-A3B`; embeddings `Qwen3-Embedding-4B`@1024. No OpenAI/Anthropic key. Needs its OWN database (vectors can't mix with OpenAI ones; a guard refuses). See "DeepInfra mode" below. |
+| **DeepInfra (Qwen + DeepSeek)** | `deepinfra` | `DEEPINFRA_API_KEY`, `DEEPINFRA_FLASH_MODEL` | Knowledge creation on a **dedicated** Qwen3.8-27B deployment (rented GPUs, billed per GPU-hour while it exists); relationships, repair, judges and **all Q&A** on serverless DeepSeek-V4.1-Flash; table vision `Qwen3-VL-235B-A22B` (serverless; only when pdfplumber cannot build the table); embeddings `Qwen3-Embedding-4B`@1024. No OpenAI/Anthropic key. Needs its OWN database (vectors can't mix with OpenAI ones; a guard refuses). See "DeepInfra mode" below. |
 
 How to describe DeepInfra when presenting the options: **cheapest to run, rented
 GPUs to build.** Q&A costs ~$0.009 per deep-research question (vs ~$0.10 on
@@ -96,7 +96,8 @@ is created. The account needs a DeepInfra display name (username) first —
      builds — e.g. class_proposal 192 on 4x B200, 48 on 2x H200;
    - **this machine's memory** — every in-flight request's prompt and reply
      must fit in RAM (Linux, macOS and Windows are read; a 600 MB reserve is
-     kept), which also sizes `table_extraction` workers and caps
+     kept), which also sizes `table_extraction` workers and
+     `table_page_vision` (page-vision calls per worker) and caps
      `chunking.streaming_batch_size`. It adds `class_judges` (Stage-3 pair and
      validity judges) from the GPU's dedup concurrency. Any value lowered by
      local memory is printed as "capped by local memory".
@@ -131,7 +132,7 @@ is created. The account needs a DeepInfra display name (username) first —
 the dedicated GPUs for every knowledge-creation task (summaries, classification,
 class proposal, dedup and its judges, entities, artifacts); **DeepSeek-V4.1-Flash
 always on serverless** (relationships, repair, all Q&A, eval judges), as are
-the embeddings (Qwen3-Embedding-4B) and table vision (Qwen3-VL-30B). Never move
+the embeddings (Qwen3-Embedding-4B) and table vision (Qwen3-VL-235B). Never move
 DeepSeek onto the dedicated deployment.
 
 **One task can use either:** `alias_judge` (mine-aliases) runs on the dedicated

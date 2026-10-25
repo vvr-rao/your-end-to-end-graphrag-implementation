@@ -44,7 +44,7 @@ from backend.app.db.models.artifacts import IntelligenceArtifact
 from backend.app.db.models.documents import Chunk, Document
 from backend.app.db.models.entities import Entity
 from backend.app.db.models.graph import GraphRelationship
-from backend.app.db.models.ontology import OntologyClass
+from backend.app.db.models.ontology import OntologyClass, OntologyObjectProperty
 from backend.app.db.session import session_scope
 from backend.app.helpers.ontology_pruning import split_disjunction_label
 from backend.app.services.db_artifact_gen import _extract_json
@@ -58,6 +58,7 @@ from backend.app.services.pipeline_llm import (
     _split_camel,
 )
 from backend.app.services.predicates import (
+    GENERIC_CONCEPT_PREDICATES,
     GRAPHRAG_RELATED_TO,
     RDF_TYPE,
     VIAO_ASSERTS_ABOUT,
@@ -1598,6 +1599,31 @@ async def _candidate_predicates(
             "domain_iris": doms,
             "range_iris": rngs,
         })
+    # Generic concept predicates, outside the cap like the fallback below. One
+    # is offered when some class here sits under its range root, so a chunk
+    # holding a concept entity can always link it to the thing it is about.
+    # Only those present in the imported ontology: an older graph without the
+    # domain-neutral layer gets exactly the menu it had.
+    offered = {o["iri"] for o in out}
+    wanted = {iri: root for iri, root in GENERIC_CONCEPT_PREDICATES.items()
+              if iri not in offered and root in expanded}
+    if wanted:
+        r = await session.execute(
+            select(OntologyObjectProperty.iri, OntologyObjectProperty.label)
+            .where(OntologyObjectProperty.iri.in_(list(wanted)))
+        )
+        for iri, label in r.all():
+            root = wanted[iri]
+            constraints[iri] = ("", root)
+            out.append({
+                "iri": iri,
+                "label": label or iri.rsplit("#", 1)[-1],
+                "domain_label": "Thing",
+                "range_label": root.rsplit("#", 1)[-1],
+                "domain_iris": [],
+                "range_iris": [root],
+            })
+
     # The reserved fallback is always on the menu (outside the cap), so a
     # stated relationship the ontology has no predicate for is recorded with
     # its phrase rather than discarded. The prompt lists it last-resort.
@@ -1737,6 +1763,9 @@ def _types_fit(
     rngs = pred.get("range_iris") or []
     s_line = ancestors.get(s_cls, {s_cls})
     o_line = ancestors.get(o_cls, {o_cls})
+    if pred.get("iri") in GENERIC_CONCEPT_PREDICATES:
+        # Any subject; the object must be a concept under the range root.
+        return any(g in o_line for g in rngs)
     return any(d in s_line for d in doms) and any(g in o_line for g in rngs)
 
 

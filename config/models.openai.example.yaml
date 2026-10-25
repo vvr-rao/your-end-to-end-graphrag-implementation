@@ -562,6 +562,22 @@ tasks:
     max_tokens: 4096   # 60 decisions ~1.5k tokens
     response_format: json_object
 
+  # Stage 3c: generic parent for qualified concept classes
+  # (SemiconductorRevenue, RelatedPartyRevenue -> Revenue < Measure). Groups
+  # proposals by head noun; the judge confirms each group and picks the root.
+  # ~1 call per 25 groups. enabled: false skips the pass.
+  concept_head_judge:
+    provider: openai
+    model: gpt-4o-mini
+    enabled: true
+    min_members: 2          # a head needs >= 2 qualified members
+    groups_per_call: 25
+    max_groups: 300
+    timeout: 600
+    temperature: 0.0
+    max_tokens: 4096        # 25 decisions ~1.5k tokens
+    response_format: json_object
+
   # Pairwise-dedup judges. UNUSED in this preset: they run only when
   # match_dedup sets `method: pairwise`, which only the deepinfra preset does
   # (this mode keeps the echo dedup). Defined so every preset has one task set.

@@ -29,6 +29,7 @@ from backend.app.helpers.ontology_pruning import (
     apply_concept_grouping,
     collect_full_class_hierarchy,
     collect_related_class_iris,
+    concept_root_menu,
     expand_with_relationship_partners,
     extract_detected_iris,
     extract_json_from_output,
@@ -1858,6 +1859,7 @@ async def _propose_concept_grouping(
     router: LLMRouter,
     orphan_classes: list[dict[str, Any]],
     concurrency: int = 8,
+    roots: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Ask gpt-4.1 to propose 5-15 high-level concept classes that group
     the orphan-class list, plus an assignment per orphan.
@@ -1874,7 +1876,7 @@ async def _propose_concept_grouping(
 
     Returns the parsed + merged JSON or an empty shape on any failure --
     this pass is purely additive; it must never break the pipeline."""
-    empty = {"TOP_LEVEL_CONCEPTS": [], "ASSIGNMENTS": []}
+    empty = {"NEW_SUBCONCEPTS": [], "ASSIGNMENTS": []}
     if not orphan_classes:
         return empty
 
@@ -1895,7 +1897,7 @@ async def _propose_concept_grouping(
     sem = asyncio.Semaphore(max(1, concurrency))
 
     async def _one(i: int, batch: list[dict[str, Any]]) -> dict[str, Any] | None:
-        system, user = PROMPTS["concept_grouping"](batch)
+        system, user = PROMPTS["concept_grouping"](batch, roots)
         async with sem:
             try:
                 result = await router.chat("concept_grouping", system=system, user=user)
@@ -1914,7 +1916,8 @@ async def _propose_concept_grouping(
             continue
 
         # Merge concepts (case-insensitive dedup by LABEL).
-        for entry in parsed.get("TOP_LEVEL_CONCEPTS") or []:
+        for entry in (list(parsed.get("NEW_SUBCONCEPTS") or [])
+                      + list(parsed.get("TOP_LEVEL_CONCEPTS") or [])):
             if not isinstance(entry, dict):
                 continue
             label = str(entry.get("LABEL") or "").strip()
@@ -1930,7 +1933,7 @@ async def _propose_concept_grouping(
                 merged_assignments.append(entry)
 
     return {
-        "TOP_LEVEL_CONCEPTS": list(merged_concepts.values()),
+        "NEW_SUBCONCEPTS": list(merged_concepts.values()),
         "ASSIGNMENTS": merged_assignments,
     }
 
@@ -3654,6 +3657,14 @@ async def _run_llm_stages(
         deduped, merges = await semantic_class_merge(router, deduped)
         if merges:
             _append_audit(audit_path, -1, "class_synonym_merge", None, {"merges": merges})
+    # Stage 3c (opt-in per preset): a generic parent for qualified concepts
+    # (SemiconductorRevenue, RelatedPartyRevenue -> Revenue). After the merge,
+    # so synonyms are already one class when heads are counted.
+    from backend.app.services.concept_heads import generalize_concept_heads
+
+    deduped, heads = await generalize_concept_heads(router, deduped)
+    if heads:
+        _append_audit(audit_path, -1, "concept_head_merge", None, {"heads": heads})
     return deduped
 
 
@@ -4526,9 +4537,12 @@ async def _run(
         )
         if orphan_classes:
             print(f"[stage4-G] concept_grouping: {len(orphan_classes)} orphan class(es) to group")
+            cg_roots = concept_root_menu(out_ontology.get("classes_dict", {}))
+            print(f"[stage4-G] concept roots: {[r['LABEL'] for r in cg_roots] or 'built-in default'}")
             cg_result = await _propose_concept_grouping(
                 router, orphan_classes,
                 concurrency=int(app_cfg.get("expansion", {}).get("max_concurrent_llm_calls", 8)),
+                roots=cg_roots or None,
             )
             _append_audit(audit_path, -1, "concept_grouping", None, cg_result)
             concept_iris, cg_audit = apply_concept_grouping(
@@ -4538,9 +4552,14 @@ async def _run(
                 default_parent_iri=parent_iri,
             )
             if cg_audit or concept_iris:
+                _by_root: dict[str, int] = {}
+                for rec in cg_audit:
+                    _by_root[rec["concept_label"]] = _by_root.get(rec["concept_label"], 0) + 1
                 print(
                     f"[stage4-G] concept-grouping re-homed {len(cg_audit)} class(es) "
-                    f"under {len(concept_iris)} new concept class(es)"
+                    f"under {len(concept_iris)} new concept class(es); "
+                    f"DomainConcept={_by_root.get('DomainConcept', 0)}; "
+                    f"top: {sorted(_by_root.items(), key=lambda kv: -kv[1])[:8]}"
                 )
                 created.extend(concept_iris)
 

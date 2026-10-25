@@ -96,13 +96,12 @@ def _hash_pdf_streaming(path: Path) -> tuple[str, str]:
     file into memory. Mirrors `table_cache.doc_sha256` and
     `table_cache.doc_cache_key` byte-for-byte but uses a streaming read.
 
-    Returns (doc_sha256_hex, sha256_of_version_pipe_bytes_hex)."""
+    Returns (doc_sha256_hex, sha256_of_key_prefix_plus_bytes_hex)."""
     import hashlib
 
     h_sha = hashlib.sha256()  # raw doc sha (matches table_cache.doc_sha256)
     h_key = hashlib.sha256()  # cache key (matches table_cache.doc_cache_key)
-    h_key.update(table_cache.EXTRACTOR_VERSION.encode("utf-8"))
-    h_key.update(b"|")
+    h_key.update(table_cache.key_prefix())
     with path.open("rb") as fh:
         while True:
             chunk = fh.read(_HASH_CHUNK_BYTES)
@@ -1161,34 +1160,158 @@ def page_vision_settings() -> dict[str, Any]:
     }
 
 
-async def _extract_page_tables_via_vision(
-    page: Any,
+def page_vision_concurrency() -> int:
+    """Whole-page vision calls in flight per PDF (concurrency.table_page_vision).
+
+    Unset = 1: pages go one at a time, as before. Sized from free memory by
+    scripts/tpm_check.py and scripts/deepinfra_sizing.py together with
+    concurrency.table_extraction (see table_concurrency_for_budget). Each call
+    is decode-bound -- serverless Qwen3-VL ~33 tok/s per stream, unchanged at 8
+    in flight (2026-10-24) -- so pages in parallel cut a PDF's wall time
+    without changing what is sent or kept."""
+    cfg = get_settings().app_config
+    return max(1, int((cfg.get("concurrency", {}) or {}).get("table_page_vision", 1)))
+
+
+async def _page_vision_request(page: Any, page_number: int) -> tuple[str | None, float]:
+    """The slow half of page vision: render the page and ask the model.
+    (None, 0.0) when the page cannot be rendered; raises VisionCallError."""
+    spec = _vision_spec("table_extract_page_vision", fallback="table_extract_vision")
+    png_b64 = _render_png_b64(page, None)
+    if png_b64 is None:
+        return None, 0.0
+    system, user = PROMPTS["table_extract_page_vision"](page_number=page_number)
+    return await _call_vision(spec, system, user, png_b64)
+
+
+def _flush(page: Any) -> None:
+    try:
+        page.flush_cache()
+    except Exception:
+        pass
+
+
+class _PageVisionPrefetch:
+    """Starts whole-page vision requests ahead of the page loop.
+
+    The loop stays sequential -- each page's result sets the table numbering
+    of every later page and whether its header strips are kept -- but the
+    REQUEST for a figure-dense page depends only on the page, so it can be in
+    flight while earlier pages are still being processed. The loop then
+    `take`s each page's answer in order, so requests, post-processing and
+    numbering are what the one-at-a-time loop produces. A prefetched page the
+    loop does not send (it had real pdfplumber tables, or the cap was hit) is
+    cancelled or, if it already finished, counted in `wasted`.
+
+    Pages are touched only AHEAD of the loop (`main_pos`), and everything runs
+    on the one event-loop thread, so pdfplumber never sees two users of a page.
+    """
+
+    def __init__(self, pdf: Any, *, page_cap: int, pv: dict[str, Any], concurrency: int) -> None:
+        self._pdf = pdf
+        self._page_cap = page_cap
+        self._pv = pv
+        self._slots = asyncio.Semaphore(concurrency)
+        self._tasks: dict[int, asyncio.Task] = {}
+        self._scheduled = 0
+        self._direct = 0
+        self.texts: dict[int, str] = {}       # page text read here, reused by the loop
+        self.main_pos = 0
+        self.wasted = 0
+        self.wasted_cost = 0.0
+        self._runner: asyncio.Task | None = None
+
+    def start(self) -> None:
+        self._runner = asyncio.create_task(self._run())
+
+    async def _run(self) -> None:
+        n_pages = len(self._pdf.pages)
+        for page_no in range(1, min(n_pages, self._page_cap) + 1):
+            # Shares the per-PDF cap with the loop's own (non-prefetched) calls.
+            if self._scheduled + self._direct >= self._pv["max_pages"]:
+                return
+            await self._slots.acquire()          # released when the loop takes/discards it
+            if page_no <= self.main_pos:         # the loop already passed it
+                self._slots.release()
+                continue
+            page = self._pdf.pages[page_no - 1]
+            try:
+                text = page.extract_text(x_tolerance=_PAGE_TEXT_X_TOLERANCE) or ""
+            except Exception:
+                text = ""
+            self.texts[page_no] = text
+            if _figure_lines(text) < self._pv["min_figure_lines"] or self._has_real_table(page):
+                self._slots.release()
+                _flush(page)
+                continue
+            self._tasks[page_no] = asyncio.create_task(_page_vision_request(page, page_no))
+            self._scheduled += 1
+            _flush(page)
+            await asyncio.sleep(0)
+
+    @staticmethod
+    def _has_real_table(page: Any) -> bool:
+        """The loop sends a figure-dense page only when none of its tables is
+        kept. A ruled table with data rows is (nearly always) kept, so such a
+        page is left to the loop: on 14 pharma labels 88 of 129 figure-dense
+        pages were of this kind (2026-10-24). A wrong guess costs nothing in
+        output -- an unsent page is asked directly, a sent one is discarded."""
+        try:
+            tables = page.find_tables() or []
+            return any(not _is_header_only(t.extract() or []) for t in tables)
+        except Exception:
+            return False
+
+    async def take(self, page: Any, page_no: int) -> tuple[str | None, float]:
+        """This page's answer: the prefetched one, or a direct request."""
+        task = self._tasks.pop(page_no, None)
+        if task is None:
+            self._direct += 1
+            return await _page_vision_request(page, page_no)
+        try:
+            return await task
+        finally:
+            self._slots.release()
+
+    def discard(self, page_no: int) -> None:
+        task = self._tasks.pop(page_no, None)
+        if task is None:
+            return
+        if task.done() and not task.cancelled() and task.exception() is None:
+            self.wasted += 1
+            self.wasted_cost += float(task.result()[1] or 0.0)
+        else:
+            task.cancel()
+        self._slots.release()
+
+    async def close(self) -> None:
+        if self._runner is not None:
+            self._runner.cancel()
+        for page_no in list(self._tasks):
+            self.discard(page_no)
+        await asyncio.gather(*(t for t in [self._runner] if t), return_exceptions=True)
+
+
+def _page_vision_payloads(
+    text: str | None,
     *,
     page_text: str,
     doc_sha: str,
     first_table_index: int,
     page_number: int,
     max_ungrounded: float,
-) -> tuple[list[dict[str, Any]], float, int, int]:
-    """Render the whole page, ask the vision model for every table on it, and
-    keep the ones whose figures are printed on the page, with any cell whose
-    number is not printed blanked. Returns (payloads, cost_usd,
-    n_rejected_ungrounded, n_cells_blanked); raises VisionCallError on a
-    failed request so the caller keeps the PDF out of the cache."""
-    spec = _vision_spec("table_extract_page_vision", fallback="table_extract_vision")
-    png_b64 = _render_png_b64(page, None)
-    if png_b64 is None:
-        return [], 0.0, 0, 0
-    system, user = PROMPTS["table_extract_page_vision"](page_number=page_number)
-    text, cost = await _call_vision(spec, system, user, png_b64)
+) -> tuple[list[dict[str, Any]], int, int]:
+    """The deterministic half of page vision: keep the returned tables whose
+    figures are printed on the page, blank any cell whose number is not.
+    Returns (payloads, n_rejected_ungrounded, n_cells_blanked)."""
     if text is None:
-        return [], cost, 0, 0
+        return [], 0, 0
     try:
         body = json.loads(text)
     except json.JSONDecodeError:
-        return [], cost, 0, 0
+        return [], 0, 0
     if not isinstance(body, dict) or body.get("no_table") is True:
-        return [], cost, 0, 0
+        return [], 0, 0
     out: list[dict[str, Any]] = []
     rejected = 0
     blanked = 0
@@ -1204,6 +1327,31 @@ async def _extract_page_tables_via_vision(
             continue
         blanked += _blank_ungrounded_cells(payload, page_text)
         out.append(payload)
+    return out, rejected, blanked
+
+
+async def _extract_page_tables_via_vision(
+    page: Any,
+    *,
+    page_text: str,
+    doc_sha: str,
+    first_table_index: int,
+    page_number: int,
+    max_ungrounded: float,
+    prefetch: _PageVisionPrefetch | None = None,
+) -> tuple[list[dict[str, Any]], float, int, int]:
+    """Render the whole page, ask the vision model for every table on it, and
+    keep the ones whose figures are printed on the page, with any cell whose
+    number is not printed blanked. Returns (payloads, cost_usd,
+    n_rejected_ungrounded, n_cells_blanked); raises VisionCallError on a
+    failed request so the caller keeps the PDF out of the cache. With
+    `prefetch`, the request may already be in flight."""
+    text, cost = (await prefetch.take(page, page_number) if prefetch is not None
+                  else await _page_vision_request(page, page_number))
+    out, rejected, blanked = _page_vision_payloads(
+        text, page_text=page_text, doc_sha=doc_sha, first_table_index=first_table_index,
+        page_number=page_number, max_ungrounded=max_ungrounded,
+    )
     return out, cost, rejected, blanked
 
 
@@ -1335,11 +1483,17 @@ async def extract_tables_async(
     n_page_vision_ungrounded = 0
     n_page_vision_cells_blanked = 0
     n_header_only_dropped = 0
+    prefetch: _PageVisionPrefetch | None = None
+    page_conc = page_vision_concurrency() if pv["enabled"] else 1
 
     try:
         with pdfplumber.open(str(p)) as pdf:
             n_pages = len(pdf.pages)
             page_cap = max_pages if max_pages is not None else _MAX_PAGES_PER_DOC
+            if page_conc > 1:
+                prefetch = _PageVisionPrefetch(pdf, page_cap=page_cap, pv=pv, concurrency=page_conc)
+                prefetch.start()
+                await asyncio.sleep(0)            # let it claim the first pages
             print(
                 f"[tables] {p.name}: starting "
                 f"({n_pages} pages, cap {min(n_pages, page_cap)}, "
@@ -1353,6 +1507,8 @@ async def extract_tables_async(
                 if page_no > page_cap:
                     pages_truncated = True
                     break
+                if prefetch is not None:
+                    prefetch.main_pos = page_no
                 page_w = float(getattr(page, "width", 0.0) or 0.0)
                 page_h = float(getattr(page, "height", 0.0) or 0.0)
                 try:
@@ -1369,10 +1525,13 @@ async def extract_tables_async(
                 page_text = ""
                 figure_dense = False
                 if pv["enabled"]:
-                    try:
-                        page_text = page.extract_text(x_tolerance=_PAGE_TEXT_X_TOLERANCE) or ""
-                    except Exception:
-                        page_text = ""
+                    if prefetch is not None and page_no in prefetch.texts:
+                        page_text = prefetch.texts.pop(page_no)
+                    else:
+                        try:
+                            page_text = page.extract_text(x_tolerance=_PAGE_TEXT_X_TOLERANCE) or ""
+                        except Exception:
+                            page_text = ""
                     figure_dense = _figure_lines(page_text) >= pv["min_figure_lines"]
                 header_only: list[dict[str, Any]] = []
                 # Reassemble row-per-candidate fragments BEFORE any filter --
@@ -1508,7 +1667,7 @@ async def extract_tables_async(
                             found, page_cost, rejected, blanked = await _extract_page_tables_via_vision(
                                 page, page_text=page_text, doc_sha=doc_sha,
                                 first_table_index=table_index, page_number=page_no,
-                                max_ungrounded=pv["max_ungrounded"],
+                                max_ungrounded=pv["max_ungrounded"], prefetch=prefetch,
                             )
                         except VisionCallError as exc:
                             n_vision_errors += 1
@@ -1528,6 +1687,8 @@ async def extract_tables_async(
                                     payloads.append(t)
                                     n_page_vision_tables += 1
                                     n_vision += 1
+                    elif prefetch is not None:
+                        prefetch.discard(page_no)
                     if replaced:
                         n_header_only_dropped += len(header_only)
                     else:
@@ -1588,8 +1749,12 @@ async def extract_tables_async(
             },
         )
     finally:
+        if prefetch is not None:
+            await prefetch.close()
         gc.collect()
 
+    if prefetch is not None:
+        cost_usd += prefetch.wasted_cost
     wall = round(time.monotonic() - started, 3)
     manifest = {
         "source": "fresh",
@@ -1608,6 +1773,8 @@ async def extract_tables_async(
         "n_page_vision_ungrounded": n_page_vision_ungrounded,
         "n_page_vision_cells_blanked": n_page_vision_cells_blanked,
         "n_header_only_dropped": n_header_only_dropped,
+        "page_vision_concurrency": page_conc,
+        "n_page_vision_prefetch_wasted": prefetch.wasted if prefetch is not None else 0,
         "cost_usd": round(cost_usd, 5),
         "wall_seconds": wall,
         "pages_processed": pages_processed,

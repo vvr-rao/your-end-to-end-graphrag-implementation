@@ -213,3 +213,20 @@ def test_build_memory_check_projects_the_peak_against_this_machine() -> None:
     assert big["needs_total_mb"] > big["peak_mb"]
     assert build_memory_check(10_000_000, mem=(16000, 16384))["verdict"] == "fits"
     assert build_memory_check(415_700, mem=(-1, -1))["verdict"] == "unknown"
+
+
+def test_table_concurrency_splits_memory_between_workers_and_pages() -> None:
+    """Workers x pages-in-flight from one budget: a tight box gets 1 x 1, a
+    roomy one 8 workers x 8 pages, and the plan never exceeds the budget."""
+    assert tpm.table_concurrency_for_budget(0) == (1, 1)
+    assert tpm.table_concurrency_for_budget(150) == (1, 1)
+    w, p = tpm.table_concurrency_for_budget(250)
+    assert (w, p) == (1, 8)
+    assert tpm.table_concurrency_for_budget(20000) == (8, 8)
+    for budget in (210, 450, 900, 1300, 2500):
+        w, p = tpm.table_concurrency_for_budget(budget)
+        assert w * (tpm._TABLE_WORKER_MB + p * tpm._PAGE_VISION_MB) <= budget
+
+
+def test_set_accepts_table_page_vision() -> None:
+    assert tpm._parse_sets(["--set", "table_page_vision=4"]) == {"table_page_vision": 4}

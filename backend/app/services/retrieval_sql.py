@@ -62,6 +62,9 @@ WITH RECURSIVE bfs(node_id, node_type, hop, score) AS (
         ON  ((gr.source_node_id = b.node_id AND gr.source_node_type = b.node_type)
           OR (gr.target_node_id = b.node_id AND gr.target_node_type = b.node_type))
      WHERE b.hop < CAST(:max_hops AS int)
+       -- Terminal nodes are reached but never expanded (concept entities:
+       -- "revenue" links every company that reports one).
+       AND NOT (b.node_id = ANY(CAST(:terminal_ids AS uuid[])))
 ) CYCLE node_id, node_type SET is_cycle USING path
 SELECT node_id, node_type, max(score) AS best_score, min(hop) AS min_hop
   FROM bfs
@@ -100,12 +103,14 @@ async def bfs_expand(
     max_hops: int = 2,
     decay: float = 0.7,
     entity_relationships_only: bool = False,
+    terminal_ids: set[uuid.UUID] | None = None,
 ) -> dict[tuple[uuid.UUID, str], dict[str, Any]]:
     """Walk `graph_relationships` outward from seeds. Returns a map of
     `(node_id, node_type) -> {score, hop}`.
 
     `decay` shrinks score by this factor each hop (0.7 by default).
     `max_hops` caps recursion depth (2 by default; configurable).
+    `terminal_ids`: nodes the walk may reach but not leave (concept entities).
     """
     if not seeds:
         return {}
@@ -118,6 +123,7 @@ async def bfs_expand(
             "seed_types": seed_types,
             "max_hops": max_hops,
             "decay": decay,
+            "terminal_ids": [str(t) for t in (terminal_ids or ())],
         },
     )
     out: dict[tuple[uuid.UUID, str], dict[str, Any]] = {}
@@ -280,6 +286,72 @@ async def fetch_candidate_chunks_for_entities(
     return [(cid, float(score)) for cid, score in result.all()]
 
 
+async def fetch_chunks_by_seed_cooccurrence(
+    session: AsyncSession,
+    seed_ids: list[uuid.UUID],
+    concept_ids: set[uuid.UUID] | None = None,
+    time_ids: list[uuid.UUID] | None = None,
+    *,
+    min_seeds: int = 2,
+    limit: int = 100,
+) -> list[tuple[uuid.UUID, float]]:
+    """Chunks asserting about >= `min_seeds` DISTINCT seeds, best-first.
+
+    The question's own entities meeting on one chunk is the evidence that the
+    chunk answers it -- and it needs no edge between them. "Revenue for LG
+    Electronics" seeds LG Electronics and the related-party-revenue concept;
+    no extraction ever links the two (the walk found 0 relation-matched
+    edges), but the LGES related-party note asserts about both.
+
+    Score = number of distinct seed entities on the chunk, + 1 when the chunk
+    is dated to a period the question asked about (`time_ids`, already
+    expanded to the periods inside it), + 0.5 when the entities include both
+    a named entity and a concept (`concept_ids`), so "company + concept"
+    beats two co-mentioned companies. Counted over SEEDS only: walk-reached
+    entities already vote through `fetch_candidate_chunks_for_entities`,
+    where a chunk mentioning many loosely-reached entities can outrank one
+    holding both of the question's.
+    """
+    if not seed_ids or len(seed_ids) + (1 if time_ids else 0) < min_seeds:
+        return []
+    result = await session.execute(
+        sql_text("""
+        WITH ent AS (
+            SELECT gr.source_node_id AS chunk_id,
+                   count(DISTINCT gr.target_node_id) AS n,
+                   bool_or(gr.target_node_id = ANY(CAST(:concepts AS uuid[]))) AS has_concept,
+                   bool_or(NOT (gr.target_node_id = ANY(CAST(:concepts AS uuid[])))) AS has_named
+              FROM graphrag.graph_relationships gr
+             WHERE gr.predicate_label = 'viao:assertsAbout'
+               AND gr.source_node_type = 'chunk'
+               AND gr.target_node_type = 'entity'
+               AND gr.target_node_id = ANY(CAST(:seeds AS uuid[]))
+             GROUP BY gr.source_node_id
+        ), dated AS (
+            SELECT DISTINCT gr.source_node_id AS chunk_id
+              FROM graphrag.graph_relationships gr
+             WHERE gr.predicate_label = 'time:hasTime'
+               AND gr.source_node_type = 'chunk'
+               AND gr.target_node_id = ANY(CAST(:times AS uuid[]))
+        )
+        SELECT ent.chunk_id, ent.n + (dated.chunk_id IS NOT NULL)::int AS n_seeds,
+               ent.has_concept, ent.has_named
+          FROM ent
+          JOIN graphrag.chunks c ON c.id = ent.chunk_id AND c.status = 'ACTIVE'
+          LEFT JOIN dated ON dated.chunk_id = ent.chunk_id
+         WHERE ent.n + (dated.chunk_id IS NOT NULL)::int >= :min_seeds
+        """),
+        {"seeds": [str(s) for s in seed_ids],
+         "concepts": [str(c) for c in (concept_ids or ())],
+         "times": [str(t) for t in (time_ids or ())],
+         "min_seeds": min_seeds},
+    )
+    scored = [(cid, float(n) + (0.5 if has_c and has_n else 0.0))
+              for cid, n, has_c, has_n in result.all()]
+    scored.sort(key=lambda t: (-t[1], str(t[0])))
+    return scored[:limit]
+
+
 async def fetch_candidate_chunks_for_time_instances(
     session: AsyncSession,
     time_instance_ids: list[uuid.UUID],
@@ -304,6 +376,40 @@ async def fetch_candidate_chunks_for_time_instances(
         {"time_ids": [str(tid) for tid in time_instance_ids], "limit": limit},
     )
     return [(cid, float(hits)) for cid, hits in result.all()]
+
+
+async def fetch_candidate_artifacts_for_time_instances(
+    session: AsyncSession,
+    time_instance_ids: list[uuid.UUID],
+    *,
+    limit: int = 200,
+) -> list[tuple[uuid.UUID, float]]:
+    """Intelligence artifacts linked to any of the given time_instances.
+
+    The edges are copied from the artifacts' source chunks by enrich-time
+    (`propagate_time_to_artifacts`); a graph built before that has none and
+    this returns [] -- the previous behaviour.
+    """
+    if not time_instance_ids:
+        return []
+    result = await session.execute(
+        sql_text("""
+        SELECT a.id, count(*) AS hits
+          FROM graphrag.intelligence_artifacts a
+          JOIN graphrag.graph_relationships gr
+            ON gr.source_node_id = a.id
+           AND gr.source_node_type = 'intelligence_artifact'
+           AND gr.predicate_label = 'time:hasTime'
+           AND gr.target_node_type = 'time_instance'
+           AND gr.target_node_id = ANY(CAST(:time_ids AS uuid[]))
+         WHERE a.status = 'ACTIVE'
+         GROUP BY a.id
+         ORDER BY hits DESC
+         LIMIT :limit
+        """),
+        {"time_ids": [str(tid) for tid in time_instance_ids], "limit": limit},
+    )
+    return [(aid, float(hits)) for aid, hits in result.all()]
 
 
 async def fetch_candidate_artifacts_for_entities(
@@ -631,6 +737,122 @@ async def resolve_class_closure(
     return {cid: int(n) for cid, n in r.all()}
 
 
+_CONCEPT_CLASS_IDS_SQL = sql_text("""
+WITH RECURSIVE down(id) AS (
+    SELECT oc.id FROM graphrag.ontology_classes oc
+     WHERE lower(oc.label) = ANY(CAST(:labels AS text[]))
+  UNION
+    SELECT gr.source_node_id
+      FROM down JOIN graphrag.graph_relationships gr
+        ON gr.target_node_id = down.id
+       AND gr.source_node_type = 'ontology_class'
+       AND gr.target_node_type = 'ontology_class'
+       AND gr.predicate_label = 'rdfs:subClassOf'
+)
+SELECT id FROM down
+""")
+
+
+async def concept_entity_ids(
+    session: AsyncSession, root_labels: list[str] | tuple[str, ...]
+) -> set[uuid.UUID]:
+    """Entities typed under the concept roots (`extraction.concept_class_roots`)
+    -- the concept pass's output: "related-party revenue", "hypoglycemia"."""
+    labels = [r.strip().lower() for r in root_labels if r and r.strip()]
+    if not labels:
+        return set()
+    r = await session.execute(sql_text("""
+        SELECT e.id FROM graphrag.entities e
+         WHERE e.status = 'ACTIVE'
+           AND e.class_id IN (SELECT id FROM (""" + _CONCEPT_CLASS_IDS_SQL.text + """) c)
+    """), {"labels": labels})
+    return {row[0] for row in r.all()}
+
+
+async def concept_seed_entities(
+    session: AsyncSession,
+    terms: list[str],
+    term_embeddings: list[list[float]],
+    question_embedding: list[float],
+    concept_ids: set[uuid.UUID],
+    *,
+    classes_per_term: int = 5,
+    limit: int = 25,
+) -> list[uuid.UUID]:
+    """Concept entities for the question's class terms, alongside named seeds.
+
+    "What was the revenue for LG Electronics?" names LG Electronics and the
+    concept "revenue". The named tier used to win outright and drop the
+    concept, so a chunk about LG Electronics' revenue ranked no higher than
+    any other chunk mentioning the company. The terms resolve to classes
+    exactly as the class tier does (`resolve_class_closure`); their CONCEPT
+    members -- under the concept roots only, never Person/Organization -- are
+    ranked by closeness to the question and capped at `limit`.
+    """
+    if not terms or not concept_ids:
+        return []
+    counts = await resolve_class_closure(
+        session, terms, term_embeddings, classes_per_term=classes_per_term,
+    )
+    if not counts:
+        return []
+    r = await session.execute(sql_text("""
+        SELECT e.id FROM graphrag.entities e
+         WHERE e.class_id = ANY(CAST(:k AS uuid[]))
+           AND e.id = ANY(CAST(:concepts AS uuid[]))
+         ORDER BY (e.embedding IS NULL), e.embedding <-> CAST(:q AS vector)
+         LIMIT :n
+    """), {"k": [str(c) for c in counts], "concepts": [str(c) for c in concept_ids],
+           "q": _vec_str(question_embedding), "n": limit})
+    return [row[0] for row in r.all()]
+
+
+async def concept_entities_by_name(
+    session: AsyncSession,
+    terms: list[str],
+    term_embeddings: list[list[float]],
+    concept_ids: set[uuid.UUID],
+    *,
+    max_l2: float,
+    per_term: int = 5,
+) -> list[uuid.UUID]:
+    """Concept entities NAMED like the question's terms, whatever their class.
+
+    `concept_seed_entities` reaches a concept only through its class, and the
+    concept pass types most conditions to a broad one: on the pharma graph
+    Pancreatitis, Hypoglycemia and Gastroparesis are three of 103 members of
+    MedicalCondition, so "Can Mounjaro cause pancreatitis?" seeded no concept
+    at all (5 of 15 test questions reached the right one, 2026-10-24). Per
+    term: concept entities within `max_l2` of the term's vector, nearest first,
+    plus an exact (case-insensitive) name match. Measured: the intended concept
+    sat at 0.40-0.65 (Qwen3-Embedding-4B) / 0.80-1.04 (text-embedding-3-small)
+    while generic terms ("patients", "risk", "company", "period") had nothing
+    nearer than 0.72 / 1.095. A trigram arm was rejected: "risk" -> "Kidney
+    Risk" (0.42), "disease" -> "Heart Disease" (0.57).
+    """
+    if not terms or not concept_ids:
+        return []
+    out: list[uuid.UUID] = []
+    concepts = [str(c) for c in concept_ids]
+    for term, vec in zip(terms, term_embeddings, strict=False):
+        r = await session.execute(sql_text("""
+            SELECT id FROM (
+              SELECT e.id, (e.embedding <-> CAST(:v AS vector)) AS d,
+                     e.normalized_name = lower(:t) AS exact
+                FROM graphrag.entities e
+               WHERE e.id = ANY(CAST(:concepts AS uuid[])) AND e.status = 'ACTIVE'
+            ) x
+             WHERE exact OR d <= :max_l2
+             ORDER BY exact DESC, d
+             LIMIT :n
+        """), {"v": _vec_str(vec), "t": term.strip(), "concepts": concepts,
+               "max_l2": max_l2, "n": per_term})
+        for (eid,) in r.all():
+            if eid not in out:
+                out.append(eid)
+    return out
+
+
 async def class_seed_entities(
     session: AsyncSession,
     terms: list[str],
@@ -841,6 +1063,30 @@ async def fetch_chunks_for_documents(
     for cid, did in result.all():
         out.append((cid, 1.0 / (1.0 + rank_of.get(did, len(document_ids)))))
     out.sort(key=lambda t: -t[1])
+    return out
+
+
+async def describe_for_log(
+    session: AsyncSession,
+    entity_ids: list[uuid.UUID] | None = None,
+    chunk_ids: list[uuid.UUID] | None = None,
+) -> dict[uuid.UUID, str]:
+    """Readable labels for --verbose lines: entity -> "name [Class]",
+    chunk -> its identifier's local name (Chunk_<doc>_<n>). Logging only."""
+    out: dict[uuid.UUID, str] = {}
+    if entity_ids:
+        r = await session.execute(sql_text("""
+            SELECT e.id, e.name, oc.label FROM graphrag.entities e
+              JOIN graphrag.ontology_classes oc ON oc.id = e.class_id
+             WHERE e.id = ANY(CAST(:ids AS uuid[]))
+        """), {"ids": [str(i) for i in entity_ids]})
+        out.update({row[0]: f"{row[1]} [{row[2]}]" for row in r.all()})
+    if chunk_ids:
+        r = await session.execute(sql_text("""
+            SELECT id, chunk_identifier FROM graphrag.chunks
+             WHERE id = ANY(CAST(:ids AS uuid[]))
+        """), {"ids": [str(i) for i in chunk_ids]})
+        out.update({row[0]: str(row[1]).rsplit("#", 1)[-1] for row in r.all()})
     return out
 
 

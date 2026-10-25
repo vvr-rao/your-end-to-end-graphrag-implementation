@@ -528,9 +528,11 @@ def memory_capped_concurrency(conc: dict[str, int], stages: dict[str, dict],
       class_judges      Stage-3 pair / validity judges (pipeline_llm reads
                         it before the preset's judge_concurrency): the GPU's
                         dedup concurrency, at most CLASS_JUDGE_MAX
-      table_extraction  one ~200 MB worker per PDF (tpm_check's rule)
+      table_extraction  PDF workers, and
+      table_page_vision page-vision calls in flight per worker -- both from
+                        tpm_check.table_concurrency_for_budget
     """
-    from tpm_check import _TABLE_WORKER_MB
+    from tpm_check import table_concurrency_for_budget
 
     out = dict(conc)
     out["class_judges"] = max(8, min(CLASS_JUDGE_MAX, conc.get("dedup", 8)))
@@ -545,7 +547,7 @@ def memory_capped_concurrency(conc: dict[str, int], stages: dict[str, dict],
         if out[stage] > cap:
             caps[stage] = cap
             out[stage] = cap
-    out["table_extraction"] = max(1, min(8, budget // _TABLE_WORKER_MB))
+    out["table_extraction"], out["table_page_vision"] = table_concurrency_for_budget(budget)
     return out, caps
 
 

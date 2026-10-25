@@ -104,3 +104,26 @@ def test_two_tier_load_returns_none_when_both_miss(tmp_path: Path) -> None:
         "x",
     )
     assert hit is None
+
+
+def test_doc_cache_key_changes_with_the_vision_model(monkeypatch) -> None:
+    """Switching the vision model must not keep serving the old model's tables."""
+    from types import SimpleNamespace
+
+    def cfg(model):
+        return lambda: SimpleNamespace(models_config={"tasks": {
+            "table_extract_vision": {"provider": "deepinfra", "model": model},
+            "table_extract_page_vision": {"provider": "deepinfra", "model": model}}})
+    monkeypatch.setattr(table_cache, "get_settings", cfg("Qwen/Qwen3-VL-30B-A3B-Instruct"))
+    old = table_cache.doc_cache_key(b"pdf")
+    monkeypatch.setattr(table_cache, "get_settings", cfg("Qwen/Qwen3-VL-235B-A22B-Instruct"))
+    assert table_cache.doc_cache_key(b"pdf") != old
+
+
+def test_streaming_key_matches_doc_cache_key(tmp_path) -> None:
+    from backend.app.services import table_extract as te
+    f = tmp_path / "x.pdf"
+    f.write_bytes(b"%PDF-1.4 some bytes" * 1000)
+    sha, key = te._hash_pdf_streaming(f)
+    assert key == table_cache.doc_cache_key(f.read_bytes())
+    assert sha == table_cache.doc_sha256(f.read_bytes())

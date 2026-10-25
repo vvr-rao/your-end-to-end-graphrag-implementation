@@ -391,7 +391,7 @@ Other things worth knowing:
 ## CLI (single entrypoint)
 `uv run python -m backend.app.cli <subcommand>`. Discover everything with
 `uv run python -m backend.app.cli --help`. Groups: ontology (`merge`, `prune`,
-`expand`, `prune-expand`, `build`), DB (`db-migrate`, `db-status`, `db-size`,
+`expand`, `prune-expand`, `build`), DB (`db-migrate`, `db-status`, `db-size`, `graph-stats`,
 `enrich-geo`, `embed-relationships`, `relink-artifact-entities`,
 `db-init`, `clear-corpus`), corpus (`register-documents`, `list-documents`,
 `update-document`, `delete-document`), enrichment (`extract-entities`,
@@ -454,6 +454,11 @@ Other things worth knowing:
     `effective concurrency = min(concurrency, ~2.5 x batch_size)`. At batch 8
     that is ~20 -- a concurrency above that is idle. Pass the corpus to
     `tpm_check.py <docs-dir>` and it will size both.
+  - **Slow table extraction (`--tables`)** is memory-bound, not rate-bound:
+    `concurrency.table_extraction` = PDFs in parallel, `concurrency.table_page_vision`
+    = whole-page vision calls in flight inside one PDF (serverless Qwen3-VL-235B:
+    ~60-250 s per page). `tpm_check.py` (and `deepinfra_sizing.py`) size both
+    from free RAM — workers x (200 + 5 x pages) MB within free minus 600 MB.
   - See the README's "Tuning throughput" section.
 
 ## How to help

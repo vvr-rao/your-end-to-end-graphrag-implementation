@@ -155,3 +155,24 @@ def test_unknown_platform_message_names_all_three() -> None:
     src = inspect.getsource(tpm.advise_memory)
     assert "non-Linux" not in src
     assert "Windows" in src and "macOS" in src
+
+
+def test_advise_memory_returns_the_table_knobs_apply_writes(monkeypatch, capsys) -> None:
+    """--apply writes what advise_memory suggests for the two table knobs, so
+    the printed suggestion and the written value cannot drift apart."""
+    monkeypatch.setattr(tpm, "_has_swap", lambda: False)
+    monkeypatch.setattr(tpm, "_mem_mb", lambda: (2028, 2737))
+    got = tpm.advise_memory(batch_size=8, table_conc=4, page_conc=1)
+    out = capsys.readouterr().out
+    assert got == dict(zip(("table_extraction", "table_page_vision"),
+                           tpm.table_concurrency_for_budget(2028 - tpm._RESERVE_MB)))
+    assert f"table_page_vision: 1  ->  suggest {got['table_page_vision']}" in out
+    monkeypatch.setattr(tpm, "_mem_mb", lambda: (-1, -1))
+    assert tpm.advise_memory(batch_size=8, table_conc=1) == {}
+
+
+def test_apply_merges_memory_suggestions_before_manual_sets() -> None:
+    import inspect
+    src = inspect.getsource(tpm)
+    i, j = src.index("values.update(mem_sugg)"), src.index("values.update(manual)")
+    assert i < j, "--set must override the memory suggestion"

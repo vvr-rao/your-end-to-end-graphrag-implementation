@@ -139,8 +139,11 @@ ask their preference — don't silently pick. Lay out the trade-off:
 - **Without `--tables` (default):** faster and free; tables inside PDFs get read as
   run-on text and lose their row/column structure.
 - **With `--tables`:** extracts structured tables from PDFs so their rows/columns
-  become retrievable. Costs ~$0.02–0.04 per typical 10-K (vision). Worth it for
-  data-heavy corpora — financial filings, spec sheets, anything numeric.
+  become retrievable. Costs ~$0.02–0.04 per typical 10-K (vision); DeepInfra mode
+  (Qwen3-VL-235B) measured $0.04–0.13 per audited filing (55–99 pages). Vision
+  only fires when pdfplumber cannot build the table itself (borderless
+  statements, merged cells). Worth it for data-heavy corpora — financial
+  filings, spec sheets, anything numeric.
 - **`--tables --no-table-vision`:** tables via pdfplumber only — free, but loses
   nested / merged-cell tables.
 
@@ -232,6 +235,14 @@ uv run python scripts/tpm_check.py "<DOCS>"
 > 48 on 2x H200 — prune-expand ran ~1 h at the old 12 because only ~9 requests
 > were in flight). DeepSeek-V4.1-Flash stays serverless.
 >
+> The same sizing also sets the memory-bound table knobs from THIS machine:
+> `table_extraction` (PDF workers) and `table_page_vision` (whole-page vision
+> calls in flight per PDF), split from one budget (free RAM minus 600 MB; each
+> worker 200 MB + 5 MB per page in flight). They are listed with the GPU
+> concurrency and written by `--apply` / `--apply-concurrency`. Read both out:
+> table vision runs on serverless Qwen3-VL-235B at ~60-250 s per page, so
+> pages in flight are what shortens a long filing.
+>
 > **Verify this machine's memory first** (the one these skills and the detached
 > run use): the sizing prints `Local memory` and `Build memory ... FITS / TIGHT /
 > DOES NOT FIT` — the projected peak of Stage 4 + the OWL export for this corpus
@@ -272,8 +283,9 @@ a 32k output budget (`class_proposal`, `match_dedup`) are additionally capped at
 Cost is one tiny probe per model.
 
 **Writing the choice:** once the user picks, apply it with
-`uv run python scripts/tpm_check.py --apply` (every suggestion) or
-`--set <stage>=N` (repeatable, their own values). It edits only the
+`uv run python scripts/tpm_check.py --apply` (every suggestion — the rate-limit
+stages AND the memory-sized `table_extraction` + `table_page_vision`) or
+`--set <stage>=N` (repeatable, their own values; `--set` wins over `--apply`). It edits only the
 `concurrency:` block and keeps every comment. Never `--apply` without their
 go-ahead. Per-run flags below still override config for a single run.
 
@@ -297,7 +309,7 @@ Knobs, grouped by what actually constrains them:
 
 | Group | Knobs | Constraint | Shipped |
 |---|---|---|---|
-| **Memory** | `concurrency.table_extraction` | ~152 MB per PDF subprocess | 1 |
+| **Memory** | `concurrency.table_extraction`, `concurrency.table_page_vision` | ~152 MB per PDF subprocess + ~5 MB per page-vision call in flight | 1, 1 |
 | **DB connection pool** | `database.pool_size` + `max_overflow` (and `evaluation` concurrency) | Supabase session mode caps the PROJECT at 15 clients | 10 + 2 |
 | **Memory (cheap) + caps concurrency** | `chunking.streaming_batch_size` | ~50 MB at 16 docs | 8 |
 | **Rate limit of the stage's tightest model** | `summarization`, `chunk_classification`, `table_mining`, `entity_extraction` (incl. gpt-4.1 orphan check), `artifact_generation` (incl. gpt-4.1 / gpt-5.4 rollup) | measured ~3% of a 10M-TPM tier at 32 | 32 |
@@ -324,6 +336,7 @@ Three knobs, three different constraints:
 | Knob | Bound by | Default | Notes |
 |---|---|---|---|
 | `concurrency.table_extraction` | **MEMORY** | 1 | Each PDF = one subprocess, ~152 MB measured. Serial extraction is often the LONG POLE: 18 PDFs at 1 is ~100 min. |
+| `concurrency.table_page_vision` | **MEMORY** | 1 | Whole-page vision calls in flight INSIDE one PDF (~60-250 s each on serverless Qwen3-VL-235B). `tpm_check.py` sizes it together with `table_extraction` (worker = 200 + 5 x pages MB); output is identical at any value. |
 | `chunking.streaming_batch_size` | memory (cheap) | 8 | Holds N documents' text (~50 MB at 16). Also CAPS effective concurrency. |
 | `concurrency.summarization` | **RATE LIMIT** | 32 | Measured ~0.5% of a 10M TPM tier; rarely the constraint on tier 3+. |
 
@@ -337,7 +350,7 @@ costs, then **ask which they want** -- and make clear they can name their own.
 | mini stages | 8 | 32-64 | up to 125 |
 | `class_proposal` | 4 | **12** | 16 |
 | `dedup` | 4 | **8** | 8 |
-| `table_extraction` | 1 | (free RAM ÷ 200 MB) | same, memory-capped |
+| `table_extraction` / `table_page_vision` | 1 / 1 | tpm_check's memory suggestion | same, memory-capped |
 | Buys | safest on any tier | ~2-4x less wall time | marginal over recommended |
 | Costs | hours of waiting | ~2% more spend | 429 risk on tier 1-2 |
 
@@ -355,8 +368,10 @@ State all four effects, because users reliably guess wrong about at least one:
 3. **Too high on the gpt-4.1 stages risks 429s**, which cost time in backoff
    rather than failing outright. 12/8 measured clean; treat 16 as the ceiling
    and raise incrementally.
-4. **Too high on `table_extraction` risks a HARD KILL**, not a slowdown, on a
-   swapless box. This is the only knob where being wrong loses the run.
+4. **Too high on `table_extraction` / `table_page_vision` risks a HARD KILL**, not
+   a slowdown, on a swapless box. These are the only knobs where being wrong
+   loses the run, which is why both come from measured free memory, never a
+   rule of thumb.
 
 ### When THEIR LIMITS are the binding constraint
 
@@ -400,6 +415,11 @@ and note that these are NOT interchangeable:
 - `concurrency.table_extraction` exists precisely because the in-process
   extractor OOMed partway through a corpus; 1 is a deliberate safe default, not
   an oversight. Raise it only against measured free memory.
+- `concurrency.table_page_vision` shares that memory budget: the tool fits
+  `workers x (200 + 5 x pages) MB` into free RAM minus the 600 MB reserve,
+  preferring 8 pages per worker. It is what shortens ONE long statement-heavy
+  PDF (dozens of ~60-250 s vision pages); `table_extraction` only helps across
+  PDFs. Results are identical at any value.
 
 ## Step 2d — Selection preview (ONLY if they chose the subset in Step 1e)
 **This is a paid, long-running step, so it takes the Step 2c concurrency
@@ -519,6 +539,11 @@ The harness runs this command **unchanged**, so the two-tier table cache
 (`output_ontologies/.../tables/` + `~/.cache/.../tables/`) and the evaluated-
 summary cache (`~/.cache/.../eval_summaries/`) work exactly as before. A re-run
 after a crash reuses everything already computed — it does not re-pay.
+The table cache key includes the two table-vision models (`table_extract_vision`,
+`table_extract_page_vision` in models.yaml): switching either one, or switching
+LLM mode, re-extracts every PDF's tables once at the new model's cost. So did
+the 2026-10-25 update that added the models to the key. Tell the user before a
+`--tables` run on a corpus whose tables were extracted with another model.
 
 ### Concurrency — check it before a multi-hour run, and tell the user
 `prune-expand` takes **six separate flags**, one per stage, because the stages run
@@ -557,6 +582,7 @@ command above when the user wants a per-run value; otherwise edit
 | `concurrency.class_proposal` | Stage 2 | gpt-4.1 @ 32k, ~2M TPM | **12** measured safe; 16 is the ceiling |
 | `concurrency.dedup` | Stage 3 batches | gpt-4.1 @ 32k, ~2M TPM | **8** measured safe |
 | `concurrency.table_extraction` | PDF subprocesses | **MEMORY**, not rate | ~1 per 200 MB free |
+| `concurrency.table_page_vision` | page-vision calls per PDF | **MEMORY**, not rate | up to 8, ~5 MB each, sized with the line above |
 
 **Measured on the 30-doc pharma corpus (2026-08-13), 64 mini / 12 proposal /
 8 dedup, zero 429s:**
@@ -665,8 +691,18 @@ uv run python scripts/pe_report.py
 If it reports NOT complete, the run is still going or DIED — check Step 4's
 `job_status.py` and the log tail before re-launching (caches make a re-run cheap).
 
-Report: version-folder path, total cost, any preflight warnings, and that a re-run
-would hit caches. Hand the prune-expand folder path to the orchestrator — the
+prune-expand prints an `ONTOLOGY COUNTS` block at its end; to print it again for
+any version folder (no database needed):
+```
+uv run python -m backend.app.cli graph-stats --no-db --ontology <PE_DIR>
+```
+
+Report: version-folder path, total cost, any preflight warnings, that a re-run
+would hit caches, and **always the ontology counts: classes created (and the
+total before/after), instances created (net), and concept classes created** --
+the classes under `extraction.concept_class_roots` that the concept-pass menu and
+concept seeding use. A run that created 0 concept classes has an empty concept
+layer; say so. Hand the prune-expand folder path to the orchestrator — the
 ontology import into the DB is the first step of the **ingest-corpus** skill
 (`db-init --input <prune-expand-folder>`).
 

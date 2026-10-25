@@ -63,7 +63,11 @@ per-stage table (see **build-app** step 2b). If the tracker has a `sizing` step
 and the LLM mode has not changed since, the config is already right -- just
 confirm. Otherwise propose values and write the agreed ones with `--apply` /
 `--set stage=N`. `extract-entities` and `generate-artifacts` follow the RATE
-LIMITS, not the DB pool. For a large add, pass `--batch-size` to both so each
+LIMITS, not the DB pool. Adding PDFs with `--tables`? The same run sizes
+`table_extraction` + `table_page_vision` from this machine's free memory — read
+those out too (a long filing is mostly page-vision time). Tables are cached per
+PDF AND vision model: after a table-vision model switch, re-registered PDFs are
+extracted again once (in DeepInfra mode ~$0.04–0.13 per audited filing). For a large add, pass `--batch-size` to both so each
 batch commits and a killed run resumes.
 
 **Chunk kind: `enrich-time` follows the corpus, `generate-artifacts` follows
@@ -83,6 +87,16 @@ fitted to the ORIGINAL corpus, so new documents on a new topic are where
 coverage degrades first. A jump against the initial ingest's figures is the
 earliest signal that the added documents need an ontology the current one does
 not cover — compare them and say whether they moved.
+
+**Report the graph counts** after the add, and after every follow-up step
+(`extract-entities`, `enrich-time`, `generate-artifacts`):
+```
+uv run python -m backend.app.cli graph-stats
+```
+Report all six with their change since the last report: entities created,
+entity-to-entity edges created, concept classes, concept entities created,
+ontology classes, ontology instances. Do the same after an update or a delete --
+a hard delete should show negative deltas.
 
 Record it:
 ```

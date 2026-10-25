@@ -2197,6 +2197,54 @@ def _collect_orphan_classes(
     return out
 
 
+_DOMAIN_CONCEPTS_NS = "https://veerla-ramrao.ai/ontology/domain-concepts#"
+# Domain-concepts classes that anchor TABLE structure, not concepts. They stay
+# off the Layer G menu; table_concept_grouping places classes under them.
+_NON_CONCEPT_ROOTS = frozenset({"FinancialTable", "FinancialObservation", "TimePeriod", "Dimension"})
+# Agent / place kinds from the other core ontologies (FOAF, ORG, geography),
+# offered when present so a kind-of-company orphan has somewhere to go.
+_AGENT_ROOT_LABELS = ("Organization", "Person", "GeographicFeature")
+
+
+def concept_root_menu(classes_dict: dict) -> list[dict[str, str]]:
+    """The Layer G root menu: [{LABEL, DESCRIPTION}] read from the merged
+    ontology, so every label the model may answer with resolves.
+
+    Roots are the domain-concepts classes directly under owl:Thing (minus the
+    table anchors), then the agent/place kinds. Empty when the merge has no
+    domain-concepts layer; the prompt then falls back to its built-in list.
+    """
+    def _desc(rec: dict) -> str:
+        for key in ("comments", "descriptions"):
+            for v in rec.get(key) or []:
+                text = v.get("value") if isinstance(v, dict) else v
+                if isinstance(text, str) and text.strip():
+                    return " ".join(text.split())[:200]
+        return ""
+
+    menu: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for iri, rec in classes_dict.items():
+        if not iri.startswith(_DOMAIN_CONCEPTS_NS):
+            continue
+        label = iri[len(_DOMAIN_CONCEPTS_NS):]
+        parent = _first_super_iri(rec)
+        if label in _NON_CONCEPT_ROOTS or (parent and parent != _OWL_THING_IRI):
+            continue
+        menu.append({"LABEL": label, "DESCRIPTION": _desc(rec)})
+        seen.add(label.lower())
+    if not menu:
+        return []
+    index = _build_label_to_iri_index(classes_dict)
+    for label in _AGENT_ROOT_LABELS:
+        iri = index.get(label.lower())
+        if iri and label.lower() not in seen:
+            menu.append({"LABEL": label, "DESCRIPTION": _desc(classes_dict.get(iri, {}))})
+    # DomainConcept last: the prompt calls it the last resort.
+    menu.sort(key=lambda r: r["LABEL"] == "DomainConcept")
+    return menu
+
+
 def apply_concept_grouping(
     classes_dict: dict,
     default_base_iri: str,
@@ -2206,8 +2254,13 @@ def apply_concept_grouping(
     """Apply the LLM's `concept_grouping` proposal.
 
     `llm_result` is expected to have:
-      TOP_LEVEL_CONCEPTS: [{LABEL, DESCRIPTION}, ...]
+      NEW_SUBCONCEPTS:    [{LABEL, DESCRIPTION, PARENT_ROOT}, ...]
+                          (TOP_LEVEL_CONCEPTS, the pre-2026-10-24 key, is
+                          read the same way; PARENT_ROOT is optional)
       ASSIGNMENTS:        [{CLASS_LABEL, CONCEPT_LABEL}, ...]
+
+    A minted concept is parented at its PARENT_ROOT when that label resolves
+    to an existing class, else at `default_parent_iri`.
 
     Behavior:
       - For each proposed concept, mint a class under `default_base_iri`
@@ -2226,7 +2279,10 @@ def apply_concept_grouping(
     """
     if not isinstance(llm_result, dict):
         return [], []
-    concepts_input = llm_result.get("TOP_LEVEL_CONCEPTS") or []
+    concepts_input = (
+        list(llm_result.get("NEW_SUBCONCEPTS") or [])
+        + list(llm_result.get("TOP_LEVEL_CONCEPTS") or [])
+    )
     assignments_input = llm_result.get("ASSIGNMENTS") or []
     if not concepts_input and not assignments_input:
         return [], []
@@ -2252,12 +2308,16 @@ def apply_concept_grouping(
             concept_by_label[key] = existing
             continue
 
-        # Mint a new concept class.
+        # Mint a new concept class, under its root when the root resolves.
+        root_label = normalize_to_string(entry.get("PARENT_ROOT"))
+        root_iri = (
+            initial_label_index.get(root_label.strip().lower()) if root_label else None
+        )
         new_iri, new_entry = create_new_class_entry(
             label=concept_label,
             description=concept_description,
             new_class_base_iri=default_base_iri,
-            default_parent_iri=default_parent_iri,
+            default_parent_iri=root_iri or default_parent_iri,
         )
         # Tag with audit annotation.
         anns = new_entry.setdefault("annotations", {})

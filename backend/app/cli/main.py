@@ -697,6 +697,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_dbsize.set_defaults(func=_cmd_db_size)
 
+    # ---------- run counts reported after every build step ----------
+    p_gstats = sub.add_parser(
+        "graph-stats",
+        help=(
+            "Report entities, entity->entity edges, concept classes, concept "
+            "entities, ontology classes and instances in the database (with "
+            "the change since the last report), and -- with --ontology -- the "
+            "classes/instances/concept classes a prune-expand run created."
+        ),
+    )
+    p_gstats.add_argument("--ontology", type=Path, default=None,
+                          help="A prune-expand/build version folder to report on.")
+    p_gstats.add_argument("--no-db", action="store_true",
+                          help="Skip the database report (ontology folder only).")
+    p_gstats.add_argument("--json", action="store_true", help="Print JSON instead of text.")
+    p_gstats.set_defaults(func=_cmd_graph_stats)
+
     # ---------- Phase 2: migrate (wraps `alembic upgrade head`) ----------
     p_migrate = sub.add_parser(
         "db-migrate",
@@ -959,10 +976,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_time.add_argument(
         "--from-fulltext", action=argparse.BooleanOptionalAction, default=None,
         help=(
-            "Scan the verbatim FULL-TEXT chunks for dates instead of summary "
-            "chunks. Default: FOLLOW the corpus — full-text when the corpus was "
-            "ingested with full-text chunks, summary when it was not. Pass the "
-            "flag (or --no-from-fulltext) to force one."
+            "Scan ONLY the verbatim full-text chunks (--from-fulltext) or ONLY "
+            "the summary chunks (--no-from-fulltext). Default: summary chunks "
+            "always, plus full-text chunks when the corpus has them."
         ),
     )
     p_time.set_defaults(func=_cmd_enrich_time)
@@ -1885,6 +1901,7 @@ def _cmd_prune_expand(args: argparse.Namespace) -> int:
         )
     )
     print(f"\nPRUNED+EXPANDED ontology written to: {version_dir}")
+    _print_ontology_stats(version_dir)
     return 0
 
 
@@ -1983,6 +2000,58 @@ def _cmd_db_size(args: argparse.Namespace) -> int:
     from backend.app.services.db_size import report_db_size
 
     asyncio.run(report_db_size())
+    return 0
+
+
+def _concept_roots_from_config() -> list[str]:
+    roots = _extraction_cfg().get("concept_class_roots")
+    return [r for r in (roots or []) if isinstance(r, str)]
+
+
+def _print_ontology_stats(version_dir: Path) -> None:
+    from backend.app.services.run_stats import format_ontology_stats, ontology_stats
+
+    try:
+        stats = ontology_stats(version_dir, _concept_roots_from_config())
+    except (OSError, ValueError) as exc:
+        print(f"[graph-stats] no ontology counts for {version_dir}: {exc}")
+        return
+    print(f"\nONTOLOGY COUNTS ({version_dir.name})")
+    print(format_ontology_stats(stats))
+
+
+def _cmd_graph_stats(args: argparse.Namespace) -> int:
+    from sqlalchemy.engine import make_url
+
+    from backend.app.core.config import get_settings
+    from backend.app.db.session import session_scope
+    from backend.app.services.run_stats import (
+        diff_against_snapshot, format_graph_stats, format_ontology_stats, graph_stats, ontology_stats,
+    )
+
+    roots = _concept_roots_from_config()
+    out: dict[str, Any] = {}
+    if args.ontology is not None:
+        out["ontology"] = ontology_stats(args.ontology, roots)
+    if not args.no_db:
+        async def _go() -> dict[str, int]:
+            async with session_scope() as session:
+                return await graph_stats(session, roots)
+
+        now = asyncio.run(_go())
+        url = make_url(get_settings().database_url)
+        db_name = f"{url.host or 'local'}_{url.port or ''}_{url.database or ''}"
+        out["database"] = now
+        out["database_delta"] = diff_against_snapshot(db_name, now)
+    if args.json:
+        print(json.dumps(out, indent=2))
+        return 0
+    if "ontology" in out:
+        print(f"ONTOLOGY COUNTS ({args.ontology.name})")
+        print(format_ontology_stats(out["ontology"]))
+    if "database" in out:
+        print("GRAPH COUNTS (database)")
+        print(format_graph_stats(out["database"], out["database_delta"]))
     return 0
 
 
@@ -2180,12 +2249,23 @@ def _cmd_list_documents(args: argparse.Namespace) -> int:
 def _cmd_enrich_time(args: argparse.Namespace) -> int:
     from backend.app.services.db_temporal_enrich import enrich_temporal
 
+    # Summary chunks ALWAYS, full-text too when the corpus has them. Summary
+    # chunks carry the entities and artifacts, and retrieval reaches full text
+    # only through them (summary -> document -> fulltext), so dating only the
+    # full-text set left time and entities on disjoint nodes. An explicit
+    # --from-fulltext / --no-from-fulltext still scans just that one kind.
+    if getattr(args, "from_fulltext", None) is not None:
+        kinds = [_resolve_chunk_kind_following_corpus(args)]
+    else:
+        kinds = ["summary"]
+        if _resolve_chunk_kind_following_corpus(args) == "fulltext":
+            kinds.append("fulltext")
     asyncio.run(
         enrich_temporal(
             limit=args.limit,
             highest_level=args.highest_level,
             lowest_level=args.lowest_level,
-            chunk_kind=_resolve_chunk_kind_following_corpus(args),
+            chunk_kinds=kinds,
         )
     )
     return 0
@@ -2466,6 +2546,12 @@ def _cmd_generate_artifacts(args: argparse.Namespace) -> int:
             )
         )
 
+    # The pipeline runs enrich-time BEFORE generate-artifacts, so the artifacts
+    # made here have no time edges yet. Copy them from their source chunks.
+    from backend.app.services.db_temporal_enrich import propagate_time_to_artifacts
+
+    reset_engine_cache()
+    asyncio.run(propagate_time_to_artifacts())
     return 0
 
 

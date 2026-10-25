@@ -77,6 +77,26 @@ GRAPHRAG_RELATED_TO: Final = f"{GRAPHRAG_NS}#relatedTo"
 # are kept out of the evidence packet for exactly that reason.
 GRAPHRAG_LOCATED_IN: Final = f"{GRAPHRAG_NS}#locatedInPlace"
 
+# ---------- Domain-neutral concept layer (core_ontologies/domain_concepts.owl) ----------
+# Generic predicates that tie an entity to a CONCEPT entity ("LG Energy
+# Solution hasMetric related-party revenue"). Declared with domain owl:Thing,
+# which the relationship menu does not treat as a wildcard in general -- the
+# pharma merge alone has 176 Thing-domain predicates, and offering all of them
+# for every pair would bury the specific ones. These seven are the exception:
+# each is offered when a chunk holds an entity under its RANGE root, with any
+# subject allowed. Maps predicate IRI -> range root IRI.
+DC_NS = "https://veerla-ramrao.ai/ontology/domain-concepts"
+DC_QUANTITY: Final = f"{DC_NS}#Quantity"
+GENERIC_CONCEPT_PREDICATES: Final = {
+    f"{DC_NS}#hasMetric": DC_QUANTITY,
+    f"{DC_NS}#hasCondition": f"{DC_NS}#Condition",
+    f"{DC_NS}#undergoesProcess": f"{DC_NS}#Process",
+    f"{DC_NS}#usesMethod": f"{DC_NS}#Method",
+    f"{DC_NS}#receivesIntervention": f"{DC_NS}#Intervention",
+    f"{DC_NS}#hasOutcome": f"{DC_NS}#Outcome",
+    f"{DC_NS}#regulatedBy": f"{DC_NS}#PolicyConcept",
+}
+
 # Built-ins that don't appear in `ontology_object_properties`.
 _BUILTIN_ALLOWLIST: Final = frozenset({
     RDFS_SUBCLASS_OF,

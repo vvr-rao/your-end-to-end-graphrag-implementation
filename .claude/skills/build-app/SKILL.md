@@ -28,6 +28,11 @@ preconditions pass.
   `scripts/job_status.py`, so a killed session never kills the work.
 - **Bulk/paid runs are opt-in.** Smoke-test with `--limit` first where available,
   report cost, and get explicit go-ahead before a full corpus run.
+- **Report the build counts after every run**: prune-expand prints the ontology
+  counts (classes and instances created, concept classes created); every database
+  step is followed by `uv run python -m backend.app.cli graph-stats` (entities,
+  entity-to-entity edges, concept classes, concept entities, ontology classes and
+  instances, each with its change since the last report).
 - Watch database size (`db-size` / `db-status`) as data grows — free-tier Postgres
   plans often cap around 500 MB, so keep an eye on headroom.
 - **Progress is tracked across sessions** in `.build/state.jsonl` (via
@@ -99,6 +104,14 @@ another model.
 > deployment the moment the last creation step finishes. The rest of this step
 > (tpm_check) does not apply.
 >
+> The same sizing also sets the memory-bound table knobs from THIS machine:
+> `table_extraction` (PDF workers) and `table_page_vision` (whole-page vision
+> calls in flight per PDF), split from one budget (free RAM minus 600 MB; each
+> worker 200 MB + 5 MB per page in flight). They are listed with the GPU
+> concurrency and written by `--apply` / `--apply-concurrency`. Read both out:
+> table vision runs on serverless Qwen3-VL-235B at ~60-250 s per page, so
+> pages in flight are what shortens a long filing.
+>
 > **Verify this machine's memory first** (the one these skills and the detached
 > run use): the sizing prints `Local memory` and `Build memory ... FITS / TIGHT /
 > DOES NOT FIT` — the projected peak of Stage 4 + the OWL export for this corpus
@@ -136,10 +149,16 @@ whichever of its seven tasks has the least headroom. Two rules to tell the user:
 Present conservative / recommended / aggressive options (the table and the
 four effects to state are in **run-prune-expand** Step 2c: speed not savings,
 ~2% more spend from cache dilution, 429 risk on the 32k-token gpt-4.1 stages,
-hard-kill risk on `table_extraction`). When the user picks, WRITE it — the tool
+hard-kill risk on `table_extraction` / `table_page_vision`). Besides the rate-limit
+stages, the memory-bound table knobs come from the same run: `table_extraction` (PDF
+workers) and `table_page_vision` (whole-page vision calls in flight per PDF),
+split from one budget — free RAM minus a 600 MB reserve, each worker costing
+200 MB + 5 MB per page in flight (`table_concurrency_for_budget`). Read both
+out from the `Machine memory` section.
+When the user picks, WRITE it — the tool
 edits only the `concurrency:` block and keeps every comment:
 ```
-uv run python scripts/tpm_check.py --apply                          # take every suggestion
+uv run python scripts/tpm_check.py --apply                          # every suggestion, incl. the memory-sized table knobs
 uv run python scripts/tpm_check.py --set entity_extraction=32 --set dedup=8   # or their own values
 ```
 Never pass `--apply` without their go-ahead. Record it:

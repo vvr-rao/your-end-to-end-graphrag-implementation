@@ -25,6 +25,7 @@ from sqlalchemy import func, select, update as sql_update
 from backend.app.db.graph_version import bump_version
 from backend.app.db.models.artifacts import ArtifactSource, IntelligenceArtifact
 from backend.app.db.models.documents import Chunk, Document
+from backend.app.db.models.graph import GraphRelationship
 from backend.app.db.session import session_scope
 from backend.app.services.db_document_ingest import (
     _document_iri,
@@ -32,6 +33,7 @@ from backend.app.services.db_document_ingest import (
     ingest_documents_folder,
 )
 from backend.app.services.document_io import load_document
+from backend.app.services.predicates import VIAO_DERIVED_FROM_DOCUMENT
 
 
 async def delete_document(iri: str, *, hard: bool = False) -> dict[str, Any]:
@@ -80,6 +82,22 @@ async def delete_document(iri: str, *, hard: bool = False) -> dict[str, Any]:
             if total_sources.scalar_one() == from_this_doc.scalar_one():
                 stale_ids.append(aid)
 
+        # StructuredTables hang off the DOCUMENT (derivedFromDocument edge), not
+        # off chunks, so the ArtifactSource sweep above never sees them. Left
+        # alone they stayed ACTIVE after a delete, and a hard delete + re-register
+        # of the same PDF then collided on their artifact_identifier (2026-10-24).
+        table_ids = [aid for (aid,) in (await session.execute(
+            select(GraphRelationship.source_node_id).where(
+                GraphRelationship.source_node_type == "intelligence_artifact",
+                GraphRelationship.target_node_type == "document",
+                GraphRelationship.target_node_id == doc_id,
+                GraphRelationship.predicate_iri == VIAO_DERIVED_FROM_DOCUMENT,
+                GraphRelationship.source_node_id.in_(
+                    select(IntelligenceArtifact.id).where(
+                        IntelligenceArtifact.artifact_type == "StructuredTable")),
+            ).distinct()
+        )).all()]
+
         chunk_count_result = await session.execute(
             select(func.count()).select_from(Chunk).where(
                 Chunk.document_id == doc_id
@@ -100,6 +118,12 @@ async def delete_document(iri: str, *, hard: bool = False) -> dict[str, Any]:
             )
 
         if hard:
+            if table_ids:
+                await session.execute(sql_delete(GraphRelationship).where(
+                    (GraphRelationship.source_node_id.in_(table_ids))
+                    | (GraphRelationship.target_node_id.in_(table_ids))))
+                await session.execute(sql_delete(IntelligenceArtifact).where(
+                    IntelligenceArtifact.id.in_(table_ids)))
             await session.execute(sql_delete(Document).where(Document.id == doc_id))
             mode = "HARD"
         else:
@@ -114,6 +138,12 @@ async def delete_document(iri: str, *, hard: bool = False) -> dict[str, Any]:
                     status="DELETED", is_deleted=True, deleted_at=now
                 )
             )
+            if table_ids:
+                await session.execute(
+                    sql_update(IntelligenceArtifact).where(
+                        IntelligenceArtifact.id.in_(table_ids)
+                    ).values(status="STALE")
+                )
             mode = "SOFT"
 
         new_version = await bump_version(session)
@@ -122,6 +152,7 @@ async def delete_document(iri: str, *, hard: bool = False) -> dict[str, Any]:
         f"[delete-document] {mode} delete: {title} ({iri})\n"
         f"  chunks affected:    {chunk_count}\n"
         f"  artifacts -> STALE: {len(stale_ids)}\n"
+        f"  tables {'deleted' if hard else '-> STALE'}: {len(table_ids)}\n"
         f"  graph_version ->    {new_version}"
     )
 
@@ -139,6 +170,7 @@ async def delete_document(iri: str, *, hard: bool = False) -> dict[str, Any]:
         "title": title,
         "chunks": chunk_count,
         "stale_artifacts": len(stale_ids),
+        "tables": len(table_ids),
         "new_graph_version": new_version,
     }
 
