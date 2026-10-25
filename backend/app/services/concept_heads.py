@@ -21,17 +21,21 @@ This pass, run on the deduplicated Stage-3 payload:
      confirmed members to it -- only members whose current parent is
      missing or a broad root, so a specific parent is never overwritten.
 
-Enabled per preset by the `concept_head_judge` task (`enabled: true`). The
-judge prompt follows `prompt_set` (default prompt, or `deepseek`); with no
+Runs whenever the `concept_head_judge` task is defined; `enabled: false` on
+the task, or `--no-concept-heads` on the CLI (env `GRAPHRAG_NO_CONCEPT_HEADS`),
+turns it off. The judge prompt follows `prompt_set` (default prompt, or `deepseek`); with no
 prompt for the configured set the pass is skipped.
 """
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any
 
 TASK = "concept_head_judge"
+# Set by the CLI's --no-concept-heads (the stage sits deep inside prune-expand).
+DISABLE_ENV = "GRAPHRAG_NO_CONCEPT_HEADS"
 CLASSES = "MATCH NOT FOUND"
 
 # Roots a head may go under: the domain-neutral layer of domain_concepts.owl
@@ -160,7 +164,10 @@ async def generalize_concept_heads(router: Any, payload: dict[str, Any], *, log=
         spec = router.task_spec(TASK)
     except (AttributeError, KeyError):
         return payload, []
-    if not spec or not spec.get("enabled"):
+    if not spec or spec.get("enabled") is False:
+        return payload, []
+    if os.environ.get(DISABLE_ENV):
+        log("[stage3c] concept heads skipped (--no-concept-heads)")
         return payload, []
     build = _judge_prompt(spec.get("prompt_set"))
     if build is None:

@@ -121,6 +121,26 @@ def test_generalize_is_a_noop_when_disabled_or_unconfigured() -> None:
         assert out is _PAYLOAD and accepted == [] and router.calls == 0
 
 
+def test_generalize_runs_when_the_task_omits_enabled() -> None:
+    reply = {"decisions": [{"id": 1, "accept": True, "root": "measure", "rejected_members": []}]}
+    router = _Router(reply, {"model": "m"})   # task defined, no `enabled` key -> ON
+    _, accepted = asyncio.run(ch.generalize_concept_heads(router, _PAYLOAD, log=lambda *_: None))
+    assert [a["head"] for a in accepted] == ["Revenue"]
+
+
+def test_no_concept_heads_flag_skips_the_pass(monkeypatch) -> None:
+    from backend.app.cli import main as cli
+
+    monkeypatch.setenv(ch.DISABLE_ENV, "1")
+    router = _Router({"decisions": []}, {"enabled": True})
+    out, accepted = asyncio.run(ch.generalize_concept_heads(router, _PAYLOAD, log=lambda *_: None))
+    assert out is _PAYLOAD and accepted == [] and router.calls == 0
+    monkeypatch.delenv(ch.DISABLE_ENV)
+    args = cli.build_parser().parse_args(
+        ["prune-expand", "--input", "in", "--documents", "docs", "--no-concept-heads"])
+    assert args.no_concept_heads is True
+
+
 def test_generalize_skips_an_unknown_prompt_set() -> None:
     router = _Router({}, {"enabled": True, "prompt_set": "qwen"})
     out, _ = asyncio.run(ch.generalize_concept_heads(router, _PAYLOAD, log=lambda *_: None))
@@ -277,14 +297,43 @@ def test_without_concept_ids_the_named_tier_is_unchanged(monkeypatch) -> None:
     assert asyncio.run(rt._cascade_entity_seeds(parsed, [0.0], {}, _Emb())) == ([LG], "named")
 
 
-def test_concept_knobs_are_off_unless_configured(monkeypatch) -> None:
+def test_concept_knobs_are_on_unless_turned_off(monkeypatch) -> None:
     monkeypatch.setattr(rt, "_qa_cfg", lambda key, default: default)
-    for k in ("concept_seeds", "concept_terminal", "seed_cooccurrence"):
-        assert rt._qa_flag(k) is False
+    for k in rt._CONCEPT_KNOBS:
+        assert rt._concept_flag(k) is True             # unset -> ON
+        assert rt._concept_flag(k, None) is True
+        assert rt._concept_flag(k, False) is False     # --no-concepts
+    monkeypatch.setattr(rt, "_qa_cfg", lambda key, default: False)
+    for k in rt._CONCEPT_KNOBS:
+        assert rt._concept_flag(k) is False            # `false` in config
+    monkeypatch.setattr(rt, "_qa_cfg", lambda key, default: "off")
+    assert rt._concept_flag("concept_seeds") is False
     import yaml
     qa = yaml.safe_load(open("config/config.example.yaml", encoding="utf-8"))["qa"]
-    assert qa["concept_seeds"] is True and qa["concept_terminal"] is True
-    assert qa["seed_cooccurrence"] is True
+    assert all(qa[k] is True for k in rt._CONCEPT_KNOBS)
+
+
+def test_concept_pass_is_on_by_default_and_off_by_flag() -> None:
+    import yaml
+
+    from backend.app.cli import main as cli
+
+    parse = cli.build_parser().parse_args
+    assert parse(["extract-entities"]).concept_pass is None          # -> config / default
+    assert parse(["extract-entities", "--concept-pass"]).concept_pass is True
+    assert parse(["extract-entities", "--no-concept-pass"]).concept_pass is False
+    ext = yaml.safe_load(open("config/config.example.yaml", encoding="utf-8"))["extraction"]
+    assert ext["concept_pass"] is True
+
+
+def test_no_concepts_flag_parses_on_query_and_turn() -> None:
+    from backend.app.cli import main as cli
+
+    parse = cli.build_parser().parse_args
+    assert parse(["query", "q?"]).no_concepts is False
+    assert parse(["query", "q?", "--no-concepts"]).no_concepts is True
+    turn = ["conversation", "turn", "--conv", "c", "q?", "--no-concepts"]
+    assert parse(turn).no_concepts is True
 
 
 PANC, MOUNJARO, HYPO = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()

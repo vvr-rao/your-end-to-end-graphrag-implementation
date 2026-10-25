@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -397,6 +398,14 @@ def _add_llm_flags(p: argparse.ArgumentParser) -> None:
         "--use-owl",
         action="store_true",
         help="Force re-parsing the prior merged.owl instead of using the fast merged.json path",
+    )
+    p.add_argument(
+        "--no-concept-heads", action="store_true",
+        help=(
+            "Skip Stage 3c, which gives qualified concept classes a generic "
+            "parent (SemiconductorRevenue -> Revenue). On by default whenever "
+            "models.yaml defines the concept_head_judge task."
+        ),
     )
     p.add_argument(
         "--no-summarize-descriptions",
@@ -1159,8 +1168,9 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Run a SECOND extraction call per chunk asking only for the "
             "CONCEPTS the passage develops -- freight rates, consolidation, "
-            "overcapacity -- rather than the named things it mentions (OFF by "
-            "default; unset => extraction.concept_pass in config.yaml). "
+            "overcapacity -- rather than the named things it mentions (ON by "
+            "default; unset => extraction.concept_pass in config.yaml, which "
+            "defaults to true; --no-concept-pass turns it off). "
             "Concept classes (EconomicConcept, Metric, Process, Industry) are "
             "reachable by the main pass too, but one call holding both jobs "
             "spends its attention on the named entities: on a measured "
@@ -1168,6 +1178,10 @@ def build_parser() -> argparse.ArgumentParser:
             "least 5. Costs one extra call per chunk (`concept_extract`, same "
             "cheap tier as entity_extract, ~half the output size)."
         ),
+    )
+    p_ext.add_argument(
+        "--no-concept-pass", dest="concept_pass", action="store_false", default=None,
+        help="Skip the concept pass (on by default; see --concept-pass).",
     )
     p_ext.add_argument(
         "--recovery-pool", type=int, default=None,
@@ -1569,6 +1583,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_q.add_argument(
+        "--no-concepts", action="store_true",
+        help=(
+            "Turn off the concept layer for this query: concept seeds, "
+            "concept-name seeds, terminal concepts and the seed co-occurrence "
+            "voter (all ON by default; qa.concept_seeds / concept_name_seeds / "
+            "concept_terminal / seed_cooccurrence: false turn them off one by one)."
+        ),
+    )
+    p_q.add_argument(
         "--json", action="store_true",
         help="Print the full response envelope as JSON.",
     )
@@ -1682,6 +1705,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--rerank", action="store_true",
         help="Vector-rerank the fused pool against the question embedding "
              "before truncation (see `query --rerank`).",
+    )
+    p_conv_turn.add_argument(
+        "--no-concepts", action="store_true",
+        help="Turn off the concept layer for this turn (see `query --no-concepts`).",
     )
     p_conv_turn.add_argument(
         "--history-window", type=int, default=3,
@@ -2292,7 +2319,7 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
         args, "validation_rounds", "validation_rounds", 2))
     _validate = getattr(args, "validate_entities", False)
     _concepts = bool(_resolve_extraction_opt(
-        args, "concept_pass", "concept_pass", False))
+        args, "concept_pass", "concept_pass", True))
     _l2 = _resolve_extraction_opt(
         args, "max_candidate_l2", "max_candidate_l2", None)
     _menu_filter = not getattr(args, "no_menu_filter", False) and bool(
@@ -2667,6 +2694,7 @@ def _cmd_query(args: argparse.Namespace) -> int:
             decompose=not args.no_decompose,
             max_probes=args.max_probes,
             rerank=True if getattr(args, "rerank", False) else None,
+            concepts=False if getattr(args, "no_concepts", False) else None,
             verbose=args.verbose,
             multi_round=getattr(args, "multi_round", True),
             persist=getattr(args, "persist", True),
@@ -2782,6 +2810,7 @@ def _cmd_conversation_turn(args: argparse.Namespace) -> int:
             decompose=not args.no_decompose,
             max_probes=args.max_probes,
             rerank=True if getattr(args, "rerank", False) else None,
+            concepts=False if getattr(args, "no_concepts", False) else None,
             history_window=args.history_window,
             verbose=args.verbose,
         )
@@ -3383,6 +3412,10 @@ def main(argv: list[str] | None = None) -> int:
     _silence_benign_asyncio_teardown()
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "no_concept_heads", False):
+        from backend.app.services.concept_heads import DISABLE_ENV
+
+        os.environ[DISABLE_ENV] = "1"
     return args.func(args)
 
 

@@ -1597,6 +1597,7 @@ SELECT t.id, t.source_node_id, t.target_node_id, t.d
        AND g.target_node_type = 'entity'
        AND (g.source_node_id = ANY(CAST(:frontier AS uuid[]))
          OR g.target_node_id = ANY(CAST(:frontier AS uuid[])))
+       AND NOT (g.id = ANY(CAST(:seen AS uuid[])))
      ORDER BY g.embedding <-> CAST(:probe AS vector)
      LIMIT :limit
   ) t
@@ -1645,8 +1646,15 @@ async def relationship_hop(
     *,
     threshold: float = 0.55,
     limit: int = 50,
+    exclude_edge_ids: list[uuid.UUID] | set[uuid.UUID] | None = None,
 ) -> list[dict[str, Any]]:
     """Edges touching `frontier` that match ANY probe relation, best first.
+
+    `exclude_edge_ids` are edges an earlier hop already took. They are dropped
+    BEFORE the LIMIT: a hop-2 frontier node touches the hop-1 edge that reached
+    it, which matched the relation once and so scores at the top again --
+    measured on fingen, 91-100% of hop-2 hits were hop-1 edges, and on a denser
+    graph they would fill the `limit` slots ahead of real next-hop edges.
 
     Scoring against the MAX over probes (rather than one vector) is what lets
     a chain whose rungs differ work: "who founded the company that acquired X"
@@ -1660,10 +1668,11 @@ async def relationship_hop(
     fr = [str(x) for x in frontier]
     ceiling = _cosine_to_l2(threshold)
     await _widen_hnsw(session, limit)
+    seen = [str(x) for x in (exclude_edge_ids or ())]
     for probe in probes:
         rows = await session.execute(
             _REL_HOP_SQL,
-            {"probe": _vec_str(probe), "frontier": fr,
+            {"probe": _vec_str(probe), "frontier": fr, "seen": seen,
              "l2_ceiling": ceiling, "limit": limit},
         )
         for rid, src, tgt, dist in rows.all():
