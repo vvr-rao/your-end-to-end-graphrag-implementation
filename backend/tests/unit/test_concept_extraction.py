@@ -164,9 +164,9 @@ def test_duplicate_between_passes_uses_the_db_dedup_key() -> None:
 
 
 @pytest.mark.parametrize("path", ["config/config.example.yaml"])
-def test_concept_pass_ships_off_by_default(path: str) -> None:
+def test_concept_pass_ships_on_by_default(path: str) -> None:
     cfg = yaml.safe_load(open(path, encoding="utf-8"))["extraction"]
-    assert cfg["concept_pass"] is False
+    assert cfg["concept_pass"] is True
 
 
 @pytest.mark.parametrize("path", ["config/config.example.yaml"])

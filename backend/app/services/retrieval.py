@@ -110,9 +110,21 @@ def _qa_cfg(key: str, default: Any) -> Any:
         return default
 
 
-def _qa_flag(key: str) -> bool:
-    """A boolean `qa.*` knob that is OFF when unset."""
-    return str(_qa_cfg(key, False)).lower() in ("true", "1", "on", "yes")
+def _qa_flag(key: str, default: bool = False) -> bool:
+    """A boolean `qa.*` knob; `default` when unset."""
+    return str(_qa_cfg(key, default)).lower() in ("true", "1", "on", "yes")
+
+
+# The concept layer's query-time knobs. ON when unset, so a config.yaml copied
+# before they existed still gets them; `false` in config, or `concepts=False`
+# (CLI `--no-concepts`), turns them off.
+_CONCEPT_KNOBS = ("concept_seeds", "concept_name_seeds", "concept_terminal", "seed_cooccurrence")
+
+
+def _concept_flag(key: str, concepts: bool | None = None) -> bool:
+    """One of `_CONCEPT_KNOBS`: off only when `concepts` is False or the
+    config sets it false."""
+    return concepts is not False and _qa_flag(key, True)
 
 
 def _concept_root_labels() -> list[str]:
@@ -416,6 +428,7 @@ async def retrieve_and_answer(
     decompose: bool = True,
     max_probes: int = 3,
     rerank: bool | None = None,
+    concepts: bool | None = None,
     conversation_turn_id: uuid.UUID | None = None,
     resolved_query: str | None = None,
     verbose: bool = False,
@@ -428,6 +441,10 @@ async def retrieve_and_answer(
 
     `top_k` defaults to 30 for deep_research (more breadth for the
     seven-section output) and 20 for simple_qa.
+
+    `concepts=False` turns off the concept layer for this query (concept
+    seeds, concept-name seeds, terminal concepts, seed co-occurrence); None
+    leaves each to its `qa.*` key, which is ON when unset.
 
     `persist=False` skips the `retrieval_runs` / `retrieval_evidence`
     writes, leaving `retrieval_run_id` None. Lets the CLI be pointed at a
@@ -473,7 +490,7 @@ async def retrieve_and_answer(
             r1 = await retrieve_and_answer(
                 plan["round1_question"], mode="simple_qa",
                 hops=hops, max_cost_usd=max_cost_usd, decompose=decompose,
-                max_probes=max_probes, rerank=rerank, verbose=verbose,
+                max_probes=max_probes, rerank=rerank, concepts=concepts, verbose=verbose,
                 multi_round=False, persist=persist, _round_depth=1,
             )
             # Round 2 (final): enrich the question with round-1 findings so the
@@ -493,7 +510,7 @@ async def retrieve_and_answer(
             r2 = await retrieve_and_answer(
                 enriched_final, mode=mode, top_k=top_k,
                 hops=hops, max_cost_usd=max_cost_usd, decompose=decompose,
-                max_probes=max_probes, rerank=rerank,
+                max_probes=max_probes, rerank=rerank, concepts=concepts,
                 conversation_turn_id=conversation_turn_id,
                 verbose=verbose, multi_round=False, persist=persist,
                 _round_depth=1,
@@ -603,12 +620,13 @@ async def retrieve_and_answer(
     # next to named entities when the question names a concept
     # (qa.concept_seeds), and TERMINAL in both walks (qa.concept_terminal): a
     # generic concept like "revenue" is linked to every company reporting
-    # one, so walking out of it reaches everything. Both default off when
-    # unset, keeping retrieval unchanged on configs that predate them.
+    # one, so walking out of it reaches everything. All ON when unset;
+    # `concepts=False` or `false` in config turns them off.
     _concept_ids: set[uuid.UUID] = set()
-    _seed_concepts = _qa_flag("concept_seeds")
-    _terminal_concepts = _qa_flag("concept_terminal")
-    if _seed_concepts or _terminal_concepts:
+    _seed_concepts = _concept_flag("concept_seeds", concepts)
+    _terminal_concepts = _concept_flag("concept_terminal", concepts)
+    _cooccurrence = _concept_flag("seed_cooccurrence", concepts)
+    if _seed_concepts or _terminal_concepts or _cooccurrence:
         async with session_scope() as session:
             _concept_ids = await retrieval_sql.concept_entity_ids(
                 session, _concept_root_labels())
@@ -616,7 +634,8 @@ async def retrieve_and_answer(
         _ent_seeds, _tier = await _cascade_entity_seeds(
             parsed, qvec, aliases, embedder, rel_probes=rel_probes,
             relations=question_relations, verbose=verbose,
-            concept_ids=_concept_ids if _seed_concepts else None)
+            concept_ids=_concept_ids if _seed_concepts else None,
+            name_seeds=_concept_flag("concept_name_seeds", concepts))
         # Time seeds still come from the ontology match; class seeds do not.
         seeds = ([(nid, t) for nid, t in seeds if t == "time_instance"]
                  + [(eid, "entity") for eid in _ent_seeds])
@@ -764,7 +783,7 @@ async def retrieve_and_answer(
                 min_seeds=int(_qa_cfg("seed_cooccurrence_min", 2)),
                 limit=int(_qa_cfg("seed_cooccurrence_limit", 100)),
             )
-            if _qa_flag("seed_cooccurrence") else []
+            if _cooccurrence else []
         )
         artifact_candidates = await retrieval_sql.fetch_candidate_artifacts_for_entities(
             session, expanded_entity_ids, limit=200,
@@ -1868,6 +1887,7 @@ async def _cascade_entity_seeds(
     relations: list[dict[str, Any]] | None = None,
     verbose: bool = False,
     concept_ids: set[uuid.UUID] | None = None,
+    name_seeds: bool | None = None,
 ) -> tuple[list[uuid.UUID], str]:
     """Entity seeds for the graph walk, from the first tier that finds any:
 
@@ -1918,7 +1938,9 @@ async def _cascade_entity_seeds(
     # class term. Only `class` ends: an `entity` end is already a named seed
     # and an `unknown` end is the category asked for ("drug"), not a concept.
     name_terms = list(class_terms)
-    if bool(_qa_cfg("concept_name_seeds", False)):
+    if name_seeds is None:
+        name_seeds = _concept_flag("concept_name_seeds")
+    if name_seeds:
         taken = {normalize_term(t) for t in terms + class_terms}
         for rel in relations or []:
             for end in (rel.get("subject"), rel.get("object")):
@@ -1935,7 +1957,7 @@ async def _cascade_entity_seeds(
         term_vecs = vecs[: len(class_terms)]
         by_name: list[uuid.UUID] = []
         async with session_scope() as session:
-            if bool(_qa_cfg("concept_name_seeds", False)):
+            if name_seeds:
                 by_name = await retrieval_sql.concept_entities_by_name(
                     session, name_terms, vecs, concept_ids,
                     max_l2=float(_qa_cfg("concept_name_max_l2", 1.0)),

@@ -438,7 +438,8 @@ extraction:
   # on a shipping chunk, the widened single call found 1 concept where the
   # passage developed at least 5. Costs one extra `concept_extract` call per
   # chunk (same cheap tier as entity_extract, ~half the output size).
-  # false = behaviour-preserving default; --concept-pass overrides.
+  # ON by default (also when the key is unset); `false` or --no-concept-pass
+  # turns it off.
   # Orphans handed to one relationship_orphan_check call. The check is what
   # rescues entities both relationship passes missed, and its recall collapses
   # when the list is long: measured on websearch-geo-time, the same chunk,
@@ -467,7 +468,7 @@ extraction:
   # usually land in the same batch. Prefer the LARGEST batch you can afford to
   # lose -- e.g. 100-200 on a multi-thousand-chunk full-text run.
   batch_size: 0
-  concept_pass: false
+  concept_pass: true
   # How far the abstention recovery may reach. When the model abstains
   # (NONE_OF_THESE) it names the type it wanted; ~half the time that class
   # ALREADY EXISTS and simply did not rank into the chunk's top-K menu, so the
@@ -795,7 +796,8 @@ qa:
   # concept entities for the concept to the named seeds (tier
   # "named+concepts"); without it the named tier drops the concept.
   # concept_terminal: concept entities are reached but never walked THROUGH
-  # -- "revenue" links every company that reports one. Unset = off.
+  # -- "revenue" links every company that reports one. ON when unset;
+  # `false` (or `query --no-concepts` for all four) turns it off.
   concept_seeds: true
   concept_seed_limit: 25
   # concept_name_seeds: ALSO seed concept entities NAMED like the question's
@@ -805,7 +807,7 @@ qa:
   # reached the right concept, 2026-10-24). concept_name_max_l2: measured on
   # text-embedding-3-small (finance graph): intended concept 0.80-1.04,
   # generic terms ("company", "period") nothing nearer than 1.095. Qwen
-  # vectors: see embedding_profiles. Unset = off.
+  # vectors: see embedding_profiles. ON when unset.
   concept_name_seeds: true
   concept_name_max_l2: 1.0
   concept_name_per_term: 5
@@ -816,7 +818,7 @@ qa:
   # named entity and a concept share the chunk). Needs no entity -> entity
   # edge, which concept entities often lack. Its own RRF voter
   # (rrf_weight_seed_cooccurrence); its chunks join the candidate pool.
-  # Unset = off.
+  # ON when unset.
   seed_cooccurrence: true
   seed_cooccurrence_min: 2
   seed_cooccurrence_limit: 100
