@@ -37,6 +37,7 @@ from backend.app.services.db_entity_extract import (
     _is_menu_unfit_class,
     _resolve_canonical_forms,
     _sanitise_verdicts,
+    _short_form_supported,
 )
 from backend.app.services.prompts import (
     PROMPTS,
@@ -727,3 +728,82 @@ def test_alias_chains_resolve_to_one_final_spelling() -> None:
     targets = set(alias.values())
     assert targets == {_norm("Or Ben Zvi Klein")}
     assert not (set(alias) & targets), "no variant may point at another variant"
+
+
+# --------------------------------------------------------------------------- #
+# word-subset pairs (2026-10-25, H6: parent folded into a subsidiary)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("canon,short", [
+    ("Tianjin Samsung SDI Co., Ltd.", "Samsung SDI Co., Ltd."),
+    ("Tianjin Samsung SDI Co., Ltd.", "Samsung SDI"),
+    ("LG Energy Solution Wroclaw sp. z o.o.", "LG Energy Solution"),
+    ("Samsung SDI Hungary Zrt.", "Samsung SDI"),
+    ("Export-Import Bank of China", "Bank of China"),
+    ("GLP-1 Receptor", "GLP-1"),
+    ("Interest Rate Risk", "Interest Rate"),
+    ("Free Cash Flow", "cash flow"),
+    ("Snap-on common stock", "common stock"),
+])
+def test_a_word_subset_with_a_distinctive_qualifier_needs_the_text(canon, short) -> None:
+    """Both OpenAI fingen builds folded `SAMSUNG SDI CO., LTD.` into its
+    subsidiary `Tianjin Samsung SDI Co., Ltd.`: one chunk paired them, and the
+    word-subset shape rule accepted the pair with no text support."""
+    alias, _ = _resolve_canonical_forms(
+        [("c1", None, None, [
+            {"canonical_name": canon, "short_name": short},
+            {"canonical_name": short, "short_name": short},
+        ], None)], chunk_text={"c1": f"{short} and {canon} are both named here."})
+    assert _norm(short) not in alias
+
+
+@pytest.mark.parametrize("canon,short", [
+    ("Mercedes-Benz Group AG", "Mercedes-Benz"),
+    ("The Boeing Company", "Boeing"),
+    ("U.S. Securities and Exchange Commission", "Securities and Exchange Commission"),
+    ("Multiple Endocrine Neoplasia syndrome type 2", "Multiple Endocrine Neoplasia type 2"),
+    ("Samsung SDI Co., Ltd.", "Samsung SDI"),
+])
+def test_a_word_subset_differing_only_by_generic_words_still_merges(canon, short) -> None:
+    alias, _ = _resolve_canonical_forms(
+        [("c1", None, None, [
+            {"canonical_name": canon, "short_name": short},
+            {"canonical_name": short, "short_name": short},
+        ], None)], chunk_text={"c1": "unrelated text"})
+    assert alias.get(_norm(short)) == _norm(canon)
+
+
+@pytest.mark.parametrize("canon,short,ok", [
+    ("Micron Technology, Inc.", "Micron", True),           # first distinctive word
+    ("A.P. Moller-Maersk A/S", "Maersk", True),            # last distinctive word
+    ("Tianjin Samsung SDI Co., Ltd.", "Samsung", False),   # a middle word
+])
+def test_a_one_word_short_form_must_be_an_end_word(canon, short, ok) -> None:
+    """Checked on `_short_form_supported` directly: a prefix short form like
+    `Micron` is stored as an alias but never merged (the `Utah` guard)."""
+    assert _short_form_supported(canon, short, "unrelated text") is ok
+
+
+def test_a_qualified_name_merges_when_the_chunk_states_the_alias() -> None:
+    rows = [{"canonical_name": "KB Kookmin Bank", "short_name": "Kookmin Bank"},
+            {"canonical_name": "Kookmin Bank", "short_name": "Kookmin Bank"}]
+    alias, _ = _resolve_canonical_forms(
+        [("c1", None, None, rows, None)],
+        chunk_text={"c1": "Borrowings from KB Kookmin Bank (Kookmin Bank) rose."})
+    assert alias.get(_norm("Kookmin Bank")) == _norm("KB Kookmin Bank")
+
+
+def test_the_parent_keeps_its_own_node_in_a_subsidiary_list() -> None:
+    """The SDI subsidiary-list chunk, as extracted in the 2026-10-25 smoke run."""
+    text = ("[Document: SAMSUNG SDI CO., LTD. -- consolidated financial statements] "
+            "Tianjin Samsung SDI Co., Ltd. (TSDI), China, 78.0% ownership; "
+            "Samsung SDI (Tianjin) Battery Co., Ltd. (SDITB), China, 80.0%.")
+    alias, _ = _resolve_canonical_forms(
+        [("c1", None, None, [
+            {"canonical_name": "SAMSUNG SDI CO., LTD.", "short_name": "Samsung SDI"},
+            {"canonical_name": "Tianjin Samsung SDI Co., Ltd.", "short_name": "Samsung SDI Co., Ltd."},
+            {"canonical_name": "Tianjin Samsung SDI Co., Ltd.", "short_name": "TSDI"},
+        ], None)], chunk_text={"c1": text})
+    assert _norm("SAMSUNG SDI CO., LTD.") not in alias
+    assert alias.get(_norm("TSDI")) == _norm("Tianjin Samsung SDI Co., Ltd.")

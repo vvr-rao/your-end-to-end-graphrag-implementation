@@ -677,9 +677,50 @@ def _is_abbreviation(short_raw: str, long_words: list[str]) -> bool:
     return False
 
 
+# Words a longer name may add to a shorter one and still be the same name:
+# legal forms and generic designators (`Mercedes-Benz Group AG` /
+# `Mercedes-Benz`, `Standard Chartered Bank` / `Standard Chartered`).
+_GENERIC_NAME_WORDS: frozenset[str] = frozenset(
+    {_stem(t) for t in (
+        "inc", "ltd", "limited", "corp", "corporation", "company", "co",
+        "holdings", "holding", "group", "plc", "ag", "gmbh", "sa", "nv",
+        "spa", "llc", "llp", "lp", "se", "asa", "ab", "oy", "kk", "pty", "bv",
+        "kg", "zrt", "sdn", "bhd", "pvt", "pte", "the", "of", "and",
+        "bank", "trial", "study", "segment", "division", "syndrome",
+        "disease", "disorder", "mellitus", "program", "programme",
+    )}
+)
+
+
+def _subset_is_same_name(aw: list[str], bw: list[str]) -> bool:
+    """One name's words are a subset of the other's. That proves identity only
+    when the extra words are generic: `Tianjin Samsung SDI Co., Ltd.` is a
+    subsidiary of `Samsung SDI Co., Ltd.`, not another name for it, and
+    `Export-Import Bank of China` is not `Bank of China`. Measured 2026-10-25:
+    the subset rule alone folded the parent into Tianjin in both OpenAI fingen
+    builds (13-14 chunks), and stored `GLP-1` on `GLP-1 Receptor`,
+    `Interest Rate` on `Interest Rate Risk`, `cash flow` on `Free Cash Flow`.
+
+    A one-word short form still counts when it is the longer name's first or
+    last distinctive word: `Micron` of `Micron Technology, Inc.`, `Maersk` of
+    `A.P. Moller-Maersk A/S`, a surname -- but not `Samsung` of `Tianjin
+    Samsung SDI Co., Ltd.`."""
+    longer, shorter = (aw, bw) if len(set(aw)) >= len(set(bw)) else (bw, aw)
+
+    def generic(t: str) -> bool:
+        # Single letters are the pieces of `A/S`, `U.S.`, `sp. z o.o.`.
+        return len(t) == 1 or t in _GENERIC_NAME_WORDS
+
+    if all(generic(t) for t in set(longer) - set(shorter)):
+        return True
+    distinctive = [t for t in longer if not generic(t)]
+    return len(set(shorter)) == 1 and shorter[0] in (distinctive[:1] + distinctive[-1:])
+
+
 def _names_match_by_shape(a_raw: str, b_raw: str) -> bool:
     """Shape alone proves `b` names the same thing as `a`: one's words are a
-    subset of the other's (after plural folding), the words are prefixes of
+    subset of the other's (after plural folding) and the extra words are
+    generic (`_subset_is_same_name`), the words are prefixes of
     each other's (`Val-Pro-Pro` / `Valine-Proline-Proline`), or -- once the
     shared words are set aside -- what is left of one is an abbreviation of
     what is left of the other (`ACE inhibitor` / `Angiotensin-converting
@@ -691,7 +732,7 @@ def _names_match_by_shape(a_raw: str, b_raw: str) -> bool:
     if not aw or not bw:
         return False
     if set(aw) <= set(bw) or set(bw) <= set(aw):
-        return True
+        return _subset_is_same_name(aw, bw)
     if len(aw) == len(bw) and all(
             x.startswith(y) or y.startswith(x) for x, y in zip(aw, bw, strict=True)):
         return True
