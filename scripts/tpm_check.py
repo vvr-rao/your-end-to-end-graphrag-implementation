@@ -429,6 +429,27 @@ _TABLE_WORKER_MB = 200
 # buffers and the OS page cache all need room, and on a swapless box an OOM is
 # a hard kill rather than a slowdown.
 _RESERVE_MB = 600
+# Whole-page vision calls in flight inside ONE worker
+# (concurrency.table_page_vision). A waiting call holds its base64 page PNG
+# (~0.05 MB at 150 dpi) plus request/response buffers; pages are rendered one
+# at a time per worker, so the ~51 MB render spike does not multiply. 5 MB per
+# call is that with a wide margin. Capped at 8: serverless Qwen3-VL kept ~33
+# tok/s per stream at 8 in flight (2026-10-24), not measured beyond.
+_PAGE_VISION_MB = 5
+_PAGE_VISION_MAX = 8
+_TABLE_WORKERS_MAX = 8
+
+
+def table_concurrency_for_budget(budget_mb: int) -> tuple[int, int]:
+    """(concurrency.table_extraction, concurrency.table_page_vision) for a
+    memory budget. Each worker costs _TABLE_WORKER_MB plus _PAGE_VISION_MB per
+    page call it keeps in flight; the most pages per worker that still leave
+    room for one worker wins, then as many such workers as fit."""
+    for pages in (_PAGE_VISION_MAX, 4, 2, 1):
+        workers = budget_mb // (_TABLE_WORKER_MB + pages * _PAGE_VISION_MB)
+        if workers >= 1:
+            return min(_TABLE_WORKERS_MAX, workers), pages
+    return 1, 1
 
 
 # --------------------------------------------------------------------------- #
@@ -484,15 +505,17 @@ def print_build_memory(check: dict) -> None:
               f"subset first (--select-subset / --limit).")
 
 
-def advise_memory(batch_size: int, table_conc: int) -> None:
-    """Recommend memory-bound settings from what this machine actually has."""
+def advise_memory(batch_size: int, table_conc: int, page_conc: int = 1) -> dict[str, int]:
+    """Recommend memory-bound settings from what this machine actually has.
+    Returns the table knobs it suggests ({} when memory cannot be read), which
+    --apply writes alongside the rate-limit suggestions."""
     avail, total = _mem_mb()
     if avail < 0:
         print("\n\nMemory: could not be read on this platform "
               f"({sys.platform}) -- skipping memory-based advice. "
               "Linux, macOS and Windows are supported; check the OS command "
               "manually (see the run-prune-expand skill).")
-        return
+        return {}
     swap = _has_swap()
     print(f"\n\nMachine memory: {avail:,} MB available of {total:,} MB total"
           f"  |  swap: {'yes' if swap else 'NONE'}")
@@ -500,7 +523,7 @@ def advise_memory(batch_size: int, table_conc: int) -> None:
         print("  No swap: exceeding RAM is a HARD KILL mid-run, not a slowdown.")
 
     budget = max(0, avail - _RESERVE_MB)
-    rec_table = max(1, min(8, budget // _TABLE_WORKER_MB))
+    rec_table, rec_pages = table_concurrency_for_budget(budget)
     print(f"\n  usable budget: {budget:,} MB "
           f"(available minus a {_RESERVE_MB} MB reserve)")
 
@@ -513,6 +536,12 @@ def advise_memory(batch_size: int, table_conc: int) -> None:
     elif rec_table < table_conc:
         print(f"    -> LOWER it: not enough free memory for {table_conc} workers.")
 
+    print(f"\n  concurrency.table_page_vision: {page_conc}  ->  suggest {rec_pages}")
+    print(f"    Whole-page vision calls in flight per PDF (~{_PAGE_VISION_MB} MB each, "
+          f"counted in the worker budget above).")
+    print("    Each page is a decode-bound call (serverless Qwen3-VL: 40-150 s); 8 in")
+    print("    flight finished 8 pages in 150 s vs ~8x that one at a time. Output is identical.")
+
     # streaming_batch_size holds N documents' extracted text, not their files.
     # Even large labels are a few hundred KB of text, so this is cheap; the
     # config's own note puts 16 docs at ~50 MB.
@@ -523,6 +552,7 @@ def advise_memory(batch_size: int, table_conc: int) -> None:
     if avail < 1200:
         print(f"\n  NOTE: under ~1.2 GB free. Close other applications (an IDE can")
         print(f"    hold 1.5+ GB) before a long paid run.")
+    return {"table_extraction": rec_table, "table_page_vision": rec_pages}
 
 
 def _selected_paths(selection_path: str) -> set[str] | None:
@@ -686,15 +716,18 @@ def db_pool_report(mini_suggestion: int | None) -> None:
     print("  never touches the database at all.")
 
 
+_TABLE_KNOBS = ("table_extraction", "table_page_vision")
+
+
 def _parse_sets(argv: list[str]) -> dict[str, int]:
     """`--set stage=N` pairs (repeatable). Unknown stages are rejected."""
     out: dict[str, int] = {}
     for i, a in enumerate(argv):
         if a == "--set" and i + 1 < len(argv):
             k, _, v = argv[i + 1].partition("=")
-            if k not in STAGE_TASKS and k != "table_extraction":
+            if k not in STAGE_TASKS and k not in _TABLE_KNOBS:
                 raise SystemExit(f"--set: unknown stage {k!r}; "
-                                 f"one of {sorted([*STAGE_TASKS, 'table_extraction'])}")
+                                 f"one of {sorted([*STAGE_TASKS, *_TABLE_KNOBS])}")
             out[k] = int(v)
     return out
 
@@ -760,9 +793,18 @@ async def main() -> int:
 
     db_pool_report(sugg.get("evaluation", {}).get("value"))
 
+    cfg0 = get_settings().app_config
+    mem_sugg = advise_memory(
+        int((cfg0.get("chunking") or {}).get("streaming_batch_size", 8)),
+        int((cfg0.get("concurrency") or {}).get("table_extraction", 1)),
+        int((cfg0.get("concurrency") or {}).get("table_page_vision", 1)),
+    )
+
     if do_apply or manual:
         values = {k: v["value"] for k, v in sugg.items()
                   if do_apply and v["value"] is not None}
+        if do_apply:
+            values.update(mem_sugg)          # table workers + pages, from free memory
         values.update(manual)
         path = Path(__file__).resolve().parent.parent / "config" / "config.yaml"
         changes = apply_concurrency(path, values)
@@ -770,11 +812,6 @@ async def main() -> int:
         for c in changes or ["(no changes -- already at these values)"]:
             print(f"  {c}")
 
-    cfg1 = get_settings().app_config
-    advise_memory(
-        int((cfg1.get("chunking") or {}).get("streaming_batch_size", 8)),
-        int((cfg1.get("concurrency") or {}).get("table_extraction", 1)),
-    )
 
     # Minimal arg handling: first positional is the corpus, optional
     # --selection <selection.json> narrows it to a chosen subset.

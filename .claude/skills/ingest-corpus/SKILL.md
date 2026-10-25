@@ -133,12 +133,14 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
   the table again so the user sees current numbers, but only re-propose changes
   if the mode or tier changed. When the user agrees to values, WRITE them --
   the tool edits only the `concurrency:` block and keeps every comment:
-  `--apply` takes every suggestion, `--set stage=N` (repeatable) sets their
-  own. Never `--apply` without their go-ahead.
+  `--apply` takes every suggestion (including the memory-sized
+  `table_extraction` + `table_page_vision`), `--set stage=N` (repeatable) sets
+  their own. Never `--apply` without their go-ahead.
 
   **This machine's memory:** read out the `Machine memory` / `Local memory`
   lines — they are measured on the machine the skills run on, and size the
-  memory-bound knobs (`table_extraction` workers, `streaming_batch_size`, and in
+  memory-bound knobs (`table_extraction` workers, `table_page_vision` pages in
+  flight per worker, `streaming_batch_size`, and in
   DeepInfra mode every in-flight request). The `Build memory` verdict is about
   prune-expand's peak; if it says DOES NOT FIT here, prune-expand on this corpus
   was already at risk on this machine — say so before ingesting.
@@ -163,7 +165,7 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
   | limit | bounds | set by |
   |---|---|---|
   | **TPM / RPM** | every LLM stage | the provider, read from response headers |
-  | **Memory** | `table_extraction`, `streaming_batch_size` | this machine |
+  | **Memory** | `table_extraction`, `table_page_vision`, `streaming_batch_size` | this machine |
   | **DB pool** | `evaluation` (worker concurrency); every stage (pool size vs the server's client cap) | `database.pool_size` + `max_overflow` |
 
   So the rate-limit suggestion is an UPPER BOUND, not an instruction: a
@@ -192,7 +194,12 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
   PDF, ~152 MB each). With `--tables` on a PDF-heavy corpus that serial
   extraction is often the single biggest time cost -- 18 PDFs at 1 is ~100
   minutes. Report free RAM, note if there is NO SWAP (an over-commit is then a
-  hard kill), and suggest closing other apps if under ~1.2 GB free.
+  hard kill), and suggest closing other apps if under ~1.2 GB free. It also
+  suggests `concurrency.table_page_vision` (default 1): whole-page vision calls
+  in flight inside one PDF, ~5 MB each, sized TOGETHER with `table_extraction`
+  from the same budget. A statement-heavy filing sends dozens of pages at
+  40-150 s each, so this is what shortens a single long PDF; results are
+  identical at any value. Apply with `--set table_page_vision=N`.
 
   Then **tell the user what you found and propose a number**, e.g.
   > *"Your gpt-4.1-mini limit is 10M TPM and we're set to 32 — that's using well
@@ -205,7 +212,7 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
   and make clear they can name their own value or keep the defaults. See
   **run-prune-expand** Step 2c for the option table and the four effects to
   state (speed-not-savings, ~2% more spend from cache dilution, 429 risk on the
-  gpt-4.1 stages, HARD KILL risk on `table_extraction`).
+  gpt-4.1 stages, HARD KILL risk on `table_extraction` / `table_page_vision`).
 
   **If their TIER is what caps the number** -- not memory, not corpus size --
   say so explicitly and point them at platform.openai.com → Settings → Limits

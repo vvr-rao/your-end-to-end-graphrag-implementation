@@ -196,6 +196,12 @@ def test_page_vision_no_table_and_bad_json(monkeypatch) -> None:
 
 # ---- extract_tables_async integration (fake pdfplumber) ----------------------
 
+class _Detected:
+    """A pdfplumber table whose cells are the fixture's header strip."""
+    def extract(self):
+        return [["", "Note", "A$'000", "", "A$'000"]]
+
+
 class _Page:
     width, height = 600.0, 800.0
 
@@ -203,7 +209,7 @@ class _Page:
         self._text, self._n = text, n_tables
 
     def find_tables(self):
-        return [object()] * self._n
+        return [_Detected()] * self._n
 
     def extract_text(self, **kw):
         self.text_kwargs = kw
@@ -349,3 +355,89 @@ def test_page_text_uses_tight_word_gap(monkeypatch, fake_pdf) -> None:
     _patch_page_vision(monkeypatch)
     _extract(pdf, tmp)
     assert pages[0].text_kwargs == {"x_tolerance": 1}
+
+
+# ---- pages in flight (concurrency.table_page_vision) -------------------------
+
+def _patch_slow_vision(monkeypatch, conc: int) -> dict:
+    """A vision call that takes a moment and returns the grounded statement;
+    records how many were in flight at once."""
+    import json
+    seen = {"now": 0, "max": 0, "pages": []}
+    body = {"tables": [{"caption": "SOFP",
+                        "columns": [{"columnIndex": 0, "columnLabel": "2025"}],
+                        "rows": [{"rowIndex": 0, "rowLabel": "Cash",
+                                  "cells": [{"columnIndex": 0, "cellValue": "12,345"}]}]}]}
+    monkeypatch.setattr(te, "_vision_spec", lambda task, fallback=None: {"model": "m"})
+    monkeypatch.setattr(te, "_render_png_b64", lambda page, bbox: "png")
+
+    async def fake_call(spec, system, user, png):
+        seen["now"] += 1
+        seen["max"] = max(seen["max"], seen["now"])
+        seen["pages"].append(user)
+        await asyncio.sleep(0.02)
+        seen["now"] -= 1
+        return json.dumps(body), 0.01
+    monkeypatch.setattr(te, "_call_vision", fake_call)
+    monkeypatch.setattr(te, "page_vision_concurrency", lambda: conc)
+    return seen
+
+
+def _five_page_filing(pages: list) -> None:
+    pages.extend([_Page(STATEMENT, n_tables=0), _Page("Directors' report.\n" * 10, n_tables=0),
+                  _Page(STATEMENT, n_tables=1), _Page(STATEMENT, n_tables=0),
+                  _Page(STATEMENT, n_tables=0)])
+
+
+def test_pages_in_flight_give_identical_tables(monkeypatch, fake_pdf) -> None:
+    import json
+    pdf, pages, tmp = fake_pdf
+    _five_page_filing(pages)
+    out = {}
+    for conc in (1, 4):
+        seen = _patch_slow_vision(monkeypatch, conc)
+        res = _extract(pdf, tmp / f"c{conc}")
+        out[conc] = (json.dumps(res.tables, sort_keys=True), seen["max"], res.manifest)
+    assert out[1][0] == out[4][0]
+    assert out[1][1] == 1 and out[4][1] > 1, "conc 4 must overlap page calls"
+    assert out[4][2]["n_page_vision_pages"] == out[1][2]["n_page_vision_pages"] == 4
+    assert out[4][2]["page_vision_concurrency"] == 4
+    assert out[4][2]["n_page_vision_prefetch_wasted"] == 0
+    assert out[4][2]["cost_usd"] == out[1][2]["cost_usd"]
+
+
+def test_prefetch_respects_the_page_cap(monkeypatch, fake_pdf) -> None:
+    pdf, pages, tmp = fake_pdf
+    _five_page_filing(pages)
+    monkeypatch.setattr(te, "page_vision_settings", lambda: {
+        "enabled": True, "min_figure_lines": 8, "max_pages": 2, "max_ungrounded": 0.1})
+    seen = _patch_slow_vision(monkeypatch, 4)
+    res = _extract(pdf, tmp)
+    assert len(seen["pages"]) == 2 and res.manifest["n_page_vision_pages"] == 2
+
+
+def test_prefetched_page_with_a_real_table_is_discarded(monkeypatch, fake_pdf) -> None:
+    """The loop only sends a page whose pdfplumber tables were all strips; a
+    page with a real table keeps it, and its prefetched answer is dropped."""
+    import json
+    pdf, pages, tmp = fake_pdf
+    pages.extend([_Page(STATEMENT, n_tables=1), _Page(STATEMENT, n_tables=1)])
+    monkeypatch.setattr(te, "_build_jsonld_from_grid", lambda grid, **k: _table(GROUNDED))
+    monkeypatch.setattr(_Detected, "extract", lambda self: [["Cash", "12,345"], ["Inventories", "1,050"]])
+    res, sent = {}, {}
+    for conc in (1, 4):
+        sent[conc] = _patch_slow_vision(monkeypatch, conc)["pages"]
+        res[conc] = _extract(pdf, tmp / f"c{conc}")
+    assert sent[4] == [], "a page with a real ruled table must not be prefetched"
+    assert json.dumps(res[1].tables, sort_keys=True) == json.dumps(res[4].tables, sort_keys=True)
+    assert res[1].manifest["n_page_vision_pages"] == res[4].manifest["n_page_vision_pages"] == 0
+    assert len(res[4].tables) == 2
+
+
+def test_page_vision_concurrency_default_and_override(monkeypatch) -> None:
+    from types import SimpleNamespace
+    monkeypatch.setattr(te, "get_settings", lambda: SimpleNamespace(app_config={}))
+    assert te.page_vision_concurrency() == 1
+    monkeypatch.setattr(te, "get_settings", lambda: SimpleNamespace(
+        app_config={"concurrency": {"table_page_vision": 6}}))
+    assert te.page_vision_concurrency() == 6

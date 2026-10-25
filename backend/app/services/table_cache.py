@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from backend.app.core.config import cache_root
+from backend.app.core.config import cache_root, get_settings
 
 
 # Bump when the extractor's routing logic or vision prompt changes
@@ -64,15 +64,36 @@ class TableCacheEntry:
     manifest: dict[str, Any] = field(default_factory=dict)
 
 
-def doc_cache_key(doc_bytes: bytes) -> str:
-    """Hash of doc-bytes + EXTRACTOR_VERSION; the cache filename stem.
+def vision_models_tag() -> str:
+    """`provider:model` of the two vision tasks (crop, whole page), part of
+    the cache key. Without it, switching the vision model kept serving the old
+    model's tables: 2026-10-24, Qwen3-VL-30B -> 235B on DeepInfra would have
+    been a no-op for every PDF already extracted. Empty when the models
+    config cannot be read (the key then depends on version + bytes only)."""
+    try:
+        tasks = get_settings().models_config.get("tasks", {}) or {}
+    except Exception:
+        return ""
+    crop = tasks.get("table_extract_vision") or {}
+    page = tasks.get("table_extract_page_vision") or crop
+    return "|".join(f"{(t.get('provider') or 'openai').lower()}:{t.get('model') or ''}"
+                    for t in (crop, page))
 
-    Tying the version into the hash means version bumps don't have to
-    invalidate-then-recompute -- the new hash just doesn't match the
-    old file, and a fresh extraction lands at the new key."""
+
+def key_prefix() -> bytes:
+    """What the cache key hashes ahead of the document bytes."""
+    return f"{EXTRACTOR_VERSION}|{vision_models_tag()}|".encode("utf-8")
+
+
+def doc_cache_key(doc_bytes: bytes) -> str:
+    """Hash of EXTRACTOR_VERSION + vision models + doc-bytes; the cache
+    filename stem.
+
+    Tying the version and models into the hash means a bump or a model switch
+    does not have to invalidate-then-recompute -- the new hash just doesn't
+    match the old file, and a fresh extraction lands at the new key."""
     h = hashlib.sha256()
-    h.update(EXTRACTOR_VERSION.encode("utf-8"))
-    h.update(b"|")
+    h.update(key_prefix())
     h.update(doc_bytes)
     return h.hexdigest()
 

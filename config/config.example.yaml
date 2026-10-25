@@ -223,6 +223,14 @@ concurrency:
   # pathological PDF (large page rasters for the vision route) can cost several
   # times the average, and an OOM kills the whole run with no swap on this box.
   table_extraction: 1
+  # Whole-page vision calls in flight per PDF worker (borderless statements
+  # sent to the vision model page by page). Each call is decode-bound:
+  # serverless Qwen3-VL ran 40-150 s per page at ~33 tok/s per stream, and 8 in
+  # flight took 150 s for 8 pages with no per-call slowdown (2026-10-24).
+  # Output is identical at any value. ~5 MB per call in flight, so
+  # scripts/tpm_check.py sizes this together with table_extraction from free
+  # memory (worker = 200 + 5 x this). 1 = one page at a time (the old behaviour).
+  table_page_vision: 1
   # prune-expand --tables: one LLM call per extracted table
   # (table_concept_grouping). Only runs during prune-expand, which has
   # no --concurrency flag, so this is the ONLY way to set it.

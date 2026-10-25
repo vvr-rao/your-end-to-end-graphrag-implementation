@@ -141,10 +141,16 @@ whichever of its seven tasks has the least headroom. Two rules to tell the user:
 Present conservative / recommended / aggressive options (the table and the
 four effects to state are in **run-prune-expand** Step 2c: speed not savings,
 ~2% more spend from cache dilution, 429 risk on the 32k-token gpt-4.1 stages,
-hard-kill risk on `table_extraction`). When the user picks, WRITE it — the tool
+hard-kill risk on `table_extraction` / `table_page_vision`). Besides the rate-limit
+stages, the memory-bound table knobs come from the same run: `table_extraction` (PDF
+workers) and `table_page_vision` (whole-page vision calls in flight per PDF),
+split from one budget — free RAM minus a 600 MB reserve, each worker costing
+200 MB + 5 MB per page in flight (`table_concurrency_for_budget`). Read both
+out from the `Machine memory` section.
+When the user picks, WRITE it — the tool
 edits only the `concurrency:` block and keeps every comment:
 ```
-uv run python scripts/tpm_check.py --apply                          # take every suggestion
+uv run python scripts/tpm_check.py --apply                          # every suggestion, incl. the memory-sized table knobs
 uv run python scripts/tpm_check.py --set entity_extraction=32 --set dedup=8   # or their own values
 ```
 Never pass `--apply` without their go-ahead. Record it:

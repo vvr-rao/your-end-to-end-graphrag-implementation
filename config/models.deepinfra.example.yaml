@@ -20,7 +20,7 @@
 #    text-embedding-3-small vectors: use a separate or wiped database (the
 #    embedding-model guard refuses a mixed one). Retrieval thresholds are
 #    calibrated per embedding model -- see `embedding_profiles` in config.yaml.
-#  - Table vision: Qwen/Qwen3-VL-30B-A3B-Instruct (serverless).
+#  - Table vision: Qwen/Qwen3-VL-235B-A22B-Instruct (serverless).
 #  - judge_* (evaluate-queries) and relationship_repair: DeepSeek-V4.1-Flash
 #    with its own prompts. The mode is DeepInfra-ONLY: no OpenAI or Anthropic
 #    key is needed. (Cross-mode benchmarks pin one judge for every arm.)
@@ -639,13 +639,21 @@ tasks:
     temperature: 0.2
     max_tokens: 1024
 
-  # Serverless vision model (OCR-tagged, $0.15 / $0.60 per 1M). The
-  # dedicated text deployment is not used here: whether it serves images is
-  # untested, and a failed vision call drops the table.
+  # Serverless vision model (OCR-tagged, $0.20 / $0.88 per 1M). Only fires
+  # when pdfplumber cannot build a table itself. The dedicated text deployment
+  # is not used here: whether it serves images is untested, and a failed vision
+  # call drops the table.
+  # 235B, not 30B (measured 2026-10-24, 16 hard fin-gen statement pages x 2
+  # runs, scored against the page text layer): rows right 0.87 vs 0.66,
+  # precision 0.87 vs 0.73, run-to-run agreement 0.92 vs 0.60, real figures
+  # under a wrong label 2 vs 11, at $0.0026 vs $0.0022 per page. Slower: median
+  # 124 s, p90 ~250 s per page -- run pages in flight
+  # (concurrency.table_page_vision). gemini-3.7-flash matched it at 25 s but
+  # ~7x the price and is a resold proprietary model.
   table_extract_vision:
     provider: deepinfra
-    model: Qwen/Qwen3-VL-30B-A3B-Instruct
-    timeout: 300
+    model: Qwen/Qwen3-VL-235B-A22B-Instruct
+    timeout: 420
     temperature: 0.0
     max_tokens: 4096
     response_format: json_object
@@ -654,8 +662,8 @@ tasks:
   # model as table_extract_vision; a full statement page runs 3-6k tokens.
   table_extract_page_vision:
     provider: deepinfra
-    model: Qwen/Qwen3-VL-30B-A3B-Instruct
-    timeout: 420
+    model: Qwen/Qwen3-VL-235B-A22B-Instruct
+    timeout: 600
     temperature: 0.0
     max_tokens: 8192
     response_format: json_object

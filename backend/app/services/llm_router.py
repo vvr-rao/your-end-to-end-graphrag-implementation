@@ -130,6 +130,7 @@ _PRICING_PER_1K = {
     "deepseek-ai/DeepSeek-V4-Pro": (0.0013, 0.0026),
     # DeepInfra serverless vision (table_extract_vision), 2026-10-17.
     "Qwen/Qwen3-VL-30B-A3B-Instruct": (0.00015, 0.0006),
+    "Qwen/Qwen3-VL-235B-A22B-Instruct": (0.0002, 0.00088),
 }
 
 
@@ -190,6 +191,7 @@ _MODEL_CONTEXT_WINDOW = {
     "deepseek-ai/DeepSeek-V4-Pro-0813": 1_048_576,
     "deepseek-ai/DeepSeek-V4-Pro": 1_048_576,
     "Qwen/Qwen3-VL-30B-A3B-Instruct": 262_144,
+    "Qwen/Qwen3-VL-235B-A22B-Instruct": 262_144,
 }
 _DEFAULT_CONTEXT_WINDOW = 128_000
 

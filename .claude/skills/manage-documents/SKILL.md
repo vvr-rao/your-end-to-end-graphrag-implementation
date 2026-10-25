@@ -63,7 +63,9 @@ per-stage table (see **build-app** step 2b). If the tracker has a `sizing` step
 and the LLM mode has not changed since, the config is already right -- just
 confirm. Otherwise propose values and write the agreed ones with `--apply` /
 `--set stage=N`. `extract-entities` and `generate-artifacts` follow the RATE
-LIMITS, not the DB pool. For a large add, pass `--batch-size` to both so each
+LIMITS, not the DB pool. Adding PDFs with `--tables`? The same run sizes
+`table_extraction` + `table_page_vision` from this machine's free memory — read
+those out too (a long filing is mostly page-vision time). For a large add, pass `--batch-size` to both so each
 batch commits and a killed run resumes.
 
 **Chunk kind: `enrich-time` follows the corpus, `generate-artifacts` follows
