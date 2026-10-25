@@ -797,6 +797,17 @@ qa:
   # -- "revenue" links every company that reports one. Unset = off.
   concept_seeds: true
   concept_seed_limit: 25
+  # concept_name_seeds: ALSO seed concept entities NAMED like the question's
+  # concept terms (and the `class` ends of its parsed relations), whatever
+  # their class -- the class route alone missed Pancreatitis/Hypoglycemia,
+  # typed to the 103-member MedicalCondition (5/15 pharma test questions
+  # reached the right concept, 2026-10-24). concept_name_max_l2: measured on
+  # text-embedding-3-small (finance graph): intended concept 0.80-1.04,
+  # generic terms ("company", "period") nothing nearer than 1.095. Qwen
+  # vectors: see embedding_profiles. Unset = off.
+  concept_name_seeds: true
+  concept_name_max_l2: 1.0
+  concept_name_per_term: 5
   concept_terminal: true
   # Seed co-occurrence voter: chunks where >= seed_cooccurrence_min of the
   # question's OWN seeds meet -- named entities, concept entities, and one
@@ -1054,6 +1065,7 @@ embedding_profiles:
   # 0.692). The prefix alone ranks better but finds less (recall@10 0.632);
   # the rerank wins the recall back. rrf_weight_graph_walk 2.0 HURT on Qwen.
   Qwen/Qwen3-Embedding-4B:
+    qa.concept_name_max_l2: 0.66            # intended concept 0.40-0.65, generic terms >= 0.72 (pharma, 2026-10-24)
     qa.probe_dist_floor: 0.971              # base 1.05 = on-topic p95
     qa.probe_dist_ceiling: 1.172            # base 1.25 = off-topic p05
     qa.probe_rel_band: 0.109                # base 0.10, scaled by the on/off gap

@@ -807,6 +807,52 @@ async def concept_seed_entities(
     return [row[0] for row in r.all()]
 
 
+async def concept_entities_by_name(
+    session: AsyncSession,
+    terms: list[str],
+    term_embeddings: list[list[float]],
+    concept_ids: set[uuid.UUID],
+    *,
+    max_l2: float,
+    per_term: int = 5,
+) -> list[uuid.UUID]:
+    """Concept entities NAMED like the question's terms, whatever their class.
+
+    `concept_seed_entities` reaches a concept only through its class, and the
+    concept pass types most conditions to a broad one: on the pharma graph
+    Pancreatitis, Hypoglycemia and Gastroparesis are three of 103 members of
+    MedicalCondition, so "Can Mounjaro cause pancreatitis?" seeded no concept
+    at all (5 of 15 test questions reached the right one, 2026-10-24). Per
+    term: concept entities within `max_l2` of the term's vector, nearest first,
+    plus an exact (case-insensitive) name match. Measured: the intended concept
+    sat at 0.40-0.65 (Qwen3-Embedding-4B) / 0.80-1.04 (text-embedding-3-small)
+    while generic terms ("patients", "risk", "company", "period") had nothing
+    nearer than 0.72 / 1.095. A trigram arm was rejected: "risk" -> "Kidney
+    Risk" (0.42), "disease" -> "Heart Disease" (0.57).
+    """
+    if not terms or not concept_ids:
+        return []
+    out: list[uuid.UUID] = []
+    concepts = [str(c) for c in concept_ids]
+    for term, vec in zip(terms, term_embeddings, strict=False):
+        r = await session.execute(sql_text("""
+            SELECT id FROM (
+              SELECT e.id, (e.embedding <-> CAST(:v AS vector)) AS d,
+                     e.normalized_name = lower(:t) AS exact
+                FROM graphrag.entities e
+               WHERE e.id = ANY(CAST(:concepts AS uuid[])) AND e.status = 'ACTIVE'
+            ) x
+             WHERE exact OR d <= :max_l2
+             ORDER BY exact DESC, d
+             LIMIT :n
+        """), {"v": _vec_str(vec), "t": term.strip(), "concepts": concepts,
+               "max_l2": max_l2, "n": per_term})
+        for (eid,) in r.all():
+            if eid not in out:
+                out.append(eid)
+    return out
+
+
 async def class_seed_entities(
     session: AsyncSession,
     terms: list[str],

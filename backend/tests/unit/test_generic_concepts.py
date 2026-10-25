@@ -259,6 +259,10 @@ def _patch_seeding(monkeypatch, concepts):
     monkeypatch.setattr(rsql, "match_entities_by_name_or_alias", by_name)
     monkeypatch.setattr(rsql, "concept_seed_entities", concept_seeds)
 
+    async def none_by_name(session, terms, vecs, concept_ids, **kw):
+        return []
+    monkeypatch.setattr(rsql, "concept_entities_by_name", none_by_name)
+
 
 def test_named_seeds_gain_concept_seeds_when_enabled(monkeypatch) -> None:
     _patch_seeding(monkeypatch, [REV])
@@ -281,6 +285,105 @@ def test_concept_knobs_are_off_unless_configured(monkeypatch) -> None:
     qa = yaml.safe_load(open("config/config.example.yaml"))["qa"]
     assert qa["concept_seeds"] is True and qa["concept_terminal"] is True
     assert qa["seed_cooccurrence"] is True
+
+
+PANC, MOUNJARO, HYPO = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+
+
+def _patch_name_route(monkeypatch, *, enabled=True, limit=25):
+    """Mounjaro is named; Pancreatitis exists as a concept entity but its
+    class (MedicalCondition, 103 members) is not near the term, so the class
+    route returns nothing -- the 2026-10-24 pharma failure."""
+    calls = {}
+
+    @contextlib.asynccontextmanager
+    async def scope():
+        yield None
+
+    async def srcs(session):
+        return []
+
+    async def by_name_or_alias(session, term, **kw):
+        return {"Mounjaro": [MOUNJARO], "amlodipine": [MOUNJARO]}.get(term, [])
+
+    async def by_class(session, terms, vecs, q, concept_ids, **kw):
+        return []
+
+    async def by_concept_name(session, terms, vecs, concept_ids, **kw):
+        calls["terms"] = list(terms)
+        calls["kw"] = kw
+        names = {"pancreatitis": PANC, "hypotension": HYPO}
+        return [names[t] for t in terms if t in names]
+
+    cfg = {"concept_name_seeds": enabled, "concept_name_max_l2": 0.66,
+           "concept_name_per_term": 5, "concept_seed_limit": limit}
+    monkeypatch.setattr(rt, "_qa_cfg", lambda key, default: cfg.get(key, default))
+    monkeypatch.setattr(rt, "session_scope", scope)
+    monkeypatch.setattr(rsql, "document_sources", srcs)
+    monkeypatch.setattr(rsql, "match_entities_by_name_or_alias", by_name_or_alias)
+    monkeypatch.setattr(rsql, "concept_seed_entities", by_class)
+    monkeypatch.setattr(rsql, "concept_entities_by_name", by_concept_name)
+    return calls
+
+
+def test_concept_is_seeded_by_name_when_its_class_is_too_broad(monkeypatch) -> None:
+    calls = _patch_name_route(monkeypatch)
+    parsed = {"entities": ["Mounjaro"], "classes": ["pancreatitis"]}
+    seeds, tier = asyncio.run(rt._cascade_entity_seeds(parsed, [0.0], {}, _Emb(), concept_ids={PANC}))
+    assert (seeds, tier) == ([MOUNJARO, PANC], "named+concepts")
+    assert calls["kw"]["max_l2"] == 0.66 and calls["kw"]["per_term"] == 5
+
+
+def test_class_ends_of_relations_become_concept_terms(monkeypatch) -> None:
+    """'Can amlodipine cause hypotension?' parses no class term; hypotension
+    is only the `class` object of the relation. Entity and unknown ends
+    (the asked-for category) are not concept terms."""
+    calls = _patch_name_route(monkeypatch)
+    parsed = {"entities": ["amlodipine"], "classes": []}
+    rels = [{"subject": {"text": "amlodipine", "kind": "entity"}, "relation": "causes",
+             "object": {"text": "hypotension", "kind": "class"}},
+            {"subject": {"text": "drug", "kind": "unknown"}, "relation": "treats",
+             "object": {"text": "amlodipine", "kind": "entity"}}]
+    seeds, tier = asyncio.run(rt._cascade_entity_seeds(
+        parsed, [0.0], {}, _Emb(), relations=rels, concept_ids={HYPO}))
+    assert calls["terms"] == ["hypotension"]
+    assert (seeds, tier) == ([MOUNJARO, HYPO], "named+concepts")
+
+
+def test_name_route_off_keeps_the_class_route_only(monkeypatch) -> None:
+    calls = _patch_name_route(monkeypatch, enabled=False)
+    parsed = {"entities": ["Mounjaro"], "classes": ["pancreatitis"]}
+    rels = [{"subject": {"text": "Mounjaro", "kind": "entity"}, "relation": "causes",
+             "object": {"text": "hypotension", "kind": "class"}}]
+    seeds, tier = asyncio.run(rt._cascade_entity_seeds(
+        parsed, [0.0], {}, _Emb(), relations=rels, concept_ids={PANC}))
+    assert "terms" not in calls and (seeds, tier) == ([MOUNJARO], "named")
+
+
+def test_name_matches_come_first_and_share_the_cap(monkeypatch) -> None:
+    _patch_name_route(monkeypatch, limit=1)
+    other = uuid.uuid4()
+
+    async def by_class(session, terms, vecs, q, concept_ids, **kw):
+        return [other]
+    monkeypatch.setattr(rsql, "concept_seed_entities", by_class)
+    parsed = {"entities": ["Mounjaro"], "classes": ["pancreatitis"]}
+    seeds, _ = asyncio.run(rt._cascade_entity_seeds(parsed, [0.0], {}, _Emb(), concept_ids={PANC, other}))
+    assert seeds == [MOUNJARO, PANC]
+
+
+def test_concept_name_threshold_is_profiled_per_embedding_model() -> None:
+    import yaml
+    from backend.app.core.config import apply_embedding_profile
+    cfg = yaml.safe_load(open("config/config.example.yaml", encoding="utf-8"))
+    assert cfg["qa"]["concept_name_seeds"] is True and cfg["qa"]["concept_name_max_l2"] == 1.0
+    qwen = apply_embedding_profile(cfg, {"tasks": {"embeddings": {"model": "Qwen/Qwen3-Embedding-4B"}}})
+    assert qwen["qa"]["concept_name_max_l2"] == 0.66
+
+
+def test_name_route_needs_terms_and_concepts_without_touching_the_db() -> None:
+    assert asyncio.run(rsql.concept_entities_by_name(None, [], [], {PANC}, max_l2=1.0)) == []
+    assert asyncio.run(rsql.concept_entities_by_name(None, ["x"], [[0.0]], set(), max_l2=1.0)) == []
 
 
 def test_cooccurrence_needs_at_least_two_seeds_without_touching_the_db() -> None:

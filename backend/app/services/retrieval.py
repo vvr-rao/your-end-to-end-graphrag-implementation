@@ -1913,22 +1913,49 @@ async def _cascade_entity_seeds(
     if verbose and pubs:
         print(f"[query] publications kept out of seeding: {pubs}")
     class_terms = [t for t in (parsed.get("classes") or [])[:8] if t and len(t.strip()) >= 3]
+    # Concept NAMES also come from the relation parse: "Can amlodipine cause
+    # hypotension?" parsed hypotension only as the object of `cause`, not as a
+    # class term. Only `class` ends: an `entity` end is already a named seed
+    # and an `unknown` end is the category asked for ("drug"), not a concept.
+    name_terms = list(class_terms)
+    if bool(_qa_cfg("concept_name_seeds", False)):
+        taken = {normalize_term(t) for t in terms + class_terms}
+        for rel in relations or []:
+            for end in (rel.get("subject"), rel.get("object")):
+                if not isinstance(end, dict) or end.get("kind") != "class":
+                    continue
+                text = (end.get("text") or "").strip()
+                if len(text) >= 3 and normalize_term(text) not in taken:
+                    name_terms.append(text)
+                    taken.add(normalize_term(text))
     if seeds:
-        if not (concept_ids and class_terms):
+        if not (concept_ids and name_terms):
             return seeds, "named"
-        term_vecs = await embedder.embed(class_terms)
+        vecs = await embedder.embed(name_terms)
+        term_vecs = vecs[: len(class_terms)]
+        by_name: list[uuid.UUID] = []
         async with session_scope() as session:
-            concepts = await retrieval_sql.concept_seed_entities(
+            if bool(_qa_cfg("concept_name_seeds", False)):
+                by_name = await retrieval_sql.concept_entities_by_name(
+                    session, name_terms, vecs, concept_ids,
+                    max_l2=float(_qa_cfg("concept_name_max_l2", 1.0)),
+                    per_term=int(_qa_cfg("concept_name_per_term", 5)),
+                )
+            by_class = (await retrieval_sql.concept_seed_entities(
                 session, class_terms, term_vecs, qvec, concept_ids,
                 classes_per_term=int(_qa_cfg("class_seed_classes_per_term", 5)),
                 limit=int(_qa_cfg("concept_seed_limit", 25)),
-            )
+            ) if class_terms else [])
+        # Named matches first: they are the precise ones; the class route fills
+        # the rest of the cap.
+        concepts = list(dict.fromkeys(by_name + by_class))[: int(_qa_cfg("concept_seed_limit", 25))]
         added = [c for c in concepts if c not in seeds]
         if verbose:
             async with session_scope() as session:
                 _names = await retrieval_sql.describe_for_log(session, entity_ids=added)
             print(f"[query] concept seeding: {len(added)} concept entity(ies) "
-                  f"for {class_terms}: {[_names.get(c, str(c)) for c in added]}")
+                  f"for {name_terms} ({len([c for c in by_name if c in added])} by name): "
+                  f"{[_names.get(c, str(c)) for c in added]}")
         return seeds + added, ("named+concepts" if added else "named")
 
     # The class that constrains the ANSWER is not usually in parsed["classes"]:
