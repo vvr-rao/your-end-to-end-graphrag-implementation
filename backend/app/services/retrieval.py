@@ -1837,7 +1837,7 @@ async def _relationship_walk(
                 break
             hits = await retrieval_sql.relationship_hop(
                 session, frontier, probes,
-                threshold=threshold, limit=per_hop,
+                threshold=threshold, limit=per_hop, exclude_edge_ids=edge_ids,
             )
             if not hits:
                 break
