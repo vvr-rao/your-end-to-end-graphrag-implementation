@@ -8,7 +8,12 @@ from pathlib import Path
 
 from backend.app.services.evaluated_summarizer import (
     EvaluatedDocSummary,
+    _cache_load,
+    _cache_save,
+    _line_split,
     _split_on_sections,
+    _split_with_context,
+    _summary_subject,
     _token_windows,
     check_section_coverage,
     evaluated_result_to_chunks,
@@ -75,6 +80,59 @@ def test_split_on_sections_oversized_single_section() -> None:
     assert all(len(_ENC.encode(p)) <= 45 for p in pieces)
 
 
+_TITLE = "**LG ENERGY SOLUTION, LTD. Interim Condensed Separate Financial Statements (Q1 2025)**"
+_STATEMENT = _TITLE + "\n\n" + "\n".join(
+    f"*   **Line item {i}:** 13,543,750 (Mar 25) / 11,923,730 (Dec 24)" for i in range(60)
+) + "\n\nCLAIMS\n- The Company reported a net loss.\n"
+
+
+def test_oversized_block_is_cut_between_lines_never_inside_one() -> None:
+    # The LGES statement narrative sits before the first section header; the
+    # old token split cut it mid-number ("13,543" | ",750").
+    lines = set(_STATEMENT.splitlines())
+    pieces = _split_on_sections(_STATEMENT, 120, _ENC)
+    assert len(pieces) > 3
+    for p in pieces:
+        assert len(_ENC.encode(p)) <= 125
+        assert all(line in lines for line in p.splitlines())
+
+
+def test_line_split_still_cuts_a_single_overlong_line() -> None:
+    pieces = _line_split("word " * 300, 40, _ENC)
+    assert len(pieces) >= 7 and all(len(_ENC.encode(p)) <= 45 for p in pieces)
+
+
+def test_every_piece_carries_the_document_line_within_the_cap() -> None:
+    subject = _summary_subject([_STATEMENT], Path("2025_1Q_LGES_Audit_Report_FS_en.pdf"))
+    assert subject == "LG ENERGY SOLUTION, LTD. Interim Condensed Separate Financial Statements (Q1 2025)"
+    pieces = _split_with_context([_STATEMENT, "CLAIMS\n- second window"], subject, 120, _ENC)
+    assert all(p.startswith(f"[Document: {subject}]\n") for p in pieces)
+    assert all(len(_ENC.encode(p)) <= 125 for p in pieces)
+    assert pieces[-1].endswith("- second window")
+
+
+def test_subject_falls_back_to_the_file_name_but_not_a_hash() -> None:
+    no_title = ["CLAIMS\n- Ozempic reshaped the diabetes market."]
+    assert _summary_subject(no_title, Path("SDI_Audit report_2025.02.21_eng.pdf")) == "SDI Audit report 2025.02.21 eng"
+    assert _summary_subject(no_title, Path("24220c53-5b7f-417d-9a9f-c4d6267d4c11.pdf")) is None
+    assert _split_with_context(no_title, None, 1000, _ENC) == [no_title[0]]
+
+
+def test_cache_holds_window_summaries_and_rejoins_old_split_pieces(tmp_path) -> None:
+    path = tmp_path / "doc.json"
+    _cache_save(path, ["window one", "window two"])
+    assert _cache_load(path, 1200, _ENC) == (["window one", "window two"], None)
+    # Old format: the split pieces. Token-cut boundaries rejoin with no gap.
+    cap = 60
+    toks = _ENC.encode(_STATEMENT)
+    legacy = [_ENC.decode(toks[i:i + cap]) for i in range(0, len(toks), cap)]
+    path.write_text(__import__("json").dumps(legacy))
+    (rejoined,), subject = _cache_load(path, cap, _ENC)
+    assert subject is None
+    assert "13,543,750" in rejoined
+    assert rejoined.split() == _STATEMENT.split()
+
+
 def test_token_windows_overlap() -> None:
     text = "token " * 1000
     windows = _token_windows(text, 300, 50, _ENC)
@@ -119,3 +177,92 @@ def test_evidence_char_cap_configurable() -> None:
     assert 1400 < len(long) < 1700
     _, user = answer_deep_research("q", ev, 1500)
     assert user.count("A") > 1000                            # cap honored downstream
+
+
+# --------------------------------------------------------------------------- #
+# document_subject: one call per document, cached with the summary.
+# --------------------------------------------------------------------------- #
+import asyncio as _asyncio
+import json as _json
+import types as _types
+
+from backend.app.services import evaluated_summarizer as _es
+from backend.app.services.document_io import LoadedDocument
+
+_LGES_SUBJECT = {
+    "subject": "LG Energy Solution, Ltd. -- interim condensed separate financial statements, Q1 2025",
+    "organization": "LG Energy Solution, Ltd.", "document_type": "interim financial statements",
+    "period": "Q1 2025",
+}
+
+
+class _SubjectRouter:
+    def __init__(self, reply: str | Exception, configured: bool = True) -> None:
+        self.reply, self.configured, self.calls = reply, configured, []
+        self.total_cost_usd = self.cache_read_tokens = self.total_input_tokens = 0
+
+    def task_spec(self, task: str) -> dict:
+        if task == "document_subject" and not self.configured:
+            raise KeyError(task)
+        return {"model": "m"}
+
+    async def chat(self, task: str, *, system: str, user: str, **_: object):
+        self.calls.append((task, user))
+        if isinstance(self.reply, Exception):
+            raise self.reply
+        return _types.SimpleNamespace(text=self.reply)
+
+
+def _doc(name: str = "2025_1Q_LGES_Audit_Report_FS_en.pdf") -> LoadedDocument:
+    return LoadedDocument(path=Path(name), text="LG Energy Solution, Ltd. Report on review. " * 800)
+
+
+def test_document_subject_reads_the_source_opening_and_file_name() -> None:
+    router = _SubjectRouter(_json.dumps(_LGES_SUBJECT))
+    info = _asyncio.run(_es._document_subject(router, _doc(), _ENC))
+    assert info == _LGES_SUBJECT
+    (task, user), = router.calls
+    assert task == "document_subject"
+    assert "FILE NAME: 2025_1Q_LGES_Audit_Report_FS_en.pdf" in user
+    assert len(_ENC.encode(user)) < _es._SUBJECT_OPENING_TOKENS + 100   # opening only
+
+
+def test_document_subject_is_optional_and_soft() -> None:
+    unconfigured = _SubjectRouter("{}", configured=False)
+    assert _asyncio.run(_es._document_subject(unconfigured, _doc(), _ENC)) is None
+    assert unconfigured.calls == []
+    for reply in (RuntimeError("timeout"), "not json", '{"subject": ""}'):
+        assert _asyncio.run(_es._document_subject(_SubjectRouter(reply), _doc(), _ENC)) is None
+
+
+def test_cached_summary_gets_its_subject_once(tmp_path, monkeypatch) -> None:
+    # A summary cached before the subject call existed (old split-piece format,
+    # no title line -- like every gpt-4.1-mini summary): one call, then cached.
+    monkeypatch.setattr(_es, "_cache_dir", lambda: tmp_path)
+    doc = _doc()
+    key = _es._cache_key(doc.text, "m", 3, 12000, 1200)
+    (tmp_path / f"{key}.json").write_text(_json.dumps(["CLAIMS\n- Revenue: 2,177,068 (2025)."]))
+    router = _SubjectRouter(_json.dumps(_LGES_SUBJECT))
+
+    def run():
+        return _asyncio.run(_es.evaluated_summarize_documents_async([doc], router))[0]
+
+    first = run()
+    assert first.chunk_summaries == [f"[Document: {_LGES_SUBJECT['subject']}]\nCLAIMS\n- Revenue: 2,177,068 (2025)."]
+    assert first.audit["subject"] == _LGES_SUBJECT
+    saved = _json.loads((tmp_path / f"{key}.json").read_text())
+    assert saved["format"] == 2 and saved["subject"] == _LGES_SUBJECT
+    second = run()
+    assert second.chunk_summaries == first.chunk_summaries
+    assert len(router.calls) == 1
+
+
+def test_without_the_task_the_file_name_is_the_subject(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(_es, "_cache_dir", lambda: tmp_path)
+    doc = _doc("SDI_Audit report_2025.02.21_eng.pdf")
+    key = _es._cache_key(doc.text, "m", 3, 12000, 1200)
+    _es._cache_save(tmp_path / f"{key}.json", ["CLAIMS\n- Net profit rose."])
+    router = _SubjectRouter("{}", configured=False)
+    out = _asyncio.run(_es.evaluated_summarize_documents_async([doc], router))[0]
+    assert out.chunk_summaries[0].startswith("[Document: SDI Audit report 2025.02.21 eng]\n")
+    assert out.audit["subject"]["source"] == "fallback" and router.calls == []

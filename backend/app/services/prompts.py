@@ -3909,6 +3909,36 @@ def summary_revise(summary_text: str, evaluation_json: str) -> tuple[str, str]:
     return _SUMMARIZER_SYSTEM, user
 
 
+def document_subject(document_opening: str, file_name: str) -> tuple[str, str]:
+    """Who and what a document is about, read from its opening text.
+
+    Becomes the `[Document: ...]` line on every stored summary piece. Without
+    it a later piece names no company at all: the LGES revenue piece said
+    "Revenue: 2,177,068" and nothing else, so it could not be linked to
+    LG Energy Solution. Read from the SOURCE opening (cover page, report
+    header), not the summary, which may not have a title line.
+    """
+    system = (
+        "You identify what a document is. Read its opening text and file name and "
+        "return ONLY JSON: {\"subject\": str, \"organization\": str|null, "
+        "\"document_type\": str|null, \"period\": str|null}.\n"
+        "- organization: the organization or person the document is BY or ABOUT "
+        "(the issuer of a financial statement, the company a profile covers), in "
+        "its full name as written (\"LG Energy Solution, Ltd.\", not \"LGES\"). "
+        "null for a document about many organizations or none.\n"
+        "- document_type: what it is (\"interim condensed separate financial "
+        "statements\", \"news article\", \"drug label\").\n"
+        "- period: the date or period it covers, if stated.\n"
+        "- subject: one line under 160 characters combining these, e.g. "
+        "\"LG Energy Solution, Ltd. -- interim condensed separate financial "
+        "statements, Q1 2025\". For a document about many organizations, its "
+        "topic: \"Top 10 EV battery manufacturers -- 2026 guide\".\n"
+        "Use only what the text states. Never guess."
+    )
+    user = f"FILE NAME: {file_name}\n\nOPENING TEXT:\n{document_opening}\n\nReturn the JSON now."
+    return system, user
+
+
 # Public registry so callers can look up a prompt builder by task name.
 PROMPTS = {
     "chunk_classification": chunk_classification,
@@ -3926,6 +3956,7 @@ PROMPTS = {
     "summary_question_gen": summary_question_gen,
     "summary_evaluate": summary_evaluate,
     "summary_revise": summary_revise,
+    "document_subject": document_subject,
     "entity_extract": entity_extract,
     "entity_validate": entity_validate,
     "concept_extract": concept_extract,

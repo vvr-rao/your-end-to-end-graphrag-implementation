@@ -125,18 +125,50 @@ def _token_split(text: str, max_tokens: int, enc) -> list[str]:
     return [enc.decode(toks[i : i + max_tokens]) for i in range(0, len(toks), max_tokens)]
 
 
+def _line_split(text: str, max_tokens: int, enc) -> list[str]:
+    """Pack whole lines into pieces <= `max_tokens`; only a single line longer
+    than the cap is token-split.
+
+    A plain token split cut every `max_tokens` tokens wherever it landed: on
+    the LGES statements one piece ended "Total Liabilities: 13,543" and the
+    next began ",750", so each piece misstated the figure, and "LGES Wroclaw"
+    was separated from "(EBRD): 47,636". A line is the smallest unit a
+    summary states a fact in, so it is never cut.
+    """
+    pieces: list[str] = []
+    cur: list[str] = []
+    cur_tok = 0
+    for line in text.splitlines(keepends=True):
+        lt = _count_tokens(line, enc)
+        if lt > max_tokens:
+            if cur:
+                pieces.append("".join(cur))
+                cur, cur_tok = [], 0
+            pieces.extend(_token_split(line, max_tokens, enc))
+            continue
+        if cur_tok + lt > max_tokens and cur:
+            pieces.append("".join(cur))
+            cur, cur_tok = [], 0
+        cur.append(line)
+        cur_tok += lt
+    if cur:
+        pieces.append("".join(cur))
+    return [p.strip() for p in pieces if p.strip()]
+
+
 def _split_on_sections(summary: str, max_tokens: int, enc) -> list[str]:
     """Split one evaluated chunk summary into pieces <= `max_tokens`, preferring
     the section-header boundaries so CLAIMS/EVIDENCE/... blocks stay coherent.
-    Lossless: every character ends up in exactly one piece. Falls back to a
-    token split when there are no section headers or a single section is too big."""
+    Lossless: every character ends up in exactly one piece. Falls back to whole
+    lines (`_line_split`) when there are no section headers or a single section
+    is too big."""
     if _count_tokens(summary, enc) <= max_tokens:
         return [summary.strip()] if summary.strip() else []
 
     # Find header line offsets; carve the summary into [header .. next header) blocks.
     starts = [m.start() for m in _SECTION_HEADER_RE.finditer(summary)]
     if not starts:
-        return [p for p in _token_split(summary, max_tokens, enc) if p.strip()]
+        return _line_split(summary, max_tokens, enc)
     if starts[0] > 0:
         starts = [0, *starts]
     blocks: list[str] = []
@@ -156,7 +188,7 @@ def _split_on_sections(summary: str, max_tokens: int, enc) -> list[str]:
             if cur:
                 pieces.append("\n\n".join(cur))
                 cur, cur_tok = [], 0
-            pieces.extend(p for p in _token_split(blk, max_tokens, enc) if p.strip())
+            pieces.extend(_line_split(blk, max_tokens, enc))
             continue
         if cur_tok + bt > max_tokens and cur:
             pieces.append("\n\n".join(cur))
@@ -166,6 +198,88 @@ def _split_on_sections(summary: str, max_tokens: int, enc) -> list[str]:
     if cur:
         pieces.append("\n\n".join(cur))
     return [p for p in pieces if p.strip()]
+
+
+_HEX_STEM_RE = re.compile(r"(?i)^[0-9a-f]{8,}(?:[-_][0-9a-f]+)*$")
+
+
+def _summary_subject(window_summaries: list[str], doc_path: Path) -> str | None:
+    """Who and what the document is about, for the context line on every piece.
+
+    The summary's first line is the evaluated summarizer's title ("LG ENERGY
+    SOLUTION, LTD. Interim Condensed Separate Financial Statements (Q1 2025)").
+    When it is a section header or missing, fall back to the file name; a
+    hash-like name ("24220c53...") says nothing, so then there is no line.
+    """
+    for ws in window_summaries[:1]:
+        for line in ws.splitlines():
+            if not line.strip():
+                continue
+            t = " ".join(line.strip(" \t*#>_-").split())
+            if 8 <= len(t) <= 200 and not _SECTION_HEADER_RE.match(line) and re.search(r"[A-Za-z]{3}", t):
+                return t
+            break
+    stem = " ".join(re.sub(r"[_\-]+", " ", doc_path.stem).split())
+    if len(stem) >= 4 and not _HEX_STEM_RE.match(doc_path.stem) and re.search(r"[A-Za-z]{3}", stem):
+        return stem
+    return None
+
+
+_SUBJECT_OPENING_TOKENS = 3000
+
+
+async def _document_subject(
+    router: LLMRouter, doc: LoadedDocument, enc, sem: asyncio.Semaphore | None = None
+) -> dict[str, Any] | None:
+    """One `document_subject` call: who/what the document is about, read from
+    the first `_SUBJECT_OPENING_TOKENS` of the SOURCE (cover page, report
+    header). Summaries from some models have no title line at all (every
+    gpt-4.1-mini summary on the bench starts at CLAIMS), and file names say
+    "LGES" or nothing ("24220c53-....pdf").
+
+    Optional and soft: no such task in models.yaml, or any failure, returns
+    None and the caller falls back to `_summary_subject`.
+    """
+    try:
+        router.task_spec("document_subject")
+    except (KeyError, AttributeError):
+        return None
+    opening = enc.decode(enc.encode(doc.text)[:_SUBJECT_OPENING_TOKENS])
+    sys_p, usr_p = PROMPTS["document_subject"](opening, doc.name)
+    try:
+        async with (sem if sem is not None else _NoLimit()):
+            out = await router.chat("document_subject", system=sys_p, user=usr_p)
+        parsed = _extract_json(out.text) or {}
+    except Exception as exc:
+        print(f"[evaluated-summary] {doc.name}: document_subject failed: {exc}"[:200])
+        return None
+    subject = " ".join(str(parsed.get("subject") or "").split())
+    if not 4 <= len(subject) <= 200:
+        return None
+    info = {"subject": subject}
+    for k in ("organization", "document_type", "period"):
+        v = parsed.get(k)
+        info[k] = " ".join(v.split()) if isinstance(v, str) and v.strip() else None
+    return info
+
+
+def _split_with_context(
+    window_summaries: list[str], subject: str | None, max_tokens: int, enc
+) -> list[str]:
+    """Split each window summary into stored pieces and start every piece with
+    the document's context line.
+
+    Only a window's first piece carried the title, so the LGES revenue piece
+    named no company: entity extraction could not link it to LG Energy
+    Solution, and its embedding said nothing about whose figures they were.
+    The line is budgeted inside `max_tokens`.
+    """
+    if not subject:
+        return [p for ws in window_summaries for p in _split_on_sections(ws, max_tokens, enc)]
+    prefix = f"[Document: {subject}]\n"
+    budget = max(1, max_tokens - _count_tokens(prefix, enc))
+    return [prefix + p for ws in window_summaries
+            for p in _split_on_sections(ws, budget, enc)]
 
 
 def _token_windows(text: str, max_tokens: int, overlap: int, enc) -> list[str]:
@@ -306,18 +420,44 @@ def _cache_key(text: str, model: str, eval_rounds: int, max_chunk_tokens: int,
     return h.hexdigest()
 
 
-def _cache_load(path: Path) -> list[str] | None:
+def _rejoin_legacy_pieces(pieces: list[str], max_tokens: int, enc) -> str:
+    """Undo the old split. A piece the token split cut is exactly `max_tokens`
+    long (give or take a decode round-trip), so it joins to the next one with
+    no separator; every other boundary was a block boundary ("\n\n")."""
+    out = pieces[0] if pieces else ""
+    for prev, cur in zip(pieces, pieces[1:]):
+        cut = _count_tokens(prev, enc) >= max_tokens - 2 and not _SECTION_HEADER_RE.match(cur)
+        out += ("" if cut else "\n\n") + cur
+    return out
+
+
+def _cache_load(
+    path: Path, max_tokens: int, enc
+) -> tuple[list[str], dict[str, Any] | None] | None:
+    """(window summaries, document subject or None). The summaries are stored
+    unsplit, so the split can change without re-summarizing. Old entries hold
+    the split pieces; they are rejoined into one summary."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         return None
-    return data if isinstance(data, list) and data else None
+    if isinstance(data, dict) and data.get("format") == 2:
+        windows = data.get("windows")
+        subject = data.get("subject") if isinstance(data.get("subject"), dict) else None
+        return (windows, subject) if isinstance(windows, list) and windows else None
+    if isinstance(data, list) and data:
+        return [_rejoin_legacy_pieces(data, max_tokens, enc)], None
+    return None
 
 
-def _cache_save(path: Path, chunk_summaries: list[str]) -> None:
+def _cache_save(
+    path: Path, window_summaries: list[str], subject: dict[str, Any] | None = None
+) -> None:
     tmp = path.with_suffix(f".tmp.{os.getpid()}")
     try:
-        tmp.write_text(json.dumps(chunk_summaries, ensure_ascii=False), encoding="utf-8")
+        tmp.write_text(json.dumps({"format": 2, "windows": window_summaries,
+                                   "subject": subject},
+                                  ensure_ascii=False), encoding="utf-8")
         tmp.replace(path)
     except OSError:
         try:
@@ -376,12 +516,22 @@ async def evaluated_summarize_documents_async(
             key = _cache_key(doc.text, model, eval_rounds, max_chunk_tokens,
                              summary_chunk_max_tokens)
             cpath = cache_dir / f"{key}.json"
-            cached = _cache_load(cpath)
-            if cached is not None:
+            hit = _cache_load(cpath, summary_chunk_max_tokens, enc)
+            if hit is not None:
+                cached, info = hit
+                if info is None:
+                    # Summarized before the subject call existed: pay for it once.
+                    info = await _document_subject(router, doc, enc, sem)
+                    if info is not None:
+                        _cache_save(cpath, cached, info)
+                subject = info["subject"] if info else _summary_subject(cached, doc.path)
                 return EvaluatedDocSummary(
-                    path=doc.path, chunk_summaries=cached,
+                    path=doc.path,
+                    chunk_summaries=_split_with_context(
+                        cached, subject, summary_chunk_max_tokens, enc),
                     combined="\n\n".join(cached), summarized=True,
-                    audit={"summarized": True, "cache": "hit", "source_tokens": n_tok},
+                    audit={"summarized": True, "cache": "hit", "source_tokens": n_tok,
+                           "subject": info or {"subject": subject, "source": "fallback"}},
                 )
 
         windows = _token_windows(doc.text, max_chunk_tokens, overlap_tokens, enc)
@@ -444,10 +594,12 @@ async def evaluated_summarize_documents_async(
         window_summaries: list[str] = [summ_by_idx[i] for i in sorted(summ_by_idx)]
         audits: list[dict[str, Any]] = [audit_by_idx[i] for i in sorted(audit_by_idx)]
 
-        # Size-cap: split each window summary on section headers into stored chunks.
-        stored: list[str] = []
-        for ws in window_summaries:
-            stored.extend(_split_on_sections(ws, summary_chunk_max_tokens, enc))
+        # Size-cap: split each window summary on section headers into stored
+        # chunks, each starting with the document's context line.
+        info = await _document_subject(router, doc, enc, sem) if window_summaries else None
+        subject = info["subject"] if info else _summary_subject(window_summaries, doc.path)
+        stored = _split_with_context(
+            window_summaries, subject, summary_chunk_max_tokens, enc)
         if not stored:  # all windows failed -> fall back to original-text chunks
             stored = [c.text for c in chunk_documents(
                 [doc], chunk_size=chunk_size, chunk_overlap=chunk_overlap,
@@ -465,13 +617,14 @@ async def evaluated_summarize_documents_async(
         # every later run takes the cache hit and never re-summarizes the doc.
         complete = failed_windows == 0 and len(window_summaries) == len(windows)
         if cache_dir is not None and complete:
-            _cache_save(cache_dir / f"{key}.json", stored)
+            _cache_save(cache_dir / f"{key}.json", window_summaries, info)
         return EvaluatedDocSummary(
             path=doc.path, chunk_summaries=stored, combined=combined,
             summarized=True,
             audit={
                 "summarized": True, "source_tokens": n_tok,
                 "windows": len(windows), "stored_chunks": len(stored),
+                "subject": info or {"subject": subject, "source": "fallback"},
                 "windows_passed": sum(1 for a in audits if a.get("passed")),
                 "failed_windows": failed_windows,
                 "complete": complete, "cached": complete,

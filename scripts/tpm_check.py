@@ -73,7 +73,7 @@ def _num(v) -> int | None:
 STAGE_TASKS: dict[str, tuple[str, ...]] = {
     "summarization": (
         "evaluated_summary_chunk", "summary_question_gen", "summary_evaluate",
-        "summary_revise",
+        "summary_revise", "document_subject",
     ),
     "chunk_classification": ("chunk_classification",),
     "class_proposal": ("class_proposal",),
