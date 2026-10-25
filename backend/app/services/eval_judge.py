@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from backend.app.core.config import get_settings
 from backend.app.services.db_artifact_gen import _extract_json
 from backend.app.services.llm_router import LLMRouter
 from backend.app.services.prompts import PROMPTS
@@ -46,6 +47,17 @@ def _citation_validity(res: RetrievalResult) -> float | None:
     if total == 0:
         return None
     return kept / total
+
+
+def _as_synthesized(evidence: list[dict]) -> list[dict]:
+    """Evidence as the synthesis saw it: each text cut to
+    `qa.evidence_char_cap`, the same cap `retrieve_and_answer` applies.
+    The judge prompts no longer clip, so this is the only cut."""
+    cap = int(get_settings().app_config.get("qa", {}).get("evidence_char_cap", 5000))
+    return [
+        {**ev, "text": ev["text"][:cap]} if len(ev.get("text") or "") > cap else ev
+        for ev in evidence
+    ]
 
 
 @dataclass
@@ -211,20 +223,21 @@ async def evaluate_questions(
             # consistency call across the run set.
             judge_tasks: list[tuple[str, str, tuple]] = []
             for run in qres.runs:
+                evidence = _as_synthesized(run["evidence"])
                 judge_tasks.append((
                     "comprehensiveness",
                     "judge_comprehensiveness",
-                    (q, run["evidence"], run["answer"]),
+                    (q, evidence, run["answer"]),
                 ))
                 judge_tasks.append((
                     "no_hallucination",
                     "judge_no_hallucination",
-                    (q, run["evidence"], run["answer"]),
+                    (q, evidence, run["answer"]),
                 ))
                 judge_tasks.append((
                     "gap_detection",
                     "judge_gap_detection",
-                    (q, run["evidence"], run["answer"], expected_gap),
+                    (q, evidence, run["answer"], expected_gap),
                 ))
             if len(qres.runs) >= 2:
                 judge_tasks.append((

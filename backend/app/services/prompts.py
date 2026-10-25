@@ -2970,15 +2970,20 @@ def answer_conversation_turn(
     return system, user
 
 
-def _format_judge_evidence(evidence: list[dict], cap: int = 15) -> str:
-    """Compact evidence block for judge prompts."""
+def _format_judge_evidence(evidence: list[dict], cap: int | None = None) -> str:
+    """Evidence block for judge prompts: every item, full text by default.
+
+    The judge must see what the synthesis saw. It used to get the first 15
+    items cut to 400 chars, while the synthesis got every item up to
+    `qa.evidence_char_cap` (5000); a figure at char 761 of its chunk was
+    then scored as fabricated. The caller (`eval_judge`) applies the
+    synthesis cap to the texts, so nothing is clipped here.
+    """
     lines = []
     for ev in evidence[:cap]:
         kind = ev.get("kind", "evidence")
         iri = ev.get("iri", "")
         text = (ev.get("text") or "").strip().replace("\n", " ")
-        if len(text) > 400:
-            text = text[:400] + "..."
         lines.append(f"  [{kind} {iri}] {text}")
     return "\n".join(lines)
 

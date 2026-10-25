@@ -362,14 +362,13 @@ def deepseek_relationship_repair(
 # Each returns JSON {"score": 0.0-1.0, "justification": str}.
 # --------------------------------------------------------------------------- #
 
-def _judge_evidence(evidence: list[dict], cap: int = 25) -> str:
+def _judge_evidence(evidence: list[dict], cap: int | None = None) -> str:
+    # Every item, full text: see prompts._format_judge_evidence.
     lines = []
     for ev in evidence[:cap]:
         kind = ev.get("kind", "?")
         iri = ev.get("iri", "?")
         text = (ev.get("text") or "").strip().replace("\n", " ")
-        if len(text) > 400:
-            text = text[:400] + "..."
         lines.append(f"  [{kind} {iri}] {text}")
     return "\n".join(lines)
 
