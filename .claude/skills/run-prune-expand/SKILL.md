@@ -665,8 +665,18 @@ uv run python scripts/pe_report.py
 If it reports NOT complete, the run is still going or DIED — check Step 4's
 `job_status.py` and the log tail before re-launching (caches make a re-run cheap).
 
-Report: version-folder path, total cost, any preflight warnings, and that a re-run
-would hit caches. Hand the prune-expand folder path to the orchestrator — the
+prune-expand prints an `ONTOLOGY COUNTS` block at its end; to print it again for
+any version folder (no database needed):
+```
+uv run python -m backend.app.cli graph-stats --no-db --ontology <PE_DIR>
+```
+
+Report: version-folder path, total cost, any preflight warnings, that a re-run
+would hit caches, and **always the ontology counts: classes created (and the
+total before/after), instances created (net), and concept classes created** --
+the classes under `extraction.concept_class_roots` that the concept-pass menu and
+concept seeding use. A run that created 0 concept classes has an empty concept
+layer; say so. Hand the prune-expand folder path to the orchestrator — the
 ontology import into the DB is the first step of the **ingest-corpus** skill
 (`db-init --input <prune-expand-folder>`).
 

@@ -494,17 +494,22 @@ extraction:
   # entity pass's job), TimePeriod (the temporal pass), FinancialTable (the
   # StructuredTable pass). Empty list disables the concept pass entirely.
   concept_class_roots:
+    # Domain-neutral roots (any corpus: pharma, finance, manufacturing, news).
+    # Quantity covers Metric + Measure.
+    - Quantity
+    - Condition
+    - Process
+    - Method
+    - Intervention
+    - Outcome
+    - PolicyConcept
+    # Domain-flavoured roots kept from the original layer.
     - EconomicConcept
     - TechnologyConcept
-    - PolicyConcept
-    - Process
     - Industry
-    - Metric
-    - Measure
-    - FinancialObservation
     - Infrastructure
     - SupplyChainConcept
-    - MediaConcept
+    - FinancialObservation
   # Candidate-menu quality filter. Withholds instance-shaped class labels
   # ("Cholla Unit 4") and disjunction labels ("SegmentOperatingExpense or
   # SegmentAsset") from the top-K menu handed to the extractor. Neither is a
@@ -775,6 +780,27 @@ qa:
   #   terms -> top chunks mentioning their members -> those entities;
   #   (3) the closest artifacts -> the entities they are about.
   graph_seeding: cascade
+  # Concept entities (typed under extraction.concept_class_roots by the
+  # concept pass). concept_seeds: when the question names entities AND a
+  # concept ("revenue for LG Electronics"), add up to concept_seed_limit
+  # concept entities for the concept to the named seeds (tier
+  # "named+concepts"); without it the named tier drops the concept.
+  # concept_terminal: concept entities are reached but never walked THROUGH
+  # -- "revenue" links every company that reports one. Unset = off.
+  concept_seeds: true
+  concept_seed_limit: 25
+  concept_terminal: true
+  # Seed co-occurrence voter: chunks where >= seed_cooccurrence_min of the
+  # question's OWN seeds meet -- named entities, concept entities, and one
+  # point for a matching period -- ranked by how many meet (+0.5 when a
+  # named entity and a concept share the chunk). Needs no entity -> entity
+  # edge, which concept entities often lack. Its own RRF voter
+  # (rrf_weight_seed_cooccurrence); its chunks join the candidate pool.
+  # Unset = off.
+  seed_cooccurrence: true
+  seed_cooccurrence_min: 2
+  seed_cooccurrence_limit: 100
+  rrf_weight_seed_cooccurrence: 1.0
   # graph_traversal: "all_edges" walks class membership and chunk mentions too
   #   (reached 40/40 documents on every question, 7% precision).
   #   "entity_relationships" walks entity -> entity relationships only.

@@ -110,6 +110,21 @@ def _qa_cfg(key: str, default: Any) -> Any:
         return default
 
 
+def _qa_flag(key: str) -> bool:
+    """A boolean `qa.*` knob that is OFF when unset."""
+    return str(_qa_cfg(key, False)).lower() in ("true", "1", "on", "yes")
+
+
+def _concept_root_labels() -> list[str]:
+    """`extraction.concept_class_roots` -- the same roots the concept pass
+    typed its entities under, so retrieval finds exactly those entities."""
+    try:
+        roots = (get_settings().app_config.get("extraction") or {}).get("concept_class_roots")
+    except Exception:                                      # pragma: no cover
+        return []
+    return [r for r in (roots or []) if isinstance(r, str)]
+
+
 def _resolve_doc_cap(value: Any, top_k: int) -> int:
     """How many evidence chunks one document may supply.
 
@@ -584,16 +599,34 @@ async def retrieve_and_answer(
     _cascade = str(_qa_cfg("graph_seeding", "cascade")).lower() == "cascade"
     _entity_walk = (str(_qa_cfg("graph_traversal", "entity_relationships")).lower()
                     == "entity_relationships")
+    # Concept entities (typed under extraction.concept_class_roots). Seeded
+    # next to named entities when the question names a concept
+    # (qa.concept_seeds), and TERMINAL in both walks (qa.concept_terminal): a
+    # generic concept like "revenue" is linked to every company reporting
+    # one, so walking out of it reaches everything. Both default off when
+    # unset, keeping retrieval unchanged on configs that predate them.
+    _concept_ids: set[uuid.UUID] = set()
+    _seed_concepts = _qa_flag("concept_seeds")
+    _terminal_concepts = _qa_flag("concept_terminal")
+    if _seed_concepts or _terminal_concepts:
+        async with session_scope() as session:
+            _concept_ids = await retrieval_sql.concept_entity_ids(
+                session, _concept_root_labels())
     if _cascade:
         _ent_seeds, _tier = await _cascade_entity_seeds(
             parsed, qvec, aliases, embedder, rel_probes=rel_probes,
-            relations=question_relations, verbose=verbose)
+            relations=question_relations, verbose=verbose,
+            concept_ids=_concept_ids if _seed_concepts else None)
         # Time seeds still come from the ontology match; class seeds do not.
         seeds = ([(nid, t) for nid, t in seeds if t == "time_instance"]
                  + [(eid, "entity") for eid in _ent_seeds])
         if verbose:
             print(f"[query] cascade seeding: tier={_tier}, "
                   f"{len(_ent_seeds)} entity seed(s)")
+            async with session_scope() as session:
+                _names = await retrieval_sql.describe_for_log(session, entity_ids=_ent_seeds[:12])
+            print(f"[query]   seeds: {[_names.get(e, str(e)) for e in _ent_seeds[:12]]}"
+                  + (f" (+{len(_ent_seeds) - 12} more)" if len(_ent_seeds) > 12 else ""))
 
     # -------- step 5: concept expansion --------
     # Only produces CLASS seeds, so it is skipped when the cascade has replaced
@@ -626,6 +659,7 @@ async def retrieve_and_answer(
     ):
         rel_nodes, _rel_edges, rel_stage = await _relationship_walk(
             seed_entity_ids, rel_probes, max_hops=hops, verbose=verbose,
+            terminal_ids=_concept_ids if _terminal_concepts else None,
         )
         for eid, score in rel_nodes.items():
             # `hop` was hardcoded to 1 here, discarding depth. Recover it from
@@ -642,6 +676,7 @@ async def retrieve_and_answer(
             bfs_nodes = await retrieval_sql.bfs_expand(
                 session, seeds, max_hops=hops, decay=0.7,
                 entity_relationships_only=_entity_walk,
+                terminal_ids=_concept_ids if _terminal_concepts else None,
             )
         if rel_stage != "off":
             rel_stage += "->broad_walk"
@@ -719,8 +754,29 @@ async def retrieve_and_answer(
         time_chunks = await retrieval_sql.fetch_candidate_chunks_for_time_instances(
             session, expanded_time_ids, limit=200,
         )
+        # Seed co-occurrence: chunks where the question's OWN entities (named
+        # + concept seeds) and period meet. Needs no edge between them --
+        # concept entities often have none -- and ranks by how many meet.
+        cooc_chunks = (
+            await retrieval_sql.fetch_chunks_by_seed_cooccurrence(
+                session, seed_entity_ids, _concept_ids,
+                expanded_time_ids if seed_time_ids else None,
+                min_seeds=int(_qa_cfg("seed_cooccurrence_min", 2)),
+                limit=int(_qa_cfg("seed_cooccurrence_limit", 100)),
+            )
+            if _qa_flag("seed_cooccurrence") else []
+        )
         artifact_candidates = await retrieval_sql.fetch_candidate_artifacts_for_entities(
             session, expanded_entity_ids, limit=200,
+        )
+        # Only when the question named a period: an artifact dated to it is a
+        # candidate on its own, and one ALSO about a seeded entity ranks first
+        # because it sits in both RRF lists.
+        time_artifacts = (
+            await retrieval_sql.fetch_candidate_artifacts_for_time_instances(
+                session, expanded_time_ids, limit=200,
+            )
+            if seed_time_ids else []
         )
         # Artifacts surfaced IN PARALLEL with graph seeding: a vector search over
         # every artifact, independent of which entities were reached. Adds
@@ -807,9 +863,23 @@ async def retrieve_and_answer(
         )
 
     candidate_chunk_ids = list(
-        {cid for cid, _ in ent_chunks + time_chunks + doc_chunks}
+        {cid for cid, _ in ent_chunks + time_chunks + doc_chunks + cooc_chunks}
     )
+    if verbose and cooc_chunks:
+        print(f"[query] seed co-occurrence: {len(cooc_chunks)} chunk(s) hold >= "
+              f"{int(_qa_cfg('seed_cooccurrence_min', 2))} seeds "
+              f"(best score {cooc_chunks[0][1]:g})")
+        async with session_scope() as session:
+            _names = await retrieval_sql.describe_for_log(
+                session, chunk_ids=[cid for cid, _ in cooc_chunks[:5]])
+        for _cid, _score in cooc_chunks[:5]:
+            print(f"[query]   {_names.get(_cid, _cid)}  score {_score:g}")
     candidate_artifact_ids = [aid for aid, _ in artifact_candidates]
+    for _tid, _ in time_artifacts:
+        if _tid not in candidate_artifact_ids:
+            candidate_artifact_ids.append(_tid)
+    if verbose and time_artifacts:
+        print(f"[query] time-linked artifacts: {len(time_artifacts)}")
     for _gid in global_artifact_ids:
         if _gid not in candidate_artifact_ids:
             candidate_artifact_ids.append(_gid)
@@ -908,6 +978,7 @@ async def retrieve_and_answer(
                 _seen_a.add(aid)
         candidate_chunk_ids = []   # no chunk arm
         ent_chunks = []            # -> empty graph_chunk_ranking; no chunk leakage
+        cooc_chunks = []
         if verbose:
             print(
                 f"[query] artifact_only: {len(candidate_artifact_ids)} artifact "
@@ -1152,6 +1223,15 @@ async def retrieve_and_answer(
     )
     chunk_rankings.append(graph_chunk_ranking)
     chunk_weights.append(_w_graph)
+    # Seed co-occurrence as its own voter: a chunk holding both of the
+    # question's entities (or an entity and its period) outranks one that
+    # merely sits near many reached entities.
+    if cooc_chunks:
+        _cand = set(candidate_chunk_ids)
+        _cooc_ranking = [cid for cid, _ in cooc_chunks if cid in _cand]
+        if _cooc_ranking:
+            chunk_rankings.append(_cooc_ranking)
+            chunk_weights.append(float(_qa_cfg("rrf_weight_seed_cooccurrence", 1.0)))
     # Document-similarity ranking as its own RRF voter. Filtered to the
     # surviving candidate set -- the step-8.5 bridge may have swapped a
     # document's summary chunks out for its full-text ones, and voting for
@@ -1165,6 +1245,8 @@ async def retrieve_and_answer(
             chunk_weights.append(float(_qa_cfg("rrf_weight_document", 1.0)))
     if artifact_candidates:
         artifact_rankings.append([aid for aid, _ in artifact_candidates])
+    if time_artifacts:
+        artifact_rankings.append([aid for aid, _ in time_artifacts])
 
     # Records whether step 10b ran, for retrieval_plan (see below).
     _rerank_note: dict[str, Any] | None = None
@@ -1699,8 +1781,12 @@ async def _relationship_walk(
     *,
     max_hops: int = 3,
     verbose: bool = False,
+    terminal_ids: set[uuid.UUID] | None = None,
 ) -> tuple[dict[uuid.UUID, float], list[uuid.UUID], str]:
     """Walk outward from the seeds along edges that MEAN what was asked.
+
+    `terminal_ids` (concept entities) are reached and scored but never put on
+    the frontier, so no hop leaves through them.
 
     Returns `(entity_id -> score, matched edge ids, stage)`. The stage names
     where it got to, which is the thing worth watching in an eval:
@@ -1723,7 +1809,8 @@ async def _relationship_walk(
     decay = float(_qa_cfg("relationship_hop_decay", 0.7))
     reached: dict[uuid.UUID, float] = {sid: 1.0 for sid in seed_entity_ids}
     edge_ids: list[uuid.UUID] = []
-    frontier = list(seed_entity_ids)
+    terminal = terminal_ids or set()
+    frontier = [sid for sid in seed_entity_ids if sid not in terminal]
 
     async with session_scope() as session:
         for hop in range(max_hops):
@@ -1740,7 +1827,7 @@ async def _relationship_walk(
                 edge_ids.append(h["id"])
                 for end in (h["source_node_id"], h["target_node_id"]):
                     score = h["sim"] * (decay ** (hop + 1))
-                    if end not in reached:
+                    if end not in reached and end not in terminal:
                         nxt.append(end)
                     if score > reached.get(end, 0.0):
                         reached[end] = score
@@ -1780,11 +1867,14 @@ async def _cascade_entity_seeds(
     rel_probes: list[list[float]] | None = None,
     relations: list[dict[str, Any]] | None = None,
     verbose: bool = False,
+    concept_ids: set[uuid.UUID] | None = None,
 ) -> tuple[list[uuid.UUID], str]:
     """Entity seeds for the graph walk, from the first tier that finds any:
 
       1 named     entities the question names (publications excluded), by
-                  name or stored alias
+                  name or stored alias -- plus, when `concept_ids` is given,
+                  the CONCEPT entities for the question's class terms
+                  (tier "named+concepts"; retrieval_sql.concept_seed_entities)
       2 classes   the closest specific classes to the question's class terms
                   -> the top chunks mentioning their members -> those chunks'
                   entities (retrieval_sql.class_seed_entities)
@@ -1822,10 +1912,25 @@ async def _cascade_entity_seeds(
                     seeds.append(eid)
     if verbose and pubs:
         print(f"[query] publications kept out of seeding: {pubs}")
-    if seeds:
-        return seeds, "named"
-
     class_terms = [t for t in (parsed.get("classes") or [])[:8] if t and len(t.strip()) >= 3]
+    if seeds:
+        if not (concept_ids and class_terms):
+            return seeds, "named"
+        term_vecs = await embedder.embed(class_terms)
+        async with session_scope() as session:
+            concepts = await retrieval_sql.concept_seed_entities(
+                session, class_terms, term_vecs, qvec, concept_ids,
+                classes_per_term=int(_qa_cfg("class_seed_classes_per_term", 5)),
+                limit=int(_qa_cfg("concept_seed_limit", 25)),
+            )
+        added = [c for c in concepts if c not in seeds]
+        if verbose:
+            async with session_scope() as session:
+                _names = await retrieval_sql.describe_for_log(session, entity_ids=added)
+            print(f"[query] concept seeding: {len(added)} concept entity(ies) "
+                  f"for {class_terms}: {[_names.get(c, str(c)) for c in added]}")
+        return seeds + added, ("named+concepts" if added else "named")
+
     # The class that constrains the ANSWER is not usually in parsed["classes"]:
     # "who was accused of fraud" parses to classes=["fraud"], which is what the
     # relation points AT, not what is being asked for. The relation parse marks

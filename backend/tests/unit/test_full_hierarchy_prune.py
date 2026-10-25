@@ -2653,7 +2653,7 @@ def test_stream_summarize_and_chunk_falls_back_to_load_all_when_batch_size_zero(
 # ============================================================================
 
 
-def test_domain_concepts_owl_parses_with_12_buckets() -> None:
+def test_domain_concepts_owl_parses_with_23_buckets() -> None:
     """source_ontologies/core_ontologies/domain_concepts.owl declares 12
     owl:Class buckets, each ALSO typed as skos:Concept (OWL Punning), and
     one skos:ConceptScheme grouping them. The pipeline expects these
@@ -2673,22 +2673,24 @@ def test_domain_concepts_owl_parses_with_12_buckets() -> None:
     skos_concepts = list(g.subjects(RDF.type, SKOS.Concept))
     schemes = list(g.subjects(RDF.type, SKOS.ConceptScheme))
 
-    assert len(owl_classes) == 18, f"expected 18 owl:Class, got {len(owl_classes)}"
-    assert len(skos_concepts) == 18, (
-        f"expected 18 skos:Concept (dual-typed via OWL Punning), "
+    assert len(owl_classes) == 23, f"expected 23 owl:Class, got {len(owl_classes)}"
+    assert len(skos_concepts) == 23, (
+        f"expected 23 skos:Concept (dual-typed via OWL Punning), "
         f"got {len(skos_concepts)}"
     )
     assert len(schemes) == 1, f"expected 1 skos:ConceptScheme, got {len(schemes)}"
 
     # The bucket names the Stage 2 LLM uses as PARENT_LABEL.
     # Original 12 + Phase-2a-followup 6 (FinancialTable / FinancialObservation /
-    # Metric / Dimension / Measure / TimePeriod).
+    # Metric / Dimension / Measure / TimePeriod) + the domain-neutral layer
+    # 2026-10-24 (Quantity / Condition / Method / Intervention / Outcome).
     expected_locals = {
         "Industry", "EconomicConcept", "PolicyConcept", "Event", "Process",
         "Material", "NaturalResource", "TechnologyConcept", "Infrastructure",
         "SupplyChainConcept", "GeographicFeature", "DomainConcept",
         "FinancialTable", "FinancialObservation", "Metric", "Dimension",
         "Measure", "TimePeriod",
+        "Quantity", "Condition", "Method", "Intervention", "Outcome",
     }
     got_locals = {str(iri).rsplit("#", 1)[-1] for iri in owl_classes}
     assert got_locals == expected_locals, (

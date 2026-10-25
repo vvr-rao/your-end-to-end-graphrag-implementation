@@ -28,6 +28,11 @@ preconditions pass.
   `scripts/job_status.py`, so a killed session never kills the work.
 - **Bulk/paid runs are opt-in.** Smoke-test with `--limit` first where available,
   report cost, and get explicit go-ahead before a full corpus run.
+- **Report the build counts after every run**: prune-expand prints the ontology
+  counts (classes and instances created, concept classes created); every database
+  step is followed by `uv run python -m backend.app.cli graph-stats` (entities,
+  entity-to-entity edges, concept classes, concept entities, ontology classes and
+  instances, each with its change since the last report).
 - Watch database size (`db-size` / `db-status`) as data grows — free-tier Postgres
   plans often cap around 500 MB, so keep an eye on headroom.
 - **Progress is tracked across sessions** in `.build/state.jsonl` (via

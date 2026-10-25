@@ -242,6 +242,61 @@ def deepseek_class_synonym_judge(pairs: list[dict[str, str]]) -> tuple[str, str]
     return system, user
 
 
+def deepseek_concept_head_judge(
+    groups: list[dict[str, Any]], roots: list[str]
+) -> tuple[str, str]:
+    """Stage 3c for the deepinfra preset: confirm a generic HEAD parent for a
+    group of qualified concept classes and pick its domain-neutral root.
+
+    `groups`: [{"id", "head", "members": [{"label", "description"}]}].
+    Returns JSON {"decisions": [{"id", "accept", "root", "description",
+    "rejected_members"}]}.
+    """
+    system = (
+        "You review groups of ontology CLASS names that end in the same HEAD "
+        "word. For each group decide whether HEAD is a generic concept that "
+        "every member is a KIND of, so HEAD can become their parent class. "
+        "Return ONE JSON object and nothing else.\n\n"
+        "ACCEPT: Revenue for SemiconductorRevenue / RelatedPartyRevenue; "
+        "ResponseRate for ObjectiveResponseRate / OverallResponseRate; "
+        "Defect for WeldDefect / PaintDefect; Therapy for InsulinTherapy / "
+        "CombinationTherapy.\n"
+        "REJECT: heads that group companies, people, places, products or "
+        "documents (Manufacturer for BatteryManufacturer / EVManufacturer), "
+        "and heads where the members only share a word, not a kind.\n"
+        "REJECT kinds of people or groups of people (Patient for "
+        "GeriatricPatient / PediatricPatient; Population): they are not "
+        "concepts.\n"
+        "Members must share ONE sense of HEAD: DebtConsolidation and "
+        "BatteryConsolidation do not; reject the group, or list the odd "
+        "members in rejected_members.\n"
+        "Put any member that is NOT a kind of HEAD in rejected_members "
+        "(RevenueRecognitionPolicy is a policy, not a revenue).\n"
+        "When unsure, REJECT: a wrong parent misplaces every member.\n\n"
+        "root (only when accepted) is ONE of: " + ", ".join(roots) + ". "
+        "Measure = a directly reported amount (revenue, dose, output volume); "
+        "Metric = a derived ratio or rate (margin, response rate, defect "
+        "rate); Condition = a state (disease, defect, insolvency); Outcome = a "
+        "result (side effect, loss); Material = a physical or biological "
+        "substance or agent (drug, inhibitor, agonist, receptor, cell type, "
+        "steel, resin); TechnologyConcept = an engineered device, system or "
+        "technique (battery, chip, software), never a drug class.\n"
+        "description: one domain-neutral sentence about HEAD.\n"
+        "Write the JSON on ONE line."
+    )
+    lines = "\n".join(
+        f'{g["id"]}. HEAD="{g["head"]}" members: '
+        + "; ".join(f'{m["label"]} ({m.get("description", "")[:100]})' for m in g["members"])
+        for g in groups
+    )
+    user = (
+        f"GROUPS:\n{lines}\n\n"
+        'Return JSON: {"decisions": [{"id": ..., "accept": ..., "root": ..., '
+        '"description": ..., "rejected_members": [...]}]}'
+    )
+    return system, user
+
+
 # --------------------------------------------------------------------------- #
 # Relationship rescue (DeepSeek-only; cloned from the shared relationship_repair
 # 2026-10-17 so the deepinfra mode needs no OpenAI model). Same contract: the
@@ -610,7 +665,7 @@ def deepseek_class_proposal(
         "LABEL, DESCRIPTION, and PARENT_LABEL (the most specific EXISTING class "
         "in DATA_CLASSES it is a kind of -- e.g. 'ChemicalElement' for "
         "'helium', 'MetabolicDisorder' for 'insulin resistance', "
-        "'EconomicConcept' for 'stagflation'). Named things -- 'Washington', "
+        "'Quantity' for 'operating margin', 'Condition' for 'downtime'). Named things -- 'Washington', "
         "'BMW', 'Ozempic', 'SUSTAIN 6' -- are never new classes: they are "
         "INSTANCES typed by an existing class (step 4). If the right parent is "
         "itself a missing KIND, you may propose it too and use its LABEL as "

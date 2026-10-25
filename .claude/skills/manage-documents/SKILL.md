@@ -84,6 +84,16 @@ coverage degrades first. A jump against the initial ingest's figures is the
 earliest signal that the added documents need an ontology the current one does
 not cover — compare them and say whether they moved.
 
+**Report the graph counts** after the add, and after every follow-up step
+(`extract-entities`, `enrich-time`, `generate-artifacts`):
+```
+uv run python -m backend.app.cli graph-stats
+```
+Report all six with their change since the last report: entities created,
+entity-to-entity edges created, concept classes, concept entities created,
+ontology classes, ontology instances. Do the same after an update or a delete --
+a hard delete should show negative deltas.
+
 Record it:
 ```
 uv run python scripts/build_state.py record add-documents docs=<n> fulltext=<yes|no>

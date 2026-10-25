@@ -27,5 +27,6 @@ def test_concurrent_batches_merge_in_batch_order(monkeypatch) -> None:
 
     out = asyncio.run(pl._propose_concept_grouping(Router(), orphans, concurrency=3))
     assert peak == 3                                                         # really concurrent
-    assert out["TOP_LEVEL_CONCEPTS"] == [{"LABEL": "Commodity", "DESCRIPTION": "from batch 0"}]
+    # Pre-2026-10-24 replies (TOP_LEVEL_CONCEPTS) still merge, under the new key.
+    assert out["NEW_SUBCONCEPTS"] == [{"LABEL": "Commodity", "DESCRIPTION": "from batch 0"}]
     assert [a["CLASS_LABEL"] for a in out["ASSIGNMENTS"]] == ["C0", "C2", "C4"]

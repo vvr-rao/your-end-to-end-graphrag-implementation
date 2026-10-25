@@ -24,6 +24,15 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
 - A completed prune-expand version folder exists (**run-prune-expand**).
 
 ## Golden rules for the paid steps
+- **Report the graph counts after EVERY step** (db-init, register-documents,
+  extract-entities, enrich-time, enrich-geo, generate-artifacts, mine-aliases),
+  smoke tests included. Run
+  `uv run python -m backend.app.cli graph-stats`
+  and report all six, each with its change since the previous report (printed in
+  brackets): **entities created, entity-to-entity edges created (and how many
+  touch a concept), concept classes, concept entities created, ontology classes,
+  ontology instances.** A step that should have added entities or edges but shows
+  `+0` is a failure to surface, not a clean finish.
 - **Smoke-test first.** Run with `--limit 5` (or a small corpus), check the result
   and cost with the user, THEN scale to the full corpus. Never launch a full paid
   run without explicit go-ahead.
@@ -571,7 +580,10 @@ uv run python scripts/build_state.py record generate-artifacts artifacts=<n>
 
 ## Step 6 — Report + hand back
 Report what's now queryable (documents, entities, artifacts), the final `db-size`,
-and total cost. The corpus is now a knowledge graph — the user can `query` /
+total cost, and the final graph counts from
+`uv run python -m backend.app.cli graph-stats`
+(entities, entity-to-entity edges, concept classes, concept entities, ontology
+classes and instances). The corpus is now a knowledge graph — the user can `query` /
 `conversation`, or proceed to the **deploy** skill (which needs a **cloud** DB).
 
 Before handing back, confirm Step 4b ran -- both commands are silent when

@@ -57,6 +57,11 @@
         <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Dimension"/>
         <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
         <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#TimePeriod"/>
+        <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Quantity"/>
+        <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Condition"/>
+        <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Method"/>
+        <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Intervention"/>
+        <skos:hasTopConcept rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Outcome"/>
     </skos:ConceptScheme>
 
     <!-- 1. Industry -->
@@ -87,7 +92,7 @@
         <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
         <rdfs:label>PolicyConcept</rdfs:label>
         <skos:prefLabel xml:lang="en">Policy Concept</skos:prefLabel>
-        <rdfs:comment>A rule, framework, or governance instrument. Examples: Regulation, Law, Treaty, Sanction, Tariff, Ban, Policy Initiative.</rdfs:comment>
+        <rdfs:comment>A kind of rule, standard, framework or governance instrument. Examples: boxed warning, FDA approval, clinical guideline (pharma); IFRS rule, loan covenant, capital requirement (finance); ISO standard, safety regulation (manufacturing); law, treaty, sanction, tariff (general).</rdfs:comment>
         <skos:definition>A rule, regulation, treaty, or framework imposed by governments or institutions.</skos:definition>
         <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
     </owl:Class>
@@ -109,7 +114,7 @@
         <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
         <rdfs:label>Process</rdfs:label>
         <skos:prefLabel xml:lang="en">Process</skos:prefLabel>
-        <rdfs:comment>A named ongoing activity. Examples: Refining, Distillation, Decarbonization, Manufacturing, Cracking.</rdfs:comment>
+        <rdfs:comment>A kind of activity or series of steps that unfolds over time, in any domain. Examples: clinical trial, drug absorption, metabolism (pharma); audit, refinancing, consolidation (finance); assembly, curing, refining, machining (manufacturing); decarbonization, migration (general).</rdfs:comment>
         <skos:definition>A named ongoing activity (operational, industrial, or natural).</skos:definition>
         <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
     </owl:Class>
@@ -120,7 +125,7 @@
         <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
         <rdfs:label>Material</rdfs:label>
         <skos:prefLabel xml:lang="en">Material</skos:prefLabel>
-        <rdfs:comment>A physical substance, compound, or commodity. Examples: Helium, Urea, Oil, Steel, Lithium, Polymer.</rdfs:comment>
+        <rdfs:comment>A kind of physical substance, compound, or commodity. Examples: active ingredient, excipient, insulin (pharma); commodity, gold (finance); steel, resin, lithium, polymer (manufacturing); water, helium, urea (general).</rdfs:comment>
         <skos:definition>A physical substance, chemical, or compound.</skos:definition>
         <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
     </owl:Class>
@@ -143,7 +148,7 @@
         <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
         <rdfs:label>TechnologyConcept</rdfs:label>
         <skos:prefLabel xml:lang="en">Technology Concept</skos:prefLabel>
-        <rdfs:comment>A technical artifact, system, or method. Examples: Semiconductor, Wafer, AI, Battery, MRI, Cloud Computing.</rdfs:comment>
+        <rdfs:comment>A kind of technical artifact or technology. Examples: MRI, drug-delivery device (pharma); payment network, blockchain (finance); semiconductor, battery, robot arm (manufacturing); AI, cloud computing (general). Procedures and techniques belong under Method.</rdfs:comment>
         <skos:definition>A technical artifact, system, technique, or method.</skos:definition>
         <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
     </owl:Class>
@@ -187,7 +192,7 @@
         <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
         <rdfs:label>DomainConcept</rdfs:label>
         <skos:prefLabel xml:lang="en">Domain Concept</skos:prefLabel>
-        <rdfs:comment>Catch-all top-level fallback for genuinely broad / abstract concepts that don't cleanly fit any of the other buckets. Better than forcing a bad placement.</rdfs:comment>
+        <rdfs:comment>Last-resort catch-all for a concept that fits none of the other buckets (Quantity, Condition, Process, Method, Intervention, Outcome, Material, PolicyConcept, EconomicConcept, TechnologyConcept, Industry, Infrastructure, SupplyChainConcept, Event). Should be rare; a large DomainConcept branch means a placement was skipped.</rdfs:comment>
         <skos:definition>Catch-all top-level fallback for broad / abstract concepts.</skos:definition>
         <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
     </owl:Class>
@@ -221,10 +226,10 @@
     <!-- 15. Metric -->
     <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Metric">
         <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
-        <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Quantity"/>
         <rdfs:label>Metric</rdfs:label>
         <skos:prefLabel xml:lang="en">Metric</skos:prefLabel>
-        <rdfs:comment>A derived or calculated numerical value (e.g. Net Margin %, ROE, Debt-to-Equity, Yield). Distinguished from Measure by being a function of one or more measures rather than a directly observed quantity.</rdfs:comment>
+        <rdfs:comment>A derived or calculated quantity, in any domain. Examples: response rate, hazard ratio, HbA1c reduction (pharma); net margin, ROE, revenue growth (finance); yield, defect rate, OEE (manufacturing); unemployment rate (general). Distinguished from Measure by being a function of one or more measures rather than directly observed.</rdfs:comment>
         <skos:definition>A derived or calculated numerical value computed from one or more measures.</skos:definition>
         <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
     </owl:Class>
@@ -243,10 +248,10 @@
     <!-- 17. Measure -->
     <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Measure">
         <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
-        <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Quantity"/>
         <rdfs:label>Measure</rdfs:label>
         <skos:prefLabel xml:lang="en">Measure</skos:prefLabel>
-        <rdfs:comment>A raw measured quantity with units (e.g. Revenue USD M, Units Sold, Employees Count, Production MT). Distinguished from Metric by being directly observed rather than derived.</rdfs:comment>
+        <rdfs:comment>A raw measured quantity, directly observed rather than derived. Examples: dose, blood pressure, body weight (pharma); revenue, sales, operating profit (finance); output volume, cycle time (manufacturing); population (general).</rdfs:comment>
         <skos:definition>A raw measured quantity with units, directly observed rather than derived.</skos:definition>
         <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
     </owl:Class>
@@ -261,5 +266,124 @@
         <skos:definition>A bounded reporting interval used as a slicing axis on financial tables.</skos:definition>
         <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
     </owl:Class>
+
+    <!-- Domain-neutral concept layer (2026-10-24). The buckets above leaned
+         toward economics and supply chain, so pharma and manufacturing concepts
+         had nowhere to go: 482 pharma classes fell into DomainConcept and
+         MedicalCondition sat under owl:Thing, outside every concept root.
+         These roots hold the KINDS of concept any domain develops; the
+         concept pass in extract-entities offers only classes under them. -->
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Quantity">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:label>Quantity</rdfs:label>
+        <skos:prefLabel xml:lang="en">Quantity</skos:prefLabel>
+        <rdfs:comment>Any kind of measurable or reported amount, raw (Measure) or derived (Metric). Examples: dose, efficacy rate (pharma); revenue, EBITDA, related-party sales (finance); yield, throughput, defect rate (manufacturing); population, temperature (general). Name the kind, not a reading: 'revenue', not 'revenue of 35,423'.</rdfs:comment>
+        <skos:definition>A kind of measurable or reported amount; parent of Measure and Metric.</skos:definition>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Condition">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:label>Condition</rdfs:label>
+        <skos:prefLabel xml:lang="en">Condition</skos:prefLabel>
+        <rdfs:comment>A kind of state or condition something can be in, typically undesirable or notable. Examples: type 2 diabetes, obesity, hypoglycemia, adverse event (pharma); insolvency, impairment, liquidity shortfall (finance); defect, downtime, overcapacity (manufacturing); drought, shortage (general).</rdfs:comment>
+        <skos:definition>A kind of state or condition a person, organization, system or thing can be in.</skos:definition>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Method">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:label>Method</rdfs:label>
+        <skos:prefLabel xml:lang="en">Method</skos:prefLabel>
+        <rdfs:comment>A kind of technique, procedure, protocol or approach used to do something. Examples: assay, dosing regimen, randomization (pharma); valuation method, hedge accounting, DCF (finance); lean manufacturing, statistical process control, injection molding (manufacturing); survey method (general).</rdfs:comment>
+        <skos:definition>A kind of technique, procedure or approach.</skos:definition>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Intervention">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:label>Intervention</rdfs:label>
+        <skos:prefLabel xml:lang="en">Intervention</skos:prefLabel>
+        <rdfs:comment>A kind of deliberate action taken to change a situation. Examples: therapy, vaccination, bariatric surgery (pharma); share buyback, hedging, recapitalization (finance); preventive maintenance, retooling, recall (manufacturing); sanction, subsidy program (general).</rdfs:comment>
+        <skos:definition>A kind of deliberate action taken to change a situation.</skos:definition>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Outcome">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:label>Outcome</rdfs:label>
+        <skos:prefLabel xml:lang="en">Outcome</skos:prefLabel>
+        <rdfs:comment>A kind of result or effect that follows from something. Examples: remission, weight loss, side effect, mortality (pharma); return, loss, default (finance); scrap, rework, quality improvement (manufacturing); impact, benefit (general).</rdfs:comment>
+        <skos:definition>A kind of result or effect that follows from a process, intervention or condition.</skos:definition>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <!-- Generic concept predicates. Domain owl:Thing on purpose: any entity
+         can report a quantity, have a condition or use a method. The
+         relationship menu in extract-entities offers each one when a chunk
+         holds an entity under its RANGE root (predicates.GENERIC_CONCEPT_PREDICATES),
+         which is what links concept entities into the entity-to-entity walk. -->
+
+    <owl:ObjectProperty rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#hasMetric">
+        <rdfs:label>hasMetric</rdfs:label>
+        <skos:prefLabel xml:lang="en">has metric</skos:prefLabel>
+        <rdfs:domain rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:range rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Quantity"/>
+        <rdfs:comment>The subject reports, has or is measured by this quantity. 'LG Energy Solution hasMetric related-party revenue'; 'semaglutide hasMetric HbA1c reduction'; 'Plant A hasMetric defect rate'.</rdfs:comment>
+    </owl:ObjectProperty>
+
+    <owl:ObjectProperty rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#hasCondition">
+        <rdfs:label>hasCondition</rdfs:label>
+        <skos:prefLabel xml:lang="en">has condition</skos:prefLabel>
+        <rdfs:domain rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:range rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Condition"/>
+        <rdfs:comment>The subject has, suffers or is in this condition. 'patient cohort hasCondition type 2 diabetes'; 'Company X hasCondition going-concern doubt'.</rdfs:comment>
+    </owl:ObjectProperty>
+
+    <owl:ObjectProperty rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#undergoesProcess">
+        <rdfs:label>undergoesProcess</rdfs:label>
+        <skos:prefLabel xml:lang="en">undergoes process</skos:prefLabel>
+        <rdfs:domain rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:range rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Process"/>
+        <rdfs:comment>The subject undergoes or performs this process. 'tirzepatide undergoesProcess phase 3 trial'; 'Company X undergoesProcess restructuring'.</rdfs:comment>
+    </owl:ObjectProperty>
+
+    <owl:ObjectProperty rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#usesMethod">
+        <rdfs:label>usesMethod</rdfs:label>
+        <skos:prefLabel xml:lang="en">uses method</skos:prefLabel>
+        <rdfs:domain rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:range rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Method"/>
+        <rdfs:comment>The subject uses this method, technique or procedure. 'study usesMethod randomization'; 'factory usesMethod lean manufacturing'.</rdfs:comment>
+    </owl:ObjectProperty>
+
+    <owl:ObjectProperty rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#receivesIntervention">
+        <rdfs:label>receivesIntervention</rdfs:label>
+        <skos:prefLabel xml:lang="en">receives intervention</skos:prefLabel>
+        <rdfs:domain rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:range rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Intervention"/>
+        <rdfs:comment>The subject receives or carries out this intervention. 'patients receivesIntervention bariatric surgery'; 'Company X receivesIntervention recapitalization'.</rdfs:comment>
+    </owl:ObjectProperty>
+
+    <owl:ObjectProperty rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#hasOutcome">
+        <rdfs:label>hasOutcome</rdfs:label>
+        <skos:prefLabel xml:lang="en">has outcome</skos:prefLabel>
+        <rdfs:domain rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:range rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Outcome"/>
+        <rdfs:comment>This outcome results from the subject. 'semaglutide hasOutcome weight loss'; 'recall hasOutcome scrap'.</rdfs:comment>
+    </owl:ObjectProperty>
+
+    <owl:ObjectProperty rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#regulatedBy">
+        <rdfs:label>regulatedBy</rdfs:label>
+        <skos:prefLabel xml:lang="en">regulated by</skos:prefLabel>
+        <rdfs:domain rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:range rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#PolicyConcept"/>
+        <rdfs:comment>The subject is governed or constrained by this rule, standard or policy. 'Ozempic regulatedBy boxed warning'; 'bank regulatedBy capital requirement'.</rdfs:comment>
+    </owl:ObjectProperty>
 
 </rdf:RDF>

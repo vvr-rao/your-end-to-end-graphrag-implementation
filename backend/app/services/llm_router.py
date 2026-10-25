@@ -629,6 +629,7 @@ def _dump_cost_reports() -> None:
     out.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%dT%H%M%S")
     cmd = next((a for a in sys.argv[1:] if not a.startswith("-")), "run")
+    cmd = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(cmd).name) or "run"  # a path arg must not become subdirs
     for i, r in enumerate(_live_routers):
         rep = r.cost_report()
         if rep["total_calls"]:

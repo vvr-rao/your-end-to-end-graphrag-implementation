@@ -391,7 +391,7 @@ Other things worth knowing:
 ## CLI (single entrypoint)
 `uv run python -m backend.app.cli <subcommand>`. Discover everything with
 `uv run python -m backend.app.cli --help`. Groups: ontology (`merge`, `prune`,
-`expand`, `prune-expand`, `build`), DB (`db-migrate`, `db-status`, `db-size`,
+`expand`, `prune-expand`, `build`), DB (`db-migrate`, `db-status`, `db-size`, `graph-stats`,
 `enrich-geo`, `embed-relationships`, `relink-artifact-entities`,
 `db-init`, `clear-corpus`), corpus (`register-documents`, `list-documents`,
 `update-document`, `delete-document`), enrichment (`extract-entities`,

@@ -250,7 +250,7 @@ def qwen_class_proposal(
         "LABEL, DESCRIPTION, and PARENT_LABEL (the most specific EXISTING class "
         "in DATA_CLASSES it is a kind of -- e.g. 'ChemicalElement' for "
         "'helium', 'MetabolicDisorder' for 'insulin resistance', "
-        "'EconomicConcept' for 'stagflation'). Named things -- 'Washington', "
+        "'Quantity' for 'operating margin', 'Condition' for 'downtime'). Named things -- 'Washington', "
         "'BMW', 'Ozempic', 'SUSTAIN 6' -- are never new classes: they are "
         "INSTANCES typed by an existing class (step 4). If the right parent is "
         "itself a missing KIND, you may propose it too and use its LABEL as "

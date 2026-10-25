@@ -572,88 +572,91 @@ def match_dedup(
     return system, user
 
 
-def concept_grouping(orphan_classes: list[dict[str, Any]]) -> tuple[str, str]:
-    """Layer G: ONE call per prune-expand. Given a list of orphan classes
-    (no parent except owl:Thing, in the synthesized namespace), propose
-    a small set of high-level concept classes that group them and assign
-    each orphan to one concept.
+# Fallback root menu for `concept_grouping` when the caller passes none. The
+# pipeline normally builds it from the merged ontology
+# (`ontology_pruning.concept_root_menu`), so the labels always resolve.
+DEFAULT_CONCEPT_ROOTS: list[dict[str, str]] = [
+    {"LABEL": "Quantity", "DESCRIPTION": "measurable or reported amounts: dose, efficacy rate, revenue, EBITDA, yield, defect rate"},
+    {"LABEL": "Condition", "DESCRIPTION": "states something can be in: disease, adverse event, insolvency, defect, downtime, drought"},
+    {"LABEL": "Process", "DESCRIPTION": "activities unfolding over time: clinical trial, metabolism, audit, refinancing, assembly, curing"},
+    {"LABEL": "Method", "DESCRIPTION": "techniques and procedures: assay, dosing regimen, valuation method, lean manufacturing"},
+    {"LABEL": "Intervention", "DESCRIPTION": "deliberate actions: therapy, surgery, share buyback, hedging, preventive maintenance, recall"},
+    {"LABEL": "Outcome", "DESCRIPTION": "results and effects: remission, side effect, return, loss, scrap, impact"},
+    {"LABEL": "Material", "DESCRIPTION": "substances: active ingredient, excipient, steel, resin, commodity"},
+    {"LABEL": "PolicyConcept", "DESCRIPTION": "rules and standards: label warning, FDA approval, IFRS rule, covenant, ISO standard, law"},
+    {"LABEL": "EconomicConcept", "DESCRIPTION": "market phenomena: price, demand, inflation, recession, market share"},
+    {"LABEL": "TechnologyConcept", "DESCRIPTION": "technologies and technical artifacts: MRI, semiconductor, battery, AI"},
+    {"LABEL": "Industry", "DESCRIPTION": "kinds of economic activity: Pharmaceuticals, Banking, Mining, Automotive"},
+    {"LABEL": "Infrastructure", "DESCRIPTION": "built facilities: factory, hospital, port, power grid"},
+    {"LABEL": "SupplyChainConcept", "DESCRIPTION": "logistics and trade flows: supply chain, shipping route, inventory"},
+    {"LABEL": "Event", "DESCRIPTION": "named happenings: COVID-19 pandemic, product launch, merger announcement"},
+    {"LABEL": "DomainConcept", "DESCRIPTION": "LAST RESORT for a concept that fits none of the others"},
+]
 
-    Each entry in `orphan_classes` is expected to be `{LABEL, DESCRIPTION}`.
-    The prompt deliberately gives ILLUSTRATIVE concept examples but does
-    not bake in a fixed taxonomy -- the LLM picks whatever buckets fit
-    the actual orphan set.
+
+def concept_grouping(
+    orphan_classes: list[dict[str, Any]],
+    roots: list[dict[str, str]] | None = None,
+) -> tuple[str, str]:
+    """Layer G: place orphan classes (parent owl:Thing, in the synthesized
+    namespace) under the ontology's domain-neutral concept ROOTS.
+
+    The model used to invent 5-15 top-level buckets per batch from
+    economics / supply-chain examples. That made the top of the taxonomy
+    depend on the corpus and the batch: the OpenAI finance build put 250
+    orphans under 2 invented buckets, the Qwen finance build under 14, and a
+    pharma build sent 482 classes to the catch-all. Now the roots are fixed
+    (shared by every domain) and the model's only freedom is to name a
+    narrower sub-concept UNDER a root when several orphans share one.
+
+    `roots`: [{LABEL, DESCRIPTION}] -- the menu, built from the merged
+    ontology by the caller. Defaults to DEFAULT_CONCEPT_ROOTS.
     """
+    menu = roots or DEFAULT_CONCEPT_ROOTS
+    root_lines = "\n".join(
+        f"  - {r['LABEL']}: {r.get('DESCRIPTION') or ''}".rstrip() for r in menu
+    )
     system = (
         "You are an ontology curator. You will be given a JSON list of "
-        "orphan classes (each has LABEL and DESCRIPTION). These classes "
-        "currently have no parent and need to be organised under a small "
-        "set of high-level concept classes.\n\n"
+        "orphan classes (each has LABEL and DESCRIPTION). They currently "
+        "have no parent. Place each one under the ROOT CONCEPTS below.\n\n"
+        "ROOT CONCEPTS (fixed; they serve every domain -- pharma, finance, "
+        "manufacturing, news):\n"
+        + root_lines
+        + "\n\n"
         "Your task:\n"
-        "  1. Propose between 5 and 15 high-level concept classes that "
-        "would together cover the orphan set well. The concept labels "
-        "should be canonical CamelCase nouns describing a KIND of thing. "
-        "Illustrative bucket examples (use as inspiration, NOT as a "
-        "fixed list):\n"
-        "       - Material               (substances, chemicals, "
-        "compounds: helium, fertilizer, oil, urea, polymer)\n"
-        "       - NaturalResource        (extracted natural inputs: "
-        "crude oil, natural gas, ore, timber)\n"
-        "       - TechnologyConcept      (technical artifacts/processes: "
-        "semiconductor, chip, wafer, AI, battery)\n"
-        "       - Industry               (kinds of economic activity: "
-        "Agriculture, Manufacturing, Mining, Healthcare, Energy, "
-        "Transportation, Finance, Aerospace, Tourism, Construction)\n"
-        "       - Infrastructure         (built things: pipeline, port, "
-        "refinery, grid, factory, station, terminal)\n"
-        "       - SupplyChainConcept     (logistics + trade flows: "
-        "supply chain, shipping route, freight corridor)\n"
-        "       - EconomicConcept        (economic phenomena: price, "
-        "market, subsidy, inflation, demand, recession)\n"
-        "       - PolicyConcept          (rules / frameworks: regulation, "
-        "law, treaty, sanction, tariff, policy initiative)\n"
-        "       - Organization           (companies, agencies, "
-        "governments, NGOs, ASSOCIATIONS only -- NOT activity domains: "
-        "FAO, World Bank, BMW, Iran government, OPEC)\n"
-        "       - Person / Role          (named individuals + role types: "
-        "farmer, policymaker, consumer)\n"
-        "       - Event                  (named happenings: Iran war, "
-        "Hormuz crisis, COVID-19 pandemic)\n"
-        "       - Process                (named ongoing activities: "
-        "manufacturing, refining, photosynthesis, decarbonization)\n"
-        "       - DomainConcept          (CATCH-ALL fallback: use this "
-        "for genuinely broad/abstract concepts that don't cleanly fit "
-        "any of the above. Better than forcing a bad placement.)\n"
-        "     Pick the actual buckets that best fit the corpus content -- "
-        "don't force one of the examples if the data wants different "
-        "ones.\n"
-        "  2. Assign each orphan to EXACTLY ONE concept. Use the orphan's "
-        "LABEL verbatim (case-insensitive match is fine for resolution).\n"
-        "  3. Skip an orphan only if it genuinely fits none of your "
-        "proposed concepts.\n"
-        "  4. Avoid extremely narrow concepts (one or two orphans each) "
-        "and avoid extremely broad concepts (everything goes to 'Thing'). "
-        "Aim for buckets of 5-100 orphans each.\n\n"
-        "CRITICAL placement rules:\n"
-        "  - Industry vs Organization: an INDUSTRY is a kind of economic "
-        "activity ('Agriculture', 'Mining', 'Healthcare'). An "
-        "ORGANIZATION is a specific entity that operates within an "
-        "industry ('Cargill', 'WHO', 'BMW'). Do NOT place 'Agriculture' "
-        "under Organization -- Agriculture is an Industry.\n"
-        "  - If you find yourself proposing 'OrganizationConcept' as a "
-        "concept that covers many activity domains, you probably want "
-        "'Industry' or 'DomainConcept' instead.\n"
-        "  - Use 'DomainConcept' as the fallback rather than forcing a "
-        "concept into a bucket that doesn't fit. The downstream system "
-        "treats DomainConcept as a legitimate top-level grouping.\n\n"
+        "  1. Assign each orphan to EXACTLY ONE concept: either a ROOT "
+        "CONCEPT label above, or a SUB-CONCEPT you define in "
+        "NEW_SUBCONCEPTS. Use the orphan's LABEL verbatim.\n"
+        "  2. Define a SUB-CONCEPT only when at least 3 orphans share a "
+        "kind narrower than a root -- e.g. Revenue under Quantity for "
+        "SemiconductorRevenue / RelatedPartyRevenue / SegmentRevenue, "
+        "or CardiovascularCondition under Condition. Each sub-concept "
+        "names its PARENT_ROOT, which must be a ROOT CONCEPT label. Do "
+        "not invent new top-level concepts.\n"
+        "  3. Judge by what KIND of thing the orphan is, not by its "
+        "domain: 'HbA1c' and 'Net Margin' are both Quantity; 'Type 2 "
+        "Diabetes' and 'Insolvency' are both Condition; 'Lean "
+        "Manufacturing' and 'Randomization' are both Method.\n"
+        "  4. Organizations, people and places: if the orphan is a KIND "
+        "of company, person or place (EVManufacturer, Physician, "
+        "MiningRegion) and such a root is on the menu (Organization, "
+        "Person, GeographicFeature), use it; otherwise skip the orphan. "
+        "An INDUSTRY is a kind of activity, not an organization: "
+        "'Agriculture', 'Mining', 'Healthcare' go under Industry, never "
+        "under Organization.\n"
+        "  5. DomainConcept is a last resort. Prefer the closest real root.\n"
+        "  6. Skip an orphan only if it fits no concept at all.\n\n"
         "Output strict JSON in the shape:\n"
         "{\n"
-        '  "TOP_LEVEL_CONCEPTS": ['
-        '    {"LABEL": "<CamelCase concept name>",'
-        ' "DESCRIPTION": "<one-sentence definition>"}, ...'
+        '  "NEW_SUBCONCEPTS": ['
+        '    {"LABEL": "<CamelCase sub-concept>",'
+        ' "DESCRIPTION": "<one-sentence definition>",'
+        ' "PARENT_ROOT": "<a ROOT CONCEPT label>"}, ...'
         "  ],\n"
         '  "ASSIGNMENTS": ['
         '    {"CLASS_LABEL": "<exact orphan LABEL>",'
-        ' "CONCEPT_LABEL": "<a LABEL from TOP_LEVEL_CONCEPTS>"}, ...'
+        ' "CONCEPT_LABEL": "<a ROOT CONCEPT label or a NEW_SUBCONCEPTS LABEL>"}, ...'
         "  ]\n"
         "}\n"
         "No prose. No comments. Only the JSON object."
@@ -661,7 +664,61 @@ def concept_grouping(orphan_classes: list[dict[str, Any]]) -> tuple[str, str]:
     user = (
         "ORPHAN_CLASSES:\n"
         + json.dumps(orphan_classes, ensure_ascii=False, default=str)
-        + '\n\nReturn JSON: {"TOP_LEVEL_CONCEPTS": [...], "ASSIGNMENTS": [...]}'
+        + '\n\nReturn JSON: {"NEW_SUBCONCEPTS": [...], "ASSIGNMENTS": [...]}'
+    )
+    return system, user
+
+
+def concept_head_judge(
+    groups: list[dict[str, Any]], roots: list[str]
+) -> tuple[str, str]:
+    """Stage 3c: confirm a generic HEAD class for groups of qualified concept
+    classes (SemiconductorRevenue, RelatedPartyRevenue -> Revenue) and place
+    the head under one domain-neutral root.
+
+    `groups`: [{"id", "head", "members": [{"label", "description"}]}].
+    Returns JSON {"decisions": [{"id", "accept", "root", "description",
+    "rejected_members"}]}.
+    """
+    system = (
+        "You are an ontology curator. Each group below lists proposed "
+        "CLASS names that end in the same HEAD word. Decide whether the HEAD "
+        "is a real, generic concept that every member is a KIND of, so the "
+        "head can become their shared parent class.\n\n"
+        "ACCEPT when the members are kinds of the head: Revenue for "
+        "SemiconductorRevenue / RelatedPartyRevenue / SegmentRevenue; "
+        "ResponseRate for ObjectiveResponseRate / OverallResponseRate; "
+        "Defect for WeldDefect / PaintDefect; Therapy for "
+        "CombinationTherapy / InsulinTherapy.\n"
+        "REJECT when the shared word does not make them one kind: "
+        "Manufacturer for BatteryManufacturer / EVManufacturer (companies, "
+        "not concepts); Report for AnnualReport / NewsReport only if they "
+        "are documents; names of organizations, people, places or products; "
+        "kinds of people or groups of people (Patient for GeriatricPatient / "
+        "PediatricPatient; Population).\n"
+        "Every member must use the head in ONE sense: DebtConsolidation and "
+        "BatteryConsolidation do not -- reject the group or list the odd "
+        "members in rejected_members.\n"
+        "List in rejected_members any member that is NOT a kind of the head "
+        "(e.g. 'RevenueRecognitionPolicy' under Revenue).\n\n"
+        "For an accepted head choose ONE root from: "
+        + ", ".join(roots)
+        + ". Use Measure for a directly reported amount (revenue, dose, "
+        "output volume), Metric for a derived ratio or rate (margin, "
+        "response rate, defect rate), Condition for states (disease, "
+        "defect, insolvency), Outcome for results (side effect, loss), "
+        "Material for physical or biological substances and agents (drug, "
+        "inhibitor, agonist, receptor, cell type, steel, resin), "
+        "TechnologyConcept for engineered devices, systems and techniques "
+        "(battery, chip, software) -- never a drug class.\n"
+        "Give a one-sentence domain-neutral description of the head.\n"
+        "Return ONLY one JSON object, no prose."
+    )
+    user = (
+        "GROUPS:\n"
+        + json.dumps(groups, ensure_ascii=False)
+        + '\n\nReturn JSON: {"decisions": [{"id": ..., "accept": true|false, '
+        '"root": "<root>", "description": "...", "rejected_members": [...]}]}'
     )
     return system, user
 
@@ -752,8 +809,18 @@ def classification_audit(items: list[dict[str, Any]]) -> tuple[str, str]:
         "  Role            - position types (President, CEO, Minister of X)\n"
         "  Event           - named happenings (X crisis, X war, X closure, "
         "X disruption, X attack, X conflict, X blockage, X embargo, X summit)\n"
-        "  Process         - ongoing activities (refining, distillation, "
-        "decarbonization)\n"
+        "  Process         - activities over time (clinical trial, "
+        "refinancing, assembly, refining)\n"
+        "  Quantity        - measurable amounts, incl. Metric / Measure "
+        "(dose, efficacy rate, revenue, yield, defect rate)\n"
+        "  Condition       - states (disease, adverse event, insolvency, "
+        "defect, downtime)\n"
+        "  Method          - techniques / procedures (assay, valuation "
+        "method, lean manufacturing)\n"
+        "  Intervention    - deliberate actions (therapy, buyback, "
+        "preventive maintenance, recall)\n"
+        "  Outcome         - results / effects (remission, side effect, "
+        "loss, scrap)\n"
         "  Material        - substances (helium, urea, oil, steel)\n"
         "  NaturalResource - extracted inputs (crude oil, natural gas, ore)\n"
         "  Infrastructure  - physical facilities (refinery complexes, ports, "
@@ -1226,15 +1293,26 @@ def concept_extract(
         "that work: no people, no companies, no places, no product names, no "
         "named events. Only concepts.\n\n"
         "WHAT COUNTS AS A CONCEPT HERE:\n"
-        "  - A common-noun idea the passage makes a CLAIM about: \"freight "
-        "rates\", \"price war\", \"overcapacity\", \"consolidation\", "
-        "\"quantitative easing\", \"supply chain disruption\".\n"
+        "  - A common-noun idea the passage makes a CLAIM about, in any "
+        "domain: a quantity (\"related-party revenue\", \"HbA1c\", \"defect "
+        "rate\", \"freight rates\"), a condition (\"hypoglycemia\", "
+        "\"impairment\", \"overcapacity\"), a process or method "
+        "(\"randomization\", \"consolidation\", \"injection molding\"), an "
+        "intervention (\"insulin therapy\", \"share buyback\", \"recall\"), "
+        "an outcome (\"weight loss\", \"scrap\"), a rule (\"boxed "
+        "warning\", \"loan covenant\").\n"
         "  - It must be DEVELOPED, not merely mentioned. The passage says "
         "something about it -- that it rose, collapsed, caused something, is "
         "contested. A word appearing once in a list is not a concept.\n"
         "  - Use the passage's OWN wording, normalised to its most natural "
         "form (prefer the singular unless the plural is how the domain says "
-        "it: \"freight rates\", not \"freight rate\").\n\n"
+        "it: \"freight rates\", not \"freight rate\").\n"
+        "  - Name the KIND, never a reading of it: \"related-party revenue\", "
+        "not \"related-party revenue of 35,423\" or \"2025 revenue\". Amounts, "
+        "periods and the company it belongs to stay out of the name -- the "
+        "graph links those separately.\n"
+        "  - Keep the passage's qualifier when it narrows the kind "
+        "(\"related-party revenue\", \"overall response rate\").\n\n"
         "WHAT DOES NOT COUNT:\n"
         "  - Empty referring phrases: \"the industry\", \"the report\", "
         "\"the situation\", \"the company\".\n"
@@ -1243,7 +1321,8 @@ def concept_extract(
         "\"technology\".\n"
         "  - Anything a proper noun names. \"the Panama Canal\" is a place; "
         "\"canal congestion\" is a concept.\n"
-        "  - Years, dates, quantities.\n\n"
+        "  - Years, dates, and bare numbers or amounts (\"35,423\", "
+        "\"12%\").\n\n"
         "PICKING THE CLASS:\n"
         "  - class_iri MUST come from the CANDIDATE CLASSES list, verbatim, "
         "and MUST be a class denoting an ABSTRACT KIND -- a concept, metric, "

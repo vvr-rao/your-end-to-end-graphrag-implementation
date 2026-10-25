@@ -17,6 +17,7 @@ Side effects:
   4. Insert `graph_relationships` rows:
        chunk -> time:hasTime -> time_instance         (source=TIME_ENRICHMENT)
        child_time -> time:intervalDuring -> parent    (source=TIME_ENRICHMENT)
+       artifact -> time:hasTime -> time_instance      (copied from its chunks)
 
 No LLM calls. Pure regex + calendar math + SQL.
 Generic: works on any corpus that has been ingested via Milestone B.
@@ -26,11 +27,12 @@ from __future__ import annotations
 import calendar
 import re
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from backend.app.db.graph_version import bump_version, current_version
@@ -38,7 +40,11 @@ from backend.app.db.models.documents import Chunk
 from backend.app.db.models.entities import TimeInstance
 from backend.app.db.models.graph import GraphRelationship
 from backend.app.db.session import session_scope
-from backend.app.services.predicates import TIME_HAS_TIME, TIME_INTERVAL_DURING
+from backend.app.services.predicates import (
+    TIME_HAS_TIME,
+    TIME_INTERVAL_DURING,
+    VIAO_DERIVED_FROM_CHUNK,
+)
 
 _MONTHS_LONG = (
     "january february march april may june july august "
@@ -74,6 +80,32 @@ _RE_QUARTER = re.compile(
 )
 _RE_YEAR = re.compile(r"\b(19[7-9]\d|20[0-3]\d)\b")
 
+# Fiscal-period forms that filings use and the patterns above miss. Measured
+# on the LGES 1Q-2025 audit report: "1Q 2025", "1Q25" and "For the three-month
+# periods ended March 31, 2025" name the reporting quarter, and none of them
+# became a quarter (the last only became a day).
+_YY = r"(19[7-9]\d|20[0-3]\d|\d{2})"
+_RE_QUARTER_LEADING = re.compile(r"\b([1-4])Q[\s'\u2019-]?" + _YY + r"\b", re.IGNORECASE)
+_RE_QUARTER_APOS = re.compile(r"\bQ([1-4])\s?['\u2019]" + _YY + r"\b", re.IGNORECASE)
+_RE_FISCAL_YEAR = re.compile(r"\bFY[\s'\u2019-]?" + _YY + r"\b", re.IGNORECASE)
+_RE_PERIOD_ENDED = re.compile(
+    r"\b(?:three|3)[\s-]months?(?:[\s-]periods?)?\s+ended\s+"
+    r"(" + "|".join(_MONTHS_LONG + _MONTHS_SHORT) + r")\.?\s+\d{1,2},?\s+"
+    r"(19[7-9]\d|20[0-3]\d)\b"
+    r"|\bquarters?\s+ended\s+"
+    r"(" + "|".join(_MONTHS_LONG + _MONTHS_SHORT) + r")\.?\s+\d{1,2},?\s+"
+    r"(19[7-9]\d|20[0-3]\d)\b",
+    re.IGNORECASE,
+)
+
+
+def _full_year(token: str) -> int | None:
+    """'2025' -> 2025, '25' -> 2025, '98' -> 1998; None outside 1970-2039."""
+    y = int(token)
+    if len(token) == 2:
+        y += 2000 if y <= 39 else 1900
+    return y if 1970 <= y <= 2039 else None
+
 _HIGHEST: dict[str, int] = {"year": 4, "quarter": 3, "month": 2, "day": 1}
 _LOWEST: dict[str, int] = {"day": 1, "month": 2, "quarter": 3, "year": 4}
 
@@ -86,6 +118,7 @@ class EnrichSummary:
     parents_filled: int = 0
     gaps_filled: int = 0
     chunk_time_edges: int = 0
+    artifact_time_edges: int = 0
     parent_edges: int = 0
     wall_seconds: float = 0.0
     new_graph_version: int = 0
@@ -182,6 +215,25 @@ def _extract_dates(text: str) -> set[str]:
         consumed_spans.append(span)
         return True
 
+    # A period ending on a date names the quarter as well as the day. Not
+    # claimed: the day regexes below still mint the end date itself.
+    for m in _RE_PERIOD_ENDED.finditer(text):
+        mo = _MONTH_TO_INT.get((m.group(1) or m.group(3) or "").lower())
+        y = int(m.group(2) or m.group(4))
+        if mo:
+            found.add(f"Q{(mo - 1) // 3 + 1}_{y}")
+
+    for rx in (_RE_QUARTER_LEADING, _RE_QUARTER_APOS):
+        for m in rx.finditer(text):
+            y = _full_year(m.group(2))
+            if y is not None and _claim(m.span()):
+                found.add(f"Q{int(m.group(1))}_{y}")
+
+    for m in _RE_FISCAL_YEAR.finditer(text):
+        y = _full_year(m.group(1))
+        if y is not None and _claim(m.span()):
+            found.add(f"YEAR_{y}")
+
     for m in _RE_DAY_ISO.finditer(text):
         if not _claim(m.span()):
             continue
@@ -259,33 +311,51 @@ def _record_for(identifier: str) -> dict[str, Any] | None:
     return None
 
 
+def _already_enriched_chunk_ids():
+    """Chunk ids that already have a TIME_ENRICHMENT hasTime edge. Artifact
+    time edges carry source_chunk_id NULL, and one NULL in a NOT IN list
+    makes the test unknown for EVERY chunk -- so without the IS NOT NULL a
+    re-run after artifacts were dated found "no chunks left" (2026-10-24)."""
+    return select(GraphRelationship.source_chunk_id).where(
+        GraphRelationship.relationship_source == "TIME_ENRICHMENT",
+        GraphRelationship.predicate_iri == TIME_HAS_TIME,
+        GraphRelationship.source_chunk_id.is_not(None),
+    )
+
+
 async def enrich_temporal(
     *,
     limit: int | None = None,
     highest_level: str = "year",
     lowest_level: str = "month",
     chunk_kind: str = "summary",
+    chunk_kinds: Sequence[str] | None = None,
 ) -> EnrichSummary:
     """Drive: scan chunks not yet enriched, mint time_instances + edges.
 
-    `chunk_kind` ('summary' default | 'fulltext'): which chunk set to scan for
-    dates, matching extract-entities / generate-artifacts so the graph anchors
-    on one chunk kind consistently.
+    `chunk_kinds`: which chunk sets to scan for dates. The CLI passes BOTH
+    kinds on a corpus with full-text chunks. Scanning only the full-text set
+    left every summary chunk without a time edge, and summary chunks are what
+    entities and artifacts hang off -- so time and entities never met on one
+    node, and the full-text bridge (summary -> document -> fulltext) could
+    never start from a time seed. `chunk_kind` is the single-kind form, kept
+    for callers that predate the list.
+
+    Ends by copying chunk time edges onto the artifacts derived from those
+    chunks (`propagate_time_to_artifacts`).
     """
     t0 = time.time()
     summary = EnrichSummary()
+    kinds = tuple(dict.fromkeys(chunk_kinds)) if chunk_kinds else (chunk_kind,)
 
     # Pull chunks that don't yet have a time:hasTime edge.
     async with session_scope() as session:
-        already_enriched_subq = select(GraphRelationship.source_chunk_id).where(
-            GraphRelationship.relationship_source == "TIME_ENRICHMENT",
-            GraphRelationship.predicate_iri == TIME_HAS_TIME,
-        )
+        already_enriched_subq = _already_enriched_chunk_ids()
         stmt = (
             select(Chunk.id, Chunk.text)
             .where(
                 Chunk.status == "ACTIVE",
-                Chunk.kind == chunk_kind,  # 'summary' (default) or 'fulltext' (--from-fulltext)
+                Chunk.kind.in_(kinds),
                 Chunk.id.notin_(already_enriched_subq),
             )
             .order_by(Chunk.created_at)
@@ -297,9 +367,10 @@ async def enrich_temporal(
 
     if not chunks:
         print("[enrich-time] no chunks left to enrich")
+        summary.artifact_time_edges = await propagate_time_to_artifacts()
         return summary
 
-    print(f"[enrich-time] {len(chunks)} chunk(s) to scan")
+    print(f"[enrich-time] {len(chunks)} chunk(s) to scan (kinds: {', '.join(kinds)})")
 
     # Per-chunk extraction -> mapping chunk_id -> set of identifiers
     chunk_to_identifiers: list[tuple[Any, set[str]]] = []
@@ -315,6 +386,7 @@ async def enrich_temporal(
 
     if not all_identifiers:
         print("[enrich-time] no dates extracted; nothing to insert")
+        summary.artifact_time_edges = await propagate_time_to_artifacts()
         summary.wall_seconds = time.time() - t0
         return summary
 
@@ -555,6 +627,8 @@ async def enrich_temporal(
             summary.chunk_time_edges = chunk_edges
             summary.parent_edges = parent_edges
 
+    summary.artifact_time_edges = await propagate_time_to_artifacts()
+
     async with session_scope() as session:
         summary.new_graph_version = await bump_version(session)
 
@@ -565,9 +639,97 @@ async def enrich_temporal(
         f"[enrich-time] DONE: instances={summary.instances_minted} "
         f"(parents+={summary.parents_filled}, gaps+={summary.gaps_filled}), "
         f"chunk_edges={summary.chunk_time_edges}, "
+        f"artifact_edges={summary.artifact_time_edges}, "
         f"parent_edges={summary.parent_edges}, "
         f"wall={summary.wall_seconds:.1f}s, "
         f"graph_version -> {summary.new_graph_version}"
     )
 
     return summary
+
+
+
+# Artifacts with a derived-from chunk and no time edge yet, with the time
+# instances on those chunks.
+_ARTIFACT_TIME_CANDIDATES_SQL = text("""
+    SELECT a.id, a.text, array_agg(DISTINCT t.target_node_id) AS chunk_times
+      FROM graphrag.intelligence_artifacts a
+      JOIN graphrag.graph_relationships d
+        ON d.source_node_type = 'intelligence_artifact'
+       AND d.source_node_id = a.id
+       AND d.target_node_type = 'chunk'
+       AND d.predicate_iri = :derived
+      JOIN graphrag.graph_relationships t
+        ON t.source_node_type = 'chunk'
+       AND t.source_node_id = d.target_node_id
+       AND t.target_node_type = 'time_instance'
+       AND t.predicate_iri = :has_time
+     WHERE NOT EXISTS (
+           SELECT 1 FROM graphrag.graph_relationships x
+            WHERE x.source_node_type = 'intelligence_artifact'
+              AND x.source_node_id = a.id
+              AND x.predicate_iri = :has_time)
+     GROUP BY a.id, a.text
+""")
+
+
+async def propagate_time_to_artifacts() -> int:
+    """artifact -time:hasTime-> time_instance, for artifacts not yet dated.
+
+    An artifact that names a period in its OWN text ("LG Electronics sales of
+    35,423 in 1Q 2025") gets exactly those periods. Copying every date on its
+    source chunk instead tagged the average fin-gen artifact with 7.9 periods
+    -- a claim about 2025 also landed on 2019 because the same related-party
+    note compared years. An artifact that names no period ("revenue rose
+    12%") inherits its chunks' periods: its text is a paraphrase that dropped
+    the date, and the chunk still carries it.
+
+    Idempotent: artifacts that already have a time edge are skipped, so
+    enrich-time and generate-artifacts can both call it in either order.
+    Returns the number of edges added.
+    """
+    params = {"has_time": TIME_HAS_TIME, "derived": VIAO_DERIVED_FROM_CHUNK}
+    async with session_scope() as session:
+        rows = (await session.execute(_ARTIFACT_TIME_CANDIDATES_SQL, params)).all()
+        if not rows:
+            print("[enrich-time] artifact time edges added: 0")
+            return 0
+        gv = await current_version(session)
+        own = {aid: _extract_dates(txt or "") for aid, txt, _ in rows}
+        wanted = {i for ids in own.values() for i in ids}
+        id_by_ident: dict[str, Any] = {}
+        if wanted:
+            res = await session.execute(
+                select(TimeInstance.id, TimeInstance.time_identifier)
+                .where(TimeInstance.time_identifier.in_(wanted))
+            )
+            id_by_ident = {ident: tid for tid, ident in res.all()}
+        payloads: list[dict[str, Any]] = []
+        n_own = 0
+        for aid, _txt, chunk_times in rows:
+            named = {id_by_ident[i] for i in own[aid] if i in id_by_ident}
+            if named:
+                n_own += 1
+            for tid in (named or set(chunk_times or ())):
+                payloads.append({
+                    "source_node_type": "intelligence_artifact",
+                    "source_node_id": aid,
+                    "target_node_type": "time_instance",
+                    "target_node_id": tid,
+                    "predicate_iri": TIME_HAS_TIME,
+                    "predicate_label": "time:hasTime",
+                    "relationship_type": "hasTime",
+                    "relationship_source": "TIME_ENRICHMENT",
+                    "is_authoritative": True,
+                    "source_chunk_id": None,
+                    "source_document_id": None,
+                    "source_artifact_id": aid,
+                    "graph_version": gv,
+                    "extra_metadata": {"time_from": "artifact_text" if named else "source_chunk"},
+                })
+        for i in range(0, len(payloads), 500):
+            await session.execute(pg_insert(GraphRelationship).values(payloads[i:i + 500]))
+    print(f"[enrich-time] artifact time edges added: {len(payloads)} over {len(rows)} "
+          f"artifact(s) ({n_own} dated from their own text, "
+          f"{len(rows) - n_own} from their source chunks)")
+    return len(payloads)
