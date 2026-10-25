@@ -24,7 +24,7 @@ def test_ontology_stats_counts_created_and_concept_classes(tmp_path) -> None:
         DC + "RelatedPartyRevenue": _cls(DC + "RelatedPartyRevenue", DC + "Revenue"),
         DC + "Acme": _cls(DC + "Acme", "http://example.org/Organization"),
     }
-    (tmp_path / "merged.json").write_text(json.dumps({"classes_dict": classes}))
+    (tmp_path / "merged.json").write_text(json.dumps({"classes_dict": classes}), encoding="utf-8")
     s = rs.ontology_stats(tmp_path, ["Measure"])
     assert s["classes_created"] == 3
     assert s["instances_created"] == 4

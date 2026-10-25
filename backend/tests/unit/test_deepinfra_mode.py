@@ -164,7 +164,7 @@ async def test_thinking_kwarg_is_not_sent_to_tasks_that_do_not_set_it() -> None:
 # --------------------------------------------------------------------------- #
 
 def test_preset_routes_creation_to_dedicated_qa_to_deepseek() -> None:
-    tasks = yaml.safe_load(open(PRESET))["tasks"]
+    tasks = yaml.safe_load(open(PRESET, encoding="utf-8"))["tasks"]
     assert tasks["class_proposal"]["model"] == "__DEEPINFRA_FLASH_MODEL__"
     assert tasks["entity_extract"]["provider"] == "deepinfra"
     # Q&A runs on serverless DeepSeek-V4.1-Flash (won the 2026-10-17 head to
@@ -529,7 +529,7 @@ def test_qwen_class_proposal_prompt_is_separate() -> None:
 
 
 def test_preset_selects_qwen_prompt_only_for_class_proposal() -> None:
-    tasks = yaml.safe_load(open(PRESET))["tasks"]
+    tasks = yaml.safe_load(open(PRESET, encoding="utf-8"))["tasks"]
     assert tasks["class_proposal"]["prompt_set"] == "qwen"
     assert tasks["relationship_extract"]["prompt_set"] == "deepseek"
     assert tasks["relationship_extract"]["model"] == "deepseek-ai/DeepSeek-V4.1-Flash"
@@ -541,7 +541,7 @@ def test_preset_selects_qwen_prompt_only_for_class_proposal() -> None:
 
 def test_deepinfra_preset_is_deepinfra_only() -> None:
     """User decision 2026-10-17: no OpenAI or Anthropic model anywhere in this mode."""
-    doc = yaml.safe_load(open(PRESET))
+    doc = yaml.safe_load(open(PRESET, encoding="utf-8"))
     assert {v["provider"] for v in doc["tasks"].values()} == {"deepinfra"}
     import select_llm_mode as sel
 
@@ -689,11 +689,11 @@ def test_salvage_is_opt_in() -> None:
     assert _salvage_enabled(_R({})) is False
     assert _salvage_enabled(object()) is False
     assert _salvage_enabled(_R({"salvage_truncated": True})) is True
-    tasks = yaml.safe_load(open(PRESET))["tasks"]
+    tasks = yaml.safe_load(open(PRESET, encoding="utf-8"))["tasks"]
     assert tasks["class_proposal"]["salvage_truncated"] is True
     for other in ("config/models.openai.example.yaml", "config/models.example.yaml",
                   "config/models.anthropic.example.yaml"):
-        assert "salvage_truncated" not in yaml.safe_load(open(other))["tasks"]["class_proposal"]
+        assert "salvage_truncated" not in yaml.safe_load(open(other, encoding="utf-8"))["tasks"]["class_proposal"]
 
 
 # --------------------------------------------------------------------------- #
@@ -938,7 +938,7 @@ def test_class_rules_prompt_and_preset_guard() -> None:
     hidden runaway guard; the per-list instance bound matches the prompt."""
     from backend.app.services import prompts_qwen as pq
 
-    spec = yaml.safe_load(open(PRESET))["tasks"]["class_proposal"]
+    spec = yaml.safe_load(open(PRESET, encoding="utf-8"))["tasks"]["class_proposal"]
     assert spec["max_new_classes"] == 60 and "max_new_classes_with_lists" not in spec
     assert spec["max_instances_per_list"] == pq.QWEN_INSTANCES_PER_LIST
     system, user = pq.qwen_class_proposal({}, "text")
@@ -1000,7 +1000,7 @@ def test_both_class_prompts_state_the_adverse_event_hierarchy() -> None:
         assert "never a class. A list of adverse reactions has ITEMS_ARE_KINDS false" in system
         assert "DRUGS ARE NEVER CLASSES" in system and "relation endpoint" in system
         assert all(t in system for t in ae.TYPES) and ae.ROOT in system
-    spec = yaml.safe_load(open(PRESET))["tasks"]["class_proposal"]
+    spec = yaml.safe_load(open(PRESET, encoding="utf-8"))["tasks"]["class_proposal"]
     assert spec["adverse_event_taxonomy"] is True
     assert spec["ontology_view"] == {"full_max_classes": 600, "subtree_max_classes": 600}
 

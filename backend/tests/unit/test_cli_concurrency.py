@@ -135,7 +135,7 @@ def test_shipped_config_defines_every_stage() -> None:
     """A stage missing from config.example.yaml would silently fall back to 4."""
     import yaml
 
-    example = yaml.safe_load(open("config/config.example.yaml"))
+    example = yaml.safe_load(open("config/config.example.yaml", encoding="utf-8"))
     block = example.get("concurrency") or {}
     missing = [s for s in STAGES + CONFIG_ONLY_STAGES if s not in block]
     assert not missing, f"config.example.yaml is missing concurrency keys: {missing}"
@@ -257,7 +257,7 @@ def test_dedup_concurrency_is_its_own_key() -> None:
     dedup batches but only 196 Stage-2 chunks."""
     import yaml
 
-    block = yaml.safe_load(open("config/config.example.yaml")).get("concurrency") or {}
+    block = yaml.safe_load(open("config/config.example.yaml", encoding="utf-8")).get("concurrency") or {}
     for key in ("chunk_classification", "class_proposal", "dedup"):
         assert key in block, f"config.example.yaml missing concurrency.{key}"
 

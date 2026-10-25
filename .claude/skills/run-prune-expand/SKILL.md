@@ -139,8 +139,11 @@ ask their preference — don't silently pick. Lay out the trade-off:
 - **Without `--tables` (default):** faster and free; tables inside PDFs get read as
   run-on text and lose their row/column structure.
 - **With `--tables`:** extracts structured tables from PDFs so their rows/columns
-  become retrievable. Costs ~$0.02–0.04 per typical 10-K (vision). Worth it for
-  data-heavy corpora — financial filings, spec sheets, anything numeric.
+  become retrievable. Costs ~$0.02–0.04 per typical 10-K (vision); DeepInfra mode
+  (Qwen3-VL-235B) measured $0.04–0.13 per audited filing (55–99 pages). Vision
+  only fires when pdfplumber cannot build the table itself (borderless
+  statements, merged cells). Worth it for data-heavy corpora — financial
+  filings, spec sheets, anything numeric.
 - **`--tables --no-table-vision`:** tables via pdfplumber only — free, but loses
   nested / merged-cell tables.
 
@@ -231,6 +234,14 @@ uv run python scripts/tpm_check.py "<DOCS>"
 > from its GPU memory and this machine's memory (class_proposal 192 on 4x B200,
 > 48 on 2x H200 — prune-expand ran ~1 h at the old 12 because only ~9 requests
 > were in flight). DeepSeek-V4.1-Flash stays serverless.
+>
+> The same sizing also sets the memory-bound table knobs from THIS machine:
+> `table_extraction` (PDF workers) and `table_page_vision` (whole-page vision
+> calls in flight per PDF), split from one budget (free RAM minus 600 MB; each
+> worker 200 MB + 5 MB per page in flight). They are listed with the GPU
+> concurrency and written by `--apply` / `--apply-concurrency`. Read both out:
+> table vision runs on serverless Qwen3-VL-235B at ~60-250 s per page, so
+> pages in flight are what shortens a long filing.
 >
 > **Verify this machine's memory first** (the one these skills and the detached
 > run use): the sizing prints `Local memory` and `Build memory ... FITS / TIGHT /
@@ -407,7 +418,7 @@ and note that these are NOT interchangeable:
 - `concurrency.table_page_vision` shares that memory budget: the tool fits
   `workers x (200 + 5 x pages) MB` into free RAM minus the 600 MB reserve,
   preferring 8 pages per worker. It is what shortens ONE long statement-heavy
-  PDF (dozens of 40-150 s vision pages); `table_extraction` only helps across
+  PDF (dozens of ~60-250 s vision pages); `table_extraction` only helps across
   PDFs. Results are identical at any value.
 
 ## Step 2d — Selection preview (ONLY if they chose the subset in Step 1e)
@@ -528,6 +539,11 @@ The harness runs this command **unchanged**, so the two-tier table cache
 (`output_ontologies/.../tables/` + `~/.cache/.../tables/`) and the evaluated-
 summary cache (`~/.cache/.../eval_summaries/`) work exactly as before. A re-run
 after a crash reuses everything already computed — it does not re-pay.
+The table cache key includes the two table-vision models (`table_extract_vision`,
+`table_extract_page_vision` in models.yaml): switching either one, or switching
+LLM mode, re-extracts every PDF's tables once at the new model's cost. So did
+the 2026-10-25 update that added the models to the key. Tell the user before a
+`--tables` run on a corpus whose tables were extracted with another model.
 
 ### Concurrency — check it before a multi-hour run, and tell the user
 `prune-expand` takes **six separate flags**, one per stage, because the stages run

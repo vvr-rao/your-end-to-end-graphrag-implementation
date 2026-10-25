@@ -92,7 +92,7 @@ def test_entity_walk_sql_only_follows_entity_relationships():
 
 def test_defaults_are_the_new_design():
     import yaml
-    qa = yaml.safe_load(open("config/config.example.yaml"))["qa"]
+    qa = yaml.safe_load(open("config/config.example.yaml", encoding="utf-8"))["qa"]
     assert qa["graph_seeding"] == "cascade"
     assert qa["graph_traversal"] == "entity_relationships"
     assert qa["global_artifact_search"] is True

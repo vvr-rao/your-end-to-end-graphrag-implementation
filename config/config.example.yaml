@@ -225,8 +225,9 @@ concurrency:
   table_extraction: 1
   # Whole-page vision calls in flight per PDF worker (borderless statements
   # sent to the vision model page by page). Each call is decode-bound:
-  # serverless Qwen3-VL ran 40-150 s per page at ~33 tok/s per stream, and 8 in
-  # flight took 150 s for 8 pages with no per-call slowdown (2026-10-24).
+  # serverless Qwen3-VL-30B ran 40-150 s per page at ~33 tok/s per stream, and 8
+  # in flight took 150 s for 8 pages with no per-call slowdown (2026-10-24);
+  # Qwen3-VL-235B ~60-250 s per page (median 124 s).
   # Output is identical at any value. ~5 MB per call in flight, so
   # scripts/tpm_check.py sizes this together with table_extraction from free
   # memory (worker = 200 + 5 x this). 1 = one page at a time (the old behaviour).

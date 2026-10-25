@@ -165,7 +165,7 @@ def test_duplicate_between_passes_uses_the_db_dedup_key() -> None:
 
 @pytest.mark.parametrize("path", ["config/config.example.yaml"])
 def test_concept_pass_ships_off_by_default(path: str) -> None:
-    cfg = yaml.safe_load(open(path))["extraction"]
+    cfg = yaml.safe_load(open(path, encoding="utf-8"))["extraction"]
     assert cfg["concept_pass"] is False
 
 
@@ -174,7 +174,7 @@ def test_concept_roots_exclude_the_other_passes_territory(path: str) -> None:
     """Event holds named events ("Super Bowl") and belongs to the entity pass;
     TimePeriod belongs to enrich-time; FinancialTable to the table pass.
     Including them would have the concept pass compete for their rows."""
-    roots = yaml.safe_load(open(path))["extraction"]["concept_class_roots"]
+    roots = yaml.safe_load(open(path, encoding="utf-8"))["extraction"]["concept_class_roots"]
     assert "EconomicConcept" in roots
     assert "Event" not in roots
     assert "TimePeriod" not in roots
@@ -190,7 +190,7 @@ def test_concept_roots_exclude_the_other_passes_territory(path: str) -> None:
 def test_concept_extract_task_exists_in_every_preset(preset: str) -> None:
     """Missing in one preset means that provider mode degrades to no concept
     pass at all -- silently, since the caller warns once and continues."""
-    tasks = yaml.safe_load(open(preset))["tasks"]
+    tasks = yaml.safe_load(open(preset, encoding="utf-8"))["tasks"]
     assert "concept_extract" in tasks
     spec = tasks["concept_extract"]
     assert spec["provider"] and spec["model"]
@@ -217,7 +217,7 @@ def test_concept_extract_matches_the_entity_extractor(preset: str) -> None:
     What is worth pinning is that the two do not silently DIVERGE, leaving the
     concept pass on a model nobody chose for it.
     """
-    tasks = yaml.safe_load(open(preset))["tasks"]
+    tasks = yaml.safe_load(open(preset, encoding="utf-8"))["tasks"]
     assert tasks["concept_extract"]["model"] == tasks["entity_extract"]["model"], (
         f"{preset}: concept_extract ({tasks['concept_extract']['model']}) has "
         f"drifted from entity_extract ({tasks['entity_extract']['model']})"

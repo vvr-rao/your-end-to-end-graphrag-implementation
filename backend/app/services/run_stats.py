@@ -72,12 +72,12 @@ def diff_against_snapshot(db_name: str, now: dict[str, int], *, save: bool = Tru
     path = _snapshot_path(db_name)
     prev = None
     try:
-        prev = json.loads(path.read_text())
+        prev = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         pass
     if save:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(now, indent=1))
+        path.write_text(json.dumps(now, indent=1), encoding="utf-8")
     if not isinstance(prev, dict):
         return None
     return {k: now[k] - int(prev.get(k, 0)) for k in now}
@@ -97,13 +97,13 @@ def _local(iri: str) -> str:
 
 def ontology_stats(version_dir: Path, concept_roots: list[str]) -> dict[str, Any]:
     """Counts for one prune-expand/build version folder."""
-    stats = json.loads((version_dir / "stats.json").read_text())
+    stats = json.loads((version_dir / "stats.json").read_text(encoding="utf-8"))
     before, after = stats.get("before") or {}, stats.get("after") or {}
     created = list(stats.get("created_classes") or [])
     roots = {r.strip().lower() for r in concept_roots if r and r.strip()}
     classes: dict[str, Any] = {}
     try:
-        classes = json.loads((version_dir / "merged.json").read_text()).get("classes_dict") or {}
+        classes = json.loads((version_dir / "merged.json").read_text(encoding="utf-8")).get("classes_dict") or {}
     except (OSError, ValueError):
         pass
     parents = {iri: [s.get("iri") for s in (c.get("superclasses") or [])

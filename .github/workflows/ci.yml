@@ -91,3 +91,8 @@ jobs:
           backend/tests/unit/test_tpm_check.py
           backend/tests/unit/test_alias_mining.py
           backend/tests/unit/test_alias_judge.py
+          backend/tests/unit/test_memory_probe.py
+          backend/tests/unit/test_run_stats.py
+          backend/tests/unit/test_table_page_vision.py
+          backend/tests/unit/test_table_cache.py
+          backend/tests/unit/test_generic_concepts.py

@@ -107,7 +107,9 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
   > create --from-sizing .build/sizing.json --apply-concurrency --yes` (takes
   > the first with capacity, writes that configuration's concurrency, sized from
   > its GPU memory and THIS machine's memory — the sizing's `Local memory` line;
-  > if it reports a value "capped by local memory", say so). DeepSeek-V4.1-Flash
+  > if it reports a value "capped by local memory", say so; it also writes
+  > `table_extraction` + `table_page_vision`, sized from this machine's free
+  > memory -- read both out). DeepSeek-V4.1-Flash
   > (relationships) stays serverless. register-documents, extract-entities, enrich-time,
   > **enrich-geo** (its `geographic_containment` task is on the dedicated model) and
   > generate-artifacts all call the GPU: run them back to back -- Step 4b included,

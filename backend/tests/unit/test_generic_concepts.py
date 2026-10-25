@@ -131,9 +131,9 @@ def test_every_preset_defines_the_concept_head_judge() -> None:
     import yaml
     for f in ("config/models.example.yaml", "config/models.openai.example.yaml",
               "config/models.anthropic.example.yaml", "config/models.deepinfra.example.yaml"):
-        spec = yaml.safe_load(open(f))["tasks"]["concept_head_judge"]
+        spec = yaml.safe_load(open(f, encoding="utf-8"))["tasks"]["concept_head_judge"]
         assert spec["enabled"] is True, f
-    di = yaml.safe_load(open("config/models.deepinfra.example.yaml"))["tasks"]["concept_head_judge"]
+    di = yaml.safe_load(open("config/models.deepinfra.example.yaml", encoding="utf-8"))["tasks"]["concept_head_judge"]
     assert di["provider"] == "deepinfra" and di["prompt_set"] == "deepseek"
 
 
@@ -282,7 +282,7 @@ def test_concept_knobs_are_off_unless_configured(monkeypatch) -> None:
     for k in ("concept_seeds", "concept_terminal", "seed_cooccurrence"):
         assert rt._qa_flag(k) is False
     import yaml
-    qa = yaml.safe_load(open("config/config.example.yaml"))["qa"]
+    qa = yaml.safe_load(open("config/config.example.yaml", encoding="utf-8"))["qa"]
     assert qa["concept_seeds"] is True and qa["concept_terminal"] is True
     assert qa["seed_cooccurrence"] is True
 

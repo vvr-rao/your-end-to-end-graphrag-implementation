@@ -104,6 +104,14 @@ another model.
 > deployment the moment the last creation step finishes. The rest of this step
 > (tpm_check) does not apply.
 >
+> The same sizing also sets the memory-bound table knobs from THIS machine:
+> `table_extraction` (PDF workers) and `table_page_vision` (whole-page vision
+> calls in flight per PDF), split from one budget (free RAM minus 600 MB; each
+> worker 200 MB + 5 MB per page in flight). They are listed with the GPU
+> concurrency and written by `--apply` / `--apply-concurrency`. Read both out:
+> table vision runs on serverless Qwen3-VL-235B at ~60-250 s per page, so
+> pages in flight are what shortens a long filing.
+>
 > **Verify this machine's memory first** (the one these skills and the detached
 > run use): the sizing prints `Local memory` and `Build memory ... FITS / TIGHT /
 > DOES NOT FIT` — the projected peak of Stage 4 + the OWL export for this corpus
