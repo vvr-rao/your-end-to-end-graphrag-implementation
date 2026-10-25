@@ -220,6 +220,17 @@ tasks:
     temperature: 0.0
     max_tokens: 8192
     stream: true
+  # One call per summarized document: who/what it is about, from its opening
+  # text. Starts every stored summary piece ("[Document: ...]"). Optional:
+  # without this task the summary's title line or the file name is used.
+  # Serverless, so cached summaries never need the dedicated deployment.
+  document_subject:
+    provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4.1-Flash
+    timeout: 90
+    temperature: 0.0
+    max_tokens: 400
+    response_format: json_object
 
   classification_audit:
     provider: deepinfra
