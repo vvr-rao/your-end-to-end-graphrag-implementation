@@ -84,3 +84,17 @@ def test_no_run_cache_dir_still_skips_the_worker(env) -> None:
     _cache(user, p, n_tables=1)
     out = _drive([p], None)
     assert spawned == [] and out[str(p)]["source"] == "cache"
+
+
+def test_a_partial_entry_starts_a_worker_and_is_reported(env, capsys) -> None:
+    """2026-10-26: a PDF cached with failed vision pages counted as a hit here,
+    so the retry the partial mark exists for never ran."""
+    tmp, user, spawned = env
+    p = _pdf(tmp, "partial.pdf")
+    doc_sha, key = te._hash_pdf_streaming(p)
+    table_cache.save(user, key, doc_sha=doc_sha, doc_path=str(p), tables=[{"@id": "t0"}],
+                     manifest={"n_tables": 1, "cost_usd": 0.01}, failed_pages=[8])
+    out = _drive([p], tmp / "run")
+    assert spawned == ["partial.pdf"]
+    assert out[str(p)]["failed_pages"] == [8]
+    assert "1 partial" in capsys.readouterr().out

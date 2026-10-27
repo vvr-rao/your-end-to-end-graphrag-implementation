@@ -240,7 +240,7 @@ uv run python scripts/tpm_check.py "<DOCS>"
 > calls in flight per PDF), split from one budget (free RAM minus 600 MB; each
 > worker 200 MB + 5 MB per page in flight). They are listed with the GPU
 > concurrency and written by `--apply` / `--apply-concurrency`. Read both out:
-> table vision runs on serverless Qwen3-VL-235B at ~60-250 s per page, so
+> table vision runs on serverless Qwen3-VL-235B at ~60-250 s per page, 3-12 min on a slow day, so
 > pages in flight are what shortens a long filing.
 >
 > **Verify this machine's memory first** (the one these skills and the detached
@@ -336,7 +336,7 @@ Three knobs, three different constraints:
 | Knob | Bound by | Default | Notes |
 |---|---|---|---|
 | `concurrency.table_extraction` | **MEMORY** | 1 | Each PDF = one subprocess, ~152 MB measured. Serial extraction is often the LONG POLE: 18 PDFs at 1 is ~100 min. |
-| `concurrency.table_page_vision` | **MEMORY** | 1 | Whole-page vision calls in flight INSIDE one PDF (~60-250 s each on serverless Qwen3-VL-235B). `tpm_check.py` sizes it together with `table_extraction` (worker = 200 + 5 x pages MB); output is identical at any value. |
+| `concurrency.table_page_vision` | **MEMORY** | 1 | Whole-page vision calls in flight INSIDE one PDF (~60-250 s each on serverless Qwen3-VL-235B, 3-12 min on a slow day; 750 s timeout, 1 retry). `tpm_check.py` sizes it together with `table_extraction` (worker = 200 + 5 x pages MB); output is identical at any value. |
 | `chunking.streaming_batch_size` | memory (cheap) | 8 | Holds N documents' text (~50 MB at 16). Also CAPS effective concurrency. |
 | `concurrency.summarization` | **RATE LIMIT** | 32 | Measured ~0.5% of a 10M TPM tier; rarely the constraint on tier 3+. |
 

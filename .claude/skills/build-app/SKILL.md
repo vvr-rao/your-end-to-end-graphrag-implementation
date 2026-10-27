@@ -109,7 +109,7 @@ another model.
 > calls in flight per PDF), split from one budget (free RAM minus 600 MB; each
 > worker 200 MB + 5 MB per page in flight). They are listed with the GPU
 > concurrency and written by `--apply` / `--apply-concurrency`. Read both out:
-> table vision runs on serverless Qwen3-VL-235B at ~60-250 s per page, so
+> table vision runs on serverless Qwen3-VL-235B at ~60-250 s per page, 3-12 min on a slow day, so
 > pages in flight are what shortens a long filing.
 >
 > **Verify this machine's memory first** (the one these skills and the detached

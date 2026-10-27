@@ -671,10 +671,14 @@ tasks:
   # Whole-page vision (--tables): a figure-dense page whose tables the
   # line-based detector missed (borderless financial statements). Same
   # model as table_extract_vision; a full statement page runs 3-6k tokens.
+  # 2026-10-26: serverless decode fell to ~7-8 tok/s; a 4k-token statement page
+  # took 594 s, so 600 s + the SDK's 2 silent retries (1,800 s) tripped the
+  # worker's silence limit. 750 s, one retry: worst case 1,500 s per page.
   table_extract_page_vision:
     provider: deepinfra
     model: Qwen/Qwen3-VL-235B-A22B-Instruct
-    timeout: 600
+    timeout: 750
+    max_retries: 1
     temperature: 0.0
     max_tokens: 8192
     response_format: json_object
