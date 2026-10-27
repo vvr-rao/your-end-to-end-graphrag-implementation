@@ -441,3 +441,141 @@ def test_page_vision_concurrency_default_and_override(monkeypatch) -> None:
     monkeypatch.setattr(te, "get_settings", lambda: SimpleNamespace(
         app_config={"concurrency": {"table_page_vision": 6}}))
     assert te.page_vision_concurrency() == 6
+
+
+def test_vision_retries_come_from_the_task(monkeypatch) -> None:
+    """`max_retries` caps the SDK's silent retries of a whole-page request;
+    absent, the SDK default applies (None), so other presets are unchanged."""
+    from types import SimpleNamespace
+    tasks = {"table_extract_page_vision": {"provider": "deepinfra", "model": "m",
+                                           "timeout": 750, "max_retries": 1},
+             "table_extract_vision": {"provider": "deepinfra", "model": "m"}}
+    monkeypatch.setattr(te, "get_settings",
+                        lambda: SimpleNamespace(models_config={"tasks": tasks}))
+    spec = te._vision_spec("table_extract_page_vision")
+    assert (spec["timeout"], spec["max_retries"]) == (750, 1)
+    assert te._vision_spec("table_extract_vision")["max_retries"] is None
+
+
+def test_vision_call_applies_max_retries(monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    class _Completions:
+        async def create(self, **kw):
+            raise RuntimeError("stop")
+
+    class _Client:
+        def with_options(self, **kw):
+            seen.update(kw)
+            return self
+
+    client = _Client()
+    client.chat = types.SimpleNamespace(completions=_Completions())
+    monkeypatch.setattr(te, "_get_deepinfra_vision_client", lambda: client)
+    with pytest.raises(te.VisionCallError):
+        asyncio.run(te._vision_call_openai("s", "u", "png", model="m", timeout=1,
+                                           temperature=0.0, max_tokens=1,
+                                           provider="deepinfra", max_retries=1))
+    assert seen == {"max_retries": 1}
+
+
+def test_one_slow_page_does_not_stop_new_pages_being_sent(monkeypatch, fake_pdf) -> None:
+    """2026-10-26: a 594 s page held every slot -- the other answers had
+    arrived but waited behind it, and nothing new was sent. A slot is now
+    freed when its request finishes, so the pages behind the slow one keep
+    going, within the look-ahead window, and the tables are unchanged."""
+    import json
+    pdf, pages, tmp = fake_pdf
+    pages.extend([_Page(STATEMENT, n_tables=0) for _ in range(10)])
+    body = {"tables": [{"caption": "SOFP",
+                        "columns": [{"columnIndex": 0, "columnLabel": "2025"}],
+                        "rows": [{"rowIndex": 0, "rowLabel": "Cash",
+                                  "cells": [{"columnIndex": 0, "cellValue": "12,345"}]}]}]}
+    monkeypatch.setattr(te, "_vision_spec", lambda task, fallback=None: {"model": "m"})
+    monkeypatch.setattr(te, "_render_png_b64", lambda page, bbox: "png")
+    out = {}
+    for conc in (1, 2):
+        log = {"started": 0, "started_while_first_ran": None}
+
+        async def fake_call(spec, system, user, png, log=log):
+            log["started"] += 1
+            first = log["started"] == 1
+            await asyncio.sleep(0.3 if first else 0.01)
+            if first:
+                log["started_while_first_ran"] = log["started"] - 1
+            return json.dumps(body), 0.01
+        monkeypatch.setattr(te, "_call_vision", fake_call)
+        monkeypatch.setattr(te, "page_vision_concurrency", lambda conc=conc: conc)
+        res = _extract(pdf, tmp / f"c{conc}")
+        out[conc] = (json.dumps(res.tables, sort_keys=True), log)
+    assert out[1][0] == out[2][0]
+    # Old behaviour: 1 (the second slot, then stuck). Window = 4 x 2 pages ahead.
+    assert out[2][1]["started_while_first_ran"] >= 6
+
+
+# ---- partial results (one failed page no longer costs the whole PDF) ---------
+
+def _patch_vision_by_page(monkeypatch, fail_pages: set[int]) -> list[int]:
+    """Real _page_vision_request; the model call fails on `fail_pages`."""
+    import json
+    import re
+    sent: list[int] = []
+    body = {"tables": [{"caption": "SOFP",
+                        "columns": [{"columnIndex": 0, "columnLabel": "2025"}],
+                        "rows": [{"rowIndex": 0, "rowLabel": "Cash",
+                                  "cells": [{"columnIndex": 0, "cellValue": "12,345"}]}]}]}
+    monkeypatch.setattr(te, "_vision_spec", lambda task, fallback=None: {"model": "m"})
+    monkeypatch.setattr(te, "_render_png_b64", lambda page, bbox: "png")
+
+    async def fake_call(spec, system, user, png):
+        n = int(re.search(r"page_number: (\d+)", user).group(1))
+        sent.append(n)
+        if n in fail_pages:
+            raise te.VisionCallError("timeout")
+        return json.dumps(body), 0.01
+    monkeypatch.setattr(te, "_call_vision", fake_call)
+    return sent
+
+
+def test_a_failed_page_is_cached_as_partial_and_keeps_the_rest(monkeypatch, fake_pdf) -> None:
+    from backend.app.services import table_cache
+    pdf, pages, tmp = fake_pdf
+    pages.extend([_Page(STATEMENT, n_tables=0) for _ in range(3)])
+    _patch_vision_by_page(monkeypatch, fail_pages={2})
+    res = _extract(pdf, tmp)
+    assert res.manifest["failed_pages"] == [2]
+    assert len(res.tables) == 2, "pages 1 and 3 keep their tables"
+    _, key = te._hash_pdf_streaming(pdf)
+    hit = table_cache.load(tmp / "user", key)
+    assert hit is not None and hit.partial and hit.failed_pages == [2]
+    assert len(hit.tables) == 2, "ingestion reads these instead of nothing"
+
+
+def test_rerunning_a_partial_pdf_sends_only_the_failed_pages(monkeypatch, fake_pdf) -> None:
+    import json
+
+    from backend.app.services import table_cache
+    pdf, pages, tmp = fake_pdf
+    pages.extend([_Page(STATEMENT, n_tables=0) for _ in range(3)])
+    first = _patch_vision_by_page(monkeypatch, fail_pages={2})
+    _extract(pdf, tmp)
+    assert sorted(first) == [1, 2, 3]
+    again = _patch_vision_by_page(monkeypatch, fail_pages=set())
+    res = _extract(pdf, tmp)
+    assert again == [2], "pages 1 and 3 replay their saved answers"
+    assert res.manifest["failed_pages"] == [] and len(res.tables) == 3
+    _, key = te._hash_pdf_streaming(pdf)
+    assert not table_cache.load(tmp / "user", key).partial
+    # Same tables as a run where nothing ever failed.
+    _patch_vision_by_page(monkeypatch, fail_pages=set())
+    clean = _extract(pdf, tmp / "clean")
+    assert json.dumps(res.tables, sort_keys=True) == json.dumps(clean.tables, sort_keys=True)
+
+
+def test_a_legacy_cache_entry_is_not_partial(tmp_path) -> None:
+    import json
+
+    from backend.app.services import table_cache
+    (tmp_path / "k.jsonld").write_text(json.dumps({"doc_sha": "s", "tables": [], "manifest": {}}))
+    hit = table_cache.load(tmp_path, "k")
+    assert hit is not None and not hit.partial

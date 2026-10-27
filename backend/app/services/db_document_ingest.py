@@ -746,7 +746,15 @@ async def _ingest_tables_for_docs(
             )
             continue
         hit = table_cache.load(user_cache, cache_key)
-        if hit is None or not hit.tables:
+        if hit is None:
+            print(f"[ingest][tables] WARNING {doc.path.name}: no extraction result "
+                  f"(worker failed or was killed); no tables loaded for it")
+            continue
+        if hit.partial:
+            print(f"[ingest][tables] WARNING {doc.path.name}: vision failed on page(s) "
+                  f"{hit.failed_pages}; loading the {len(hit.tables)} table(s) it did "
+                  f"extract. Re-extracting this PDF retries only those pages.")
+        if not hit.tables:
             continue
         for t_idx, payload in enumerate(hit.tables):
             errors = table_jsonld.validate_table_jsonld(payload)

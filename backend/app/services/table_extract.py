@@ -32,6 +32,7 @@ Caller integration shape:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import base64
 import io
 import json
@@ -739,6 +740,7 @@ async def _vision_call_openai(
     temperature: float,
     max_tokens: int,
     provider: str = "openai",
+    max_retries: int | None = None,
 ) -> tuple[str | None, float]:
     """OpenAI-compatible vision call (OpenAI, or DeepInfra's endpoint).
     Returns (json_text, cost_usd); raises VisionCallError when the request
@@ -746,6 +748,8 @@ async def _vision_call_openai(
     client = _get_deepinfra_vision_client() if provider == "deepinfra" else _get_vision_client()
     if client is None:
         raise VisionCallError(f"no API key for vision provider {provider!r}")
+    if max_retries is not None:
+        client = client.with_options(max_retries=max_retries)
     try:
         resp = await client.chat.completions.create(
             model=model,
@@ -790,6 +794,7 @@ async def _vision_call_anthropic(
     timeout: int,
     temperature: float,
     max_tokens: int,
+    max_retries: int | None = None,
 ) -> tuple[str | None, float]:
     """Anthropic vision call (base64 image content block). Returns
     (json_text, cost_usd) or (None, 0.0). Anthropic has no
@@ -798,6 +803,8 @@ async def _vision_call_anthropic(
     client = _get_anthropic_vision_client()
     if client is None:
         raise VisionCallError("no API key for vision provider 'anthropic'")
+    if max_retries is not None:
+        client = client.with_options(max_retries=max_retries)
     sys_prompt = (
         f"{system}\n\nOutput only a single valid JSON object. "
         "Do not include any prose, explanation, or markdown code fences."
@@ -859,6 +866,10 @@ def _vision_spec(task: str, fallback: str | None = None) -> dict[str, Any]:
         "timeout": int(spec.get("timeout", _DEFAULT_VISION_TIMEOUT)),
         "temperature": float(spec.get("temperature", _DEFAULT_VISION_TEMP)),
         "max_tokens": int(spec.get("max_tokens", _DEFAULT_VISION_MAX_TOKENS)),
+        # SDK-level retries of a failed or timed-out request (None = the SDK
+        # default, 2). A retry re-sends the whole page, so worst case one page
+        # holds the loop for timeout x (max_retries + 1).
+        "max_retries": (int(spec["max_retries"]) if spec.get("max_retries") is not None else None),
     }
 
 
@@ -881,7 +892,8 @@ async def _call_vision(
     return (json_text, cost_usd) or raise VisionCallError. The anthropic path
     keeps table extraction fully OpenAI-free."""
     kw = {"model": spec["model"], "timeout": spec["timeout"],
-          "temperature": spec["temperature"], "max_tokens": spec["max_tokens"]}
+          "temperature": spec["temperature"], "max_tokens": spec["max_tokens"],
+          "max_retries": spec.get("max_retries")}
     if spec["provider"] == "anthropic":
         return await _vision_call_anthropic(system, user, png_b64, **kw)
     return await _vision_call_openai(system, user, png_b64, provider=spec["provider"], **kw)
@@ -1173,15 +1185,51 @@ def page_vision_concurrency() -> int:
     return max(1, int((cfg.get("concurrency", {}) or {}).get("table_page_vision", 1)))
 
 
+# (cache dirs, document key) of the PDF being extracted, for per-page vision
+# answers. A context variable rather than a parameter because the requests run
+# in prefetch tasks, which inherit the context of extract_tables_async.
+_PAGE_ANSWERS: contextvars.ContextVar[tuple[list[Path], str] | None] = (
+    contextvars.ContextVar("page_answers", default=None))
+# File name for the per-request log lines (several PDFs log to one stream).
+_PDF_NAME: contextvars.ContextVar[str] = contextvars.ContextVar("pdf_name", default="")
+
+
 async def _page_vision_request(page: Any, page_number: int) -> tuple[str | None, float]:
     """The slow half of page vision: render the page and ask the model.
-    (None, 0.0) when the page cannot be rendered; raises VisionCallError."""
+    (None, 0.0) when the page cannot be rendered; raises VisionCallError.
+    An answer saved by an earlier, partial run of this PDF is replayed (cost
+    0: it was paid then), so re-running sends only the pages that failed."""
+    answers = _PAGE_ANSWERS.get()
+    where = f"{_PDF_NAME.get()} p{page_number}".strip()
+    if answers is not None:
+        saved = table_cache.load_page_answer(answers[0], answers[1], page_number)
+        if saved is not None:
+            print(f"[tables]     page-vision {where}: saved answer reused", flush=True)
+            return saved[0], 0.0
     spec = _vision_spec("table_extract_page_vision", fallback="table_extract_vision")
     png_b64 = _render_png_b64(page, None)
     if png_b64 is None:
         return None, 0.0
     system, user = PROMPTS["table_extract_page_vision"](page_number=page_number)
-    return await _call_vision(spec, system, user, png_b64)
+    # One line per request, start and end. The page loop prints only once a
+    # page is fully processed, in page order, so without these a slow request
+    # is invisible and finished prefetched pages give the worker watchdog no
+    # sign of life.
+    started = time.monotonic()
+    print(f"[tables]     page-vision {where}: sent "
+          f"({len(png_b64) * 3 // 4 // 1024} KB PNG)", flush=True)
+    try:
+        text, cost = await _call_vision(spec, system, user, png_b64)
+    except VisionCallError as exc:
+        print(f"[tables]     page-vision {where}: FAILED after "
+              f"{time.monotonic() - started:.0f}s ({str(exc)[:160]})", flush=True)
+        raise
+    print(f"[tables]     page-vision {where}: done in "
+          f"{time.monotonic() - started:.0f}s, {len(text or '')} chars, "
+          f"${cost:.4f}", flush=True)
+    if answers is not None:
+        table_cache.save_page_answer(answers[0], answers[1], page_number, text, cost)
+    return text, cost
 
 
 def _flush(page: Any) -> None:
@@ -1205,6 +1253,12 @@ class _PageVisionPrefetch:
 
     Pages are touched only AHEAD of the loop (`main_pos`), and everything runs
     on the one event-loop thread, so pdfplumber never sees two users of a page.
+
+    A slot is freed when its REQUEST finishes, not when the loop takes the
+    answer. Freeing on take let one slow page (594 s on 2026-10-26) hold every
+    slot: the other requests finished, their answers waited behind it, and
+    nothing new was sent. Finished answers now wait in memory instead (a few
+    KB each), at most `_PREFETCH_WINDOW` x concurrency pages ahead of the loop.
     """
 
     def __init__(self, pdf: Any, *, page_cap: int, pv: dict[str, Any], concurrency: int) -> None:
@@ -1212,14 +1266,25 @@ class _PageVisionPrefetch:
         self._page_cap = page_cap
         self._pv = pv
         self._slots = asyncio.Semaphore(concurrency)
+        self._window = _PREFETCH_WINDOW * concurrency
+        self._advanced = asyncio.Event()
         self._tasks: dict[int, asyncio.Task] = {}
         self._scheduled = 0
         self._direct = 0
         self.texts: dict[int, str] = {}       # page text read here, reused by the loop
-        self.main_pos = 0
+        self._main_pos = 0
         self.wasted = 0
         self.wasted_cost = 0.0
         self._runner: asyncio.Task | None = None
+
+    @property
+    def main_pos(self) -> int:
+        return self._main_pos
+
+    @main_pos.setter
+    def main_pos(self, pos: int) -> None:
+        self._main_pos = pos
+        self._advanced.set()
 
     def start(self) -> None:
         self._runner = asyncio.create_task(self._run())
@@ -1230,7 +1295,10 @@ class _PageVisionPrefetch:
             # Shares the per-PDF cap with the loop's own (non-prefetched) calls.
             if self._scheduled + self._direct >= self._pv["max_pages"]:
                 return
-            await self._slots.acquire()          # released when the loop takes/discards it
+            while page_no > self._main_pos + self._window:
+                self._advanced.clear()
+                await self._advanced.wait()
+            await self._slots.acquire()          # released when the request ends
             if page_no <= self.main_pos:         # the loop already passed it
                 self._slots.release()
                 continue
@@ -1244,7 +1312,10 @@ class _PageVisionPrefetch:
                 self._slots.release()
                 _flush(page)
                 continue
-            self._tasks[page_no] = asyncio.create_task(_page_vision_request(page, page_no))
+            task = asyncio.create_task(_page_vision_request(page, page_no))
+            # A done-callback also fires for a task cancelled before it ran.
+            task.add_done_callback(lambda _t: self._slots.release())
+            self._tasks[page_no] = task
             self._scheduled += 1
             _flush(page)
             await asyncio.sleep(0)
@@ -1268,10 +1339,7 @@ class _PageVisionPrefetch:
         if task is None:
             self._direct += 1
             return await _page_vision_request(page, page_no)
-        try:
-            return await task
-        finally:
-            self._slots.release()
+        return await task
 
     def discard(self, page_no: int) -> None:
         task = self._tasks.pop(page_no, None)
@@ -1282,7 +1350,6 @@ class _PageVisionPrefetch:
             self.wasted_cost += float(task.result()[1] or 0.0)
         else:
             task.cancel()
-        self._slots.release()
 
     async def close(self) -> None:
         if self._runner is not None:
@@ -1290,6 +1357,11 @@ class _PageVisionPrefetch:
         for page_no in list(self._tasks):
             self.discard(page_no)
         await asyncio.gather(*(t for t in [self._runner] if t), return_exceptions=True)
+
+
+# How far ahead of the page loop the prefetcher may run, in multiples of
+# table_page_vision: bounds the finished answers held while one page is slow.
+_PREFETCH_WINDOW = 4
 
 
 def _page_vision_payloads(
@@ -1439,6 +1511,10 @@ async def extract_tables_async(
         user_cache_dir = table_cache.user_cache_dir()
 
     hit = table_cache.two_tier_load(run_cache_dir, user_cache_dir, cache_key)
+    if hit is not None and hit.partial:
+        print(f"[tables] {p.name}: cached result is partial (vision failed on page(s) "
+              f"{hit.failed_pages}); re-running, earlier page answers are reused", flush=True)
+        hit = None
     if hit is not None:
         # When the hit came from the user cache but a run cache is
         # configured, copy the payload into the run cache so downstream
@@ -1468,6 +1544,9 @@ async def extract_tables_async(
     n_vision = 0
     n_dropped = 0
     n_vision_errors = 0
+    failed_pages: list[int] = []
+    _PAGE_ANSWERS.set(([d for d in (run_cache_dir, user_cache_dir) if d is not None], cache_key))
+    _PDF_NAME.set(p.name)
     cost_usd = 0.0
     table_index = 0
     pages_processed = 0
@@ -1620,9 +1699,10 @@ async def extract_tables_async(
                         except VisionCallError as exc:
                             payload, vision_cost = None, 0.0
                             n_vision_errors += 1
-                            if n_vision_errors == 1:
-                                print(f"[tables] {p.name}: vision call FAILED ({exc}); "
-                                      f"this PDF will not be cached", flush=True)
+                            failed_pages.append(page_no)
+                            print(f"[tables] {p.name}: vision call FAILED on p{page_no} "
+                                  f"({exc}); cached as partial, a later run retries it",
+                                  flush=True)
                         cost_usd += vision_cost
                         if payload is not None:
                             n_vision += 1
@@ -1671,9 +1751,10 @@ async def extract_tables_async(
                             )
                         except VisionCallError as exc:
                             n_vision_errors += 1
-                            if n_vision_errors == 1:
-                                print(f"[tables] {p.name}: page vision FAILED ({exc}); "
-                                      f"this PDF will not be cached", flush=True)
+                            failed_pages.append(page_no)
+                            print(f"[tables] {p.name}: page vision FAILED on p{page_no} "
+                                  f"({exc}); cached as partial, a later run retries it",
+                                  flush=True)
                         else:
                             # Strips are dropped only when vision returned the
                             # statement; a "no table" answer keeps them.
@@ -1791,10 +1872,13 @@ async def extract_tables_async(
         flush=True,
     )
 
-    # Persist to both cache tiers (run cache + user cache) -- unless a
-    # vision call failed: caching that result would freeze the missing
-    # tables in, and every later run would hit the cache and never retry.
-    for tier_dir in ((run_cache_dir, user_cache_dir) if not n_vision_errors else ()):
+    # Persist to both cache tiers (run cache + user cache). A result with
+    # failed vision pages is saved too, marked partial: ingestion reads the
+    # cache, so NOT saving it (the old rule) dropped every table of the PDF
+    # for one failed page, silently. Extraction re-runs a partial entry, so
+    # the missing tables are still retried.
+    manifest["failed_pages"] = sorted(set(failed_pages))
+    for tier_dir in (run_cache_dir, user_cache_dir):
         if tier_dir is not None:
             try:
                 table_cache.save(
@@ -1803,6 +1887,7 @@ async def extract_tables_async(
                     doc_path=str(p),
                     tables=payloads,
                     manifest=manifest,
+                    failed_pages=failed_pages,
                 )
             except Exception:
                 # Cache writes are best-effort; never propagate.
@@ -2022,7 +2107,7 @@ async def _drive_subprocess_workers(
     done = 0
     folder_started = time.monotonic()
     summary_stats = {"n_tables": 0, "cost_usd": 0.0, "n_cached": 0,
-                     "n_failed": 0, "cost_saved_usd": 0.0}
+                     "n_failed": 0, "n_partial": 0, "cost_saved_usd": 0.0}
     results: dict[str, dict[str, Any]] = {}
 
     cmd_base = [sys.executable, "-u", "-m",
@@ -2064,7 +2149,9 @@ async def _drive_subprocess_workers(
                 pre_hit = table_cache.two_tier_load(
                     run_cache_dir, table_cache.user_cache_dir(), _pre_key,
                 )
-                was_cached = pre_hit is not None
+                # A partial entry (failed vision pages) is not a hit: the
+                # worker re-runs it and replays the pages that succeeded.
+                was_cached = pre_hit is not None and not pre_hit.partial
             except Exception:  # noqa: BLE001 -- accounting only, never fatal
                 was_cached = False
 
@@ -2099,6 +2186,8 @@ async def _drive_subprocess_workers(
                 if hit is not None:
                     manifest.update(hit.manifest)
                     manifest["doc_sha"] = hit.doc_sha
+                    manifest["failed_pages"] = hit.failed_pages
+                    summary_stats["n_partial"] += int(hit.partial)
                     summary_stats["n_tables"] += int(
                         hit.manifest.get("n_tables", 0) or 0
                     )
@@ -2146,7 +2235,8 @@ async def _drive_subprocess_workers(
         f"[tables/worker] folder DONE: {summary_stats['n_tables']} tables "
         f"across {len(pdfs)} PDF(s) "
         f"({summary_stats['n_cached']} cache-hits, "
-        f"{summary_stats['n_failed']} failed), "
+        f"{summary_stats['n_failed']} failed, "
+        f"{summary_stats['n_partial']} partial -- vision failed on some pages), "
         f"{time.monotonic() - folder_started:.0f}s, "
         f"cost=${summary_stats['cost_usd']:.4f}"
         + (

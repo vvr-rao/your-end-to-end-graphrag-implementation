@@ -29,8 +29,14 @@ The on-disk format is ONE JSON file per document:
         "n_vision_llm": M,
         "cost_usd": <float>,
         "wall_seconds": <float>
-      }
+      },
+      "failed_pages": [<page number>, ...]
     }
+
+`failed_pages` lists the pages whose vision request failed. Such an entry is
+PARTIAL: ingestion uses its tables (and warns), extraction treats it as a
+miss and re-runs. The successful whole-page vision answers are kept per page
+under `pages/<key>/p<N>.json`, so the re-run sends only the failed pages.
 """
 from __future__ import annotations
 
@@ -62,6 +68,11 @@ class TableCacheEntry:
     doc_sha: str
     tables: list[dict[str, Any]] = field(default_factory=list)
     manifest: dict[str, Any] = field(default_factory=dict)
+    failed_pages: list[int] = field(default_factory=list)
+
+    @property
+    def partial(self) -> bool:
+        return bool(self.failed_pages)
 
 
 def vision_models_tag() -> str:
@@ -140,7 +151,9 @@ def load(cache_dir: Path | None, key: str) -> TableCacheEntry | None:
     manifest = payload.get("manifest") or {}
     if not isinstance(doc_sha, str) or not isinstance(tables, list):
         return None
-    return TableCacheEntry(doc_sha=doc_sha, tables=tables, manifest=manifest)
+    failed = [int(n) for n in (payload.get("failed_pages") or []) if isinstance(n, int)]
+    return TableCacheEntry(doc_sha=doc_sha, tables=tables, manifest=manifest,
+                           failed_pages=failed)
 
 
 def save(
@@ -151,6 +164,7 @@ def save(
     doc_path: str | None,
     tables: list[dict[str, Any]],
     manifest: dict[str, Any] | None = None,
+    failed_pages: list[int] | None = None,
 ) -> Path:
     """Write the cache entry. Parent dirs are created on demand."""
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -161,6 +175,7 @@ def save(
         "extractor_version": EXTRACTOR_VERSION,
         "tables": tables,
         "manifest": manifest or {},
+        "failed_pages": sorted(set(failed_pages or [])),
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
@@ -177,3 +192,37 @@ def two_tier_load(
     if hit is not None:
         return hit
     return load(user_cache, key) if user_cache is not None else None
+
+
+def _page_answer_file(cache_dir: Path, key: str, page_number: int) -> Path:
+    return cache_dir / "pages" / key / f"p{page_number}.json"
+
+
+def load_page_answer(
+    cache_dirs: list[Path], key: str, page_number: int,
+) -> tuple[str | None, float] | None:
+    """A whole-page vision answer saved by an earlier run of the same PDF and
+    models (`key` is the document key), or None."""
+    for d in cache_dirs:
+        path = _page_answer_file(d, key, page_number)
+        try:
+            body = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(body, dict) and "text" in body:
+            return body["text"], float(body.get("cost_usd") or 0.0)
+    return None
+
+
+def save_page_answer(
+    cache_dirs: list[Path], key: str, page_number: int, text: str | None, cost_usd: float,
+) -> None:
+    """Best-effort: keep one page's vision answer so a re-run of a partial
+    PDF does not pay for (or wait on) it again."""
+    for d in cache_dirs:
+        path = _page_answer_file(d, key, page_number)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"text": text, "cost_usd": cost_usd}), encoding="utf-8")
+        except OSError:
+            pass

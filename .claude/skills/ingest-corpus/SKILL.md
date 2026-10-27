@@ -281,6 +281,8 @@ detect this from the corpus themselves; the record is for humans and for
 uv run python scripts/build_state.py record register-documents docs=<n> chunks=<n> fulltext=<yes|no> tables=<n>
 ```
 
+**Tables with failed vision pages (`[ingest][tables] WARNING ... vision failed on page(s) [...]`).** A whole-page vision request that times out twice (DeepInfra preset: 750 s, 1 retry) no longer costs the PDF its tables: the result is cached as PARTIAL, every table that was extracted is loaded, and the warning names the missing pages. Re-running `register-documents --tables` (or prune-expand `--tables`) retries ONLY those pages -- the other pages' vision answers are replayed from the cache. Report the failed pages to the user; a page that fails every time usually has a very long answer for the model's current speed. In DeepInfra mode, retry such pages BEFORE creating a GPU deployment, or the deployment idles while they run.
+
 **Corpus synonyms refresh automatically here.** A successful (non-dry-run) ingest
 ends by re-running `mine-aliases`, which extracts brand/generic pairs, acronym
 expansions and alias phrases straight out of the text — "MOUNJARO (tirzepatide)
