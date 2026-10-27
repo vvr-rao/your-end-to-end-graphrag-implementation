@@ -31,10 +31,12 @@ from types import SimpleNamespace
 import pytest
 
 from backend.app.services.db_entity_extract import (
+    _PERSON_ROOT_LABELS,
     ABSTAIN_SENTINEL,
     _dedup_key,
     _filter_entities,
     _is_menu_unfit_class,
+    _person_classes,
     _resolve_canonical_forms,
     _sanitise_verdicts,
     _short_form_supported,
@@ -807,3 +809,42 @@ def test_the_parent_keeps_its_own_node_in_a_subsidiary_list() -> None:
         ], None)], chunk_text={"c1": text})
     assert _norm("SAMSUNG SDI CO., LTD.") not in alias
     assert alias.get(_norm("TSDI")) == _norm("Tianjin Samsung SDI Co., Ltd.")
+
+
+_FOAF_AGENT = "http://xmlns.com/foaf/0.1/Agent"
+_FOAF_PERSON = "http://xmlns.com/foaf/0.1/Person"
+_FOAF_ORG = "http://xmlns.com/foaf/0.1/Organization"
+_EXEC = "http://ex#Executive"
+_ORG_UNDER_PERSON = "http://ex#LegalPersonCompany"
+
+
+def test_person_classes_exclude_organizations_under_agent() -> None:
+    """H6: seeding person classes from foaf:Agent typed every company as a
+    person, because foaf:Organization is rdfs:subClassOf foaf:Agent."""
+    pairs = [(c, c) for c in (_FOAF_AGENT, _FOAF_PERSON, _FOAF_ORG, _EXEC, _ORG_UNDER_PERSON)]
+    pairs += [(_FOAF_PERSON, _FOAF_AGENT), (_FOAF_ORG, _FOAF_AGENT),
+              (_EXEC, _FOAF_PERSON), (_EXEC, _FOAF_AGENT),
+              (_ORG_UNDER_PERSON, _FOAF_PERSON), (_ORG_UNDER_PERSON, _FOAF_ORG)]
+    got = _person_classes({_FOAF_PERSON}, {_FOAF_ORG}, pairs)
+    assert got == {_FOAF_PERSON, _EXEC}
+    assert "agent" not in _PERSON_ROOT_LABELS
+
+
+def test_a_parent_company_is_not_folded_into_its_subsidiary() -> None:
+    """The real SDI extraction (smoke_h6diag): the parent and its Tianjin
+    subsidiary are both Organization. "Samsung SDI Co., Ltd." is a token
+    suffix of "Tianjin Samsung SDI Co., Ltd.", which the surname rule merged
+    when Organization counted as a person class."""
+    rows = [
+        {"canonical_name": "SAMSUNG SDI CO., LTD.", "short_name": "The Group", "class_iri": _FOAF_ORG},
+        {"canonical_name": "Samsung SDI Co., Ltd.", "short_name": "Samsung SDI Co., Ltd.", "class_iri": _FOAF_ORG},
+        {"canonical_name": "Tianjin Samsung SDI Co., Ltd.", "short_name": "Tianjin Samsung SDI Co., Ltd.", "class_iri": _FOAF_ORG},
+        {"canonical_name": "TSDI", "short_name": "TSDI", "class_iri": _FOAF_ORG},
+    ]
+    person = _person_classes({_FOAF_PERSON}, {_FOAF_ORG},
+                             [(_FOAF_ORG, _FOAF_ORG), (_FOAF_ORG, _FOAF_AGENT)])
+    alias, _ = _resolve_canonical_forms(_res(rows), person_class_iris=person)
+    assert alias.get(_norm("Samsung SDI Co., Ltd.")) != _norm("Tianjin Samsung SDI Co., Ltd.")
+    # Before the fix: Organization in the person set reproduces the merge.
+    old, _ = _resolve_canonical_forms(_res(rows), person_class_iris={_FOAF_ORG})
+    assert old[_norm("Samsung SDI Co., Ltd.")] == _norm("Tianjin Samsung SDI Co., Ltd.")

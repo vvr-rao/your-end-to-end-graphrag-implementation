@@ -31,7 +31,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from sqlalchemy import func, select, text as sql_text
@@ -574,6 +574,40 @@ def _dedup_key(name: str) -> str:
     stripped = re.sub(r"\s+", " ", stripped).strip()
     # Never collapse a name to nothing: "Group" and "Co" are real short names.
     return stripped or base
+
+
+# Class labels (lowercased, spaces removed) that root the PERSON classes the
+# surname rule and the prefix guard in `_resolve_canonical_forms` apply to.
+# `agent` is deliberately absent: foaf:Organization and org:Organization are
+# rdfs:subClassOf foaf:Agent, so seeding from Agent typed every company as a
+# person and the surname rule folded "Samsung SDI Co., Ltd." into its
+# subsidiary "Tianjin Samsung SDI Co., Ltd." (a token suffix of it).
+_PERSON_ROOT_LABELS: frozenset[str] = frozenset({"person", "foafperson"})
+# Descendants of these are never person classes, whatever else they sit under.
+_ORGANIZATION_ROOT_LABELS: frozenset[str] = frozenset({
+    "organization", "organisation", "formalorganization"})
+
+
+def _label_key(label: str | None) -> str:
+    return (label or "").lower().replace(" ", "")
+
+
+def _person_classes(
+    person_roots: set[str],
+    organization_roots: set[str],
+    ancestor_pairs: Iterable[tuple[str, str]],
+) -> set[str]:
+    """Person roots plus every class below one, minus anything below an
+    organization root. `ancestor_pairs` are `(class, ancestor)` rows from
+    `_ANCESTOR_SQL`, which include each class as its own ancestor."""
+    below_person: set[str] = set()
+    below_org: set[str] = set(organization_roots)
+    for origin, a in ancestor_pairs:
+        if a in person_roots:
+            below_person.add(origin)
+        if a in organization_roots:
+            below_org.add(origin)
+    return (below_person | person_roots) - below_org
 
 
 def _person_surname_merges(
@@ -3270,20 +3304,21 @@ async def extract_entities(
     # people as `Executive` or `Journalist` is covered without configuration.
     _person_iris: set[str] = set()
     async with session_scope() as session:
-        _roots = (await session.execute(
-            select(OntologyClass.iri).where(
+        _labelled = (await session.execute(
+            select(OntologyClass.iri, OntologyClass.label).where(
                 func.lower(func.replace(OntologyClass.label, " ", "")).in_(
-                    ["person", "agent", "foafperson"])
+                    list(_PERSON_ROOT_LABELS | _ORGANIZATION_ROOT_LABELS))
             )
-        )).scalars().all()
+        )).all()
+        _roots = {i for i, lb in _labelled if _label_key(lb) in _PERSON_ROOT_LABELS}
         if _roots:
             _all = (await session.execute(select(OntologyClass.iri))).scalars().all()
             anc = await session.execute(_ANCESTOR_SQL, {"iris": list(_all)})
-            _rootset = set(_roots)
-            for origin, a in anc.all():
-                if a in _rootset:
-                    _person_iris.add(origin)
-            _person_iris |= _rootset
+            _person_iris = _person_classes(
+                _roots,
+                {i for i, lb in _labelled if _label_key(lb) in _ORGANIZATION_ROOT_LABELS},
+                anc.all(),
+            )
 
     _chunk_text = {cid: txt for cid, _ciri, txt, _emb, _did in chunks}
     _pair_rejects: list[tuple[str, str]] = []
