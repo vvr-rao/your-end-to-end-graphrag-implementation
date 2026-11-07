@@ -2653,11 +2653,12 @@ def test_stream_summarize_and_chunk_falls_back_to_load_all_when_batch_size_zero(
 # ============================================================================
 
 
-def test_domain_concepts_owl_parses_with_23_buckets() -> None:
-    """source_ontologies/core_ontologies/domain_concepts.owl declares 12
-    owl:Class buckets, each ALSO typed as skos:Concept (OWL Punning), and
-    one skos:ConceptScheme grouping them. The pipeline expects these
-    classes to land in classes_dict via the standard merge path."""
+def test_domain_concepts_owl_parses_with_its_buckets() -> None:
+    """source_ontologies/core_ontologies/domain_concepts.owl declares its
+    owl:Class buckets and the ConceptArea umbrellas, each ALSO typed as
+    skos:Concept (OWL Punning), and one skos:ConceptScheme grouping them. The
+    pipeline expects these classes to land in classes_dict via the standard
+    merge path."""
     from pathlib import Path
     from rdflib import Graph, RDF, OWL
     import rdflib
@@ -2673,10 +2674,9 @@ def test_domain_concepts_owl_parses_with_23_buckets() -> None:
     skos_concepts = list(g.subjects(RDF.type, SKOS.Concept))
     schemes = list(g.subjects(RDF.type, SKOS.ConceptScheme))
 
-    assert len(owl_classes) == 23, f"expected 23 owl:Class, got {len(owl_classes)}"
-    assert len(skos_concepts) == 23, (
-        f"expected 23 skos:Concept (dual-typed via OWL Punning), "
-        f"got {len(skos_concepts)}"
+    assert len(skos_concepts) == len(owl_classes), (
+        f"expected every owl:Class dual-typed skos:Concept (OWL Punning), "
+        f"got {len(skos_concepts)} of {len(owl_classes)}"
     )
     assert len(schemes) == 1, f"expected 1 skos:ConceptScheme, got {len(schemes)}"
 
@@ -2693,8 +2693,8 @@ def test_domain_concepts_owl_parses_with_23_buckets() -> None:
         "Quantity", "Condition", "Method", "Intervention", "Outcome",
     }
     got_locals = {str(iri).rsplit("#", 1)[-1] for iri in owl_classes}
-    assert got_locals == expected_locals, (
-        f"missing or extra buckets. expected={expected_locals} got={got_locals}"
+    assert expected_locals | {"ConceptArea"} <= got_locals, (
+        f"missing buckets: {(expected_locals | {'ConceptArea'}) - got_locals}"
     )
 
 
@@ -3029,3 +3029,29 @@ def test_repair_output_rebrands_local_iris_to_veerla_ramrao_ai(tmp_path) -> None
     parent_iri = classes[widget_iri]["superclasses"][0]["iri"]
     assert parent_iri.startswith(default_base_iri)
     assert "thing" in parent_iri
+
+
+def test_relation_endpoints_that_are_never_classes() -> None:
+    """NONE keeps the predicate with that side open; a value or bare verb
+    drops the relation. Neither mints a class."""
+    from backend.app.helpers.ontology_pruning import add_new_relations_from_match_results
+
+    drug = "https://x/o#Drug"
+    ontology = {"classes_dict": {drug: {"iri": drug, "name": "Drug", "labels": ["Drug"]}},
+                "object_properties_dict": {}, "data_properties_dict": {}, "instances_dict": {}}
+    rels = [{"LABEL": "causes", "DOMAIN": "Drug", "RANGE": "NONE"},
+            {"LABEL": "partOf", "DOMAIN": "NONE", "RANGE": "NONE"},
+            {"LABEL": "has6.5", "DOMAIN": "Drug", "RANGE": "6.5"},
+            {"LABEL": "hasLowers", "DOMAIN": "Drug", "RANGE": "Lowers"}]
+    out, created, skipped, minted = add_new_relations_from_match_results(
+        ontology, {"MATCH NOT FOUND RELATIONS": rels}, "https://x/p#",
+        new_class_base_iri="https://x/c#",
+    )
+    assert minted == []
+    assert set(out["classes_dict"]) == {drug}
+    props = {p["labels"][0]: p for p in out["object_properties_dict"].values()}
+    assert set(props) == {"causes", "partOf"}
+    assert [d["iri"] for d in props["causes"]["domain"]] == [drug]
+    assert props["causes"]["range"] == []
+    assert props["partOf"]["domain"] == [] and props["partOf"]["range"] == []
+    assert len(skipped) == 2

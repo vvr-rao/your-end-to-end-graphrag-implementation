@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from backend.app.services.class_junk_filter import FAMILY_KEEP, filter_reply, junk_reason, words
+from backend.app.services.class_junk_filter import FAMILY_KEEP, filter_reply, junk_reason, non_class_reason, words
 
 
 @pytest.mark.parametrize("label,reason", [
@@ -95,3 +95,22 @@ def test_validity_judge_demotes_named_things_drops_junk_and_keeps_on_failure() -
     stats = asyncio.run(run_validity_judge(store, Router(), log=lambda *_: None))
     assert store.status == {2: "instance", 3: "junk"}          # Refinery kept; Tariff kept on failure
     assert stats["failed_batches"] == 1 and stats["category"] == 1 and Router.calls == 2
+
+
+@pytest.mark.parametrize("label,reason", [
+    ("6", "number"), ("6.5", "number"), ("50%", "number"), ("123%", "number"),
+    ("$84B", "number"), ("$1.8B", "number"), ("2026", "number"), ("Q1 2026", "number"),
+    ("FY24", "number"), ("NONE", "placeholder"), ("N/A", "placeholder"),
+    ("Lowers", "verb"), ("Reduces", "verb"), ("is", "verb"),
+])
+def test_non_class_reason_catches_values_placeholders_and_bare_verbs(label: str, reason: str) -> None:
+    assert non_class_reason(label) == reason
+    assert junk_reason(label) == reason
+
+
+@pytest.mark.parametrize("label", [
+    "3M", "5G", "4K", "10K", "B12", "A1C", "CO2", "PM2.5", "Type2Diabetes", "HbA1c",
+    "Reduction", "Lowering", "Blockade", "Treatment", "Revenue", "Sales",
+])
+def test_non_class_reason_keeps_real_names(label: str) -> None:
+    assert non_class_reason(label) is None

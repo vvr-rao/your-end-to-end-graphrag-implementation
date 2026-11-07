@@ -56,6 +56,8 @@ class Settings(BaseSettings):
     groq_api_key: str | None = None
     anthropic_api_key: str | None = None
     deepinfra_api_key: str | None = None
+    # Evaluations only (eval-dataset, eval-questions --langsmith).
+    langsmith_api_key: str | None = None
 
     render_api_key: str | None = None
 

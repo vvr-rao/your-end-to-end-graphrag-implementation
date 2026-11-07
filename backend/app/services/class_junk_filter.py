@@ -19,6 +19,9 @@ corpus as a false-positive control):
   url         a URL, domain or e-mail address
   superlative Most*/Least* fragments (MostNonet, LeastDuodecet)
   phrase      more than 6 words -- a sentence fragment, not a class name
+  placeholder a model's "nothing here" answer used as a name (NONE, N/A)
+  verb        a bare inflected verb (Lowers, Reduces): what a relation endpoint
+              becomes when the model splits "X lowers Y" into hasLowers
   family      within ONE reply, more than FAMILY_MAX labels sharing their
               first word: the loop signature. The first FAMILY_KEEP are kept.
               OFF by default (drop_family=False) since 2026-10-19: with the
@@ -40,7 +43,7 @@ MAX_WORDS = 6
 
 _YEAR = re.compile(r"(?<!\d)(19|20)\d{2}(?!\d)")
 _BIG_NUMBER = re.compile(r"\d{3,}")
-_AMOUNT = re.compile(r"\d+(?:\.\d+)?\s*(?:bn|b|mn|m|k|mt|tn|t|%|percent|usd|eur|kg|mg|ml|bpd)\b", re.I)
+_AMOUNT = re.compile(r"\d+(?:\.\d+)?\s*(?:%|(?:bn|b|mn|m|k|mt|tn|t|percent|usd|eur|kg|mg|ml|bpd)\b)", re.I)
 _DESIGNATOR = re.compile(r"^[A-Za-z]?\d+[A-Za-z]?$")
 # A word of 4+ letters with digits stuck on the end ("Refinery5", "Refinery51bn").
 # All-caps stems are acronyms that legitimately carry a number (COVID19, CO2).
@@ -50,6 +53,19 @@ _TRAILING_NUMBER = re.compile(r"^(?P<stem>[A-Za-z][a-z]{3,}(?:[A-Z][a-z]+)*)\d+[
 _QUALIFIED_NUMBER = re.compile(r"(?:Type|Phase|Tier|Scope|Grade|Stage|Class|Level|Generation|Industry)\d+[a-z]?$")
 _URL = re.compile(r"(https?://|www\.|\.(?:com|org|net|gov|edu|io|co|ai)\b|@[a-z0-9-]+\.)", re.I)
 _SUPERLATIVE = re.compile(r"^(?:Most|Least)(?=[A-Z\s])")
+# The WHOLE label is a value. A letter unit needs a currency sign, so 3M, 5G,
+# 4K and 10K stay names; B12 and A1C never match because they start with a letter.
+_VALUE = re.compile(
+    r"^(?:[$\u20ac\u00a3\u00a5\u20a9]\s*\d[\d,.]*\s*(?:bn|b|mn|m|k|tn|t|billion|million|thousand|trillion)?"
+    r"|\d[\d,.]*\s*(?:%|percent|bn|mn|billion|million|trillion|mg|kg|ml|bpd)?)$",
+    re.I,
+)
+_PERIOD = re.compile(r"^(?:Q[1-4]\s*(?:FY)?\s*\d{2,4}|[1-4]Q\s*\d{2,4}|FY\s*\d{2,4})$", re.I)
+_PLACEHOLDERS = frozenset({"NONE", "NULL", "N/A", "UNKNOWN", "TBD", "UNDEFINED"})
+_BARE_VERBS = frozenset({
+    "is", "are", "be", "has", "have", "lowers", "raises", "reduces", "increases",
+    "decreases", "causes", "treats", "improves", "inhibits", "blocks",
+})
 
 
 def words(label: str) -> list[str]:
@@ -59,11 +75,32 @@ def words(label: str) -> list[str]:
     return [w for w in re.split(r"[\s_\-/]+", s) if w]
 
 
+def non_class_reason(label: Any) -> str | None:
+    """Why a label can never name a class, or None.
+
+    The narrow subset of `junk_reason` that every provider mode applies at
+    Stage 4, where a class also gets minted from a relation endpoint. It looks
+    at the whole label only, so a real name that carries a number stays.
+    """
+    lab = str(label or "").strip()
+    low = lab.lower()
+    if lab in _PLACEHOLDERS:
+        return "placeholder"
+    if low in _BARE_VERBS:
+        return "verb"
+    if _VALUE.match(lab) or _PERIOD.match(lab):
+        return "number"
+    return None
+
+
 def junk_reason(label: Any) -> str | None:
     """The rule a single label breaks, or None. Per label; no context."""
     lab = str(label or "").strip()
     if not lab:
         return "empty"
+    narrow = non_class_reason(lab)
+    if narrow:
+        return narrow
     if _URL.search(lab):
         return "url"
     # Only "Most/Least + one word" (MostPopular, LeastPhysical, MostNonet):

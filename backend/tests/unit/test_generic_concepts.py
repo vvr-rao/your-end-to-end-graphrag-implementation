@@ -9,6 +9,8 @@ import json
 import uuid
 from types import SimpleNamespace
 
+import pytest
+
 from backend.app.services import concept_heads as ch
 from backend.app.services import retrieval as rt
 from backend.app.services import retrieval_sql as rsql
@@ -94,8 +96,8 @@ def test_generalize_accepts_rejects_and_drops_rejected_members() -> None:
     # Groups go largest-first, ties alphabetical: Manufacturer=0, Revenue=1.
     # RevenueRecognitionPolicy heads 'Policy' (alone), so it is no Revenue member.
     reply = {"decisions": [
-        {"id": 0, "accept": False},
-        {"id": 1, "accept": True, "root": "measure", "description": "Income.",
+        {"id": 0, "kind": "none"},
+        {"id": 1, "kind": "amount", "description": "Income.",
          "rejected_members": []},
     ]}
     router = _Router(reply, {"enabled": True})
@@ -107,11 +109,44 @@ def test_generalize_accepts_rejects_and_drops_rejected_members() -> None:
     assert by["EVManufacturer"]["PARENT_LABEL"] == "Organization"
 
 
-def test_generalize_rejects_a_root_outside_the_concept_layer() -> None:
-    reply = {"decisions": [{"id": 1, "accept": True, "root": "Organization"}]}
+@pytest.mark.parametrize("kind", ["body_part", "document_item", "descriptor", "none", "Organization", "", None])
+def test_generalize_accepts_only_a_kind_that_maps_to_a_root(kind) -> None:
+    reply = {"decisions": [{"id": 1, "kind": kind}]}
     out, accepted = asyncio.run(ch.generalize_concept_heads(
         _Router(reply, {"enabled": True}), _PAYLOAD, log=lambda *_: None))
     assert accepted == [] and out is _PAYLOAD
+
+
+def test_every_accepting_kind_maps_to_a_real_head_root() -> None:
+    assert {r for _, r, _ in ch.HEAD_KINDS if r} <= set(ch.HEAD_ROOTS)
+
+
+def test_blocked_heads_never_reach_the_judge() -> None:
+    items = [{"LABEL": x} for x in ("RevisionDate", "PublicationDate", "FooterSection", "HeaderSection")]
+    assert ch.candidate_groups(items) == {}
+
+
+def test_concept_grouping_splits_a_batch_with_no_usable_reply() -> None:
+    from backend.app.services import pipeline_llm as pl
+
+    orphans = [{"LABEL": f"Orphan{i}", "DESCRIPTION": ""} for i in range(24)]
+
+    class Router:
+        def __init__(self) -> None:
+            self.sizes: list[int] = []
+
+        async def chat(self, task, system, user):
+            n = user.count("Orphan")
+            self.sizes.append(n)
+            if n > 12:
+                return SimpleNamespace(text='{"ASSIGNMENTS": [')
+            return SimpleNamespace(text=json.dumps({"ASSIGNMENTS": [
+                {"CLASS_LABEL": "x", "CONCEPT_LABEL": "Process"}] * n}))
+
+    router = Router()
+    out = asyncio.run(pl._propose_concept_grouping(router, orphans))
+    assert router.sizes == [24, 12, 12]
+    assert len(out["ASSIGNMENTS"]) == 24
 
 
 def test_generalize_is_a_noop_when_disabled_or_unconfigured() -> None:
@@ -122,7 +157,7 @@ def test_generalize_is_a_noop_when_disabled_or_unconfigured() -> None:
 
 
 def test_generalize_runs_when_the_task_omits_enabled() -> None:
-    reply = {"decisions": [{"id": 1, "accept": True, "root": "measure", "rejected_members": []}]}
+    reply = {"decisions": [{"id": 1, "kind": "amount", "rejected_members": []}]}
     router = _Router(reply, {"model": "m"})   # task defined, no `enabled` key -> ON
     _, accepted = asyncio.run(ch.generalize_concept_heads(router, _PAYLOAD, log=lambda *_: None))
     assert [a["head"] for a in accepted] == ["Revenue"]
@@ -474,3 +509,20 @@ def test_already_enriched_subquery_excludes_null_chunk_ids() -> None:
 
     sql = str(_already_enriched_chunk_ids().compile()).lower()
     assert "source_chunk_id is not null" in sql
+
+
+def test_candidate_groups_skip_negated_labels_but_not_acronyms() -> None:
+    items = [{"LABEL": x} for x in ("NoRenalFinding", "ImagingFinding", "LabFinding")]
+    assert ch.candidate_groups(items) == {"Finding": [1, 2]}
+    assert not ch._is_negated("NoSQLDatabase")
+    assert not ch._is_negated("NobelPrize")
+
+
+def test_plural_head_joins_singular_only_when_singular_exists() -> None:
+    items = [{"LABEL": x} for x in ("OperatingCost", "LabourCosts", "TravelCosts")]
+    assert sorted(ch.candidate_groups(items)["Cost"]) == [0, 1, 2]
+    # No singular group or class: the plural head is left alone.
+    items = [{"LABEL": x} for x in ("TypeTwoDiabetes", "GestationalDiabetes")]
+    assert ch.candidate_groups(items) == {"Diabetes": [0, 1]}
+    items = [{"LABEL": x} for x in ("TravelCosts", "LabourCosts", "Cost")]
+    assert sorted(ch.candidate_groups(items)["Cost"]) == [0, 1]

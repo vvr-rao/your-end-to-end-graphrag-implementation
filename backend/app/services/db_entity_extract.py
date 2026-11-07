@@ -47,6 +47,7 @@ from backend.app.db.models.graph import GraphRelationship
 from backend.app.db.models.ontology import OntologyClass, OntologyObjectProperty
 from backend.app.db.session import session_scope
 from backend.app.helpers.ontology_pruning import split_disjunction_label
+from backend.app.services import concept_review
 from backend.app.services.db_artifact_gen import _extract_json
 from backend.app.services.embeddings import Embedder
 from backend.app.services.llm_router import LLMRouter
@@ -215,11 +216,12 @@ def _filter_entities(
     if not isinstance(raw_entities, list):
         return kept
     menu_index = _build_menu_index(cand_iris, cand_labels)
+    label_set = set((cand_labels or {}).values())
     for e in raw_entities:
         if not isinstance(e, dict):
             continue
-        name = (e.get("canonical_name") or "").strip()
-        short = (e.get("short_name") or name).strip()
+        name = _humanize_class_name((e.get("canonical_name") or "").strip(), label_set)
+        short = _humanize_class_name((e.get("short_name") or name).strip(), label_set)
         class_iri = (e.get("class_iri") or "").strip()
         if not name:
             ent_drops["no_name"] += 1
@@ -568,12 +570,33 @@ def _dedup_key(name: str) -> str:
     Duplicate nodes are not cosmetic: each carries its own edges, so a
     multi-hop traversal that arrives at one cannot see what is hung off the
     other -- the same failure that motivated name-level identity below.
+
+    The key also ignores spacing and a plural on the LAST word, so SUSTAIN 6 /
+    SUSTAIN-6, ApneaHypopneaIndex / Apnea-Hypopnea Index and tariff / tariffs
+    are one node. Measured on 2,647 entities (fin-gen + pharma, 2026-11-03):
+    47 more merges, none wrong. A space between two digits stays, because
+    "Phase 1 2" and "Phase 12" differ.
     """
     base = _normalize_name(name)
     stripped = _LEGAL_SUFFIX_RE.sub(" ", base)
-    stripped = re.sub(r"\s+", " ", stripped).strip()
     # Never collapse a name to nothing: "Group" and "Co" are real short names.
-    return stripped or base
+    words = stripped.split() or base.split()
+    if words and len(words[-1]) > 3 and words[-1].endswith("s") \
+            and not words[-1].endswith(("ss", "us", "is")):
+        words[-1] = words[-1][:-1]
+    return re.sub(r"(?<!\d) | (?!\d)", "", " ".join(words))
+
+
+_CAMEL_NAME_RE = re.compile(r"^[A-Z][a-z]+(?:[A-Z][a-z]+)+$")
+
+
+def _humanize_class_name(name: str, labels: Iterable[str]) -> str:
+    """A name copied from a CamelCase class label reads as words:
+    `HypoxicBurden` under class HypoxicBurden -> `Hypoxic Burden`. Any other
+    CamelCase name (a real name like `BioNTech`, `PayPal`) is left alone."""
+    if _CAMEL_NAME_RE.match(name) and name in labels:
+        return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", name)
+    return name
 
 
 # Class labels (lowercased, spaces removed) that root the PERSON classes the
@@ -2536,6 +2559,7 @@ async def extract_entities(
                 "config/models.example.yaml) to enable --concept-pass."
             )
             concept_pass = False
+    concept_review_prompt = concept_review.resolve_prompt(router) if concept_pass else None
     # Which classes the concept pass is allowed to assign to, resolved ONCE.
     #
     # The prompt tells the model to use only classes denoting an abstract
@@ -2681,8 +2705,9 @@ async def extract_entities(
     }
     concept_stats: dict[str, int] = {
         "chunks_run": 0, "added": 0, "duplicate_of_entity": 0, "failed": 0,
-        "no_concept_classes": 0,
+        "no_concept_classes": 0, **concept_review.new_stats(),
     }
+    concept_review_samples: list[dict[str, Any]] = []
     abstained: list[dict[str, Any]] = []
     _abstain_sample_cap = 200
     # Verification pass repairs as well as rejects: a claim whose quote states
@@ -3133,6 +3158,7 @@ async def extract_entities(
                 concept_stats["no_concept_classes"] += 1
             if c_menu:
                 concept_stats["chunks_run"] += 1
+                c_added: set[int] = set()
                 try:
                     c_sys, c_user = PROMPTS["concept_extract"](txt, c_menu)
                     c_out = await router.chat(
@@ -3163,6 +3189,7 @@ async def extract_entities(
                             continue
                         seen.add(key)
                         kept.append(c)
+                        c_added.add(id(c))
                         concept_stats["added"] += 1
                 except Exception as exc:
                     concept_stats["failed"] += 1
@@ -3170,6 +3197,31 @@ async def extract_entities(
                         f"[extract-entities] chunk {chunk_iri} concept pass "
                         f"failed: {exc}"
                     )
+
+                # ---- Concept review ----
+                #
+                # Everything that counts as a concept, whichever call found
+                # it. A recovered class can be off the concept menu, so the
+                # reviewer is also shown each concept's current class.
+                if concept_review_prompt is not None:
+                    r_idx = [
+                        i for i, e in enumerate(kept)
+                        if id(e) in c_added or e["class_iri"] in concept_class_iris
+                    ]
+                    r_menu = list(c_menu)
+                    _on_menu = {c["iri"] for c in c_menu}
+                    for _iri in {kept[i]["class_iri"] for i in r_idx} - _on_menu:
+                        _m = class_meta.get(_iri) or (recovery_meta or {}).get(_iri) or {}
+                        r_menu.append({"iri": _iri, "label": _m.get("label", ""),
+                                       "description": _m.get("description", "")})
+                    reviewed = await concept_review.review_concepts(
+                        router, concept_review_prompt, txt,
+                        [kept[i] for i in r_idx], r_menu,
+                        concept_stats, concept_review_samples,
+                    )
+                    for i, res in zip(r_idx, reviewed):
+                        kept[i] = res
+                    kept[:] = [e for e in kept if e is not None]
 
             # ---- Second pass: relationships ----
             #
@@ -3474,6 +3526,16 @@ async def extract_entities(
     else:
         primary_class_by_name = {}
 
+    _doubtful_norms = concept_review.doubtful_names(
+        (
+            (_normalize_name(e["canonical_name"]), e["class_iri"],
+             bool(e.get(concept_review.DOUBTFUL_KEY)))
+            for tup in results if tup is not None
+            for e in (tup[3] or [])
+        ),
+        primary_class_by_name,
+    )
+
     # Every key the loop below would send to the fuzzy fallback: first-seen
     # exact misses. The DB does not change during the loop and each key is
     # looked up at most once, so resolving them up front gives the same answer.
@@ -3552,6 +3614,8 @@ async def extract_entities(
                 "extra_metadata": {
                     "first_seen_in_chunk": chunk_iri,
                     "first_confidence": e["confidence"],
+                    **({concept_review.DOUBTFUL_KEY: True}
+                       if normalized in _doubtful_norms else {}),
                     **({"aliases": sorted(
                         _aliases_by_norm[normalized] - {e["canonical_name"]})[:25]}
                        if _aliases_by_norm.get(normalized) else {}),
@@ -3964,6 +4028,24 @@ async def extract_entities(
             f"no concept class on the menu and cost no call, "
             f"{concept_stats['failed']} call(s) failed)"
         )
+        if concept_stats["review_calls"]:
+            print(
+                f"[extract-entities] concept review: "
+                f"{concept_stats['review_checked']} checked over "
+                f"{concept_stats['review_calls']} call(s): "
+                f"{concept_stats['review_kept']} kept, "
+                f"{concept_stats['review_moved']} moved, "
+                f"{concept_stats['review_dropped']} dropped, "
+                f"{concept_stats['review_flagged']} flagged (no fitting class), "
+                f"{concept_stats['review_unanswered']} unanswered, "
+                f"{concept_stats['review_bad_move']} unusable move(s), "
+                f"{concept_stats['review_failed']} call(s) failed (kept unreviewed)"
+            )
+            for r in concept_review_samples[:15]:
+                print(f"[extract-entities]   {r['verdict']}: {r['name']!r} "
+                      f"{r['from'].rsplit('#', 1)[-1]}"
+                      + (f" -> {r['to'].rsplit('#', 1)[-1]}" if r["to"] else "")
+                      + f" ({r['reason']})")
 
     if extract_relationships:
         _dropped = sum(rel_drops.values())

@@ -121,6 +121,7 @@ async def main() -> int:
     total_invalid = 0
     t0 = time.time()
     rows: list[tuple] = []
+    results: list[tuple] = []
 
     for qid, question, expectation in qs:
         print(f"\n{'=' * 78}\nQ{qid}: {question}\n  expect: {expectation}", flush=True)
@@ -149,6 +150,7 @@ async def main() -> int:
             qid, "ok", len(res.evidence), res.cost_usd, res.wall_seconds,
             aliases, res.invalid_citations,
         ))
+        results.append((question, res))
 
         print(f"  cost ${res.cost_usd:.4f}  wall {res.wall_seconds:.0f}s  "
               f"evidence {len(res.evidence)}  docs {len(titles)}  "
@@ -183,6 +185,10 @@ async def main() -> int:
         print(f"{qid:>3}  {st:<5} {ev:>3} ${cost:>7.4f} {wall:>5.0f}s{alias_note}{flag}")
     print(f"\ntotal cost ${total_cost:.4f}   invalid citations: {total_invalid}")
     print(f"written: {out_path}")
+    # Standing question evaluation (backend/app/evals); fails soft.
+    from backend.app.evals.question_eval import report_from_results
+
+    await report_from_results(results, label="audit-questions", mode=args.mode)
     return 0
 
 

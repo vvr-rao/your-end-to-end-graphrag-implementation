@@ -22,10 +22,13 @@ from __future__ import annotations
 
 import math
 import uuid
+from collections.abc import Iterable
 from typing import Any
 
 from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from backend.app.services.predicates import GRAPHRAG_LOCATED_IN
 
 
 def _vec_str(v: list[float]) -> str:
@@ -94,6 +97,16 @@ _ENTITY_BFS_SQL = sql_text(
         "       AND gr.target_node_type = 'entity'",
     )
 )
+# Place containment is directional too, and for the same reason: a Germany seed
+# must not climb to Europe and descend into Spain. `expand_place_entities` walks
+# it, so this walk leaves it out while that expansion is on.
+_ENTITY_BFS_NO_CONTAINMENT_SQL = sql_text(
+    _ENTITY_BFS_SQL.text.replace(
+        "AND gr.target_node_type = 'entity'",
+        "AND gr.target_node_type = 'entity'\n"
+        f"       AND gr.predicate_iri <> '{GRAPHRAG_LOCATED_IN}'",
+    )
+)
 
 
 async def bfs_expand(
@@ -104,6 +117,7 @@ async def bfs_expand(
     decay: float = 0.7,
     entity_relationships_only: bool = False,
     terminal_ids: set[uuid.UUID] | None = None,
+    skip_containment: bool = False,
 ) -> dict[tuple[uuid.UUID, str], dict[str, Any]]:
     """Walk `graph_relationships` outward from seeds. Returns a map of
     `(node_id, node_type) -> {score, hop}`.
@@ -117,7 +131,8 @@ async def bfs_expand(
     seed_ids = [str(sid) for sid, _ in seeds]
     seed_types = [stype for _, stype in seeds]
     result = await session.execute(
-        _ENTITY_BFS_SQL if entity_relationships_only else _BFS_SQL,
+        (_ENTITY_BFS_NO_CONTAINMENT_SQL if skip_containment else _ENTITY_BFS_SQL)
+        if entity_relationships_only else _BFS_SQL,
         {
             "seed_ids": seed_ids,
             "seed_types": seed_types,
@@ -514,9 +529,16 @@ async def fetch_fulltext_chunks_for_chunks(
     *,
     limit: int = 500,
     per_document_limit: int = 50,
+    rank_chunk_ids: list[uuid.UUID] | None = None,
 ) -> list[tuple[uuid.UUID, float, uuid.UUID]]:
     """Full-text chunks (kind='fulltext') belonging to the documents that own
     any of the given (summary) chunks.
+
+    `rank_chunk_ids`, when given, are the only chunks that count towards a
+    document's `hits` (its rank). Retrieval passes the graph routes' chunks, so
+    the document arm's chunks -- up to 50 per document -- cannot outrank the
+    documents the graph found; a document reached only by the document arm
+    gets hits 0 and ranks last.
 
     Mirrors `fetch_table_artifacts_for_chunks`: the graph reaches a document via
     its summary chunks' entity edges, but those edges point at summary chunks.
@@ -541,7 +563,10 @@ async def fetch_fulltext_chunks_for_chunks(
     result = await session.execute(
         sql_text("""
         WITH candidate_docs AS (
-            SELECT c.document_id, count(*) AS n_chunks
+            SELECT c.document_id,
+                   count(*) FILTER (
+                       WHERE CAST(:rank_all AS boolean)
+                          OR c.id = ANY(CAST(:rank_ids AS uuid[]))) AS n_chunks
               FROM graphrag.chunks c
              WHERE c.id = ANY(CAST(:chunk_ids AS uuid[]))
                AND c.document_id IS NOT NULL
@@ -576,12 +601,127 @@ async def fetch_fulltext_chunks_for_chunks(
         """),
         {
             "chunk_ids": [str(cid) for cid in chunk_ids],
+            "rank_all": rank_chunk_ids is None,
+            "rank_ids": [str(cid) for cid in (rank_chunk_ids or [])],
             "limit": limit,
             "per_doc": per_document_limit,
             "probe": _vec_str(probe_embedding),
         },
     )
     return [(cid, float(hits), did) for cid, hits, did in result.all()]
+
+
+async def fulltext_document_ids(
+    session: AsyncSession, document_ids: Iterable[uuid.UUID]
+) -> set[uuid.UUID]:
+    """The documents among these that carry active full-text chunks."""
+    ids = [str(d) for d in document_ids]
+    if not ids:
+        return set()
+    rows = await session.execute(sql_text("""
+        SELECT DISTINCT document_id FROM graphrag.chunks
+         WHERE document_id = ANY(CAST(:ids AS uuid[]))
+           AND kind = 'fulltext' AND status = 'ACTIVE' AND embedding IS NOT NULL
+    """), {"ids": ids})
+    return {r[0] for r in rows.all()}
+
+
+async def fetch_fulltext_passages_for_anchors(
+    session: AsyncSession,
+    anchors: list[tuple[uuid.UUID, float]],
+    documents: list[uuid.UUID],
+    probe_embedding: list[float],
+    *,
+    per_anchor: int = 5,
+    question_chunks: int = 3,
+    document_scores: dict[uuid.UUID, float] | None = None,
+) -> list[tuple[uuid.UUID, float, uuid.UUID]]:
+    """Full-text passages of `documents`: for each anchor (a graph-found summary
+    chunk, with its 0-1 score) the `per_anchor` full-text chunks of the SAME
+    document nearest it, and per document the `question_chunks` nearest the
+    question. Returns `(fulltext chunk id, score, document id)`, best first.
+
+    Score = anchor score x cosine similarity (vectors are unit length, so
+    cos = 1 - d^2/2 for the L2 distance d); a passage near several anchors
+    keeps its best. A question-backstop passage scores its document's score
+    (`document_scores`, the document's best graph-found chunk, 0-1) x its cosine
+    similarity to the question. Scoring them 0 ranked them last in the graph
+    vote and lost an answer the question pointed straight at (measured
+    2026-11-07 on fin_longdoc: the 2nd-nearest passage of a 596-chunk 20-F)."""
+    if not documents:
+        return []
+    result = await session.execute(
+        sql_text("""
+        WITH a AS (
+            SELECT c.id AS aid, c.document_id, c.embedding, s.score
+              FROM unnest(CAST(:aids AS uuid[]), CAST(:ascores AS float8[])) AS s(id, score)
+              JOIN graphrag.chunks c ON c.id = s.id
+             WHERE c.embedding IS NOT NULL
+               AND c.document_id = ANY(CAST(:docs AS uuid[]))
+        ),
+        near AS (
+            SELECT ft.id, ft.document_id,
+                   a.score * (1 - power(ft.embedding <-> a.embedding, 2) / 2) AS sc,
+                   row_number() OVER (PARTITION BY a.aid
+                                      ORDER BY ft.embedding <-> a.embedding, ft.chunk_index) AS rn
+              FROM a
+              JOIN graphrag.chunks ft
+                ON ft.document_id = a.document_id
+               AND ft.kind = 'fulltext' AND ft.status = 'ACTIVE'
+               AND ft.embedding IS NOT NULL
+        ),
+        ds AS (
+            SELECT * FROM unnest(CAST(:sdocs AS uuid[]), CAST(:sscores AS float8[]))
+                AS t(document_id, score)
+        ),
+        q AS (
+            SELECT ft.id, ft.document_id,
+                   coalesce(ds.score, 0)
+                     * (1 - power(ft.embedding <-> CAST(:probe AS vector), 2) / 2) AS sc,
+                   row_number() OVER (PARTITION BY ft.document_id
+                                      ORDER BY ft.embedding <-> CAST(:probe AS vector),
+                                               ft.chunk_index) AS rn
+              FROM graphrag.chunks ft
+              LEFT JOIN ds ON ds.document_id = ft.document_id
+             WHERE ft.document_id = ANY(CAST(:docs AS uuid[]))
+               AND ft.kind = 'fulltext' AND ft.status = 'ACTIVE'
+               AND ft.embedding IS NOT NULL
+        ),
+        picked AS (
+            SELECT id, document_id, sc FROM near WHERE rn <= :per_anchor
+            UNION ALL
+            SELECT id, document_id, sc FROM q WHERE rn <= :per_q
+        )
+        SELECT id, max(sc) AS sc, document_id
+          FROM picked
+         GROUP BY id, document_id
+         ORDER BY sc DESC, id
+        """),
+        {
+            "aids": [str(a) for a, _ in anchors],
+            "ascores": [float(s) for _, s in anchors],
+            "docs": [str(d) for d in documents],
+            "probe": _vec_str(probe_embedding),
+            "per_anchor": per_anchor,
+            "per_q": question_chunks,
+            "sdocs": [str(d) for d in (document_scores or {})],
+            "sscores": [float(v) for v in (document_scores or {}).values()],
+        },
+    )
+    return [(cid, float(sc), did) for cid, sc, did in result.all()]
+
+
+async def summary_chunk_ids(
+    session: AsyncSession, chunk_ids: list[uuid.UUID] | set[uuid.UUID]
+) -> set[uuid.UUID]:
+    """The ids among `chunk_ids` that are summary chunks."""
+    if not chunk_ids:
+        return set()
+    result = await session.execute(sql_text("""
+        SELECT id FROM graphrag.chunks
+         WHERE id = ANY(CAST(:ids AS uuid[])) AND kind = 'summary'
+    """), {"ids": [str(c) for c in chunk_ids]})
+    return {r[0] for r in result.all()}
 
 
 async def fetch_chunk_document_ids(
@@ -757,7 +897,8 @@ async def concept_entity_ids(
     session: AsyncSession, root_labels: list[str] | tuple[str, ...]
 ) -> set[uuid.UUID]:
     """Entities typed under the concept roots (`extraction.concept_class_roots`)
-    -- the concept pass's output: "related-party revenue", "hypoglycemia"."""
+    -- the concept pass's output: "related-party revenue", "hypoglycemia" --
+    minus those judged named things (`concept_kinds.py`)."""
     labels = [r.strip().lower() for r in root_labels if r and r.strip()]
     if not labels:
         return set()
@@ -765,8 +906,14 @@ async def concept_entity_ids(
         SELECT e.id FROM graphrag.entities e
          WHERE e.status = 'ACTIVE'
            AND e.class_id IN (SELECT id FROM (""" + _CONCEPT_CLASS_IDS_SQL.text + """) c)
+           AND e.extra_metadata->>'concept_kind' IS DISTINCT FROM 'named'
     """), {"labels": labels})
     return {row[0] for row in r.all()}
+
+
+# A concept whose class the review could not confirm (`concept_review.py`) stays
+# in the graph and can still be reached by a walk, but never seeds one as a concept.
+_NOT_DOUBTFUL_SQL = "e.extra_metadata->>'concept_class_doubtful' IS DISTINCT FROM 'true'"
 
 
 async def concept_seed_entities(
@@ -800,6 +947,7 @@ async def concept_seed_entities(
         SELECT e.id FROM graphrag.entities e
          WHERE e.class_id = ANY(CAST(:k AS uuid[]))
            AND e.id = ANY(CAST(:concepts AS uuid[]))
+           AND """ + _NOT_DOUBTFUL_SQL + """
          ORDER BY (e.embedding IS NULL), e.embedding <-> CAST(:q AS vector)
          LIMIT :n
     """), {"k": [str(c) for c in counts], "concepts": [str(c) for c in concept_ids],
@@ -841,6 +989,7 @@ async def concept_entities_by_name(
                      e.normalized_name = lower(:t) AS exact
                 FROM graphrag.entities e
                WHERE e.id = ANY(CAST(:concepts AS uuid[])) AND e.status = 'ACTIVE'
+                 AND """ + _NOT_DOUBTFUL_SQL + """
             ) x
              WHERE exact OR d <= :max_l2
              ORDER BY exact DESC, d
@@ -948,6 +1097,12 @@ async def vector_search_all_artifacts(
         {"probe": _vec_str(probe_embedding), "limit": top_k},
     )
     return [row[0] for row in result.all()]
+
+
+async def active_document_count(session: AsyncSession) -> int:
+    r = await session.execute(sql_text(
+        "SELECT count(*) FROM graphrag.documents WHERE status = 'ACTIVE'"))
+    return int(r.scalar() or 0)
 
 
 async def vector_search_documents(
@@ -1867,6 +2022,68 @@ async def expand_time_instances(
                 continue
             out[tid] = max(out.get(tid, 0.0), 0.5 * (0.8 ** int(depth)))
     return out
+
+
+_PLACE_DESCEND_SQL = sql_text("""
+WITH RECURSIVE down(id, depth) AS (
+    SELECT CAST(x AS uuid), 0 FROM unnest(CAST(:seed_ids AS uuid[])) AS x
+  UNION
+    SELECT gr.source_node_id, d.depth + 1
+      FROM down d
+      JOIN graphrag.graph_relationships gr
+        ON gr.target_node_id = d.id
+       AND gr.predicate_iri = :predicate
+       AND gr.source_node_type = 'entity'
+       AND gr.target_node_type = 'entity'
+     WHERE d.depth < CAST(:max_depth AS int)
+)
+SELECT d.id, min(d.depth)
+  FROM down d
+  JOIN graphrag.entities e ON e.id = d.id AND e.status = 'ACTIVE'
+ WHERE d.depth > 0
+ GROUP BY d.id
+""")
+
+
+async def container_places(session: AsyncSession) -> list[tuple[uuid.UUID, str, list[str]]]:
+    """`(id, name, aliases)` of every place with something located in it, the only
+    places an expansion can start from."""
+    rows = await session.execute(sql_text("""
+        SELECT DISTINCT e.id, e.name, e.extra_metadata -> 'aliases'
+          FROM graphrag.graph_relationships gr
+          JOIN graphrag.entities e ON e.id = gr.target_node_id AND e.status = 'ACTIVE'
+         WHERE gr.predicate_iri = :predicate
+           AND gr.source_node_type = 'entity'
+           AND gr.target_node_type = 'entity'
+    """), {"predicate": GRAPHRAG_LOCATED_IN})
+    return [(eid, name, [a for a in (aliases or []) if isinstance(a, str)])
+            for eid, name, aliases in rows.all()]
+
+
+async def expand_place_entities(
+    session: AsyncSession,
+    seed_ids: list[uuid.UUID],
+    *,
+    max_depth: int = 3,
+) -> dict[uuid.UUID, tuple[float, int]]:
+    """Places inside the ones a question named, as `id -> (score, depth)`.
+
+    The geographic counterpart of `expand_time_instances`: a question about
+    Europe is about Germany, whatever relation it asks about, and the relation
+    walk would not take "Germany is located in Europe" for a revenue question.
+    Down only: unlike a period, a place is not also about what contains it, and
+    going up is how a Germany question would reach Spain.
+    """
+    if not seed_ids:
+        return {}
+    rows = await session.execute(_PLACE_DESCEND_SQL, {
+        "seed_ids": [str(s) for s in seed_ids],
+        "predicate": GRAPHRAG_LOCATED_IN,
+        "max_depth": max_depth,
+    })
+    seeds = set(seed_ids)
+    return {eid: (0.8 ** int(depth), int(depth))
+            for eid, depth in rows.all() if eid not in seeds}
 
 
 async def time_instances_by_identifier(

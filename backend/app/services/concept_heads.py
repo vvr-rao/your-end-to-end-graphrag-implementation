@@ -14,8 +14,9 @@ This pass, run on the deduplicated Stage-3 payload:
   1. groups the proposed classes by their HEAD noun (the last word of the
      label, or the last two when the last is too generic to stand alone:
      `Rate`, `Ratio`, `Value`...),
-  2. asks a judge model, per group, whether every member is a kind of the
-     head and which domain-neutral root the head belongs under,
+  2. asks a judge model, per group, what KIND of thing the head is and which
+     members are not kinds of it; code maps the kind to a root, so the model
+     never chooses a root and can answer that a head is not a concept at all,
   3. adds the head as a proposal under that root (reused by Stage 4's
      exact-label dedup when the ontology already has it) and re-parents
      confirmed members to it -- only members whose current parent is
@@ -28,7 +29,6 @@ prompt for the configured set the pass is skipped.
 """
 from __future__ import annotations
 
-import json
 import os
 import re
 from typing import Any
@@ -46,6 +46,35 @@ HEAD_ROOTS = (
     "Intervention", "Outcome", "Material", "PolicyConcept", "EconomicConcept",
     "TechnologyConcept", "Industry", "Infrastructure", "SupplyChainConcept",
 )
+# The judge's only choices, and the root each maps to (None = not a concept
+# head, so rejected). Choosing among 15 broad roots let it force nearly anything
+# in: Nerve under Material, Temperature under Condition (replay, 2026-11-03).
+HEAD_KINDS: tuple[tuple[str, str | None, str], ...] = (
+    ("amount", "Measure", "a directly reported amount (revenue, dose, output volume, voltage)"),
+    ("ratio", "Metric", "a derived ratio or rate (margin, response rate, defect rate)"),
+    ("state", "Condition", "a state, disease or defect (diabetes, insolvency, corrosion, a risk)"),
+    ("result", "Outcome", "a result or change (side effect, loss, growth, decline)"),
+    ("substance", "Material", "a physical or biological substance or agent (drug, inhibitor, receptor, steel, resin)"),
+    ("device", "TechnologyConcept", "an engineered device, system or software (battery, chip, syringe), never a drug or an accounting item"),
+    ("network", "Infrastructure", "a physical network or utility (roads, grids, pipelines, ports), never financial or anatomical"),
+    ("rule", "PolicyConcept", "a rule, law, standard or official decision (regulation, covenant, approval)"),
+    ("activity", "Process", "an activity or sequence of steps (production, assembly, clinical study)"),
+    ("technique", "Method", "a technique or way of doing something (assay, valuation method, lean)"),
+    ("treatment", "Intervention", "a treatment or deliberate action taken on something (therapy, surgery, hedging)"),
+    ("economic", "EconomicConcept", "an economic or financial item that is not an amount (loan, asset, subsidy, market)"),
+    ("industry", "Industry", "an industry or sector (mining, healthcare)"),
+    ("supply_chain", "SupplyChainConcept", "a supply-chain concept (procurement, logistics, supplier network)"),
+    ("body_part", None, "a body part or anatomical structure (CoronaryArtery / RenalArtery under Artery)"),
+    ("document_item", None, "part of a document, page or website, or a site category (AuthorByline under Byline, TableFootnote under Footnote)"),
+    ("descriptor", None, "an adjective, participle or vague abstraction, not a concrete kind of thing (Reported, Pending, Essence)"),
+    ("none", None, "none of the above, or the members only share a word"),
+)
+_KIND_ROOT = {k: r for k, r, _ in HEAD_KINDS}
+# Almost never a useful parent in any domain; rejected without asking the model.
+_BLOCKED_HEADS = frozenset({
+    "date", "section", "page", "purpose", "chapter", "paragraph", "title",
+    "author", "website", "link", "tag", "category",
+})
 # A member keeps a parent that is more specific than these.
 _BROAD_PARENTS = frozenset(
     r.lower() for r in (*HEAD_ROOTS, "DomainConcept", "Concept", "Thing", "owl:Thing", "NONE", "")
@@ -99,15 +128,38 @@ def head_of(label: Any) -> str | None:
     return "".join(t[:1].upper() + t[1:] for t in head)
 
 
+def _is_negated(label: Any) -> bool:
+    """A negative finding: NoPancreaticFinding is not a kind of Finding. NoSQL
+    stays out of this, because the capital after `No` starts an acronym."""
+    return bool(re.match(r"^No(?:[A-Z][a-z]|\s)", str(label or "")))
+
+
+def _singular(head: str) -> str | None:
+    if head.endswith("ies") and len(head) > 4:
+        return head[:-3] + "y"
+    if head.endswith("s") and not head.endswith(("ss", "us", "is")):
+        return head[:-1]
+    return None
+
+
 def candidate_groups(items: list[dict[str, Any]], min_members: int = 2) -> dict[str, list[int]]:
     """{head: [item index, ...]} for heads shared by >= `min_members` proposals
     other than the head itself. A proposal whose label IS the head is not a
-    member (it is the head)."""
+    member (it is the head); a negated label is never a member.
+
+    A plural head joins its singular only when that singular is also a head or
+    a proposed class, so Costs joins Cost while Diabetes never becomes Diabete."""
     groups: dict[str, list[int]] = {}
     for idx, it in enumerate(items):
         head = head_of(it.get("LABEL"))
-        if head and _key(head) != _key(it.get("LABEL")):
+        if head and head.lower() not in _BLOCKED_HEADS \
+                and _key(head) != _key(it.get("LABEL")) and not _is_negated(it.get("LABEL")):
             groups.setdefault(head, []).append(idx)
+    labels = {_key(it.get("LABEL")) for it in items}
+    for head in list(groups):
+        one = _singular(head)
+        if one and (one in groups or _key(one) in labels):
+            groups.setdefault(one, []).extend(groups.pop(head))
     return {h: m for h, m in groups.items() if len(m) >= min_members}
 
 
@@ -174,7 +226,8 @@ async def generalize_concept_heads(router: Any, payload: dict[str, Any], *, log=
         log(f"[stage3c] concept heads skipped: no {TASK} prompt for prompt_set={spec.get('prompt_set')!r}")
         return payload, []
     items = [it for it in (payload.get(CLASSES) or []) if isinstance(it, dict) and it.get("LABEL")]
-    groups = candidate_groups(items, int(spec.get("min_members", 2)))
+    min_members = int(spec.get("min_members", 2))
+    groups = candidate_groups(items, min_members)
     if not groups:
         log("[stage3c] concept heads: no shared heads among the proposals")
         return payload, []
@@ -183,7 +236,6 @@ async def generalize_concept_heads(router: Any, payload: dict[str, Any], *, log=
     max_members = int(spec.get("max_members_per_group", 30))
     batch = int(spec.get("groups_per_call", 25))
     accepted: list[dict[str, Any]] = []
-    roots = {r.lower(): r for r in HEAD_ROOTS}
     from backend.app.services.db_artifact_gen import _extract_json
 
     for start in range(0, len(ordered), batch):
@@ -193,7 +245,7 @@ async def generalize_concept_heads(router: Any, payload: dict[str, Any], *, log=
                              "description": str(items[i].get("DESCRIPTION") or "")[:160]}
                             for i in members[:max_members]]}
                for k, (head, members) in enumerate(chunk)]
-        system, user = build(ask, list(HEAD_ROOTS))
+        system, user = build(ask, [(k, d) for k, _, d in HEAD_KINDS])
         try:
             res = await router.chat(TASK, system=system, user=user)
             parsed = _extract_json(res.text)
@@ -206,15 +258,16 @@ async def generalize_concept_heads(router: Any, payload: dict[str, Any], *, log=
                 head, members = chunk[int(d["id"])]
             except (KeyError, ValueError, IndexError, TypeError):
                 continue
-            root = roots.get(str(d.get("root") or "").strip().lower())
-            if d.get("accept") is not True or root is None:
+            root = _KIND_ROOT.get(str(d.get("kind") or "").strip().lower())
+            if root is None:
                 continue
             rejected = {_key(x) for x in d.get("rejected_members") or []}
             keep = [items[i]["LABEL"] for i in members[:max_members]
                     if _key(items[i]["LABEL"]) not in rejected]
-            if len(keep) < 2:
+            if len(keep) < min_members:
                 continue
-            accepted.append({"head": head, "root": root, "members": keep,
+            accepted.append({"head": head, "root": root, "kind": str(d.get("kind")).strip().lower(),
+                             "members": keep,
                              "description": str(d.get("description") or "").strip()})
     if not accepted:
         log(f"[stage3c] concept heads: {len(ordered)} candidate group(s), none accepted")

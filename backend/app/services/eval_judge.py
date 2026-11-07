@@ -401,6 +401,15 @@ async def evaluate_questions(
         print(f"[eval] wrote {output_md}")
 
     _print_summary(envelope)
+
+    # Standing question evaluation (backend/app/evals), from the persisted runs:
+    # what each question ties to and what the walk found. Free; fails soft.
+    from backend.app.evals.question_eval import report_from_run_ids
+
+    run_ids = [r["retrieval_run_id"] for qr in all_results for r in qr.runs[:1]
+               if r.get("retrieval_run_id")]
+    if run_ids:
+        await report_from_run_ids(run_ids, label="evaluate-queries", mode=mode)
     return envelope
 
 

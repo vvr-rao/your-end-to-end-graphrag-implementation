@@ -386,4 +386,1782 @@
         <rdfs:comment>The subject is governed or constrained by this rule, standard or policy. 'Ozempic regulatedBy boxed warning'; 'bank regulatedBy capital requirement'.</rdfs:comment>
     </owl:ObjectProperty>
 
+
+    <!-- Concept areas (2026-11-04). The everyday words people ask with: "financials"
+         should reach revenue, cost and sales, which sit under Quantity and have no
+         link to anything financial. A class's conceptTerm values are the phrases
+         that mean it; a question containing one expands down to the entities under
+         that class, and an entity named by one is typed with it. Kept for every
+         domain in this one file. A leaf keeps a second parent under its kind of
+         concept (Revenue is also a Measure). -->
+
+    <owl:AnnotationProperty rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#conceptTerm">
+        <rdfs:label>conceptTerm</rdfs:label>
+        <rdfs:comment>A lowercase phrase that means this class, in a question or as an entity name.</rdfs:comment>
+    </owl:AnnotationProperty>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="http://www.w3.org/2002/07/owl#Thing"/>
+        <rdfs:label>ConceptArea</rdfs:label>
+        <skos:prefLabel xml:lang="en">Concept area</skos:prefLabel>
+        <rdfs:comment>A broad subject people ask about, grouping related kinds of concept. Not for typing an entity directly; use its most specific member.</rdfs:comment>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Financials">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea"/>
+        <rdfs:label>Financials</rdfs:label>
+        <skos:prefLabel xml:lang="en">Financials</skos:prefLabel>
+        <rdfs:comment>A company's financial picture: performance, position, cash flow, statements, valuation and financial risk.</rdfs:comment>
+        <conceptTerm>financials</conceptTerm>
+        <conceptTerm>financial information</conceptTerm>
+        <conceptTerm>financial data</conceptTerm>
+        <conceptTerm>financial results</conceptTerm>
+        <conceptTerm>financial details</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialPerformance">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Financials"/>
+        <rdfs:label>FinancialPerformance</rdfs:label>
+        <skos:prefLabel xml:lang="en">Financial performance</skos:prefLabel>
+        <rdfs:comment>How much an organization earned and spent.</rdfs:comment>
+        <conceptTerm>financial performance</conceptTerm>
+        <conceptTerm>profitability</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Revenue">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialPerformance"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>Revenue</rdfs:label>
+        <skos:prefLabel xml:lang="en">Revenue</skos:prefLabel>
+        <conceptTerm>revenue</conceptTerm>
+        <conceptTerm>revenues</conceptTerm>
+        <conceptTerm>total revenue</conceptTerm>
+        <conceptTerm>net revenue</conceptTerm>
+        <conceptTerm>turnover</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Sales">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialPerformance"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#MarketAccess"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>Sales</rdfs:label>
+        <skos:prefLabel xml:lang="en">Sales</skos:prefLabel>
+        <conceptTerm>sales</conceptTerm>
+        <conceptTerm>net sales</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Cost">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialPerformance"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>Cost</rdfs:label>
+        <skos:prefLabel xml:lang="en">Cost</skos:prefLabel>
+        <conceptTerm>cost</conceptTerm>
+        <conceptTerm>costs</conceptTerm>
+        <conceptTerm>cost of sales</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Expense">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialPerformance"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>Expense</rdfs:label>
+        <skos:prefLabel xml:lang="en">Expense</skos:prefLabel>
+        <conceptTerm>expense</conceptTerm>
+        <conceptTerm>expenses</conceptTerm>
+        <conceptTerm>operating expense</conceptTerm>
+        <conceptTerm>operating expenses</conceptTerm>
+        <conceptTerm>opex</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Profit">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialPerformance"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>Profit</rdfs:label>
+        <skos:prefLabel xml:lang="en">Profit</skos:prefLabel>
+        <conceptTerm>profit</conceptTerm>
+        <conceptTerm>profits</conceptTerm>
+        <conceptTerm>net income</conceptTerm>
+        <conceptTerm>net profit</conceptTerm>
+        <conceptTerm>net loss</conceptTerm>
+        <conceptTerm>operating profit</conceptTerm>
+        <conceptTerm>operating income</conceptTerm>
+        <conceptTerm>operating loss</conceptTerm>
+        <conceptTerm>gross profit</conceptTerm>
+        <conceptTerm>earnings</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Margin">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialPerformance"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Metric"/>
+        <rdfs:label>Margin</rdfs:label>
+        <skos:prefLabel xml:lang="en">Margin</skos:prefLabel>
+        <conceptTerm>margin</conceptTerm>
+        <conceptTerm>margins</conceptTerm>
+        <conceptTerm>gross margin</conceptTerm>
+        <conceptTerm>operating margin</conceptTerm>
+        <conceptTerm>profit margin</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#EarningsPerShare">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialPerformance"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Metric"/>
+        <rdfs:label>EarningsPerShare</rdfs:label>
+        <skos:prefLabel xml:lang="en">Earnings per share</skos:prefLabel>
+        <conceptTerm>earnings per share</conceptTerm>
+        <conceptTerm>eps</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialPosition">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Financials"/>
+        <rdfs:label>FinancialPosition</rdfs:label>
+        <skos:prefLabel xml:lang="en">Financial position</skos:prefLabel>
+        <rdfs:comment>What an organization owns and owes at a point in time.</rdfs:comment>
+        <conceptTerm>financial position</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Assets">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialPosition"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>Assets</rdfs:label>
+        <skos:prefLabel xml:lang="en">Assets</skos:prefLabel>
+        <conceptTerm>assets</conceptTerm>
+        <conceptTerm>total assets</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Liabilities">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialPosition"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>Liabilities</rdfs:label>
+        <skos:prefLabel xml:lang="en">Liabilities</skos:prefLabel>
+        <conceptTerm>liabilities</conceptTerm>
+        <conceptTerm>total liabilities</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Equity">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialPosition"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>Equity</rdfs:label>
+        <skos:prefLabel xml:lang="en">Equity</skos:prefLabel>
+        <conceptTerm>equity</conceptTerm>
+        <conceptTerm>total equity</conceptTerm>
+        <conceptTerm>shareholders equity</conceptTerm>
+        <conceptTerm>shareholders' equity</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Debt">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialPosition"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>Debt</rdfs:label>
+        <skos:prefLabel xml:lang="en">Debt</skos:prefLabel>
+        <conceptTerm>debt</conceptTerm>
+        <conceptTerm>total debt</conceptTerm>
+        <conceptTerm>borrowings</conceptTerm>
+        <conceptTerm>debentures</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Cash">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialPosition"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>Cash</rdfs:label>
+        <skos:prefLabel xml:lang="en">Cash</skos:prefLabel>
+        <conceptTerm>cash</conceptTerm>
+        <conceptTerm>cash and cash equivalents</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#CashFlow">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Financials"/>
+        <rdfs:label>CashFlow</rdfs:label>
+        <skos:prefLabel xml:lang="en">Cash flow</skos:prefLabel>
+        <rdfs:comment>Money moving into and out of an organization.</rdfs:comment>
+        <conceptTerm>cash flow</conceptTerm>
+        <conceptTerm>cash flows</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#OperatingCashFlow">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#CashFlow"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>OperatingCashFlow</rdfs:label>
+        <skos:prefLabel xml:lang="en">Operating cash flow</skos:prefLabel>
+        <conceptTerm>operating cash flow</conceptTerm>
+        <conceptTerm>cash flows from operating activities</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#InvestingCashFlow">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#CashFlow"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>InvestingCashFlow</rdfs:label>
+        <skos:prefLabel xml:lang="en">Investing cash flow</skos:prefLabel>
+        <conceptTerm>investing cash flow</conceptTerm>
+        <conceptTerm>cash flows from investing activities</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#FinancingCashFlow">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#CashFlow"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>FinancingCashFlow</rdfs:label>
+        <skos:prefLabel xml:lang="en">Financing cash flow</skos:prefLabel>
+        <conceptTerm>financing cash flow</conceptTerm>
+        <conceptTerm>cash flows from financing activities</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#CapitalExpenditure">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#CashFlow"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>CapitalExpenditure</rdfs:label>
+        <skos:prefLabel xml:lang="en">Capital expenditure</skos:prefLabel>
+        <conceptTerm>capital expenditure</conceptTerm>
+        <conceptTerm>capital expenditures</conceptTerm>
+        <conceptTerm>capex</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Dividends">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#CashFlow"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>Dividends</rdfs:label>
+        <skos:prefLabel xml:lang="en">Dividends</skos:prefLabel>
+        <conceptTerm>dividend</conceptTerm>
+        <conceptTerm>dividends</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialStatements">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Financials"/>
+        <rdfs:label>FinancialStatements</rdfs:label>
+        <skos:prefLabel xml:lang="en">Financial statements</skos:prefLabel>
+        <rdfs:comment>The documents that report an organization's finances.</rdfs:comment>
+        <conceptTerm>financial statements</conceptTerm>
+        <conceptTerm>financial statement</conceptTerm>
+        <conceptTerm>financial reports</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#IncomeStatement">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialStatements"/>
+        <rdfs:label>IncomeStatement</rdfs:label>
+        <skos:prefLabel xml:lang="en">Income statement</skos:prefLabel>
+        <conceptTerm>income statement</conceptTerm>
+        <conceptTerm>statement of profit or loss</conceptTerm>
+        <conceptTerm>statement of comprehensive income</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#BalanceSheet">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialStatements"/>
+        <rdfs:label>BalanceSheet</rdfs:label>
+        <skos:prefLabel xml:lang="en">Balance sheet</skos:prefLabel>
+        <conceptTerm>balance sheet</conceptTerm>
+        <conceptTerm>statement of financial position</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#CashFlowStatement">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialStatements"/>
+        <rdfs:label>CashFlowStatement</rdfs:label>
+        <skos:prefLabel xml:lang="en">Cash flow statement</skos:prefLabel>
+        <conceptTerm>cash flow statement</conceptTerm>
+        <conceptTerm>statement of cash flows</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#NotesToFinancialStatements">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialStatements"/>
+        <rdfs:label>NotesToFinancialStatements</rdfs:label>
+        <skos:prefLabel xml:lang="en">Notes to financial statements</skos:prefLabel>
+        <conceptTerm>notes to the financial statements</conceptTerm>
+        <conceptTerm>notes to financial statements</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#AuditReport">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialStatements"/>
+        <rdfs:label>AuditReport</rdfs:label>
+        <skos:prefLabel xml:lang="en">Audit report</skos:prefLabel>
+        <conceptTerm>audit report</conceptTerm>
+        <conceptTerm>auditor's report</conceptTerm>
+        <conceptTerm>independent auditor's report</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Valuation">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Financials"/>
+        <rdfs:label>Valuation</rdfs:label>
+        <skos:prefLabel xml:lang="en">Valuation</skos:prefLabel>
+        <rdfs:comment>What the market or analysts say an organization is worth.</rdfs:comment>
+        <conceptTerm>valuation</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#MarketCapitalization">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Valuation"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Metric"/>
+        <rdfs:label>MarketCapitalization</rdfs:label>
+        <skos:prefLabel xml:lang="en">Market capitalization</skos:prefLabel>
+        <conceptTerm>market cap</conceptTerm>
+        <conceptTerm>market capitalization</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#PriceEarningsRatio">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Valuation"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Metric"/>
+        <rdfs:label>PriceEarningsRatio</rdfs:label>
+        <skos:prefLabel xml:lang="en">Price/earnings ratio</skos:prefLabel>
+        <conceptTerm>p/e ratio</conceptTerm>
+        <conceptTerm>price to earnings ratio</conceptTerm>
+        <conceptTerm>price/earnings ratio</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#TargetPrice">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Valuation"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Metric"/>
+        <rdfs:label>TargetPrice</rdfs:label>
+        <skos:prefLabel xml:lang="en">Target price</skos:prefLabel>
+        <conceptTerm>target price</conceptTerm>
+        <conceptTerm>price target</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialRisk">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Financials"/>
+        <rdfs:label>FinancialRisk</rdfs:label>
+        <skos:prefLabel xml:lang="en">Financial risk</skos:prefLabel>
+        <rdfs:comment>Ways an organization's finances can be harmed.</rdfs:comment>
+        <conceptTerm>financial risk</conceptTerm>
+        <conceptTerm>financial risks</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#CreditRisk">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialRisk"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Condition"/>
+        <rdfs:label>CreditRisk</rdfs:label>
+        <skos:prefLabel xml:lang="en">Credit risk</skos:prefLabel>
+        <conceptTerm>credit risk</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#LiquidityRisk">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialRisk"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Condition"/>
+        <rdfs:label>LiquidityRisk</rdfs:label>
+        <skos:prefLabel xml:lang="en">Liquidity risk</skos:prefLabel>
+        <conceptTerm>liquidity risk</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#CurrencyRisk">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialRisk"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Condition"/>
+        <rdfs:label>CurrencyRisk</rdfs:label>
+        <skos:prefLabel xml:lang="en">Currency risk</skos:prefLabel>
+        <conceptTerm>currency risk</conceptTerm>
+        <conceptTerm>foreign exchange risk</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#InterestRateRisk">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#FinancialRisk"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Condition"/>
+        <rdfs:label>InterestRateRisk</rdfs:label>
+        <skos:prefLabel xml:lang="en">Interest rate risk</skos:prefLabel>
+        <conceptTerm>interest rate risk</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#ClinicalEvidence">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea"/>
+        <rdfs:label>ClinicalEvidence</rdfs:label>
+        <skos:prefLabel xml:lang="en">Clinical evidence</skos:prefLabel>
+        <rdfs:comment>What trials found about a treatment.</rdfs:comment>
+        <conceptTerm>clinical evidence</conceptTerm>
+        <conceptTerm>clinical data</conceptTerm>
+        <conceptTerm>clinical results</conceptTerm>
+        <conceptTerm>trial results</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#TrialPhase">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ClinicalEvidence"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Process"/>
+        <rdfs:label>TrialPhase</rdfs:label>
+        <skos:prefLabel xml:lang="en">Trial phase</skos:prefLabel>
+        <conceptTerm>trial phase</conceptTerm>
+        <conceptTerm>phase 1</conceptTerm>
+        <conceptTerm>phase 2</conceptTerm>
+        <conceptTerm>phase 3</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#TrialEndpoint">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ClinicalEvidence"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Outcome"/>
+        <rdfs:label>TrialEndpoint</rdfs:label>
+        <skos:prefLabel xml:lang="en">Trial endpoint</skos:prefLabel>
+        <conceptTerm>endpoint</conceptTerm>
+        <conceptTerm>endpoints</conceptTerm>
+        <conceptTerm>primary endpoint</conceptTerm>
+        <conceptTerm>secondary endpoint</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Efficacy">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ClinicalEvidence"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Outcome"/>
+        <rdfs:label>Efficacy</rdfs:label>
+        <skos:prefLabel xml:lang="en">Efficacy</skos:prefLabel>
+        <conceptTerm>efficacy</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#ResponseRate">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ClinicalEvidence"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Metric"/>
+        <rdfs:label>ResponseRate</rdfs:label>
+        <skos:prefLabel xml:lang="en">Response rate</skos:prefLabel>
+        <conceptTerm>response rate</conceptTerm>
+        <conceptTerm>response rates</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#HazardRatio">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ClinicalEvidence"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Metric"/>
+        <rdfs:label>HazardRatio</rdfs:label>
+        <skos:prefLabel xml:lang="en">Hazard ratio</skos:prefLabel>
+        <conceptTerm>hazard ratio</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#DrugSafety">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea"/>
+        <rdfs:label>DrugSafety</rdfs:label>
+        <skos:prefLabel xml:lang="en">Drug safety</skos:prefLabel>
+        <rdfs:comment>Harms a treatment can cause.</rdfs:comment>
+        <conceptTerm>drug safety</conceptTerm>
+        <conceptTerm>safety profile</conceptTerm>
+        <conceptTerm>safety data</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#AdverseEvent">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DrugSafety"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Condition"/>
+        <rdfs:label>AdverseEvent</rdfs:label>
+        <skos:prefLabel xml:lang="en">Adverse event</skos:prefLabel>
+        <conceptTerm>adverse event</conceptTerm>
+        <conceptTerm>adverse events</conceptTerm>
+        <conceptTerm>side effect</conceptTerm>
+        <conceptTerm>side effects</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#SeriousAdverseEvent">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#AdverseEvent"/>
+        <rdfs:label>SeriousAdverseEvent</rdfs:label>
+        <skos:prefLabel xml:lang="en">Serious adverse event</skos:prefLabel>
+        <conceptTerm>serious adverse event</conceptTerm>
+        <conceptTerm>serious adverse events</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Contraindication">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DrugSafety"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Condition"/>
+        <rdfs:label>Contraindication</rdfs:label>
+        <skos:prefLabel xml:lang="en">Contraindication</skos:prefLabel>
+        <conceptTerm>contraindication</conceptTerm>
+        <conceptTerm>contraindications</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#BoxedWarning">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DrugSafety"/>
+        <rdfs:label>BoxedWarning</rdfs:label>
+        <skos:prefLabel xml:lang="en">Boxed warning</skos:prefLabel>
+        <conceptTerm>boxed warning</conceptTerm>
+        <conceptTerm>black box warning</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Toxicity">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DrugSafety"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Condition"/>
+        <rdfs:label>Toxicity</rdfs:label>
+        <skos:prefLabel xml:lang="en">Toxicity</skos:prefLabel>
+        <conceptTerm>toxicity</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#DrugProperties">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea"/>
+        <rdfs:label>DrugProperties</rdfs:label>
+        <skos:prefLabel xml:lang="en">Drug properties</skos:prefLabel>
+        <rdfs:comment>What a treatment is, what it treats and how it is given.</rdfs:comment>
+        <conceptTerm>drug properties</conceptTerm>
+        <conceptTerm>drug information</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Indication">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DrugProperties"/>
+        <rdfs:label>Indication</rdfs:label>
+        <skos:prefLabel xml:lang="en">Indication</skos:prefLabel>
+        <conceptTerm>indication</conceptTerm>
+        <conceptTerm>indications</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Dosage">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DrugProperties"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>Dosage</rdfs:label>
+        <skos:prefLabel xml:lang="en">Dosage</skos:prefLabel>
+        <conceptTerm>dosage</conceptTerm>
+        <conceptTerm>dose</conceptTerm>
+        <conceptTerm>dosing</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#MechanismOfAction">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DrugProperties"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Process"/>
+        <rdfs:label>MechanismOfAction</rdfs:label>
+        <skos:prefLabel xml:lang="en">Mechanism of action</skos:prefLabel>
+        <conceptTerm>mechanism of action</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Pharmacokinetics">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DrugProperties"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Process"/>
+        <rdfs:label>Pharmacokinetics</rdfs:label>
+        <skos:prefLabel xml:lang="en">Pharmacokinetics</skos:prefLabel>
+        <conceptTerm>pharmacokinetics</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Formulation">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DrugProperties"/>
+        <rdfs:label>Formulation</rdfs:label>
+        <skos:prefLabel xml:lang="en">Formulation</skos:prefLabel>
+        <conceptTerm>formulation</conceptTerm>
+        <conceptTerm>formulations</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#RegulatoryStatus">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea"/>
+        <rdfs:label>RegulatoryStatus</rdfs:label>
+        <skos:prefLabel xml:lang="en">Regulatory status</skos:prefLabel>
+        <rdfs:comment>Where a product stands with its regulators.</rdfs:comment>
+        <conceptTerm>regulatory status</conceptTerm>
+        <conceptTerm>regulatory approval status</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Approval">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#RegulatoryStatus"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Process"/>
+        <rdfs:label>Approval</rdfs:label>
+        <skos:prefLabel xml:lang="en">Approval</skos:prefLabel>
+        <conceptTerm>approval</conceptTerm>
+        <conceptTerm>approvals</conceptTerm>
+        <conceptTerm>marketing authorization</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#DrugLabel">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#RegulatoryStatus"/>
+        <rdfs:label>DrugLabel</rdfs:label>
+        <skos:prefLabel xml:lang="en">Drug label</skos:prefLabel>
+        <conceptTerm>drug label</conceptTerm>
+        <conceptTerm>prescribing information</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#RegulatorySubmission">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#RegulatoryStatus"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Process"/>
+        <rdfs:label>RegulatorySubmission</rdfs:label>
+        <skos:prefLabel xml:lang="en">Regulatory submission</skos:prefLabel>
+        <conceptTerm>regulatory submission</conceptTerm>
+        <conceptTerm>new drug application</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#PostMarketingRequirement">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#RegulatoryStatus"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#PolicyConcept"/>
+        <rdfs:label>PostMarketingRequirement</rdfs:label>
+        <skos:prefLabel xml:lang="en">Post-marketing requirement</skos:prefLabel>
+        <conceptTerm>post-marketing requirement</conceptTerm>
+        <conceptTerm>post-marketing requirements</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#MarketAccess">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea"/>
+        <rdfs:label>MarketAccess</rdfs:label>
+        <skos:prefLabel xml:lang="en">Market access</skos:prefLabel>
+        <rdfs:comment>Whether and at what price a product reaches its buyers.</rdfs:comment>
+        <conceptTerm>market access</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Pricing">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#MarketAccess"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>Pricing</rdfs:label>
+        <skos:prefLabel xml:lang="en">Pricing</skos:prefLabel>
+        <conceptTerm>pricing</conceptTerm>
+        <conceptTerm>list price</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Reimbursement">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#MarketAccess"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#PolicyConcept"/>
+        <rdfs:label>Reimbursement</rdfs:label>
+        <skos:prefLabel xml:lang="en">Reimbursement</skos:prefLabel>
+        <conceptTerm>reimbursement</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Coverage">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#MarketAccess"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#PolicyConcept"/>
+        <rdfs:label>Coverage</rdfs:label>
+        <skos:prefLabel xml:lang="en">Coverage</skos:prefLabel>
+        <conceptTerm>insurance coverage</conceptTerm>
+        <conceptTerm>payer coverage</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#ProductionPerformance">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea"/>
+        <rdfs:label>ProductionPerformance</rdfs:label>
+        <skos:prefLabel xml:lang="en">Production performance</skos:prefLabel>
+        <rdfs:comment>How much a plant produces and how efficiently.</rdfs:comment>
+        <conceptTerm>production performance</conceptTerm>
+        <conceptTerm>production data</conceptTerm>
+        <conceptTerm>manufacturing performance</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#ProductionCapacity">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ProductionPerformance"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>ProductionCapacity</rdfs:label>
+        <skos:prefLabel xml:lang="en">Production capacity</skos:prefLabel>
+        <conceptTerm>production capacity</conceptTerm>
+        <conceptTerm>manufacturing capacity</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#ProductionOutput">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ProductionPerformance"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>ProductionOutput</rdfs:label>
+        <skos:prefLabel xml:lang="en">Production output</skos:prefLabel>
+        <conceptTerm>production output</conceptTerm>
+        <conceptTerm>output volume</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Throughput">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ProductionPerformance"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Metric"/>
+        <rdfs:label>Throughput</rdfs:label>
+        <skos:prefLabel xml:lang="en">Throughput</skos:prefLabel>
+        <conceptTerm>throughput</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Utilization">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ProductionPerformance"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Metric"/>
+        <rdfs:label>Utilization</rdfs:label>
+        <skos:prefLabel xml:lang="en">Utilization</skos:prefLabel>
+        <conceptTerm>utilization</conceptTerm>
+        <conceptTerm>capacity utilization</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#ProductionYield">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ProductionPerformance"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Metric"/>
+        <rdfs:label>ProductionYield</rdfs:label>
+        <skos:prefLabel xml:lang="en">Production yield</skos:prefLabel>
+        <conceptTerm>production yield</conceptTerm>
+        <conceptTerm>manufacturing yield</conceptTerm>
+        <conceptTerm>yield rate</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Quality">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea"/>
+        <rdfs:label>Quality</rdfs:label>
+        <skos:prefLabel xml:lang="en">Quality</skos:prefLabel>
+        <rdfs:comment>Whether products meet their requirements.</rdfs:comment>
+        <conceptTerm>product quality</conceptTerm>
+        <conceptTerm>quality data</conceptTerm>
+        <conceptTerm>quality issues</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#DefectRate">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Quality"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Metric"/>
+        <rdfs:label>DefectRate</rdfs:label>
+        <skos:prefLabel xml:lang="en">Defect rate</skos:prefLabel>
+        <conceptTerm>defect rate</conceptTerm>
+        <conceptTerm>defect rates</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Inspection">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Quality"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Process"/>
+        <rdfs:label>Inspection</rdfs:label>
+        <skos:prefLabel xml:lang="en">Inspection</skos:prefLabel>
+        <conceptTerm>inspection</conceptTerm>
+        <conceptTerm>inspections</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Nonconformance">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Quality"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Condition"/>
+        <rdfs:label>Nonconformance</rdfs:label>
+        <skos:prefLabel xml:lang="en">Nonconformance</skos:prefLabel>
+        <conceptTerm>nonconformance</conceptTerm>
+        <conceptTerm>non-conformance</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#ProductRecall">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Quality"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Event"/>
+        <rdfs:label>ProductRecall</rdfs:label>
+        <skos:prefLabel xml:lang="en">Product recall</skos:prefLabel>
+        <conceptTerm>recall</conceptTerm>
+        <conceptTerm>recalls</conceptTerm>
+        <conceptTerm>product recall</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Certification">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Quality"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#PolicyConcept"/>
+        <rdfs:label>Certification</rdfs:label>
+        <skos:prefLabel xml:lang="en">Certification</skos:prefLabel>
+        <conceptTerm>certification</conceptTerm>
+        <conceptTerm>certifications</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#ManufacturingCosts">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea"/>
+        <rdfs:label>ManufacturingCosts</rdfs:label>
+        <skos:prefLabel xml:lang="en">Manufacturing costs</skos:prefLabel>
+        <rdfs:comment>What it costs to make a product.</rdfs:comment>
+        <conceptTerm>manufacturing costs</conceptTerm>
+        <conceptTerm>manufacturing cost</conceptTerm>
+        <conceptTerm>production costs</conceptTerm>
+        <conceptTerm>production cost</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#UnitCost">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ManufacturingCosts"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Cost"/>
+        <rdfs:label>UnitCost</rdfs:label>
+        <skos:prefLabel xml:lang="en">Unit cost</skos:prefLabel>
+        <conceptTerm>unit cost</conceptTerm>
+        <conceptTerm>unit costs</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#CostOfGoodsSold">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ManufacturingCosts"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Cost"/>
+        <rdfs:label>CostOfGoodsSold</rdfs:label>
+        <skos:prefLabel xml:lang="en">Cost of goods sold</skos:prefLabel>
+        <conceptTerm>cost of goods sold</conceptTerm>
+        <conceptTerm>cogs</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#LabourCost">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ManufacturingCosts"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Cost"/>
+        <rdfs:label>LabourCost</rdfs:label>
+        <skos:prefLabel xml:lang="en">Labour cost</skos:prefLabel>
+        <conceptTerm>labour cost</conceptTerm>
+        <conceptTerm>labor cost</conceptTerm>
+        <conceptTerm>labour costs</conceptTerm>
+        <conceptTerm>labor costs</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#EnergyCost">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ManufacturingCosts"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Cost"/>
+        <rdfs:label>EnergyCost</rdfs:label>
+        <skos:prefLabel xml:lang="en">Energy cost</skos:prefLabel>
+        <conceptTerm>energy cost</conceptTerm>
+        <conceptTerm>energy costs</conceptTerm>
+        <conceptTerm>electricity cost</conceptTerm>
+        <conceptTerm>electricity costs</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Scrap">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ManufacturingCosts"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Metric"/>
+        <rdfs:label>Scrap</rdfs:label>
+        <skos:prefLabel xml:lang="en">Scrap</skos:prefLabel>
+        <conceptTerm>scrap rate</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Equipment">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea"/>
+        <rdfs:label>Equipment</rdfs:label>
+        <skos:prefLabel xml:lang="en">Equipment</skos:prefLabel>
+        <rdfs:comment>The machinery production depends on and how it performs.</rdfs:comment>
+        <conceptTerm>plant equipment</conceptTerm>
+        <conceptTerm>manufacturing equipment</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Maintenance">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Equipment"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Process"/>
+        <rdfs:label>Maintenance</rdfs:label>
+        <skos:prefLabel xml:lang="en">Maintenance</skos:prefLabel>
+        <conceptTerm>maintenance</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Downtime">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Equipment"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>Downtime</rdfs:label>
+        <skos:prefLabel xml:lang="en">Downtime</skos:prefLabel>
+        <conceptTerm>downtime</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#EquipmentEffectiveness">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Equipment"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Metric"/>
+        <rdfs:label>EquipmentEffectiveness</rdfs:label>
+        <skos:prefLabel xml:lang="en">Equipment effectiveness</skos:prefLabel>
+        <conceptTerm>equipment effectiveness</conceptTerm>
+        <conceptTerm>oee</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Tooling">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Equipment"/>
+        <rdfs:label>Tooling</rdfs:label>
+        <skos:prefLabel xml:lang="en">Tooling</skos:prefLabel>
+        <conceptTerm>tooling</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#PlantSafetyAndCompliance">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea"/>
+        <rdfs:label>PlantSafetyAndCompliance</rdfs:label>
+        <skos:prefLabel xml:lang="en">Plant safety and compliance</skos:prefLabel>
+        <rdfs:comment>Keeping people and the environment safe around production.</rdfs:comment>
+        <conceptTerm>plant safety</conceptTerm>
+        <conceptTerm>workplace safety</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#IncidentRate">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#PlantSafetyAndCompliance"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Metric"/>
+        <rdfs:label>IncidentRate</rdfs:label>
+        <skos:prefLabel xml:lang="en">Incident rate</skos:prefLabel>
+        <conceptTerm>incident rate</conceptTerm>
+        <conceptTerm>injury rate</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#SafetyStandard">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#PlantSafetyAndCompliance"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#PolicyConcept"/>
+        <rdfs:label>SafetyStandard</rdfs:label>
+        <skos:prefLabel xml:lang="en">Safety standard</skos:prefLabel>
+        <conceptTerm>safety standard</conceptTerm>
+        <conceptTerm>safety standards</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#EnvironmentalPermit">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#PlantSafetyAndCompliance"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#PolicyConcept"/>
+        <rdfs:label>EnvironmentalPermit</rdfs:label>
+        <skos:prefLabel xml:lang="en">Environmental permit</skos:prefLabel>
+        <conceptTerm>environmental permit</conceptTerm>
+        <conceptTerm>environmental permits</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Sourcing">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea"/>
+        <rdfs:label>Sourcing</rdfs:label>
+        <skos:prefLabel xml:lang="en">Sourcing</skos:prefLabel>
+        <rdfs:comment>Where inputs come from and how they are bought.</rdfs:comment>
+        <conceptTerm>sourcing</conceptTerm>
+        <conceptTerm>supply base</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#SupplierRelationship">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Sourcing"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#SupplyChainConcept"/>
+        <rdfs:label>SupplierRelationship</rdfs:label>
+        <skos:prefLabel xml:lang="en">Supplier relationship</skos:prefLabel>
+        <conceptTerm>supplier relationship</conceptTerm>
+        <conceptTerm>supplier relationships</conceptTerm>
+        <conceptTerm>supplier agreement</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Procurement">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Sourcing"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Process"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#SupplyChainConcept"/>
+        <rdfs:label>Procurement</rdfs:label>
+        <skos:prefLabel xml:lang="en">Procurement</skos:prefLabel>
+        <conceptTerm>procurement</conceptTerm>
+        <conceptTerm>purchasing</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#SingleSourcing">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Sourcing"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Condition"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#SupplyChainConcept"/>
+        <rdfs:label>SingleSourcing</rdfs:label>
+        <skos:prefLabel xml:lang="en">Single sourcing</skos:prefLabel>
+        <conceptTerm>single sourcing</conceptTerm>
+        <conceptTerm>single source</conceptTerm>
+        <conceptTerm>sole source</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#SupplyContract">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Sourcing"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#SupplyChainConcept"/>
+        <rdfs:label>SupplyContract</rdfs:label>
+        <skos:prefLabel xml:lang="en">Supply contract</skos:prefLabel>
+        <conceptTerm>supply contract</conceptTerm>
+        <conceptTerm>supply contracts</conceptTerm>
+        <conceptTerm>offtake agreement</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Inventory">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea"/>
+        <rdfs:label>Inventory</rdfs:label>
+        <skos:prefLabel xml:lang="en">Inventory</skos:prefLabel>
+        <rdfs:comment>Stock held and how it moves.</rdfs:comment>
+        <conceptTerm>inventory</conceptTerm>
+        <conceptTerm>inventories</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#StockLevel">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Inventory"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>StockLevel</rdfs:label>
+        <skos:prefLabel xml:lang="en">Stock level</skos:prefLabel>
+        <conceptTerm>stock level</conceptTerm>
+        <conceptTerm>stock levels</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#SafetyStock">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Inventory"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>SafetyStock</rdfs:label>
+        <skos:prefLabel xml:lang="en">Safety stock</skos:prefLabel>
+        <conceptTerm>safety stock</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#InventoryTurnover">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Inventory"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Metric"/>
+        <rdfs:label>InventoryTurnover</rdfs:label>
+        <skos:prefLabel xml:lang="en">Inventory turnover</skos:prefLabel>
+        <conceptTerm>inventory turnover</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Stockout">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Inventory"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Condition"/>
+        <rdfs:label>Stockout</rdfs:label>
+        <skos:prefLabel xml:lang="en">Stockout</skos:prefLabel>
+        <conceptTerm>stockout</conceptTerm>
+        <conceptTerm>stockouts</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Logistics">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea"/>
+        <rdfs:label>Logistics</rdfs:label>
+        <skos:prefLabel xml:lang="en">Logistics</skos:prefLabel>
+        <rdfs:comment>Moving goods from one place to another.</rdfs:comment>
+        <conceptTerm>logistics</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Freight">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Logistics"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#SupplyChainConcept"/>
+        <rdfs:label>Freight</rdfs:label>
+        <skos:prefLabel xml:lang="en">Freight</skos:prefLabel>
+        <conceptTerm>freight</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Shipping">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Logistics"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Process"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#SupplyChainConcept"/>
+        <rdfs:label>Shipping</rdfs:label>
+        <skos:prefLabel xml:lang="en">Shipping</skos:prefLabel>
+        <conceptTerm>shipping</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#LeadTime">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Logistics"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>LeadTime</rdfs:label>
+        <skos:prefLabel xml:lang="en">Lead time</skos:prefLabel>
+        <conceptTerm>lead time</conceptTerm>
+        <conceptTerm>lead times</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#TransportCost">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Logistics"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Cost"/>
+        <rdfs:label>TransportCost</rdfs:label>
+        <skos:prefLabel xml:lang="en">Transport cost</skos:prefLabel>
+        <conceptTerm>transport cost</conceptTerm>
+        <conceptTerm>transport costs</conceptTerm>
+        <conceptTerm>transportation cost</conceptTerm>
+        <conceptTerm>shipping cost</conceptTerm>
+        <conceptTerm>shipping costs</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#SupplyDisruption">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea"/>
+        <rdfs:label>SupplyDisruption</rdfs:label>
+        <skos:prefLabel xml:lang="en">Supply disruption</skos:prefLabel>
+        <rdfs:comment>What interrupts supply.</rdfs:comment>
+        <conceptTerm>supply disruption</conceptTerm>
+        <conceptTerm>supply disruptions</conceptTerm>
+        <conceptTerm>supply chain disruption</conceptTerm>
+        <conceptTerm>supply chain disruptions</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Shortage">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#SupplyDisruption"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Condition"/>
+        <rdfs:label>Shortage</rdfs:label>
+        <skos:prefLabel xml:lang="en">Shortage</skos:prefLabel>
+        <conceptTerm>shortage</conceptTerm>
+        <conceptTerm>shortages</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Tariff">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#SupplyDisruption"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#PolicyConcept"/>
+        <rdfs:label>Tariff</rdfs:label>
+        <skos:prefLabel xml:lang="en">Tariff</skos:prefLabel>
+        <conceptTerm>tariff</conceptTerm>
+        <conceptTerm>tariffs</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Sanctions">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#SupplyDisruption"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#GeopoliticalEvents"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#PolicyConcept"/>
+        <rdfs:label>Sanctions</rdfs:label>
+        <skos:prefLabel xml:lang="en">Sanctions</skos:prefLabel>
+        <conceptTerm>sanction</conceptTerm>
+        <conceptTerm>sanctions</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#PortClosure">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#SupplyDisruption"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Event"/>
+        <rdfs:label>PortClosure</rdfs:label>
+        <skos:prefLabel xml:lang="en">Port closure</skos:prefLabel>
+        <conceptTerm>port closure</conceptTerm>
+        <conceptTerm>port closures</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Demand">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea"/>
+        <rdfs:label>Demand</rdfs:label>
+        <skos:prefLabel xml:lang="en">Demand</skos:prefLabel>
+        <rdfs:comment>How much is wanted and how predictably.</rdfs:comment>
+        <conceptTerm>demand outlook</conceptTerm>
+        <conceptTerm>demand data</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#DemandForecast">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Demand"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Metric"/>
+        <rdfs:label>DemandForecast</rdfs:label>
+        <skos:prefLabel xml:lang="en">Demand forecast</skos:prefLabel>
+        <conceptTerm>demand forecast</conceptTerm>
+        <conceptTerm>demand forecasts</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#OrderBacklog">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Demand"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>OrderBacklog</rdfs:label>
+        <skos:prefLabel xml:lang="en">Order backlog</skos:prefLabel>
+        <conceptTerm>order backlog</conceptTerm>
+        <conceptTerm>backlog</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#DemandVolatility">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Demand"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Condition"/>
+        <rdfs:label>DemandVolatility</rdfs:label>
+        <skos:prefLabel xml:lang="en">Demand volatility</skos:prefLabel>
+        <conceptTerm>demand volatility</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#CorporateEvents">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Event"/>
+        <rdfs:label>CorporateEvents</rdfs:label>
+        <skos:prefLabel xml:lang="en">Corporate events</skos:prefLabel>
+        <rdfs:comment>Things that happen to or are done by organizations.</rdfs:comment>
+        <conceptTerm>corporate events</conceptTerm>
+        <conceptTerm>corporate news</conceptTerm>
+        <conceptTerm>corporate developments</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Merger">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#CorporateEvents"/>
+        <rdfs:label>Merger</rdfs:label>
+        <skos:prefLabel xml:lang="en">Merger</skos:prefLabel>
+        <conceptTerm>merger</conceptTerm>
+        <conceptTerm>mergers</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Acquisition">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#CorporateEvents"/>
+        <rdfs:label>Acquisition</rdfs:label>
+        <skos:prefLabel xml:lang="en">Acquisition</skos:prefLabel>
+        <conceptTerm>acquisition</conceptTerm>
+        <conceptTerm>acquisitions</conceptTerm>
+        <conceptTerm>takeover</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Partnership">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#CorporateEvents"/>
+        <rdfs:label>Partnership</rdfs:label>
+        <skos:prefLabel xml:lang="en">Partnership</skos:prefLabel>
+        <conceptTerm>partnership</conceptTerm>
+        <conceptTerm>partnerships</conceptTerm>
+        <conceptTerm>joint venture</conceptTerm>
+        <conceptTerm>joint ventures</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#PlantOpening">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#CorporateEvents"/>
+        <rdfs:label>PlantOpening</rdfs:label>
+        <skos:prefLabel xml:lang="en">Plant opening</skos:prefLabel>
+        <conceptTerm>plant opening</conceptTerm>
+        <conceptTerm>factory opening</conceptTerm>
+        <conceptTerm>new plant</conceptTerm>
+        <conceptTerm>new factory</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Layoff">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#CorporateEvents"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Workforce"/>
+        <rdfs:label>Layoff</rdfs:label>
+        <skos:prefLabel xml:lang="en">Layoff</skos:prefLabel>
+        <conceptTerm>layoff</conceptTerm>
+        <conceptTerm>layoffs</conceptTerm>
+        <conceptTerm>job cuts</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#LeadershipChange">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#CorporateEvents"/>
+        <rdfs:label>LeadershipChange</rdfs:label>
+        <skos:prefLabel xml:lang="en">Leadership change</skos:prefLabel>
+        <conceptTerm>leadership change</conceptTerm>
+        <conceptTerm>leadership changes</conceptTerm>
+        <conceptTerm>ceo change</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#LegalAndRegulatoryEvents">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Event"/>
+        <rdfs:label>LegalAndRegulatoryEvents</rdfs:label>
+        <skos:prefLabel xml:lang="en">Legal and regulatory events</skos:prefLabel>
+        <rdfs:comment>Laws made and enforced.</rdfs:comment>
+        <conceptTerm>legal events</conceptTerm>
+        <conceptTerm>regulatory events</conceptTerm>
+        <conceptTerm>legal developments</conceptTerm>
+        <conceptTerm>regulatory developments</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#NewLaw">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#LegalAndRegulatoryEvents"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#PolicyConcept"/>
+        <rdfs:label>NewLaw</rdfs:label>
+        <skos:prefLabel xml:lang="en">New law</skos:prefLabel>
+        <conceptTerm>new law</conceptTerm>
+        <conceptTerm>new regulation</conceptTerm>
+        <conceptTerm>new laws</conceptTerm>
+        <conceptTerm>new regulations</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Fine">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#LegalAndRegulatoryEvents"/>
+        <rdfs:label>Fine</rdfs:label>
+        <skos:prefLabel xml:lang="en">Fine</skos:prefLabel>
+        <conceptTerm>regulatory fine</conceptTerm>
+        <conceptTerm>fines and penalties</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Lawsuit">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#LegalAndRegulatoryEvents"/>
+        <rdfs:label>Lawsuit</rdfs:label>
+        <skos:prefLabel xml:lang="en">Lawsuit</skos:prefLabel>
+        <conceptTerm>lawsuit</conceptTerm>
+        <conceptTerm>lawsuits</conceptTerm>
+        <conceptTerm>litigation</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Investigation">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#LegalAndRegulatoryEvents"/>
+        <rdfs:label>Investigation</rdfs:label>
+        <skos:prefLabel xml:lang="en">Investigation</skos:prefLabel>
+        <conceptTerm>investigation</conceptTerm>
+        <conceptTerm>investigations</conceptTerm>
+        <conceptTerm>probe</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#MarketEvents">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Event"/>
+        <rdfs:label>MarketEvents</rdfs:label>
+        <skos:prefLabel xml:lang="en">Market events</skos:prefLabel>
+        <rdfs:comment>Things that happen in financial markets.</rdfs:comment>
+        <conceptTerm>market events</conceptTerm>
+        <conceptTerm>market news</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#EarningsRelease">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#MarketEvents"/>
+        <rdfs:label>EarningsRelease</rdfs:label>
+        <skos:prefLabel xml:lang="en">Earnings release</skos:prefLabel>
+        <conceptTerm>earnings release</conceptTerm>
+        <conceptTerm>earnings call</conceptTerm>
+        <conceptTerm>quarterly results</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#InitialPublicOffering">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#MarketEvents"/>
+        <rdfs:label>InitialPublicOffering</rdfs:label>
+        <skos:prefLabel xml:lang="en">Initial public offering</skos:prefLabel>
+        <conceptTerm>ipo</conceptTerm>
+        <conceptTerm>initial public offering</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#PriceMove">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#MarketEvents"/>
+        <rdfs:label>PriceMove</rdfs:label>
+        <skos:prefLabel xml:lang="en">Price move</skos:prefLabel>
+        <conceptTerm>price move</conceptTerm>
+        <conceptTerm>price surge</conceptTerm>
+        <conceptTerm>price drop</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#GeopoliticalEvents">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Event"/>
+        <rdfs:label>GeopoliticalEvents</rdfs:label>
+        <skos:prefLabel xml:lang="en">Geopolitical events</skos:prefLabel>
+        <rdfs:comment>Things that happen between or within states.</rdfs:comment>
+        <conceptTerm>geopolitical events</conceptTerm>
+        <conceptTerm>geopolitical news</conceptTerm>
+        <conceptTerm>geopolitics</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Conflict">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#GeopoliticalEvents"/>
+        <rdfs:label>Conflict</rdfs:label>
+        <skos:prefLabel xml:lang="en">Conflict</skos:prefLabel>
+        <conceptTerm>armed conflict</conceptTerm>
+        <conceptTerm>war</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Election">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#GeopoliticalEvents"/>
+        <rdfs:label>Election</rdfs:label>
+        <skos:prefLabel xml:lang="en">Election</skos:prefLabel>
+        <conceptTerm>election</conceptTerm>
+        <conceptTerm>elections</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#TradeDeal">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#GeopoliticalEvents"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#PolicyConcept"/>
+        <rdfs:label>TradeDeal</rdfs:label>
+        <skos:prefLabel xml:lang="en">Trade deal</skos:prefLabel>
+        <conceptTerm>trade deal</conceptTerm>
+        <conceptTerm>trade deals</conceptTerm>
+        <conceptTerm>trade agreement</conceptTerm>
+        <conceptTerm>trade agreements</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#ESG">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea"/>
+        <rdfs:label>ESG</rdfs:label>
+        <skos:prefLabel xml:lang="en">ESG</skos:prefLabel>
+        <rdfs:comment>Environmental, social and governance performance.</rdfs:comment>
+        <conceptTerm>esg</conceptTerm>
+        <conceptTerm>sustainability data</conceptTerm>
+        <conceptTerm>environmental social and governance</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Emissions">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ESG"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>Emissions</rdfs:label>
+        <skos:prefLabel xml:lang="en">Emissions</skos:prefLabel>
+        <conceptTerm>emissions</conceptTerm>
+        <conceptTerm>carbon emissions</conceptTerm>
+        <conceptTerm>greenhouse gas emissions</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#EnergyUse">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ESG"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>EnergyUse</rdfs:label>
+        <skos:prefLabel xml:lang="en">Energy use</skos:prefLabel>
+        <conceptTerm>energy use</conceptTerm>
+        <conceptTerm>energy consumption</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#WaterUse">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ESG"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>WaterUse</rdfs:label>
+        <skos:prefLabel xml:lang="en">Water use</skos:prefLabel>
+        <conceptTerm>water use</conceptTerm>
+        <conceptTerm>water consumption</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#WorkforceDiversity">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ESG"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Workforce"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Metric"/>
+        <rdfs:label>WorkforceDiversity</rdfs:label>
+        <skos:prefLabel xml:lang="en">Workforce diversity</skos:prefLabel>
+        <conceptTerm>workforce diversity</conceptTerm>
+        <conceptTerm>diversity metrics</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#CorporateGovernance">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ESG"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#PolicyConcept"/>
+        <rdfs:label>CorporateGovernance</rdfs:label>
+        <skos:prefLabel xml:lang="en">Corporate governance</skos:prefLabel>
+        <conceptTerm>corporate governance</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#EnergyMarkets">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea"/>
+        <rdfs:label>EnergyMarkets</rdfs:label>
+        <skos:prefLabel xml:lang="en">Energy</skos:prefLabel>
+        <rdfs:comment>Generating and selling power.</rdfs:comment>
+        <conceptTerm>energy market</conceptTerm>
+        <conceptTerm>energy markets</conceptTerm>
+        <conceptTerm>energy data</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#GenerationCapacity">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#EnergyMarkets"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>GenerationCapacity</rdfs:label>
+        <skos:prefLabel xml:lang="en">Generation capacity</skos:prefLabel>
+        <conceptTerm>generation capacity</conceptTerm>
+        <conceptTerm>installed capacity</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#PowerPurchaseAgreement">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#EnergyMarkets"/>
+        <rdfs:label>PowerPurchaseAgreement</rdfs:label>
+        <skos:prefLabel xml:lang="en">Power purchase agreement</skos:prefLabel>
+        <conceptTerm>power purchase agreement</conceptTerm>
+        <conceptTerm>power purchase agreements</conceptTerm>
+        <conceptTerm>ppa</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#EnergyPrice">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#EnergyMarkets"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>EnergyPrice</rdfs:label>
+        <skos:prefLabel xml:lang="en">Energy price</skos:prefLabel>
+        <conceptTerm>energy price</conceptTerm>
+        <conceptTerm>energy prices</conceptTerm>
+        <conceptTerm>electricity price</conceptTerm>
+        <conceptTerm>electricity prices</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#GridConnection">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#EnergyMarkets"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Infrastructure"/>
+        <rdfs:label>GridConnection</rdfs:label>
+        <skos:prefLabel xml:lang="en">Grid connection</skos:prefLabel>
+        <conceptTerm>grid connection</conceptTerm>
+        <conceptTerm>grid connections</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#TechnologyAndRnD">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea"/>
+        <rdfs:label>TechnologyAndRnD</rdfs:label>
+        <skos:prefLabel xml:lang="en">Technology and R&amp;D</skos:prefLabel>
+        <rdfs:comment>Developing new products and technology.</rdfs:comment>
+        <conceptTerm>research and development</conceptTerm>
+        <conceptTerm>r&amp;d</conceptTerm>
+        <conceptTerm>innovation pipeline</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#RnDSpend">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#TechnologyAndRnD"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Expense"/>
+        <rdfs:label>RnDSpend</rdfs:label>
+        <skos:prefLabel xml:lang="en">R&amp;D spend</skos:prefLabel>
+        <conceptTerm>r&amp;d spend</conceptTerm>
+        <conceptTerm>r&amp;d spending</conceptTerm>
+        <conceptTerm>r&amp;d expense</conceptTerm>
+        <conceptTerm>research and development expense</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Patent">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#TechnologyAndRnD"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#TechnologyConcept"/>
+        <rdfs:label>Patent</rdfs:label>
+        <skos:prefLabel xml:lang="en">Patent</skos:prefLabel>
+        <conceptTerm>patent</conceptTerm>
+        <conceptTerm>patents</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#ProductRoadmap">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#TechnologyAndRnD"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#TechnologyConcept"/>
+        <rdfs:label>ProductRoadmap</rdfs:label>
+        <skos:prefLabel xml:lang="en">Product roadmap</skos:prefLabel>
+        <conceptTerm>product roadmap</conceptTerm>
+        <conceptTerm>roadmap</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#TechnologyReadiness">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#TechnologyAndRnD"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Metric"/>
+        <rdfs:label>TechnologyReadiness</rdfs:label>
+        <skos:prefLabel xml:lang="en">Technology readiness</skos:prefLabel>
+        <conceptTerm>technology readiness</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Workforce">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea"/>
+        <rdfs:label>Workforce</rdfs:label>
+        <skos:prefLabel xml:lang="en">Workforce</skos:prefLabel>
+        <rdfs:comment>The people an organization employs.</rdfs:comment>
+        <conceptTerm>workforce</conceptTerm>
+        <conceptTerm>employees</conceptTerm>
+        <conceptTerm>staffing</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Headcount">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Workforce"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Measure"/>
+        <rdfs:label>Headcount</rdfs:label>
+        <skos:prefLabel xml:lang="en">Headcount</skos:prefLabel>
+        <conceptTerm>headcount</conceptTerm>
+        <conceptTerm>number of employees</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Wages">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Workforce"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Expense"/>
+        <rdfs:label>Wages</rdfs:label>
+        <skos:prefLabel xml:lang="en">Wages</skos:prefLabel>
+        <conceptTerm>wages</conceptTerm>
+        <conceptTerm>salaries</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Hiring">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Workforce"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Process"/>
+        <rdfs:label>Hiring</rdfs:label>
+        <skos:prefLabel xml:lang="en">Hiring</skos:prefLabel>
+        <conceptTerm>hiring</conceptTerm>
+        <conceptTerm>recruitment</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#LabourDispute">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Workforce"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Event"/>
+        <rdfs:label>LabourDispute</rdfs:label>
+        <skos:prefLabel xml:lang="en">Labour dispute</skos:prefLabel>
+        <conceptTerm>labour dispute</conceptTerm>
+        <conceptTerm>labor dispute</conceptTerm>
+        <conceptTerm>strike</conceptTerm>
+        <conceptTerm>strikes</conceptTerm>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+    </owl:Class>
 </rdf:RDF>

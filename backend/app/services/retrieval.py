@@ -58,6 +58,14 @@ from backend.app.db.models.entities import Entity, TimeInstance
 from backend.app.db.models.ontology import OntologyClass
 from backend.app.db.session import session_scope
 from backend.app.services.alias_mining import is_acronym, normalize_term
+from backend.app.services.concept_areas import area_chunks, classes_in_question, term_classes
+from backend.app.services.fulltext_bridge import (
+    DOCUMENT_RANKS,
+    PASSAGE_MODES,
+    pick_anchors,
+    rank_documents,
+    route_scores,
+)
 from backend.app.services.db_artifact_gen import _extract_json
 from backend.app.services.db_temporal_enrich import extract_time_identifiers
 from backend.app.services.embeddings import Embedder
@@ -65,7 +73,13 @@ from backend.app.services.llm_router import LLMRouter
 from backend.app.services.predicates import GRAPHRAG_RELATED_TO
 from backend.app.services.prompts import PROMPTS
 from backend.app.services import retrieval_sql
-from backend.app.services.retrieval_ranking import cap_per_source, rrf_fuse
+from backend.app.services.question_places import places_in_question
+from backend.app.services.retrieval_ranking import (
+    cap_per_source,
+    dead_end_seeds_trigger,
+    documents_for_fraction,
+    rrf_fuse,
+)
 from backend.app.services.retrieval_sql import _vec_str
 
 log = logging.getLogger(__name__)
@@ -434,6 +448,7 @@ async def retrieve_and_answer(
     verbose: bool = False,
     multi_round: bool = True,
     persist: bool = True,
+    answer_question: bool = True,
     _round_depth: int = 0,
 ) -> RetrievalResult:
     """Driver. `resolved_query` skips the follow-up resolution step
@@ -450,6 +465,11 @@ async def retrieve_and_answer(
     writes, leaving `retrieval_run_id` None. Lets the CLI be pointed at a
     deployed database for testing without leaving rows in it; the API
     path always persists.
+
+    `answer_question=False` stops before the answer call: retrieval and the
+    evidence packet are complete, `answer` is empty. Used by the question
+    evaluation (`backend/app/evals/question_eval.py`), which reads
+    `parsed["eval_trace"]`.
     """
     if mode not in _VALID_MODES:
         raise ValueError(
@@ -533,6 +553,22 @@ async def retrieve_and_answer(
                 "round2_question": plan["round2_question"],
                 "round1_answer": r1.answer,
             }
+            # Keep round 1's trace: the question evaluation reports the final
+            # round and would otherwise lose what the bridge question tied to.
+            if isinstance(r2.parsed.get("eval_trace"), dict):
+                r2.parsed["eval_trace"]["round1"] = {
+                    "question": plan["round1_question"],
+                    **(r1.parsed.get("eval_trace") or {}),
+                }
+                if r2.retrieval_run_id is not None:
+                    async with session_scope() as session:
+                        await session.execute(sql_text("""
+                            UPDATE graphrag.retrieval_runs
+                               SET retrieval_plan = jsonb_set(
+                                   retrieval_plan, '{eval_trace}', CAST(:t AS jsonb))
+                             WHERE id = :id AND retrieval_plan ? 'eval_trace'
+                        """), {"t": json.dumps(r2.parsed["eval_trace"]),
+                               "id": r2.retrieval_run_id})
             r2.wall_seconds = time.time() - t0
             return r2
 
@@ -663,6 +699,33 @@ async def retrieve_and_answer(
     seed_entity_ids = [nid for nid, t in seeds if t == "entity"]
     seed_time_ids = [nid for nid, t in seeds if t == "time_instance"]
 
+    # Places the question names, read from its text as time terms are, whatever
+    # the parse reported and whichever tier seeded; and the places inside them.
+    # They start the walks, so a company in Germany is reached from a question
+    # about Europe, but they are not seeds: `seed_entity_ids` also drives
+    # co-occurrence ranking, where Germany and Spain meeting in a chunk says
+    # nothing about the question.
+    _place_expansion = _cascade and _entity_walk and _qa_flag("place_expansion", True)
+    _places: dict[uuid.UUID, tuple[float, int]] = {}
+    _named_places: list[uuid.UUID] = []
+    if _place_expansion:
+        async with session_scope() as session:
+            _named_places = places_in_question(
+                resolved_query, await retrieval_sql.container_places(session))
+            _from = list(dict.fromkeys(
+                _named_places + (seed_entity_ids if _tier.startswith("named") else [])))
+            _places = await retrieval_sql.expand_place_entities(
+                session, _from, max_depth=int(_qa_cfg("place_expansion_depth", 3)))
+        _places.update({p: (1.0, 0) for p in _named_places if p not in seed_entity_ids})
+        for _sid in seed_entity_ids:
+            _places.pop(_sid, None)
+        if verbose and _places:
+            async with session_scope() as session:
+                _names = await retrieval_sql.describe_for_log(
+                    session, entity_ids=list(_places)[:20])
+            print(f"[query] place expansion: {len(_places)} place(s) named or inside "
+                  f"the seeds: {[_names.get(p, str(p)) for p in list(_places)[:20]]}")
+
     # Relationship-aware walk. Where the broad walk takes every edge out of a
     # seed, this takes only the edges whose stored text matches a relation the
     # question asked about -- re-scored at EVERY hop, which is what carries a
@@ -677,7 +740,7 @@ async def retrieve_and_answer(
         "false", "off", "0"
     ):
         rel_nodes, _rel_edges, rel_stage = await _relationship_walk(
-            seed_entity_ids, rel_probes, max_hops=hops, verbose=verbose,
+            seed_entity_ids + list(_places), rel_probes, max_hops=hops, verbose=verbose,
             terminal_ids=_concept_ids if _terminal_concepts else None,
         )
         for eid, score in rel_nodes.items():
@@ -693,12 +756,17 @@ async def retrieve_and_answer(
     if not bfs_nodes:
         async with session_scope() as session:
             bfs_nodes = await retrieval_sql.bfs_expand(
-                session, seeds, max_hops=hops, decay=0.7,
+                session, seeds + [(p, "entity") for p in _places],
+                max_hops=hops, decay=0.7,
                 entity_relationships_only=_entity_walk,
                 terminal_ids=_concept_ids if _terminal_concepts else None,
+                skip_containment=_place_expansion,
             )
         if rel_stage != "off":
             rel_stage += "->broad_walk"
+    # Both walks start them at 1.0, the score of a question's own seed.
+    for _pid, (_score, _depth) in _places.items():
+        bfs_nodes[(_pid, "entity")] = {"score": _score, "hop": _depth}
 
     expanded_entity_ids = [
         nid for (nid, ntype), _ in bfs_nodes.items() if ntype == "entity"
@@ -738,9 +806,24 @@ async def retrieve_and_answer(
         "seeding": _tier if _cascade else "legacy",
         "seed_entities": len(seed_entity_ids),
         "stage": rel_stage,
+        "contained_places": len(_places),
         "relation_matched_edges": len(_rel_edges),
         "nodes": len(bfs_nodes),
     }
+    # What the question tied to and what each route found, for the question
+    # evaluation (backend/app/evals). Ids and counts only, so a persisted run
+    # stays small; classes are looked up by the evaluation, not here.
+    _trace: dict[str, Any] = {
+        "seeding": _tier if _cascade else "legacy",
+        "seed_entities": [str(e) for e in seed_entity_ids],
+        "seed_times": [str(t) for t in seed_time_ids],
+        "named_places": [str(p) for p in _named_places],
+        "contained_places": len(_places),
+        "matched_classes": [c["iri"] for c in matched_classes[:50]],
+        "walk_entities": len(expanded_entity_ids),
+        "expanded_times": len(expanded_time_ids),
+    }
+    parsed["eval_trace"] = _trace
     if verbose:
         print(
             f"[query] graph expansion ({rel_stage}) yielded {len(bfs_nodes)} "
@@ -812,24 +895,31 @@ async def retrieve_and_answer(
     # ABOUT the query topic surfaces here even when no individual chunk
     # matches the query's vocabulary -- an independent path to the same
     # recall gap brand/generic names open at chunk level, and one that
-    # needs no mined alias pair. `qa.k_documents: 0` disables it.
+    # needs no mined alias pair. `qa.document_arm_fraction: 0` disables it.
     #
     # `qa.document_arm` decides WHEN it runs. It used to run on every query,
     # and measurement said that costs precision for recall already had:
     # switching it off left every gold document and every fact-bearing chunk
     # in place while precision went 41% -> 46% and the packet shrank from 20
     # chunks to 17.5. So the default is `conditional` -- run it only where the
-    # graph cannot answer:
+    # graph cannot answer: when the graph arm produced fewer than
+    # `document_arm_min_chunks_factor` x `k_chunks` candidate chunks, it has
+    # not given the ranker enough to work with, whatever the reason.
     #
-    #   * a seed entity with no relationships at all is a node with no arcs;
-    #     the walk reaches exactly itself, and a document-level match is the
-    #     only way to recover its context.
-    #   * a graph arm that produced fewer than
-    #     `document_arm_min_chunks_factor` x `k_chunks` candidate chunks has
-    #     not given the ranker enough to work with, whatever the reason.
+    # It also used to fire whenever ANY seed entity had no relationships. With
+    # concept seeds that is nearly every question: measured 2026-11-07 on 21
+    # questions it fired on 19, 18 of them for that reason, while the graph
+    # had returned 40-110 summary chunks. `qa.document_arm_dead_end_trigger:
+    # true` restores it (with `document_arm_orphan_share` to narrow it).
     #
-    # `always` restores the old behaviour, `off` disables it like k_documents: 0.
-    _k_docs = int(_qa_cfg("k_documents", 10))
+    # `always` restores the old behaviour, `off` disables it like document_arm_fraction: 0.
+    _ft_share = _qa_cfg("fulltext_bridge_fraction", None)
+    async with session_scope() as session:
+        _total_docs = await retrieval_sql.active_document_count(session)
+    _doc_floor = int(_qa_cfg("document_arm_min_documents", 3))
+    _k_docs = documents_for_fraction(
+        float(_qa_cfg("document_arm_fraction", 0.25)), _total_docs, minimum=_doc_floor
+    )
     _doc_arm_mode = str(_qa_cfg("document_arm", "conditional")).lower()
     _graph_chunks = len({cid for cid, _ in ent_chunks + time_chunks})
     _doc_arm_floor = int(
@@ -837,26 +927,35 @@ async def retrieve_and_answer(
     )
     _run_doc_arm = _doc_arm_mode == "always"
     _doc_arm_reason = "qa.document_arm=always"
-    if _doc_arm_mode == "conditional":
+    if _doc_arm_mode == "conditional" and _qa_flag("document_arm_dead_end_trigger", False):
+        # With a share set, only named seeds count: a concept seed is often
+        # unconnected by design, so it says nothing about what the graph can do.
+        _orphan_share = float(_qa_cfg("document_arm_orphan_share", 0))
+        _judged = (
+            [e for e in seed_entity_ids if e not in _concept_ids]
+            if _orphan_share > 0 else seed_entity_ids
+        )
         _orphan_seeds: list[uuid.UUID] = []
-        if seed_entity_ids:
+        if _judged:
             async with session_scope() as session:
                 _orphan_seeds = await retrieval_sql.entities_without_relationships(
-                    session, seed_entity_ids
+                    session, _judged
                 )
-        if _orphan_seeds:
+        if dead_end_seeds_trigger(len(_orphan_seeds), len(_judged), _orphan_share):
             _run_doc_arm = True
             _doc_arm_reason = (
-                f"{len(_orphan_seeds)}/{len(seed_entity_ids)} seed entity(ies) "
+                f"{len(_orphan_seeds)}/{len(_judged)} seed entity(ies) "
                 f"have no relationships"
             )
-        elif _graph_chunks < _doc_arm_floor:
+    if _doc_arm_mode == "conditional" and not _run_doc_arm:
+        if _graph_chunks < _doc_arm_floor:
             _run_doc_arm = True
             _doc_arm_reason = (
                 f"graph arm returned {_graph_chunks} chunk(s), "
                 f"below the {_doc_arm_floor} floor"
             )
     doc_chunks: list[tuple[uuid.UUID, float]] = []
+    _doc_ids: list[uuid.UUID] = []
     if _k_docs > 0 and _run_doc_arm:
         async with session_scope() as session:
             _doc_ids = await retrieval_sql.vector_search_documents(
@@ -877,13 +976,47 @@ async def retrieve_and_answer(
     elif verbose and _k_docs > 0:
         print(
             f"[query] document arm skipped: graph arm returned "
-            f"{_graph_chunks} chunk(s) (floor {_doc_arm_floor}) and every "
-            f"seed entity has relationships"
+            f"{_graph_chunks} chunk(s) (floor {_doc_arm_floor})"
         )
 
+    # Concept areas: the terms in the question, down the class tree, to the chunks
+    # about those classes' entities. Its own route, so a broad area is not limited
+    # by a seed cap or by what the walk reached.
+    area_ranked: list[tuple[uuid.UUID, float]] = []
+    _area_classes: list[uuid.UUID] = []
+    if _qa_flag("concept_areas", True):
+        async with session_scope() as session:
+            _term_classes = await term_classes(session)
+            _area_classes = classes_in_question(resolved_query, _term_classes)
+            area_ranked = await area_chunks(
+                session, _area_classes,
+                [e for e in seed_entity_ids if e not in _concept_ids],
+                limit=int(_qa_cfg("concept_area_chunk_limit", 100)),
+            )
+        if verbose and _area_classes:
+            _labels = {c: label for c, label, _ in _term_classes}
+            print(f"[query] concept areas: {[_labels[c] for c in _area_classes]} "
+                  f"-> {len(area_ranked)} chunk(s), "
+                  f"{sum(1 for _, s in area_ranked if s >= 1000)} also naming a seed")
     candidate_chunk_ids = list(
-        {cid for cid, _ in ent_chunks + time_chunks + doc_chunks + cooc_chunks}
+        {cid for cid, _ in ent_chunks + time_chunks + doc_chunks + cooc_chunks + area_ranked}
     )
+    _graph_route_ids = {cid for cid, _ in ent_chunks + time_chunks + cooc_chunks + area_ranked}
+    _doc_arm_ids = {cid for cid, _ in doc_chunks}
+    _trace.update({
+        "walk_chunks": len(ent_chunks),
+        "time_chunks": len(time_chunks),
+        "cooccurrence_chunks": len(cooc_chunks),
+        "concept_area_classes": [str(c) for c in _area_classes],
+        "concept_area_chunks": len(area_ranked),
+        "doc_arm": {
+            "fired": bool(_k_docs > 0 and _run_doc_arm),
+            "reason": _doc_arm_reason if _run_doc_arm else "",
+            "limit": _k_docs,
+            "documents": len(_doc_ids),
+            "chunks": len(doc_chunks),
+        },
+    })
     if verbose and cooc_chunks:
         print(f"[query] seed co-occurrence: {len(cooc_chunks)} chunk(s) hold >= "
               f"{int(_qa_cfg('seed_cooccurrence_min', 2))} seeds "
@@ -1017,31 +1150,121 @@ async def retrieve_and_answer(
         ft_rows: list[tuple[uuid.UUID, float, uuid.UUID]] = []
         chunk_doc_map: dict[uuid.UUID, uuid.UUID] = {}
         async with session_scope() as session:
-            ft_rows = await retrieval_sql.fetch_fulltext_chunks_for_chunks(
-                session, candidate_chunk_ids, qvec,
-                limit=int(_qa_cfg("fulltext_bridge_limit", 500)),
-                per_document_limit=int(
-                    _qa_cfg("max_fulltext_chunks_per_document", 50)
-                ),
-            )
-            # Expand only the documents the graph ranked HIGHEST, not every
-            # document it touched. On the 66-doc build the bridge was pulling
-            # 464 verbatim chunks from 62 of 66 documents -- effectively the
-            # whole corpus -- and "which cities are in India" then failed to
-            # rank its answer among 650 candidates, where 186 had found it.
-            # `hits` is the number of candidate chunks the document owns, so
-            # this follows the graph's own document ranking.
-            _max_ft_docs = int(_qa_cfg("fulltext_bridge_max_documents", 10))
-            if _max_ft_docs > 0 and ft_rows:
+            # Rank documents by what the GRAPH routes found in them. Counting
+            # every candidate chunk let the document arm's chunks (up to 50 per
+            # document) outrank the documents the graph reached: measured
+            # 2026-11-07, the limit cut 5-9 graph documents on 20 of 21
+            # questions. `qa.fulltext_bridge_rank_by: all` restores that.
+            _rank_by_graph = str(_qa_cfg("fulltext_bridge_rank_by", "graph")).lower() == "graph"
+            # Which documents to expand and which of their passages to take:
+            # see services/fulltext_bridge.py. The defaults (count, question)
+            # run the original code below unchanged.
+            _doc_rank_mode = str(_qa_cfg("fulltext_bridge_document_rank", "count")).lower()
+            _passage_mode = str(_qa_cfg("fulltext_bridge_passages", "question")).lower()
+            if _doc_rank_mode not in DOCUMENT_RANKS:
+                _doc_rank_mode = "count"
+            if _passage_mode not in PASSAGE_MODES:
+                _passage_mode = "question"
+            if _doc_rank_mode == "best" or _passage_mode == "anchors":
+                _routes = [ent_chunks, time_chunks, cooc_chunks, area_ranked]
+                if not _rank_by_graph:
+                    _routes.append(doc_chunks)
+                _scores = route_scores(_routes)
+                _c_doc = await retrieval_sql.fetch_chunk_document_ids(
+                    session, candidate_chunk_ids)
+                _ft_docs = await retrieval_sql.fulltext_document_ids(
+                    session, set(_c_doc.values()))
+                _max_ft_docs = (
+                    documents_for_fraction(float(_ft_share), _total_docs, minimum=_doc_floor)
+                    if _ft_share is not None
+                    else int(_qa_cfg("fulltext_bridge_max_documents", 10))
+                )
+                _ranked_docs = rank_documents(_scores, _c_doc, mode=_doc_rank_mode,
+                                              candidates=_ft_docs)
+                _by_doc = {d: b for d, b, _ in _ranked_docs}
+                _kept_list = [d for d, _, _ in (
+                    _ranked_docs[:_max_ft_docs] if _max_ft_docs > 0 else _ranked_docs)]
+                _keep_docs = set(_kept_list)
+                if _passage_mode == "anchors":
+                    _summary_ids = await retrieval_sql.summary_chunk_ids(
+                        session, set(_scores))
+                    _anchors = pick_anchors(
+                        _scores, _c_doc, _kept_list,
+                        per_document=int(_qa_cfg("fulltext_bridge_anchors_per_document", 5)),
+                        allowed=_summary_ids)
+                    ft_rows = await retrieval_sql.fetch_fulltext_passages_for_anchors(
+                        session, _anchors, _kept_list, qvec,
+                        per_anchor=int(_qa_cfg("fulltext_bridge_per_anchor", 5)),
+                        question_chunks=int(_qa_cfg("fulltext_bridge_question_chunks", 3)),
+                        document_scores={d: _by_doc.get(d, 0.0) for d in _kept_list},
+                    )
+                    _trace["fulltext_bridge_anchors"] = len(_anchors)
+                else:
+                    # Question-nearest passages of the documents ranked by best
+                    # score; each passage carries its document's score.
+                    _rows = await retrieval_sql.fetch_fulltext_chunks_for_chunks(
+                        session,
+                        [c for c in candidate_chunk_ids if _c_doc.get(c) in _keep_docs],
+                        qvec,
+                        limit=int(_qa_cfg("fulltext_bridge_limit", 500)),
+                        per_document_limit=int(
+                            _qa_cfg("max_fulltext_chunks_per_document", 50)),
+                    )
+                    _order = {d: i for i, d in enumerate(_kept_list)}
+                    _rows.sort(key=lambda r: _order.get(r[2], len(_order)))
+                    ft_rows = [(c, _by_doc.get(d, 0.0), d) for c, _, d in _rows]
+                _trace["fulltext_bridge_mode"] = f"{_doc_rank_mode}/{_passage_mode}"
+            else:
+                _rank_by_graph = str(_qa_cfg("fulltext_bridge_rank_by", "graph")).lower() == "graph"
+                ft_rows = await retrieval_sql.fetch_fulltext_chunks_for_chunks(
+                    session, candidate_chunk_ids, qvec,
+                    limit=int(_qa_cfg("fulltext_bridge_limit", 500)),
+                    per_document_limit=int(
+                        _qa_cfg("max_fulltext_chunks_per_document", 50)
+                    ),
+                    rank_chunk_ids=list(_graph_route_ids) if _rank_by_graph else None,
+                )
+                # Expand only the documents the graph ranked HIGHEST, not every
+                # document it touched. On the 66-doc build the bridge was pulling
+                # 464 verbatim chunks from 62 of 66 documents -- effectively the
+                # whole corpus -- and "which cities are in India" then failed to
+                # rank its answer among 650 candidates, where 186 had found it.
+                # `hits` is the number of candidate chunks the document owns, so
+                # this follows the graph's own document ranking.
+                _max_ft_docs = (
+                    documents_for_fraction(float(_ft_share), _total_docs, minimum=_doc_floor)
+                    if _ft_share is not None
+                    else int(_qa_cfg("fulltext_bridge_max_documents", 10))
+                )
                 _by_doc: dict[uuid.UUID, float] = {}
                 for _c, _h, _d in ft_rows:
                     _by_doc[_d] = max(_by_doc.get(_d, 0.0), float(_h))
-                _keep_docs = {
-                    d for d, _ in sorted(
-                        _by_doc.items(), key=lambda kv: kv[1], reverse=True
-                    )[:_max_ft_docs]
-                }
-                ft_rows = [r for r in ft_rows if r[2] in _keep_docs]
+                _keep_docs = set(_by_doc)
+                if _max_ft_docs > 0 and ft_rows:
+                    _keep_docs = {
+                        d for d, _ in sorted(
+                            _by_doc.items(), key=lambda kv: kv[1], reverse=True
+                        )[:_max_ft_docs]
+                    }
+                    ft_rows = [r for r in ft_rows if r[2] in _keep_docs]
+            # Which documents the limit cut, by the route that brought them in:
+            # a graph route (walk, time, co-occurrence, concept area), only the
+            # document arm, or only the artifact->chunk bridge.
+            _doc_of = await retrieval_sql.fetch_chunk_document_ids(
+                session, candidate_chunk_ids)
+            _graph_docs = {d for c, d in _doc_of.items() if c in _graph_route_ids}
+            _arm_docs = {d for c, d in _doc_of.items() if c in _doc_arm_ids} - _graph_docs
+            _bridged = set(_by_doc)
+            _trace["fulltext_bridge"] = {
+                "limit": _max_ft_docs,
+                "candidate_documents": len(_bridged),
+                "graph_documents": len(_bridged & _graph_docs),
+                "doc_arm_only_documents": len(_bridged & _arm_docs),
+                "other_only_documents": len(_bridged - _graph_docs - _arm_docs),
+                "kept": len(_keep_docs),
+                "graph_documents_cut": len((_bridged & _graph_docs) - _keep_docs),
+                "doc_arm_only_kept": len(_keep_docs & _arm_docs),
+            }
             if ft_rows:
                 chunk_doc_map = await retrieval_sql.fetch_chunk_document_ids(
                     session, candidate_chunk_ids,
@@ -1085,6 +1308,10 @@ async def retrieve_and_answer(
             # Propagate graph scores: fulltext chunks inherit their document's
             # candidate-chunk count; summary chunks keep their entity score.
             ent_score = {cid: sc for cid, sc in ent_chunks}
+            if _trace.get("fulltext_bridge_mode"):
+                # The new bridge scores passages 0-1; scale the walk scores the
+                # same way (same order) so the two interleave in the graph vote.
+                ent_score = route_scores([ent_chunks])
             scored = [(cid, ent_score.get(cid, 0.0)) for cid in kept_summary]
             scored += [(cid, hits) for cid, hits, _ in ft_rows
                        if cid not in _have]
@@ -1251,6 +1478,12 @@ async def retrieve_and_answer(
         if _cooc_ranking:
             chunk_rankings.append(_cooc_ranking)
             chunk_weights.append(float(_qa_cfg("rrf_weight_seed_cooccurrence", 1.0)))
+    if area_ranked:
+        _cand = set(candidate_chunk_ids)
+        _area_ranking = [cid for cid, _ in area_ranked if cid in _cand]
+        if _area_ranking:
+            chunk_rankings.append(_area_ranking)
+            chunk_weights.append(float(_qa_cfg("rrf_weight_concept_area", 1.0)))
     # Document-similarity ranking as its own RRF voter. Filtered to the
     # surviving candidate set -- the step-8.5 bridge may have swapped a
     # document's summary chunks out for its full-text ones, and voting for
@@ -1509,6 +1742,17 @@ async def retrieve_and_answer(
             "confidence": info["confidence"],
         })
 
+    _walk_ids = {cid for cid, _ in ent_chunks}
+    async with session_scope() as session:
+        _walk_summary = await retrieval_sql.summary_chunk_ids(session, _walk_ids)
+    _ev_chunks = [ev for ev in evidence if ev.get("kind") == "chunk"]
+    _trace["evidence_chunks"] = len(_ev_chunks)
+    _trace["walk_chunks_in_evidence"] = sum(
+        1 for ev in _ev_chunks if ev.get("node_id") in _walk_ids)
+    _trace["walk_summary_chunks"] = len(_walk_summary)
+    _trace["walk_summary_chunks_in_evidence"] = sum(
+        1 for ev in _ev_chunks if ev.get("node_id") in _walk_summary)
+
     # -------- step 12: answer generation --------
     answer_task_name = _ANSWER_TASK_BY_MODE[mode]
     answer_prompt_fn = PROMPTS[answer_task_name]
@@ -1530,11 +1774,14 @@ async def retrieve_and_answer(
         parsed.get("aliases") or {},
         parsed.get("time_terms") or [],
     )
-    try:
-        out = await router.chat(answer_task_name, system=sys_p, user=user_p)
-        answer = out.text.strip()
-    except Exception as exc:
-        answer = f"(answer generation failed: {exc})"
+    if not answer_question:
+        answer = ""
+    else:
+        try:
+            out = await router.chat(answer_task_name, system=sys_p, user=user_p)
+            answer = out.text.strip()
+        except Exception as exc:
+            answer = f"(answer generation failed: {exc})"
 
     # Every cited id must resolve to something we actually retrieved.
     answer, invalid_citations = _validate_citations(answer, evidence)
@@ -2760,6 +3007,7 @@ async def _persist_run(
                     "time_terms": result.parsed.get("time_terms", []),
                     "relations": [_relation_text(r) for r in result.parsed.get("relations") or []],
                     "graph_walk": result.parsed.get("graph_walk"),
+                    "eval_trace": result.parsed.get("eval_trace"),
                     # Persisted so citation quality is trendable across runs
                     # rather than only visible in a log line.
                     "invalid_citations": result.invalid_citations,

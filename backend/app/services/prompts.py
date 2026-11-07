@@ -646,7 +646,9 @@ def concept_grouping(
         "'Agriculture', 'Mining', 'Healthcare' go under Industry, never "
         "under Organization.\n"
         "  5. DomainConcept is a last resort. Prefer the closest real root.\n"
-        "  6. Skip an orphan only if it fits no concept at all.\n\n"
+        "  6. Skip an orphan that fits no concept at all, and one that is "
+        "not a concept: a bare verb, adjective or colour, a value, a date, "
+        "or document metadata.\n\n"
         "Output strict JSON in the shape:\n"
         "{\n"
         '  "NEW_SUBCONCEPTS": ['
@@ -670,55 +672,79 @@ def concept_grouping(
 
 
 def concept_head_judge(
-    groups: list[dict[str, Any]], roots: list[str]
+    groups: list[dict[str, Any]], kinds: list[tuple[str, str]]
 ) -> tuple[str, str]:
-    """Stage 3c: confirm a generic HEAD class for groups of qualified concept
-    classes (SemiconductorRevenue, RelatedPartyRevenue -> Revenue) and place
-    the head under one domain-neutral root.
+    """Stage 3c: classify the generic HEAD of each group of qualified concept
+    classes (SemiconductorRevenue, RelatedPartyRevenue -> Revenue). Code maps
+    the kind to a root (`concept_heads.HEAD_KINDS`).
 
     `groups`: [{"id", "head", "members": [{"label", "description"}]}].
-    Returns JSON {"decisions": [{"id", "accept", "root", "description",
+    Returns JSON {"decisions": [{"id", "kind", "description",
     "rejected_members"}]}.
     """
+    kind_lines = "\n".join(f"  {k}: {d}" for k, d in kinds)
     system = (
-        "You are an ontology curator. Each group below lists proposed "
-        "CLASS names that end in the same HEAD word. Decide whether the HEAD "
-        "is a real, generic concept that every member is a KIND of, so the "
-        "head can become their shared parent class.\n\n"
-        "ACCEPT when the members are kinds of the head: Revenue for "
-        "SemiconductorRevenue / RelatedPartyRevenue / SegmentRevenue; "
-        "ResponseRate for ObjectiveResponseRate / OverallResponseRate; "
-        "Defect for WeldDefect / PaintDefect; Therapy for "
-        "CombinationTherapy / InsulinTherapy.\n"
-        "REJECT when the shared word does not make them one kind: "
-        "Manufacturer for BatteryManufacturer / EVManufacturer (companies, "
-        "not concepts); Report for AnnualReport / NewsReport only if they "
-        "are documents; names of organizations, people, places or products; "
-        "kinds of people or groups of people (Patient for GeriatricPatient / "
-        "PediatricPatient; Population).\n"
-        "Every member must use the head in ONE sense: DebtConsolidation and "
-        "BatteryConsolidation do not -- reject the group or list the odd "
-        "members in rejected_members.\n"
-        "List in rejected_members any member that is NOT a kind of the head "
-        "(e.g. 'RevenueRecognitionPolicy' under Revenue).\n\n"
-        "For an accepted head choose ONE root from: "
-        + ", ".join(roots)
-        + ". Use Measure for a directly reported amount (revenue, dose, "
-        "output volume), Metric for a derived ratio or rate (margin, "
-        "response rate, defect rate), Condition for states (disease, "
-        "defect, insolvency), Outcome for results (side effect, loss), "
-        "Material for physical or biological substances and agents (drug, "
-        "inhibitor, agonist, receptor, cell type, steel, resin), "
-        "TechnologyConcept for engineered devices, systems and techniques "
-        "(battery, chip, software) -- never a drug class.\n"
+        "You are an ontology curator. Each group below lists proposed CLASS "
+        "names that end in the same HEAD word. Say what KIND of thing the HEAD "
+        "is, judging the head as the members use it. Choose exactly one:\n"
+        + kind_lines
+        + "\n\nUse none for heads that group companies, people, places or "
+        "products (Manufacturer for BatteryManufacturer / EVManufacturer; "
+        "Patient for GeriatricPatient / PediatricPatient), and when the members "
+        "use the head in different senses (DebtConsolidation and "
+        "BatteryConsolidation).\n"
+        "When unsure, or when the head is an everyday word that names no one "
+        "clear kind of thing, use none or descriptor: a wrong parent misplaces "
+        "every member.\n"
+        "List in rejected_members any member that is NOT a kind of the head. A "
+        "label can end in the head word and still name something else: "
+        "RevenueRecognitionPolicy is not a Revenue, EarningsBeforeInterest is "
+        "not an Interest, ChangeInInventory is not an Inventory, BloodSupply is "
+        "not a Supply of goods.\n"
         "Give a one-sentence domain-neutral description of the head.\n"
         "Return ONLY one JSON object, no prose."
     )
     user = (
         "GROUPS:\n"
         + json.dumps(groups, ensure_ascii=False)
-        + '\n\nReturn JSON: {"decisions": [{"id": ..., "accept": true|false, '
-        '"root": "<root>", "description": "...", "rejected_members": [...]}]}'
+        + '\n\nReturn JSON: {"decisions": [{"id": ..., "kind": "<kind>", '
+        '"description": "...", "rejected_members": [...]}]}'
+    )
+    return system, user
+
+
+def concept_kind_judge(items: list[dict[str, Any]]) -> tuple[str, str]:
+    """Sort entities typed under the concept roots into named things and real
+    concepts (`concept_kinds.py`).
+
+    `items`: [{"id", "name", "class"}].
+    Returns JSON {"decisions": [{"id", "kind": "named"|"concept"}]}.
+    """
+    system = (
+        "You sort items from a knowledge graph into NAMED things and CONCEPTS. "
+        "Each item has a name and the class it was filed under. The class is "
+        "only a hint: one class can hold both.\n\n"
+        "NAMED: one specific, identifiable thing with its own name or "
+        "identifier -- a product or model ('iPhone 15', 'Boeing 737'), a "
+        "facility or project ('Hoover Dam', 'Line 4 press'), a specific study "
+        "('RECOVERY trial', 'Study 301', 'NCT01234567'), a specific law, "
+        "standard or filing ('Basel III', 'ISO 9001', 'Form 20-F'), a specific "
+        "drug or compound ('atorvastatin', 'Lipitor'), a fund or programme.\n"
+        "CONCEPT: a general kind, quantity, condition, process or type of rule "
+        "that many different things can have or be -- 'operating margin', "
+        "'defect rate', 'hypertension', 'statin', 'clinical trial', 'tariff', "
+        "'injection molding', 'pension liability', 'electric vehicle'.\n\n"
+        "Capitalization is NOT evidence: 'Net Income' and 'Heart Failure' are "
+        "concepts; 'atorvastatin' is named. A disease is a concept even when "
+        "named after a person ('Alzheimer\'s disease'). A category of drugs or "
+        "products is a concept; one member of it is named. If unsure, answer "
+        "concept.\n"
+        "Answer every id. Return ONLY one JSON object, no prose."
+    )
+    user = (
+        "ITEMS:\n"
+        + json.dumps(items, ensure_ascii=False)
+        + '\n\nReturn JSON: {"decisions": [{"id": ..., "kind": "named"|"concept"}]}'
     )
     return system, user
 
@@ -1354,6 +1380,59 @@ def concept_extract(
         + "\n```\n\n"
         "Return JSON: {\"entities\": [{\"canonical_name\": ..., "
         "\"short_name\": ..., \"class_iri\": ..., \"confidence\": ...}]}"
+    )
+    return system, user
+
+
+def concept_review(
+    chunk_text: str,
+    candidate_classes: list[dict[str, str]],
+    items: list[dict[str, Any]],
+) -> tuple[str, str]:
+    """`concept_review.py`: check each proposed concept against its passage.
+
+    `items`: [{"id", "name", "class_iri", "class_label"}]. Returns JSON
+    {"verdicts": [{"id", "verdict", "better_class_iri", "reason"}]}.
+    """
+    system = (
+        "You review concepts another model extracted from a passage. Each has "
+        "an ontology class. Return ONE JSON object and nothing else. For each "
+        "concept, work in this order.\n\n"
+        "FIRST, class_passes: read \"<concept> is a kind of <class>\" using the "
+        "class label and description, and decide whether it is literally true. "
+        "Start from what the thing IS: an amount or score you report a number "
+        "for, a state, an activity, a technique, a rule, a result, a property "
+        "or ability, an occurrence. It only fits a class of the same sort. "
+        "\"Bed occupancy rate\" is an amount, not a state; a \"hospital visiting "
+        "rule\" is a rule, not a market phenomenon; \"port dredging oversight\" "
+        "is an activity, not a kind of Port. Loosely true counts as false.\n\n"
+        "THEN the verdict:\n"
+        "  keep     -- class_passes is true and the passage says something about it.\n"
+        "  move     -- class_passes is false and the sentence is literally true "
+        "for another listed class, or class_passes is true and it is also true "
+        "for a narrower listed class. Put that class in better_class_iri, copied "
+        "verbatim. Test it the same way first: a related topic is not enough.\n"
+        "  no_class -- class_passes is false and no listed class passes.\n"
+        "  drop     -- too vague to mean anything alone (\"importance\", "
+        "\"progress\"), or only mentioned with nothing said about it. Never drop "
+        "because the class is wrong.\n\n"
+        "RULES:\n"
+        "  - A specific named thing (a product, a trial, a law, a facility) may "
+        "appear here. Another step handles names. Do not drop it for being "
+        "named; only check its class.\n"
+        "  - Give a reason of at most 12 words for anything but keep.\n"
+        "  - Answer every id."
+    )
+    lines = "\n".join(
+        f'{i["id"]}. {i["name"]} -- class: {i["class_iri"]} ({i["class_label"]})'
+        for i in items
+    )
+    user = (
+        "CLASSES:\n" + _render_candidate_block(candidate_classes)
+        + "\n\nPASSAGE:\n```\n" + chunk_text + "\n```\n\n"
+        + "CONCEPTS TO REVIEW:\n" + lines + "\n\n"
+        + 'Return JSON: {"verdicts": [{"id": ..., "class_passes": true|false, "verdict": '
+        + '"keep"|"move"|"drop"|"no_class", "better_class_iri": ..., "reason": ...}]}'
     )
     return system, user
 
@@ -2219,8 +2298,8 @@ def geographic_containment(
 
     Prose never states that Frankfurt is in Germany, so extraction never mints
     the edge, and a question about "companies in Germany" cannot walk there.
-    This recovers the containment -- but ONLY between places the corpus
-    already names, so the pass adds edges and never nodes.
+    This recovers the containment between entities that already exist; the
+    model never adds a node.
     """
     system = (
         "You state geographic containment between places. You are given a "

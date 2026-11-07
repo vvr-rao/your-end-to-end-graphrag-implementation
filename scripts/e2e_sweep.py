@@ -107,6 +107,8 @@ def main() -> int:
     results.append(run("generate-artifacts",
                        ["generate-artifacts", "--max-cost-usd", "5.0"], timeout=3600))
     results.append(run("mine-aliases", ["mine-aliases"], timeout=1800))
+    # Standing corpus evaluation on the finished graph (free).
+    results.append(run("eval-corpus", ["eval-corpus"]))
 
     # --- retrieval ---------------------------------------------------------
     q = "Which GLP-1 drugs are described and what are their main side effects?"

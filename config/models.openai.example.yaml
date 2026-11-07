@@ -572,6 +572,33 @@ tasks:
     max_tokens: 4096   # 60 decisions ~1.5k tokens
     response_format: json_object
 
+  # Reviews each chunk's concepts against the passage: keep, move to a better
+  # listed class, or drop. A different model from concept_extract where possible.
+  # ~1 extra call per chunk with concepts; a failed call keeps them unreviewed.
+  # Set enabled: true to run it.
+  concept_review:
+    provider: openai
+    model: gpt-4o-mini
+    enabled: false        # off until it beats the blind test; see concept_review.py
+    timeout: 300
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+
+  # Named things vs concepts among entities typed under the concept roots
+  # (`BMW iX3` vs `operating margin`). Runs after extract-entities; ~1 call per
+  # 25 entities with no verdict. enabled: false skips it.
+  concept_kind_judge:
+    provider: openai
+    model: gpt-4o-mini
+    enabled: true
+    entities_per_call: 25
+    concurrency: 8
+    timeout: 300
+    temperature: 0.0
+    max_tokens: 2048        # 25 decisions ~400 tokens
+    response_format: json_object
+
   # Stage 3c: generic parent for qualified concept classes
   # (SemiconductorRevenue, RelatedPartyRevenue -> Revenue < Measure). Groups
   # proposals by head noun; the judge confirms each group and picks the root.
@@ -580,7 +607,7 @@ tasks:
     provider: openai
     model: gpt-4o-mini
     enabled: true
-    min_members: 2          # a head needs >= 2 qualified members
+    min_members: 3          # 2 let in chance groups: replay 2026-11-03, 3 cut bad heads 23 -> 7 (finance) and 32 -> 17 (pharma)
     groups_per_call: 25
     max_groups: 300
     timeout: 600
