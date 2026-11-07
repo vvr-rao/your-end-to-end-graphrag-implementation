@@ -240,8 +240,11 @@ uv run python scripts/tpm_check.py "<DOCS>"
 > calls in flight per PDF), split from one budget (free RAM minus 600 MB; each
 > worker 200 MB + 5 MB per page in flight). They are listed with the GPU
 > concurrency and written by `--apply` / `--apply-concurrency`. Read both out:
-> table vision runs on serverless Qwen3-VL-235B at ~60-250 s per page, 3-12 min on a slow day, so
-> pages in flight are what shortens a long filing.
+> pages in flight are what shortens a long filing. In DeepInfra mode **host
+> the table-vision model** (recommended; serverless Qwen3-VL ran ~60-250 s per
+> page, 3-12 min on a slow day, vs ~6-7x faster hosted; the 235B needs 2x B200,
+> it does not start on 2x H200) — see choose-llm-mode,
+> "Table vision: HOST it", for the separate deployment and the cache-key rule.
 >
 > **Verify this machine's memory first** (the one these skills and the detached
 > run use): the sizing prints `Local memory` and `Build memory ... FITS / TIGHT /
@@ -336,7 +339,7 @@ Three knobs, three different constraints:
 | Knob | Bound by | Default | Notes |
 |---|---|---|---|
 | `concurrency.table_extraction` | **MEMORY** | 1 | Each PDF = one subprocess, ~152 MB measured. Serial extraction is often the LONG POLE: 18 PDFs at 1 is ~100 min. |
-| `concurrency.table_page_vision` | **MEMORY** | 1 | Whole-page vision calls in flight INSIDE one PDF (~60-250 s each on serverless Qwen3-VL-235B, 3-12 min on a slow day; 750 s timeout, 1 retry). `tpm_check.py` sizes it together with `table_extraction` (worker = 200 + 5 x pages MB); output is identical at any value. |
+| `concurrency.table_page_vision` | **MEMORY** | 1 | Whole-page vision calls in flight INSIDE one PDF (~60-250 s each on serverless Qwen3-VL-235B, 3-12 min on a slow day; 750 s timeout, 1 retry -- in DeepInfra mode host the 235B on 2x B200 instead, see choose-llm-mode; it does NOT fit 2x H200). `tpm_check.py` sizes it together with `table_extraction` (worker = 200 + 5 x pages MB); output is identical at any value. |
 | `chunking.streaming_batch_size` | memory (cheap) | 8 | Holds N documents' text (~50 MB at 16). Also CAPS effective concurrency. |
 | `concurrency.summarization` | **RATE LIMIT** | 32 | Measured ~0.5% of a 10M TPM tier; rarely the constraint on tier 3+. |
 
@@ -697,7 +700,26 @@ any version folder (no database needed):
 uv run python -m backend.app.cli graph-stats --no-db --ontology <PE_DIR>
 ```
 
-Report: version-folder path, total cost, any preflight warnings, that a re-run
+**Ontology evaluation (always run it, then report it).** An LLM judge
+(DeepSeek-V4.1-Flash serverless in DeepInfra mode; the cheap judge model in the
+other modes — task `eval_definition_judge`) says yes/no for every class
+definition in the new ontology. Classes with no definition are counted, not
+sent. Cheap (~1 call per 20 classes; ~5,000 classes cost about $0.08):
+```
+uv run python -m backend.app.cli eval-ontology <PE_DIR>
+```
+Smoke-test a big ontology first with `--limit 60`. It prints Yes / judged and
+Yes / all for all classes, concept vs other classes, and new (minted by this
+run) vs source classes, and saves every verdict with its one-line reason to
+`.build/evals/ontology/<PE_DIR name>/definitions-<time>.jsonl` (gitignored) for
+the user to review. **LangSmith:** when `LANGSMITH_API_KEY` is installed, the
+report uploads by itself to the `graphrag-corpus-evals` tracing project (the
+output ends with a `[langsmith] project ...` line; check with `uv run python scripts/check_env.py LANGSMITH_API_KEY`, which
+never prints the key). With no key nothing is sent; say so.
+
+Report: version-folder path, total cost, any preflight warnings, the ontology
+evaluation's Yes / judged and Yes / all (all, concept classes, new classes),
+the number with no definition and where the log is, that a re-run
 would hit caches, and **always the ontology counts: classes created (and the
 total before/after), instances created (net), and concept classes created** --
 the classes under `extraction.concept_class_roots` that the concept-pass menu and

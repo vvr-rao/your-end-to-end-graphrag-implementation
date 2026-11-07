@@ -12,6 +12,8 @@ Metrics, per chunk kind (summary / fulltext):
   * entities and concepts per chunk (mean, median), from `viao:assertsAbout`
     mention edges;
   * chunks with no entities and no concepts (and with none of each);
+  * chunks by how many they mention: 0, 1, 2, 3, 4, 5 and more than 5, counted
+    for entities and concepts together, entities alone and concepts alone;
 Graph-wide:
   * entity-to-entity relationships, split entity-entity / entity-concept /
     concept-concept, with the place-containment edges counted on their own;
@@ -27,7 +29,7 @@ from typing import Any
 
 from sqlalchemy import text
 
-from backend.app.evals.common import buckets, entity_kinds, mean, median
+from backend.app.evals.common import buckets, count_buckets, entity_kinds, mean, median
 from backend.app.services.predicates import GRAPHRAG_LOCATED_IN
 
 BIG_CLASS = 50
@@ -80,6 +82,12 @@ async def corpus_eval(session: Any) -> dict[str, Any]:
                 1 for e, c in zip(ents, cons, strict=True) if e == 0 and c == 0),
             "chunks_without_entities": sum(1 for e in ents if e == 0),
             "chunks_without_concepts": sum(1 for c in cons if c == 0),
+            "chunks_by_count": {
+                "entities_and_concepts": count_buckets(
+                    [e + c for e, c in zip(ents, cons, strict=True)]),
+                "entities": count_buckets(ents),
+                "concepts": count_buckets(cons),
+            },
         }
 
     rels = Counter()
@@ -149,6 +157,9 @@ def format_corpus_eval(r: dict[str, Any]) -> str:
             f"  without entities or concepts {c['chunks_without_entities_or_concepts']}; "
             f"without entities {c['chunks_without_entities']}; "
             f"without concepts {c['chunks_without_concepts']}")
+        for what, b in (c.get("chunks_by_count") or {}).items():
+            lines.append(f"  chunks by {what.replace('_', ' ')}: "
+                         + ", ".join(f"{k}: {v}" for k, v in b.items()))
     rel = r["relationships"]
     lines.append(
         f"relationships {rel['total']}: entity-entity {rel['entity_entity']}, "

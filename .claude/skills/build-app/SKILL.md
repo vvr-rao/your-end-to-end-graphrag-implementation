@@ -109,8 +109,11 @@ another model.
 > calls in flight per PDF), split from one budget (free RAM minus 600 MB; each
 > worker 200 MB + 5 MB per page in flight). They are listed with the GPU
 > concurrency and written by `--apply` / `--apply-concurrency`. Read both out:
-> table vision runs on serverless Qwen3-VL-235B at ~60-250 s per page, 3-12 min on a slow day, so
-> pages in flight are what shortens a long filing.
+> pages in flight are what shortens a long filing. In DeepInfra mode **host
+> the table-vision model** (recommended; serverless Qwen3-VL ran ~60-250 s per
+> page, 3-12 min on a slow day, vs ~6-7x faster hosted; the 235B needs 2x B200,
+> it does not start on 2x H200) — see choose-llm-mode,
+> "Table vision: HOST it", for the separate deployment and the cache-key rule.
 >
 > **Verify this machine's memory first** (the one these skills and the detached
 > run use): the sizing prints `Local memory` and `Build memory ... FITS / TIGHT /

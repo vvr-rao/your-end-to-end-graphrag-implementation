@@ -4157,3 +4157,69 @@ def alias_judge(pairs: list[dict[str, str]]) -> tuple[str, str]:
         'Return JSON: {"same": [ids], "different": [ids]}'
     )
     return system, user
+
+
+# --------------------------------------------------------------------------- #
+# Standing LLM-as-judge evaluations (backend/app/evals/judge_evals.py).
+# Yes/no per item with a one-line reason; nothing is changed in the graph.
+# --------------------------------------------------------------------------- #
+
+def eval_typing_judge(items: list[dict[str, Any]]) -> tuple[str, str]:
+    """eval-typing: is each entity (or concept) typed with a right class?
+
+    `items`: [{"id", "name", "kind", "class", "class_definition", "parents",
+    "passage"}]. Returns JSON {"decisions": [{"id", "verdict": "yes"|"no",
+    "reason"}]}.
+    """
+    system = (
+        "You review how a knowledge graph typed the things it extracted from "
+        "documents. For each item decide whether its CLASS is right.\n\n"
+        "kind=entity: a named thing (company, person, place, product, project, "
+        "document, event). yes = '<name> is a <class>' is true, using the class "
+        "definition and the passage.\n"
+        "kind=concept: a general idea (a measure, condition, process, policy "
+        "type, technology). yes = the concept is a kind of <class> or falls "
+        "squarely under it.\n\n"
+        "no = the class is wrong (a company typed as a Person; revenue typed as "
+        "a Condition), the item is not what the class describes, or the name is "
+        "garbage (a sentence fragment, a bare number). A broad but correct class "
+        "is yes (Samsung SDI as Organization). Judge only the class given; do "
+        "not ask for a better one.\n"
+        "Answer every id. reason: at most 12 words."
+    )
+    lines = "\n".join(
+        f'{i["id"]}. name: {i["name"]} | kind: {i["kind"]} | class: {i["class"]}'
+        f' | class definition: {i["class_definition"] or "(none)"}'
+        f' | parents: {i["parents"] or "(none)"}\n   passage: {i["passage"] or "(none)"}'
+        for i in items)
+    user = (f"ITEMS:\n{lines}\n\n"
+            'Return JSON: {"decisions": [{"id": ..., "verdict": "yes"|"no", "reason": "..."}]}')
+    return system, user
+
+
+def eval_definition_judge(items: list[dict[str, Any]]) -> tuple[str, str]:
+    """eval-ontology: does each class definition fit its class?
+
+    `items`: [{"id", "class", "definition", "parents"}]. Returns JSON
+    {"decisions": [{"id", "verdict": "yes"|"no", "reason"}]}.
+    """
+    system = (
+        "You review the class definitions of an OWL ontology. For each class "
+        "decide whether its DEFINITION is right.\n\n"
+        "yes = the definition describes what the class label names, is "
+        "factually correct, and is consistent with its parent classes.\n"
+        "no = it describes something else, is wrong, contradicts its parents "
+        "(a 'Revenue' defined as a cost; a subclass of Event defined as an "
+        "organisation), only repeats the label ('Battery: a battery'), or is "
+        "garbled or cut off.\n"
+        "Short or plain definitions are fine. Do not judge whether the class "
+        "should exist.\n"
+        "Answer every id. reason: at most 12 words."
+    )
+    lines = "\n".join(
+        f'{i["id"]}. class: {i["class"]} | parents: {i["parents"] or "(none)"}'
+        f'\n   definition: {i["definition"]}'
+        for i in items)
+    user = (f"CLASSES:\n{lines}\n\n"
+            'Return JSON: {"decisions": [{"id": ..., "verdict": "yes"|"no", "reason": "..."}]}')
+    return system, user

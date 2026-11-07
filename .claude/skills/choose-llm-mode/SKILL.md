@@ -46,7 +46,7 @@ active preset is OpenAI). `test_deepinfra_mode_uses_only_deepinfra` enforces it.
 | **Groq + OpenAI** (default) | `groq-openai` | `OPENAI_API_KEY`, `GROQ_API_KEY` | Groq runs chunk_classification (best disambiguation); OpenAI everything else. |
 | **OpenAI only** | `openai` | `OPENAI_API_KEY` | Simplest; one provider. chunk_classification → `gpt-4.1-mini`. |
 | **Anthropic + OpenAI** | `anthropic` | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` | Claude for chat (haiku cheap tasks / sonnet synthesis); OpenAI for embeddings only. |
-| **DeepInfra (Qwen + DeepSeek)** | `deepinfra` | `DEEPINFRA_API_KEY`, `DEEPINFRA_FLASH_MODEL` | Knowledge creation on a **dedicated** Qwen3.8-27B deployment (rented GPUs, billed per GPU-hour while it exists); relationships, repair, judges and **all Q&A** on serverless DeepSeek-V4.1-Flash; table vision `Qwen3-VL-235B-A22B` (serverless; only when pdfplumber cannot build the table); embeddings `Qwen3-Embedding-4B`@1024. No OpenAI/Anthropic key. Needs its OWN database (vectors can't mix with OpenAI ones; a guard refuses). See "DeepInfra mode" below. |
+| **DeepInfra (Qwen + DeepSeek)** | `deepinfra` | `DEEPINFRA_API_KEY`, `DEEPINFRA_FLASH_MODEL` | Knowledge creation on a **dedicated** Qwen3.8-27B deployment (rented GPUs, billed per GPU-hour while it exists); relationships, repair, judges and **all Q&A** on serverless DeepSeek-V4.1-Flash; table vision `Qwen3-VL-235B-A22B` (only when pdfplumber cannot build the table; **host it on its own short-lived deployment — recommended**, serverless is the slow fallback); embeddings `Qwen3-Embedding-4B`@1024. No OpenAI/Anthropic key. Needs its OWN database (vectors can't mix with OpenAI ones; a guard refuses). See "DeepInfra mode" below. |
 
 How to describe DeepInfra when presenting the options: **cheapest to run, rented
 GPUs to build.** Q&A costs ~$0.009 per deep-research question (vs ~$0.10 on
@@ -132,8 +132,75 @@ is created. The account needs a DeepInfra display name (username) first —
 the dedicated GPUs for every knowledge-creation task (summaries, classification,
 class proposal, dedup and its judges, entities, artifacts); **DeepSeek-V4.1-Flash
 always on serverless** (relationships, repair, all Q&A, eval judges), as are
-the embeddings (Qwen3-Embedding-4B) and table vision (Qwen3-VL-235B). Never move
-DeepSeek onto the dedicated deployment.
+the embeddings (Qwen3-Embedding-4B). Never move DeepSeek onto the dedicated
+deployment. Table vision (Qwen3-VL) is the one exception: see below.
+
+**Table vision (`--tables` on PDFs): HOST it — recommended over serverless.**
+
+*Which model — Qwen3-VL-235B, not 30B.* Measured 2026-10-24 on 16 hard fin-gen
+statement pages (LGES/SDI/24220c53), each twice, scored against the PDF's own
+text layer (serverless, 8 pages in flight, production page-vision prompt,
+150 dpi, 16k output cap):
+
+| Model | Rows right | Precision | Same rows both runs | Figures under a wrong label | Median s/page | $/page |
+|---|---|---|---|---|---|---|
+| Qwen3-VL-30B-A3B | 0.66 | 0.73 | 0.60 | 11 | 98 | 0.0022 |
+| **Qwen3-VL-235B-A22B** | **0.87** | **0.87** | 0.92 | 2 | 124 | 0.0026 |
+| gemma-4-31B | 0.75 | 0.85 | 0.95 | - | 70 | 0.0014 |
+| gemini-3.7-flash (proprietary, resold) | 0.86 | 0.86 | 0.99 | - | 25 | 0.016 |
+
+The full 3-PDF re-extraction confirmed it (rows right 235B vs 30B: 235 vs 201,
+596 vs 520, 483 vs 399). Never fall back to the 30B to save time.
+
+*Why host.* Serverless speed drifts badly: the 124 s/page above was a good day
+(3 fin-gen PDFs in ~25 min, ~$0.26); on 2026-10-26 it was ~7 tok/s (217 s for
+1.5k tokens) and on 2026-11-07 ~200-230 s/page with dense statement pages
+timing out at 2 x 750 s and left PARTIAL. Hosted Qwen3-VL measured **~205 tok/s
+per stream vs ~33 serverless, identical output** (2026-10-24, the 30B on 1x H100).
+
+*Where to host the 235B* (FP8 repo `Qwen/Qwen3-VL-235B-A22B-Instruct-FP8`, ~236 GB
+of weights; DeepInfra bills **per GPU**, so N GPUs = N x the per-GPU rate):
+
+| Configuration | GPU memory | $/hour | Result |
+|---|---|---|---|
+| 2x H200-141GB | 282 GB | 5.38 | **FAILS** — `wont-start: couldn't start model` after ~10 min (~$0.85 billed), 2026-11-07 |
+| 1x B300-270GB | 270 GB | 4.89 | do not try: less headroom than the failed 2x H200 |
+| **2x B200-180GB** | 360 GB | **7.38** | **recommended, WORKS** (2026-11-07): ~12 min to load; 3 fin-gen PDFs (LGES 58 p, SDI 99 p, 24220c53 55 p) -> 206 tables in **337 s** with 24 pages in flight (40-70 s per dense statement page), 0 failed / 0 partial; **$2.18 billed in total** (~18 min) |
+| 4x H100-80GB | 320 GB | 8.80 ($2.20 per H100; 2x H100 is $4.40) | works on paper; dearer and tighter than 2x B200 |
+
+Cost for 3 audited filings: **$2.18 measured** on 2x B200 (load dominates;
+extraction itself ~6 min), vs ~$0.26 serverless on a good day — and serverless
+took >30 min for 2 pages on 2026-11-07. Budget ~$2.50 + ~$0.10 per extra filing. The account limit is 4 GPUs across all live deployments; running
+the VL deployment first and deleting it before the 27B one (step 1) keeps
+them from overlapping.
+
+Procedure:
+1. Run it as a SEPARATE deployment, **before** the Qwen3.8-27B deployment
+   exists (tables need no 27B; otherwise the 27B bills idle while pages run).
+   Sizing file (`deepinfra_deploy.py create --from-sizing <file> --name qwenvl235 --no-fallback --yes`):
+   `{"option": {"gpu": "B200-180GB", "num_gpus": 2, "instances": 1, "precision": "fp8",
+   "repo": "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8", "usd_hr": 7.38,
+   "label": "2x B200-180GB fp8 (Qwen3-VL-235B-A22B)"}, "max_batch_size": 24, "fallbacks": []}`.
+   Give it a hard time cap and delete it on exit (the bench recipe
+   `benchmarks/2026-11-07/dcv2/vl_phase.sh` traps EXIT and deletes).
+2. Point BOTH `table_extract_vision` and `table_extract_page_vision` in
+   `config/models.yaml` at `<username>/<printed model_name>` (provider stays
+   `deepinfra`), set `concurrency.table_page_vision` to ~8 (pages in flight per
+   PDF, memory-bound — see tpm_check; keep PDFs x pages <= `max_batch_size`),
+   and warm the table cache: run the `--tables` step (or extract tables on
+   their own) with the deployment up.
+3. Delete the VL deployment as soon as extraction finishes.
+4. **Keep that hosted model id in both vision tasks for every later `--tables`
+   step** (prune-expand AND register-documents) even after the deployment is
+   gone. The table cache key hashes `provider:model` of both vision tasks
+   (`table_cache.vision_models_tag`): switching back to the serverless name
+   misses every cached PDF and re-extracts it. Cached PDFs need no calls; a
+   PDF cached as PARTIAL re-sends only its failed pages, which then fail
+   against the deleted deployment (set a short `timeout` / `max_retries: 0`
+   so they fail fast instead of holding the 27B GPU idle).
+Serverless stays acceptable for a handful of short PDFs, or when no GPU budget
+is approved; then run 8 pages in flight. Ask for approval of the hourly rate
+as for any deployment, quoting the PER-GPU rate x GPU count.
 
 **One task can use either:** `alias_judge` (mine-aliases) runs on the dedicated
 deployment while it is `running` and falls back to serverless `Qwen/Qwen3.8-27B`

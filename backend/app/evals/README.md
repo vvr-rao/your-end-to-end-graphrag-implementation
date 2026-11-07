@@ -1,6 +1,6 @@
 # Standing evaluations
 
-Two evaluations, run every time a graph is built and every time a set of
+Standing evaluations, run every time a graph is built and every time a set of
 questions is tested. Reports are printed and saved as JSON under
 `.build/evals/<database>/` (gitignored); `--out` writes elsewhere.
 
@@ -11,8 +11,11 @@ later step that changes entities or relationships (enrich-geo, a re-extract,
 document deletes). Free: database queries only.
 
 ```
-uv run python -m backend.app.cli eval-corpus
+uv run python -m backend.app.cli eval-corpus [--label <build or corpus name>] [--no-langsmith]
 ```
+
+With `LANGSMITH_API_KEY` set, every corpus evaluation (including the one at the
+end of `extract-entities`) is uploaded too; see LangSmith below.
 
 Entities are split three ways: **concepts** (typed under
 `extraction.concept_class_roots`, minus those judged named things),
@@ -24,10 +27,44 @@ places.
 |---|---|
 | Entities / concepts per chunk | Mean and median, per chunk kind (summary, fulltext), counted from `viao:assertsAbout` mention edges |
 | Chunks without entities or concepts | Per chunk kind; also without entities, and without concepts |
+| Chunks by count | Per chunk kind: how many chunks mention 0, 1, 2, 3, 4, 5 and more than 5, for entities and concepts together, entities alone and concepts alone |
 | Relationships | Entity-to-entity edges, split entity-entity, entity-concept, concept-concept; place-containment edges counted separately |
 | Entities per class | Mean and median over classes with at least one entity, for entity classes, concept classes and both |
 | Classes with >50 entities | Count and the largest classes |
 | Relationships per node | Entities and concepts with 0, 1, 2, 3 and more than 3 relationships |
+
+## LLM-as-judge evaluations (`eval-typing`, `eval-ontology`)
+
+A judge model says **yes or no** for every item, with a one-line reason. Cheap
+(about one call per 20 items) but not free; nothing in the graph or the
+ontology is changed. The model is the task `eval_typing_judge` /
+`eval_definition_judge` in models.yaml: DeepSeek-V4.1-Flash (serverless) in
+DeepInfra mode, gpt-4o-mini in the OpenAI presets, claude-haiku-4-5 in the
+Anthropic preset.
+
+```
+# after extract-entities: is each entity's class (and each concept's concept class) right?
+uv run python -m backend.app.cli eval-typing [--limit N] [--label <build>] [--no-langsmith]
+# after prune-expand: does each class definition fit its class?
+uv run python -m backend.app.cli eval-ontology <prune-expand folder> [--limit N] [--label ...]
+```
+
+| Evaluation | The judge sees | Groups reported |
+|---|---|---|
+| `eval-typing` | name, entity or concept, class, class definition, parent classes, a passage where it is mentioned | all, entities, concepts, places |
+| `eval-ontology` | class label, definition, parent classes (classes with no definition are not sent: `no_definition`) | all, concept classes vs other classes, new (minted by prune-expand) vs source classes |
+
+Each group reports yes, no, unanswered (a failed call), no definition, and two
+percentages: **Yes / judged** and **Yes / all** (no definition and unanswered
+count against the second). `--limit N` judges a fixed pseudo-random sample.
+
+Every verdict and reason is saved for review (gitignored):
+`.build/evals/<database>/typing-<time>.jsonl` (+ `.json` summary) and
+`.build/evals/ontology/<folder>/definitions-<time>.jsonl` (+ `.json`). With
+`LANGSMITH_API_KEY` set, the summary goes to the same tracing project as the
+corpus evaluation (runs `typing-eval: <label or database>` and
+`ontology-eval: <label or folder>`; the ontology run records the folder, not a database; every count and
+percentage as a feedback score, e.g. `typing.concepts.yes_pct_of_judged`).
 
 ## Question evaluation (`eval-questions`)
 
@@ -124,6 +161,19 @@ names and chunk ids, and every score above as a feedback column. Chunk text is
 never uploaded. Without a key nothing is sent and nothing fails;
 `--no-langsmith` skips one run. Set `langsmith.user` in config.yaml (uploads
 are skipped with a message until it is).
+
+**Corpus evaluations** have no questions, so no dataset. Each one becomes a
+run in the tracing project `langsmith.corpus_project` (default
+`<dataset_prefix>-corpus-evals`), named `corpus-eval: <label or database>`. The run's
+output is the full report; its metadata holds the user, database, label, git
+commit and config paths; and every number in the report is a feedback score on
+the run (89 keys, e.g. `entities`, `concepts`,
+`summary.chunks_without_entities_or_concepts`,
+`summary.by_entities_and_concepts.0` ... `.>5`, `relationships.entity_concept`,
+`relationships_per_node.entities.0`). In LangSmith, open the project: the runs
+table shows the scores as columns, filtering on `metadata.database` or
+`metadata.label` (or the run tags) follows one corpus, and the monitoring tab
+charts any score over time. `eval-corpus --no-langsmith` skips one upload.
 
 ```
 uv run python -m backend.app.cli eval-dataset push eval_questions/testsets/fingen.json

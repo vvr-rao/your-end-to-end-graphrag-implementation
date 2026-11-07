@@ -608,11 +608,34 @@ entities; try `--limit 25 --dry-run` first). The corpus is now a knowledge graph
 **Corpus evaluation (always report it).** `extract-entities` prints a CORPUS
 EVALUATION block at its end; after the later steps run it again so the numbers
 match the finished graph, and include them in the hand-back:
-`uv run python -m backend.app.cli eval-corpus`
-(entities and concepts per chunk, chunks with none, relationships by type,
+`uv run python -m backend.app.cli eval-corpus [--label <build name>]`
+(entities and concepts per chunk, chunks with 0/1/2/3/4/5/>5 of them, chunks with none, relationships by type,
 entities per class and classes with >50, entities and concepts by relationship
 count; free, saved under `.build/evals/`). Definitions:
-`backend/app/evals/README.md`. If the user has an evaluation question set, also
+`backend/app/evals/README.md`.
+
+**Typing evaluation (always run it after the corpus evaluation, then report
+it).** An LLM judge (DeepSeek-V4.1-Flash serverless in DeepInfra mode; the cheap
+judge model otherwise — task `eval_typing_judge`) says yes/no for every entity's
+class and every concept's concept class, reading the class definition, its
+parents and a passage where the entity is mentioned. ~1 call per 20 entities
+(~1,200 entities cost about $0.05); smoke-test with `--limit 60` first:
+```
+uv run python -m backend.app.cli eval-typing [--label <build name>]
+```
+It prints Yes / judged and Yes / all for all, entities, concepts and places, and
+saves every verdict and reason to `.build/evals/<database>/typing-<time>.jsonl`
+(gitignored) for the user to review.
+
+**LangSmith (corpus and typing evaluations).** When `LANGSMITH_API_KEY` is
+installed both reports upload by themselves to the `graphrag-corpus-evals`
+tracing project (each output ends with a `[langsmith] project ...` line). Check
+without reading `.env`: `uv run python scripts/check_env.py LANGSMITH_API_KEY`
+(prints present / MISSING, never the key).
+Pass the same `--label <build name>` to `eval-corpus` and `eval-typing` so the
+runs line up. With no key nothing is sent; say so in the hand-back.
+
+If the user has an evaluation question set, also
 run `uv run python -m backend.app.cli eval-questions <file>` (question parse
 cost only) and report what the questions tie to and what the walk finds.
 

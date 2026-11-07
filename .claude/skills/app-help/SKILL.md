@@ -393,7 +393,7 @@ Other things worth knowing:
 `uv run python -m backend.app.cli --help`. Groups: ontology (`merge`, `prune`,
 `expand`, `prune-expand`, `build`), DB (`db-migrate`, `db-status`, `db-size`, `graph-stats`,
 `enrich-geo`, `embed-relationships`, `relink-artifact-entities`, `classify-concepts`,
-`db-init`, `clear-corpus`), evaluation (`eval-corpus`, `eval-questions`, `eval-dataset`; Recall@K/Precision@K/MRR on `eval_questions/testsets/`; optional LangSmith upload; see `backend/app/evals/README.md`), corpus (`register-documents`, `list-documents`,
+`db-init`, `clear-corpus`), evaluation (`eval-corpus`, `eval-typing` and `eval-ontology` (LLM-as-judge yes/no on entity typing and class definitions), `eval-questions`, `eval-dataset`; Recall@K/Precision@K/MRR on `eval_questions/testsets/`; optional LangSmith upload; see `backend/app/evals/README.md`), corpus (`register-documents`, `list-documents`,
 `update-document`, `delete-document`), enrichment (`extract-entities`,
 `enrich-time`, `generate-artifacts`), retrieval (`query`, `evaluate-queries`,
 `conversation start|turn|show`), deploy (`render-*`).
@@ -457,7 +457,10 @@ Other things worth knowing:
   - **Slow table extraction (`--tables`)** is memory-bound, not rate-bound:
     `concurrency.table_extraction` = PDFs in parallel, `concurrency.table_page_vision`
     = whole-page vision calls in flight inside one PDF (serverless Qwen3-VL-235B:
-    ~60-250 s per page, 3-12 min on a slow day). `tpm_check.py` (and `deepinfra_sizing.py`) size both
+    ~60-250 s per page, 3-12 min on a slow day). In DeepInfra mode the
+    recommended route is a HOSTED Qwen3-VL deployment (~6-7x faster, same
+    output), Qwen3-VL-235B on 2x B200 ($7.38/h; it fails on 2x H200), run
+    before the 27B deployment; never the weaker 30B. See choose-llm-mode. `tpm_check.py` (and `deepinfra_sizing.py`) size both
     from free RAM — workers x (200 + 5 x pages) MB within free minus 600 MB.
   - See the README's "Tuning throughput" section.
 

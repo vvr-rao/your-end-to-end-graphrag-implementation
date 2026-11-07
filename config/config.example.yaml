@@ -1089,11 +1089,15 @@ evals:
 # --- LangSmith (eval-dataset, eval-questions --langsmith) ----------------------
 # The API key is LANGSMITH_API_KEY in .env. `user` is required to upload: it is
 # stamped on every dataset and experiment. Datasets are named
-# <dataset_prefix>-<test set name>. Nothing is sent unless asked.
+# <dataset_prefix>-<test set name>. Nothing is sent without LANGSMITH_API_KEY;
+# corpus evaluations go to the corpus_project tracing project.
 langsmith:
   user: ""
   endpoint: https://api.smith.langchain.com
   dataset_prefix: graphrag
+  # Corpus evaluations (eval-corpus) go to this tracing project, one run per
+  # evaluation; default <dataset_prefix>-corpus-evals.
+  corpus_project: graphrag-corpus-evals
 
 # ---- enrich-geo. Contained places per LLM call, and how many containers
 # ride along in every call. Small on purpose: at ~109 places per call the
