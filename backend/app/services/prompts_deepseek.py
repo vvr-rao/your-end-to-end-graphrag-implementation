@@ -1074,3 +1074,22 @@ def deepseek_class_proposal(
         '"MATCHES FOUND": [...]}'
     )
     return system, user
+
+
+# --------------------------------------------------------------------------- #
+# Standing LLM-as-judge evaluations (judge_evals.py) for the deepinfra preset:
+# the shared prompts plus the bare-JSON instruction DeepSeek needs.
+# --------------------------------------------------------------------------- #
+
+def deepseek_eval_typing_judge(items: list[dict[str, Any]]) -> tuple[str, str]:
+    from backend.app.services.prompts import eval_typing_judge
+
+    system, user = eval_typing_judge(items)
+    return system + "\nReturn ONE JSON object and nothing else.", user
+
+
+def deepseek_eval_definition_judge(items: list[dict[str, Any]]) -> tuple[str, str]:
+    from backend.app.services.prompts import eval_definition_judge
+
+    system, user = eval_definition_judge(items)
+    return system + "\nReturn ONE JSON object and nothing else.", user

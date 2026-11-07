@@ -757,7 +757,48 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_ecorp.add_argument("--out", type=Path, default=None, help="Write the JSON report here.")
     p_ecorp.add_argument("--json", action="store_true", help="Print JSON instead of text.")
+    p_ecorp.add_argument("--label", default="",
+                         help="A name for this evaluation in LangSmith (e.g. the build or "
+                              "corpus); default the database name.")
+    p_ecorp.add_argument("--no-langsmith", action="store_true",
+                         help="Do not upload this report. (With LANGSMITH_API_KEY set, every "
+                              "corpus evaluation is uploaded as a run in the "
+                              "<prefix>-corpus-evals project.)")
     p_ecorp.set_defaults(func=_cmd_eval_corpus)
+
+    p_etyp = sub.add_parser(
+        "eval-typing",
+        help=(
+            "LLM-as-judge: is each entity's class (and each concept's concept "
+            "class) right? Yes/no per entity, ~1 cheap call per 20 entities "
+            "(task eval_typing_judge). Run after extract-entities. Verdicts and "
+            "reasons go to .build/evals/<database>/typing-<time>.jsonl."
+        ),
+    )
+    p_etyp.add_argument("--limit", type=int, default=None,
+                        help="Judge a fixed pseudo-random sample of N entities (smoke test).")
+    p_etyp.add_argument("--label", default="", help="Run name in LangSmith (default database).")
+    p_etyp.add_argument("--no-langsmith", action="store_true", help="Do not upload this report.")
+    p_etyp.set_defaults(func=_cmd_eval_typing)
+
+    p_eont = sub.add_parser(
+        "eval-ontology",
+        help=(
+            "LLM-as-judge: does each class definition fit its class? Yes/no per "
+            "class of a prune-expand output folder; classes with no definition "
+            "are counted, not sent. ~1 cheap call per 20 classes (task "
+            "eval_definition_judge). Run after prune-expand. Verdicts go to "
+            ".build/evals/ontology/<folder>/definitions-<time>.jsonl."
+        ),
+    )
+    p_eont.add_argument("folder", type=Path,
+                        help="A prune-expand (or merge/build) output folder holding merged.json.")
+    p_eont.add_argument("--limit", type=int, default=None,
+                        help="Judge a fixed pseudo-random sample of N classes (smoke test).")
+    p_eont.add_argument("--label", default="",
+                        help="Run name in LangSmith (default the folder name).")
+    p_eont.add_argument("--no-langsmith", action="store_true", help="Do not upload this report.")
+    p_eont.set_defaults(func=_cmd_eval_ontology)
 
     p_eq = sub.add_parser(
         "eval-questions",
@@ -2191,13 +2232,17 @@ async def _run_corpus_eval() -> dict[str, Any]:
         return await corpus_eval(session)
 
 
-def _print_corpus_eval(report: dict[str, Any], out: Path | None = None) -> None:
+def _print_corpus_eval(report: dict[str, Any], out: Path | None = None, *,
+                       upload: bool = True, label: str = "") -> None:
+    from backend.app.evals import langsmith_sync
     from backend.app.evals.common import save_report
     from backend.app.evals.corpus_eval import format_corpus_eval
 
     print("CORPUS EVALUATION")
     print(format_corpus_eval(report))
     print(f"[eval-corpus] saved {save_report('corpus', report, out)}")
+    if upload:
+        langsmith_sync.maybe_upload_corpus(report, label=label)
 
 
 def _cmd_eval_corpus(args: argparse.Namespace) -> int:
@@ -2205,7 +2250,46 @@ def _cmd_eval_corpus(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(report, indent=2, default=str))
         return 0
-    _print_corpus_eval(report, args.out)
+    _print_corpus_eval(report, args.out, upload=not args.no_langsmith, label=args.label)
+    return 0
+
+
+def _cmd_eval_typing(args: argparse.Namespace) -> int:
+    from backend.app.db.session import session_scope
+    from backend.app.evals import langsmith_sync
+    from backend.app.evals.judge_evals import format_judge_eval, save_typing, typing_eval
+    from backend.app.services.llm_router import LLMRouter
+
+    async def run() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        async with session_scope() as session:
+            return await typing_eval(session, LLMRouter(), limit=args.limit)
+
+    report, items = asyncio.run(run())
+    summary, _log = save_typing(report, items)
+    print("TYPING EVALUATION (LLM judge)")
+    print(format_judge_eval(report))
+    print(f"[eval-typing] saved {summary}")
+    if not args.no_langsmith:
+        langsmith_sync.maybe_upload_judge(report, label=args.label)
+    return 0
+
+
+def _cmd_eval_ontology(args: argparse.Namespace) -> int:
+    from backend.app.evals import langsmith_sync
+    from backend.app.evals.judge_evals import format_judge_eval, ontology_eval, save_ontology
+    from backend.app.services.llm_router import LLMRouter
+
+    if not (args.folder / "merged.json").exists():
+        print(f"[eval-ontology] no merged.json in {args.folder}")
+        return 2
+    report, items = asyncio.run(ontology_eval(
+        args.folder, LLMRouter(), _concept_roots_from_config(), limit=args.limit))
+    summary, _log = save_ontology(report, items)
+    print("ONTOLOGY EVALUATION (LLM judge)")
+    print(format_judge_eval(report))
+    print(f"[eval-ontology] saved {summary}")
+    if not args.no_langsmith:
+        langsmith_sync.maybe_upload_judge(report, label=args.label or args.folder.name)
     return 0
 
 

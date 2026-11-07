@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from backend.app.evals import langsmith_sync
-from backend.app.evals.common import buckets, mean, median
+from backend.app.evals.common import buckets, count_buckets, mean, median
 from backend.app.evals.corpus_eval import format_corpus_eval
 from backend.app.evals.question_eval import (
     _row,
@@ -215,6 +215,89 @@ def test_corpus_report_formats():
     assert "Organization 60" in text
     assert "entity-concept 2" in text
     assert "without entities or concepts 1" in text
+
+
+def test_count_buckets_go_to_five_then_more():
+    assert count_buckets([0, 1, 5, 6, 40, 0]) == {
+        "0": 2, "1": 1, "2": 0, "3": 0, "4": 0, "5": 1, ">5": 2}
+
+
+def _corpus_report() -> dict:
+    chunk = {"chunks": 3, "entities_per_chunk_mean": 2.0, "entities_per_chunk_median": 2,
+             "places_per_chunk_mean": 0.5, "concepts_per_chunk_mean": 1.0,
+             "concepts_per_chunk_median": 1, "chunks_without_entities_or_concepts": 1,
+             "chunks_without_entities": 1, "chunks_without_concepts": 2,
+             "chunks_by_count": {"entities_and_concepts": count_buckets([0, 3, 9]),
+                                 "entities": count_buckets([0, 2, 6]),
+                                 "concepts": count_buckets([0, 0, 3])}}
+    cls = {"classes_with_entities": 4, "entities_per_class_mean": 3.0,
+           "classes_over_50": 1, "classes_over_50_list": [("Organization", 60)]}
+    return {"entities": 12, "places": 3, "concepts": 5, "chunks": {"summary": chunk},
+            "relationships": {"total": 7, "entity_entity": 4, "entity_concept": 2,
+                              "concept_concept": 1, "of_which_place_containment": 2},
+            "classes": {"entity": cls, "concept": cls, "all": cls},
+            "relationships_per_node": {"entities": buckets([0, 1]), "concepts": buckets([5])}}
+
+
+def test_corpus_report_shows_chunks_by_count():
+    text = format_corpus_eval(_corpus_report())
+    assert "chunks by entities and concepts: 0: 1, 1: 0, 2: 0, 3: 1, 4: 0, 5: 0, >5: 1" in text
+    assert "chunks by concepts: 0: 2," in text
+
+
+def test_corpus_scores_flatten_every_number():
+    scores = langsmith_sync.corpus_scores(_corpus_report())
+    assert scores["entities"] == 12
+    assert scores["summary.chunks_without_entities_or_concepts"] == 1
+    assert scores["summary.by_entities_and_concepts.>5"] == 1
+    assert scores["summary.by_concepts.0"] == 2
+    assert scores["relationships.entity_concept"] == 2
+    assert scores["classes.entity.classes_over_50"] == 1
+    assert scores["relationships_per_node.concepts.>3"] == 1
+    assert not any("list" in k for k in scores)  # largest-class lists stay in outputs
+
+
+class _StubTracer:
+    def __init__(self):
+        self.projects, self.runs, self.feedback = [], [], []
+
+    def has_project(self, name):
+        return bool(self.projects)
+
+    def create_project(self, name, description):
+        self.projects.append(name)
+        return SimpleNamespace(id="p1", name=name)
+
+    def read_project(self, *, project_name):
+        return SimpleNamespace(id="p1", name=project_name)
+
+    def create_run(self, name, inputs, run_type, **kw):
+        self.runs.append({"name": name, "inputs": inputs, "run_type": run_type, **kw})
+
+    def create_feedback(self, run_id, key, *, score, session_id):
+        assert session_id == "p1"
+        self.feedback.append((run_id, key, score))
+
+
+def test_corpus_eval_uploads_one_run_with_metrics(ls_config, monkeypatch):
+    monkeypatch.setattr("backend.app.evals.common.database_name", lambda: "db1")
+    stub = _StubTracer()
+    out = langsmith_sync.upload_corpus_eval(_corpus_report(), label="build-7", ls=stub)
+    assert out["project"] == "graphrag-corpus-evals" == stub.projects[0]
+    run = stub.runs[0]
+    assert run["name"] == "corpus-eval: build-7"
+    assert run["project_name"] == "graphrag-corpus-evals"
+    assert run["outputs"]["entities"] == 12
+    assert run["extra"]["metadata"]["database"] == "db1"
+    assert {r for r, _, _ in stub.feedback} == {run["id"]}
+    assert ("entities", 12) in {(k, v) for _, k, v in stub.feedback}
+    assert out["scores"] == len(stub.feedback)
+
+
+def test_corpus_project_name_can_be_set(monkeypatch):
+    monkeypatch.setattr(langsmith_sync, "settings",
+                        lambda: {"dataset_prefix": "graphrag", "corpus_project": "mine"})
+    assert langsmith_sync.corpus_project() == "mine"
 
 
 # ---------------------------------------------------------------- LangSmith (no network)
@@ -474,3 +557,25 @@ def test_trace_outputs_carry_answer_scores_only_when_present():
         "answers_found": ["a"], "answers_missed": ["b"]}}, 10)
     assert out["scores"]["answer_recall"] == 0.5
     assert out["answers_missed"] == ["b"]
+
+
+def test_judge_evals_upload_to_the_same_project(ls_config, monkeypatch):
+    monkeypatch.setattr("backend.app.evals.common.database_name", lambda: "db1")
+    stub = _StubTracer()
+    out = langsmith_sync.upload_eval_run("typing", {"evaluation": "typing"},
+                                         {"typing.all.yes_pct_of_all": 95.0}, ls=stub)
+    assert out["run"] == "typing-eval: db1"
+    assert stub.runs[0]["tags"][0] == "typing-eval"
+    assert stub.runs[0]["extra"]["metadata"]["evaluation"] == "typing"
+    assert stub.feedback[0][1:] == ("typing.all.yes_pct_of_all", 95.0)
+
+
+def test_ontology_runs_record_the_folder_not_a_database(ls_config, monkeypatch):
+    monkeypatch.setattr("backend.app.evals.common.database_name", lambda: "some-db-host")
+    stub = _StubTracer()
+    out = langsmith_sync.upload_eval_run(
+        "ontology", {"evaluation": "ontology", "folder": "/x/v1-prune-expand"}, {}, ls=stub)
+    assert out["run"] == "ontology-eval: v1-prune-expand"
+    meta = stub.runs[0]["extra"]["metadata"]
+    assert meta["folder"] == "v1-prune-expand" and "database" not in meta
+    assert "some-db-host" not in stub.runs[0]["tags"]

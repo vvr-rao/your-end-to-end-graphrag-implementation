@@ -1,0 +1,252 @@
+{
+  "ontology": "https://veerla-ramrao.ai/ontology/domain-concepts",
+  "namespace": "https://veerla-ramrao.ai/ontology/domain-concepts#",
+  "from_version": "1.x (pre-2026-11-07)",
+  "to_version": "2.0",
+  "note": "Old IRI -> new IRI(s). 'deprecated': the old IRI is kept with owl:deprecated and dcterms:isReplacedBy and should not be used. 'retyped' / 're-parented': same IRI, new rdfs:subClassOf parent. 'narrowed': same IRI, some terms moved to new, more specific classes. No owl:equivalentClass is asserted between old and new meanings.",
+  "mappings": [
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#Scrap",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#ScrapRate",
+        "https://veerla-ramrao.ai/ontology/domain-concepts#ScrapMaterial"
+      ],
+      "kind": "deprecated",
+      "reason": "'Scrap' named a rate but read as the material. Split into ScrapRate (Metric) and ScrapMaterial (Material)."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#NewLaw",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#LawEnactment",
+        "https://veerla-ramrao.ai/ontology/domain-concepts#Law"
+      ],
+      "kind": "deprecated",
+      "reason": "Mixed the event of passing a law with the law itself. LawEnactment (Event) and Law (PolicyConcept)."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#Pricing",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#Pricing",
+        "https://veerla-ramrao.ai/ontology/domain-concepts#Price",
+        "https://veerla-ramrao.ai/ontology/domain-concepts#ListPrice"
+      ],
+      "kind": "retyped",
+      "reason": "Pricing is now the process (Process, was Measure); the amounts are Price and ListPrice. 'list price' moved to ListPrice."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#Debt",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#Debt",
+        "https://veerla-ramrao.ai/ontology/domain-concepts#DebtBalance"
+      ],
+      "kind": "retyped",
+      "reason": "Debt is now the obligation (EconomicConcept, was Measure); the amount outstanding is DebtBalance. 'total debt' moved to DebtBalance."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#Assets",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#Assets",
+        "https://veerla-ramrao.ai/ontology/domain-concepts#Asset"
+      ],
+      "kind": "narrowed",
+      "reason": "Assets stays the reported amount (Measure); a single resource is the new Asset (EconomicConcept)."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#Partnership",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#Partnership",
+        "https://veerla-ramrao.ai/ontology/domain-concepts#AgreementSigning"
+      ],
+      "kind": "retyped",
+      "reason": "Partnership is now an Agreement (was under CorporateEvents, an Event); forming it is AgreementSigning."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#TradeDeal",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#TradeDeal",
+        "https://veerla-ramrao.ai/ontology/domain-concepts#AgreementSigning"
+      ],
+      "kind": "retyped",
+      "reason": "TradeDeal is now an Agreement (was PolicyConcept under GeopoliticalEvents); signing it is AgreementSigning."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#SupplyContract",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#SupplyContract"
+      ],
+      "kind": "retyped",
+      "reason": "Now a kind of Agreement (was SupplyChainConcept)."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#PowerPurchaseAgreement",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#PowerPurchaseAgreement"
+      ],
+      "kind": "retyped",
+      "reason": "Now a kind of Agreement (had no type parent, only the EnergyMarkets area)."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#TrialPhase",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#TrialPhase"
+      ],
+      "kind": "retyped",
+      "reason": "Now a Classification (stage label); was Process."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#TrialEndpoint",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#TrialEndpoint"
+      ],
+      "kind": "retyped",
+      "reason": "Now a Measure (what a trial measures), skos:related Outcome; was Outcome."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#AdverseEvent",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#AdverseEvent",
+        "https://veerla-ramrao.ai/ontology/domain-concepts#AdverseDrugReaction"
+      ],
+      "kind": "retyped",
+      "reason": "Now an Event (an occurrence, matching the adverse-event taxonomy's root); was Condition. Attributed effects are the new AdverseDrugReaction. 'side effect' moved to AdverseDrugReaction."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#AuditReport",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#AuditReport"
+      ],
+      "kind": "re-parented",
+      "reason": "Sibling of FinancialStatements under ReportingDocument; was a child of FinancialStatements."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#FinancialStatements",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#FinancialStatements"
+      ],
+      "kind": "retyped",
+      "reason": "Now a type (ReportingDocument) in the FinancialReporting area; was an area under Financials."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#NotesToFinancialStatements",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#NotesToFinancialStatements"
+      ],
+      "kind": "re-parented",
+      "reason": "A ReportingDocument accompanying the statements; was a child of FinancialStatements."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#EarningsRelease",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#EarningsRelease",
+        "https://veerla-ramrao.ai/ontology/domain-concepts#EarningsCall",
+        "https://veerla-ramrao.ai/ontology/domain-concepts#QuarterlyResults"
+      ],
+      "kind": "narrowed",
+      "reason": "'earnings call' and 'quarterly results' moved to their own classes."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#IncomeStatement",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#IncomeStatement",
+        "https://veerla-ramrao.ai/ontology/domain-concepts#StatementOfComprehensiveIncome"
+      ],
+      "kind": "narrowed",
+      "reason": "'statement of comprehensive income' moved to its own class."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#Profit",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#Profit",
+        "https://veerla-ramrao.ai/ontology/domain-concepts#GrossProfit",
+        "https://veerla-ramrao.ai/ontology/domain-concepts#OperatingProfit",
+        "https://veerla-ramrao.ai/ontology/domain-concepts#NetIncome"
+      ],
+      "kind": "narrowed",
+      "reason": "Profit is the grouping; gross profit, operating profit and net income are subclasses."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#Margin",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#Margin",
+        "https://veerla-ramrao.ai/ontology/domain-concepts#GrossMargin",
+        "https://veerla-ramrao.ai/ontology/domain-concepts#OperatingMargin"
+      ],
+      "kind": "narrowed",
+      "reason": "Margin is the grouping; gross and operating margin are subclasses."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#SingleSourcing",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#SingleSourcing",
+        "https://veerla-ramrao.ai/ontology/domain-concepts#SoleSourcing"
+      ],
+      "kind": "narrowed",
+      "reason": "'sole source' moved to the new SoleSourcing."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#Metric",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#Metric"
+      ],
+      "kind": "re-parented",
+      "reason": "Metric is now a kind of Measure (was a sibling under Quantity)."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#MarketCapitalization",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#MarketCapitalization"
+      ],
+      "kind": "retyped",
+      "reason": "An amount: Measure (was Metric)."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#TargetPrice",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#TargetPrice"
+      ],
+      "kind": "retyped",
+      "reason": "An amount: Measure (was Metric)."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#DemandForecast",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#DemandForecast"
+      ],
+      "kind": "retyped",
+      "reason": "An amount: Measure (was Metric)."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#Patent",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#Patent"
+      ],
+      "kind": "retyped",
+      "reason": "Now IntellectualProperty (was TechnologyConcept)."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#ProductRoadmap",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#ProductRoadmap"
+      ],
+      "kind": "retyped",
+      "reason": "Now a Plan (was TechnologyConcept)."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#Equipment",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#Equipment",
+        "https://veerla-ramrao.ai/ontology/domain-concepts#ProductionEquipment"
+      ],
+      "kind": "narrowed",
+      "reason": "Equipment stays a topic area; the machinery type is the new ProductionEquipment."
+    },
+    {
+      "old": "https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea",
+      "new": [
+        "https://veerla-ramrao.ai/ontology/domain-concepts#ConceptArea"
+      ],
+      "kind": "re-parented",
+      "reason": "Areas now nest with skos:broader (each area is a direct subClassOf ConceptArea) and hold concepts through inConceptArea, not rdfs:subClassOf. Area classes no longer have Event or other type parents."
+    }
+  ]
+}

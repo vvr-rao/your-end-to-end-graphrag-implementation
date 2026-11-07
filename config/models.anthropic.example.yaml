@@ -558,6 +558,28 @@ tasks:
     temperature: 0.0
     max_tokens: 2048        # 25 decisions ~400 tokens
 
+  # Standing LLM-as-judge evaluations (eval-typing after extract-entities;
+  # eval-ontology after prune-expand). Yes/no per item with a short reason;
+  # nothing is changed. ~1 call per 20 items.
+  eval_typing_judge:
+    provider: anthropic
+    model: claude-haiku-4-5
+    items_per_call: 20
+    concurrency: 8
+    timeout: 300
+    temperature: 0.0
+    max_tokens: 4096        # 20 verdicts with reasons ~1k tokens
+
+  eval_definition_judge:
+    provider: anthropic
+    model: claude-haiku-4-5
+    items_per_call: 20
+    concurrency: 8
+    timeout: 300
+    temperature: 0.0
+    max_tokens: 4096
+
+
   # Stage 3c: generic parent for qualified concept classes
   # (SemiconductorRevenue, RelatedPartyRevenue -> Revenue < Measure). Groups
   # proposals by head noun; the judge confirms each group and picks the root.

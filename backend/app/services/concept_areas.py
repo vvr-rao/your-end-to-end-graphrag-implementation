@@ -2,20 +2,29 @@
 
 "Financial information for Samsung SDI" names nothing the graph holds: `revenue` is
 a Quantity, with no link to anything financial, and concept seeding found 0 entities
-for that term (measured 2026-11-04). `domain_concepts.owl` now groups kinds of
-concept under areas (Financials -> FinancialPerformance -> Revenue), with
-`conceptTerm` annotations listing the phrases that mean each class.
+for that term (measured 2026-11-04). `domain_concepts.owl` keeps three layers apart:
 
-Two things use the terms:
+- TYPES (`rdfs:subClassOf`): Revenue is a Measure, Maintenance is a Process.
+- TOPICS: concept areas (Financials, Transportation...), nested with `skos:broader`.
+- MEMBERSHIP: `dc:inConceptArea` on a concept's class IRI names its areas
+  (Revenue inConceptArea FinancialPerformance; Port in Transportation AND Logistics).
 
-- A question containing one expands down the class tree to every entity under that
-  class, and from them to the chunks asserting about them. This is the only route
-  from a class to a chunk (chunk -> assertsAbout -> entity -> class), and it does
-  not depend on the entity walk or on a capped list of seeds, so a broad area keeps
-  all its children.
-- An entity named by one is typed with that class. Extraction types generically
-  (`revenue` was a `Metric` although a `Revenue` class existed), and an entity left
-  there is not under the area. Costs nothing, so it always runs.
+`conceptTerm` lists the phrases that route a QUESTION to a concept or area. A
+question containing one expands: the matched class -> narrower areas (inverse
+`skos:broader`) -> their member concepts (`inConceptArea`) -> every subclass of
+those -> the entities typed with them -> the chunks asserting about them. This is
+the only route from a class to a chunk (chunk -> assertsAbout -> entity -> class),
+and it does not depend on the entity walk or a capped list of seeds, so a broad area
+keeps all its children. Databases built before v2 nest areas with subClassOf; the
+subclass step still covers them.
+
+Membership is never stored as an edge and never links two entities: two companies
+reporting Revenue share an area, and that is not a fact about them.
+
+Entity retyping is separate and stricter: an entity named exactly by a concept's
+label, `skos:prefLabel` or `skos:altLabel` (never a `conceptTerm`, never an area)
+is typed with that concept. Ambiguous names (margin, equity, yield, turnover,
+earnings) are never used to retype.
 
 An ontology with no terms makes both a no-op.
 """
@@ -33,7 +42,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.db.session import session_scope
 from backend.app.services.retrieval_sql import _CONCEPT_CLASS_IDS_SQL
 
-TERM_KEY = "https://veerla-ramrao.ai/ontology/domain-concepts#conceptTerm"
+DC_NS = "https://veerla-ramrao.ai/ontology/domain-concepts#"
+TERM_KEY = DC_NS + "conceptTerm"
+IN_AREA_KEY = DC_NS + "inConceptArea"
+_SKOS = "http://www.w3.org/2004/02/skos/core#"
+BROADER_KEY = _SKOS + "broader"
+PREF_LABEL_KEY = _SKOS + "prefLabel"
+ALT_LABEL_KEY = _SKOS + "altLabel"
+# Names that mean different things in different contexts ("margin" of profit,
+# of collateral, of a price). A question may route through them; an entity named
+# by one is never retyped from it.
+AMBIGUOUS_NAMES = frozenset({"margin", "margins", "equity", "yield", "yields",
+                             "turnover", "earnings"})
 _WORD = r"[^\W_]"
 
 _TERM_CLASSES_SQL = sql_text("""
@@ -48,8 +68,7 @@ async def term_classes(session: AsyncSession) -> list[tuple[uuid.UUID, str, list
     rows = await session.execute(_TERM_CLASSES_SQL, {"key": TERM_KEY})
     out: list[tuple[uuid.UUID, str, list[str]]] = []
     for cid, label, terms in rows.all():
-        values = [terms] if isinstance(terms, str) else list(terms or [])
-        out.append((cid, label, [t for t in values if isinstance(t, str) and t.strip()]))
+        out.append((cid, label, _values(terms)))
     return out
 
 
@@ -114,6 +133,70 @@ SELECT gr.source_node_id,
 """)
 
 
+def _values(raw: Any) -> list[str]:
+    """Annotation values as strings: the merge stores plain strings, the raw
+    parser `{"value": ...}` / `{"iri": ...}` dicts; both are read."""
+    items = raw if isinstance(raw, list) else ([] if raw is None else [raw])
+    out: list[str] = []
+    for v in items:
+        if isinstance(v, dict):
+            v = v.get("iri") or v.get("value")
+        if isinstance(v, str) and v.strip():
+            out.append(v.strip())
+    return out
+
+
+_TOPIC_LINKS_SQL = sql_text("""
+    SELECT id, iri,
+           extra_metadata -> 'annotations' -> :broader,
+           extra_metadata -> 'annotations' -> :in_area
+      FROM graphrag.ontology_classes
+     WHERE extra_metadata -> 'annotations' ? :broader
+        OR extra_metadata -> 'annotations' ? :in_area
+""")
+
+
+async def topic_links(session: AsyncSession) -> list[tuple[Any, str, list[str], list[str]]]:
+    """`(class id, iri, broader IRIs, area IRIs)` for every class that names a
+    broader concept or a concept area."""
+    rows = await session.execute(
+        _TOPIC_LINKS_SQL, {"broader": BROADER_KEY, "in_area": IN_AREA_KEY})
+    return [(cid, iri, _values(b), _values(a)) for cid, iri, b, a in rows.all()]
+
+
+def expand_topics(
+    class_ids: Iterable[Any],
+    links: Iterable[tuple[Any, str, Iterable[str], Iterable[str]]],
+    iri_of: dict[Any, str] | None = None,
+) -> list[Any]:
+    """The matched classes plus everything narrower in the TOPIC layer: concepts
+    whose `skos:broader` is one of them and concepts `inConceptArea` one of them,
+    transitively. Downward only; subclasses are added later by the SQL.
+
+    `iri_of` maps a matched class id to its IRI when the class has no link row
+    of its own (an area at the top names no broader area)."""
+    links = list(links)
+    iri_by_id = dict(iri_of or {})
+    narrower: dict[str, list[tuple[Any, str]]] = {}
+    for cid, iri, broader, areas in links:
+        iri_by_id.setdefault(cid, iri)
+        for parent in {*broader, *areas}:
+            narrower.setdefault(parent, []).append((cid, iri))
+    out: list[Any] = []
+    seen: set[Any] = set()
+    queue = [c for c in class_ids]
+    while queue:
+        cid = queue.pop(0)
+        if cid in seen:
+            continue
+        seen.add(cid)
+        out.append(cid)
+        for child, _iri in narrower.get(iri_by_id.get(cid, ""), ()):
+            if child not in seen:
+                queue.append(child)
+    return out
+
+
 async def area_chunks(
     session: AsyncSession,
     class_ids: list[Any],
@@ -121,16 +204,29 @@ async def area_chunks(
     *,
     limit: int = 100,
 ) -> list[tuple[uuid.UUID, float]]:
-    """Chunks about anything under these classes, best first: those also mentioning
-    an entity the question names, then by how many different kinds they cover."""
+    """Chunks about anything the matched classes cover, best first: those also
+    mentioning an entity the question names, then by how many different kinds
+    they cover. Coverage = the topic layer (narrower areas and their member
+    concepts) and then every subclass."""
     if not class_ids:
         return []
+    links = await topic_links(session)
+    iris = await session.execute(sql_text(
+        "SELECT id, iri FROM graphrag.ontology_classes WHERE id = ANY(CAST(:ids AS uuid[]))"
+    ), {"ids": [str(c) for c in class_ids]})
+    expanded = expand_topics(class_ids, links, dict(iris.all()))
     rows = await session.execute(_AREA_CHUNKS_SQL, {
-        "classes": [str(c) for c in class_ids],
+        "classes": [str(c) for c in expanded],
         "named": [str(n) for n in named_ids],
         "limit": limit,
     })
     return [(cid, float(score)) for cid, score in rows.all()]
+
+
+def _label_words(label: str) -> str:
+    """'CostOfGoodsSold' -> 'Cost Of Goods Sold' (a class label as a name)."""
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", label or "")
+    return re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", text)
 
 
 def plan_retype(
@@ -138,25 +234,63 @@ def plan_retype(
     classes: Iterable[tuple[Any, str, Iterable[str]]],
     normalize: Any,
 ) -> list[tuple[Any, Any]]:
-    """`(entity id, class id)` for entities named exactly by a class's term or label
-    and not already typed with it."""
-    by_term: dict[str, Any] = {}
-    for cid, label, terms in classes:
-        for term in (*terms, label):
-            by_term.setdefault(normalize(term), cid)
+    """`(entity id, class id)` for entities named exactly by a class's label or
+    one of its `names` (prefLabel / altLabel) and not already typed with it.
+    Ambiguous names (`AMBIGUOUS_NAMES`) never retype; a name two classes share
+    is dropped rather than guessed."""
+    by_name: dict[str, Any] = {}
+    clash: set[str] = set()
+    for cid, label, names in classes:
+        for name in {normalize(n) for n in (*names, label, _label_words(label)) if n}:
+            if not name or name in AMBIGUOUS_NAMES:
+                continue
+            if name in by_name and by_name[name] != cid:
+                clash.add(name)
+            by_name.setdefault(name, cid)
     moves: list[tuple[Any, Any]] = []
     for eid, name, class_id in entities:
-        target = by_term.get(normalize(name))
+        key = normalize(name)
+        if key in clash:
+            continue
+        target = by_name.get(key)
         if target is not None and target != class_id:
             moves.append((eid, target))
     return moves
 
 
+_NAME_CLASSES_SQL = """
+    SELECT oc.id, oc.label,
+           oc.extra_metadata -> 'annotations' -> :pref,
+           oc.extra_metadata -> 'annotations' -> :alt
+      FROM graphrag.ontology_classes oc
+     WHERE oc.iri LIKE :ns
+       -- curated concepts only: classes the pipeline minted into the namespace
+       -- carry none of these
+       AND (oc.extra_metadata -> 'annotations' ?| ARRAY[:pref, :alt, :term])
+       AND NOT coalesce(oc.extra_metadata -> 'annotations' ? :deprecated, false)
+       AND oc.id IN (SELECT id FROM (""" + _CONCEPT_CLASS_IDS_SQL.text + """) c)
+"""
+
+
+async def name_classes(
+    session: AsyncSession, root_labels: list[str]
+) -> list[tuple[uuid.UUID, str, list[str]]]:
+    """`(class id, label, names)` for the curated domain-concepts classes under the
+    concept roots: a concept area is not under them, so it is never a retype
+    target, and classes the pipeline minted into the namespace are not curated."""
+    rows = await session.execute(sql_text(_NAME_CLASSES_SQL), {
+        "pref": PREF_LABEL_KEY, "alt": ALT_LABEL_KEY, "term": TERM_KEY, "ns": DC_NS + "%",
+        "deprecated": "http://www.w3.org/2002/07/owl#deprecated", "labels": root_labels,
+    })
+    return [(cid, label, _values(p) + _values(a)) for cid, label, p, a in rows.all()]
+
+
 async def retype_entities_by_term(
     roots: list[str], *, dry_run: bool = False, log=print
 ) -> dict[str, int]:
-    """Type each concept named by a concept term with that term's class. Keeps a
-    more specific class the entity already has: `SegmentRevenue` stays."""
+    """Type each concept entity named exactly by a domain concept (its label,
+    prefLabel or altLabel) with that concept. Keeps a more specific class the
+    entity already has: `SegmentRevenue` stays."""
     from backend.app.services.db_entity_extract import _normalize_name
 
     stats = {"concepts": 0, "retyped": 0}
@@ -164,7 +298,7 @@ async def retype_entities_by_term(
     if not labels:
         return stats
     async with session_scope() as session:
-        classes = await term_classes(session)
+        classes = await name_classes(session, labels)
         if not classes:
             return stats
         rows = await session.execute(sql_text("""
@@ -207,5 +341,5 @@ async def retype_entities_by_term(
                    "meta": json.dumps({"retyped_from": str(current[eid])})})
     if stats["retyped"]:
         log(f"[concept-areas] {stats['retyped']} of {stats['concepts']} concepts typed "
-            f"from their concept term")
+            f"from a concept's name")
     return stats

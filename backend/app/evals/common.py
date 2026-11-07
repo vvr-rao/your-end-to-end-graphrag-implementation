@@ -97,6 +97,15 @@ def buckets(counts: list[int]) -> dict[str, int]:
     return out
 
 
+def count_buckets(counts: list[int], top: int = 5) -> dict[str, int]:
+    """How many values are 0, 1, ..., `top` and more than `top`."""
+    out = {str(i): 0 for i in range(top + 1)}
+    out[f">{top}"] = 0
+    for n in counts:
+        out[str(n) if n <= top else f">{top}"] += 1
+    return out
+
+
 def mean(values: list[float]) -> float:
     return round(sum(values) / len(values), 2) if values else 0.0
 

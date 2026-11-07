@@ -97,7 +97,10 @@ Then the corpus evaluation, so coverage is compared before and after (free;
 `extract-entities` and `enrich-geo` also print it themselves):
 ```
 uv run python -m backend.app.cli eval-corpus
+uv run python -m backend.app.cli eval-typing      # LLM judge, ~1 cheap call per 20 entities
 ```
+Both upload to LangSmith by themselves when `LANGSMITH_API_KEY` is installed
+(see ingest-corpus). Report the typing Yes / judged and Yes / all with the rest.
 Report all six with their change since the last report: entities created,
 entity-to-entity edges created, concept classes, concept entities created,
 ontology classes, ontology instances. Do the same after an update or a delete --

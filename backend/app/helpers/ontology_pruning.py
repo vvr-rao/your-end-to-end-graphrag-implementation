@@ -2207,13 +2207,29 @@ _NON_CONCEPT_ROOTS = frozenset({"FinancialTable", "FinancialObservation", "TimeP
 _AGENT_ROOT_LABELS = ("Organization", "Person", "GeographicFeature")
 
 
+_OWL_DEPRECATED = "http://www.w3.org/2002/07/owl#deprecated"
+# Topics, not types (domain_concepts v2): never offered as a parent.
+_TOPIC_ROOT = "ConceptArea"
+
+
+def _is_deprecated(rec: dict) -> bool:
+    values = (rec.get("annotations") or {}).get(_OWL_DEPRECATED) or []
+    for v in values if isinstance(values, list) else [values]:
+        v = v.get("value") if isinstance(v, dict) else v
+        if v is True or str(v).strip().lower() == "true":
+            return True
+    return False
+
+
 def concept_root_menu(classes_dict: dict) -> list[dict[str, str]]:
     """The Layer G root menu: [{LABEL, DESCRIPTION}] read from the merged
     ontology, so every label the model may answer with resolves.
 
-    Roots are the domain-concepts classes directly under owl:Thing (minus the
-    table anchors), then the agent/place kinds. Empty when the merge has no
-    domain-concepts layer; the prompt then falls back to its built-in list.
+    Roots are the domain-concepts TYPE roots: classes directly under owl:Thing,
+    or under a class outside domain-concepts (InformationArtifact under
+    foaf:Document), minus the table anchors, the ConceptArea topic root and
+    deprecated classes; then the agent/place kinds. Empty when the merge has
+    no domain-concepts layer; the prompt then falls back to its built-in list.
     """
     def _desc(rec: dict) -> str:
         for key in ("comments", "descriptions"):
@@ -2230,7 +2246,9 @@ def concept_root_menu(classes_dict: dict) -> list[dict[str, str]]:
             continue
         label = iri[len(_DOMAIN_CONCEPTS_NS):]
         parent = _first_super_iri(rec)
-        if label in _NON_CONCEPT_ROOTS or (parent and parent != _OWL_THING_IRI):
+        if label in _NON_CONCEPT_ROOTS or label == _TOPIC_ROOT or _is_deprecated(rec):
+            continue
+        if parent and parent != _OWL_THING_IRI and parent.startswith(_DOMAIN_CONCEPTS_NS):
             continue
         menu.append({"LABEL": label, "DESCRIPTION": _desc(rec)})
         seen.add(label.lower())

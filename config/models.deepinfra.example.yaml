@@ -766,6 +766,32 @@ tasks:
     max_tokens: 2048        # 25 decisions ~400 tokens
     response_format: json_object
 
+  # Standing LLM-as-judge evaluations (eval-typing after extract-entities;
+  # eval-ontology after prune-expand). Yes/no per item with a short reason;
+  # nothing is changed. ~1 call per 20 items.
+  eval_typing_judge:
+    provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4.1-Flash
+    prompt_set: deepseek
+    items_per_call: 20
+    concurrency: 8
+    timeout: 300
+    temperature: 0.0
+    max_tokens: 4096        # 20 verdicts with reasons ~1k tokens
+    response_format: json_object
+
+  eval_definition_judge:
+    provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4.1-Flash
+    prompt_set: deepseek
+    items_per_call: 20
+    concurrency: 8
+    timeout: 300
+    temperature: 0.0
+    max_tokens: 4096
+    response_format: json_object
+
+
   # Stage 3c: generic parent for qualified concept classes
   # (SemiconductorRevenue, RelatedPartyRevenue -> Revenue < Measure). Groups
   # proposals by head noun; the judge confirms each group and picks the root.
