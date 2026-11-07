@@ -2670,15 +2670,20 @@ def test_domain_concepts_owl_parses_with_its_buckets() -> None:
     g = Graph()
     g.parse(p, format="xml")
 
-    owl_classes = list(g.subjects(RDF.type, OWL.Class))
-    skos_concepts = list(g.subjects(RDF.type, SKOS.Concept))
+    ns = "https://veerla-ramrao.ai/ontology/domain-concepts#"
+    # Own classes only: foaf:Document is declared (not owned) so the file
+    # stands alone.
+    owl_classes = [c for c in g.subjects(RDF.type, OWL.Class) if str(c).startswith(ns)]
+    skos_concepts = [c for c in g.subjects(RDF.type, SKOS.Concept) if str(c).startswith(ns)]
     schemes = list(g.subjects(RDF.type, SKOS.ConceptScheme))
 
     assert len(skos_concepts) == len(owl_classes), (
         f"expected every owl:Class dual-typed skos:Concept (OWL Punning), "
         f"got {len(skos_concepts)} of {len(owl_classes)}"
     )
-    assert len(schemes) == 1, f"expected 1 skos:ConceptScheme, got {len(schemes)}"
+    # v2: one scheme for the types, one for the concept areas.
+    assert {str(s).rsplit("#", 1)[-1] for s in schemes} == {
+        "DomainConceptsScheme", "ConceptAreaScheme"}
 
     # The bucket names the Stage 2 LLM uses as PARENT_LABEL.
     # Original 12 + Phase-2a-followup 6 (FinancialTable / FinancialObservation /

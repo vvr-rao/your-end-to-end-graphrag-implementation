@@ -266,14 +266,15 @@ ontology:
   # curated ontologies across prune / prune-expand / build runs.
   # Property survival follows automatically: any object/data property whose
   # domain or range touches a protected class also survives.
-  protected_iri_prefixes: []
-  # Example (uncomment and edit):
-  # protected_iri_prefixes:
-  #   - https://your-domain.example.com/ontology/your-curated-ontology
-  #   # FOAF (foaf:Person, foaf:Organization, foaf:Agent, foaf:Group)
-  #   - http://xmlns.com/foaf/0.1/
-  #   # W3C Organization Ontology (org:Organization, org:Role, org:Membership)
-  #   - http://www.w3.org/ns/org#
+  # The shipped core ontologies live under these prefixes: VIAO and
+  # domain_concepts under the branded https://veerla-ramrao.ai/ontology/
+  # umbrella, plus FOAF and ORG (people, organizations, and foaf:Document, the
+  # parent of domain_concepts' InformationArtifact). Add your own curated
+  # ontologies' prefixes below them.
+  protected_iri_prefixes:
+    - https://veerla-ramrao.ai/ontology/
+    - http://xmlns.com/foaf/0.1/
+    - http://www.w3.org/ns/org#
 
 # -----------------------------------------------------------------------------
 # LLM expansion run parameters.
@@ -519,10 +520,19 @@ extraction:
     - Infrastructure
     - SupplyChainConcept
     - FinancialObservation
-    # Concept areas and events. A named event ("Super Bowl") is told apart from a
-    # kind of event ("acquisition") by concept_kind_judge, as other named things are.
-    - ConceptArea
+    # Type anchors added in domain_concepts v2: kinds of agreement, intellectual
+    # property, plan, classification (trial phase, transport mode) and
+    # information artifact (financial statements, audit report, drug label).
+    - Agreement
+    - IntellectualProperty
+    - Plan
+    - Classification
+    - InformationArtifact
+    # Events. A named event ("Super Bowl") is told apart from a kind of event
+    # ("acquisition") by concept_kind_judge, as other named things are.
     - Event
+    # NOT ConceptArea: concept areas (Financials, Transportation...) are topics
+    # questions route through, never entity types (domain_concepts v2).
   # Candidate-menu quality filter. Withholds instance-shaped class labels
   # ("Cholla Unit 4") and disjunction labels ("SegmentOperatingExpense or
   # SegmentAsset") from the top-K menu handed to the extractor. Neither is a

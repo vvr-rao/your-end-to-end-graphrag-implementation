@@ -651,6 +651,8 @@ Two related knobs worth knowing:
 
 Drop your source ontologies in `source_ontologies/` (any combination of `.owl`, `.rdf`, `.ttl`, `.zip`). Two CLI paths:
 
+`core_ontologies/domain_concepts.owl` (v2) is the concept layer for finance, pharma and manufacturing / supply chain. It keeps three things apart: **types** (`rdfs:subClassOf` only for "is a kind of": Maintenance is a Process), **topics** (concept areas such as Financials or Transportation, nested with `skos:broader`), and **membership** (`dc:inConceptArea`, an annotation, so Port is in both Transportation and Logistics without being a kind of either). `conceptTerm` phrases route questions; `skos:altLabel` holds true synonyms only. Renamed or split concepts are listed in `domain_concepts_migration.json` beside it.
+
 ```bash
 # Deterministic merge (no LLM cost). Combines multiple input ontologies.
 # NOTE: you HAVE TO import the VIAO ontology - core_ontologies/viao_intelligence_artifact_ontology_v2.owl

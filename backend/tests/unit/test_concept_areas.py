@@ -57,6 +57,8 @@ def _classes() -> dict[str, dict]:
         out[iri] = {
             "parents": [p.getAttribute("rdf:resource").split("#")[-1]
                         for p in node.getElementsByTagName("rdfs:subClassOf")],
+            "areas": [p.getAttribute("rdf:resource").split("#")[-1]
+                      for p in node.getElementsByTagName("inConceptArea")],
             "terms": [t.firstChild.data for t in node.getElementsByTagName("conceptTerm")],
         }
     return out
@@ -71,11 +73,13 @@ def test_every_term_means_one_class():
             seen[term] = name
 
 
-def test_every_class_with_terms_reaches_a_concept_root():
+def test_every_class_with_terms_reaches_a_concept_root_or_is_an_area():
     classes = _classes()
     roots = {"Quantity", "Condition", "Process", "Method", "Outcome", "PolicyConcept",
-             "ConceptArea", "Event", "TechnologyConcept", "Infrastructure",
-             "SupplyChainConcept", "Intervention"}
+             "Event", "TechnologyConcept", "Infrastructure", "SupplyChainConcept",
+             "Intervention", "EconomicConcept", "Material", "Agreement",
+             "IntellectualProperty", "Plan", "Classification", "InformationArtifact",
+             "Dimension", "DomainConcept"}
 
     def reaches(name: str, seen: set[str]) -> bool:
         if name in roots:
@@ -87,14 +91,14 @@ def test_every_class_with_terms_reaches_a_concept_root():
 
     for name, cls in classes.items():
         if cls["terms"]:
-            assert reaches(name, set()), name
+            assert reaches(name, set()) or cls["parents"] == ["ConceptArea"], name
 
 
 def test_the_finance_area_reaches_revenue_and_cost():
     classes = _classes()
-    assert "FinancialPerformance" in classes["Revenue"]["parents"]
-    assert "FinancialPerformance" in classes["Cost"]["parents"]
-    assert "Financials" in classes["FinancialPerformance"]["parents"]
+    assert "FinancialPerformance" in classes["Revenue"]["areas"]
+    assert "FinancialPerformance" in classes["Cost"]["areas"]
+    assert classes["FinancialPerformance"]["parents"] == ["ConceptArea"]
 
 
 def test_a_fraction_scales_with_the_corpus():

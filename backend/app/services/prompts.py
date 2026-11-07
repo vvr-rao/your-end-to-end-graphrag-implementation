@@ -589,7 +589,12 @@ DEFAULT_CONCEPT_ROOTS: list[dict[str, str]] = [
     {"LABEL": "Industry", "DESCRIPTION": "kinds of economic activity: Pharmaceuticals, Banking, Mining, Automotive"},
     {"LABEL": "Infrastructure", "DESCRIPTION": "built facilities: factory, hospital, port, power grid"},
     {"LABEL": "SupplyChainConcept", "DESCRIPTION": "logistics and trade flows: supply chain, shipping route, inventory"},
-    {"LABEL": "Event", "DESCRIPTION": "named happenings: COVID-19 pandemic, product launch, merger announcement"},
+    {"LABEL": "Event", "DESCRIPTION": "happenings: COVID-19 pandemic, product launch, merger announcement, agreement signing"},
+    {"LABEL": "Agreement", "DESCRIPTION": "binding arrangements between parties: supply contract, joint venture, trade agreement"},
+    {"LABEL": "IntellectualProperty", "DESCRIPTION": "legally protected intangibles: patent, trademark, copyright"},
+    {"LABEL": "Plan", "DESCRIPTION": "intended courses of action: product roadmap, contingency plan, production order"},
+    {"LABEL": "Classification", "DESCRIPTION": "stages or categories in a scheme: trial phase, therapeutic area, transport mode"},
+    {"LABEL": "InformationArtifact", "DESCRIPTION": "kinds of document: financial statements, audit report, drug label, bill of materials"},
     {"LABEL": "DomainConcept", "DESCRIPTION": "LAST RESORT for a concept that fits none of the others"},
 ]
 
@@ -853,12 +858,21 @@ def classification_audit(items: list[dict[str, Any]]) -> tuple[str, str]:
         "terminals, plants, pipelines)\n"
         "  Industry        - kinds of economic activity (Agriculture, "
         "Manufacturing, Mining, Healthcare, Energy)\n"
-        "  TechnologyConcept - artifacts / processes (semiconductor, AI, "
-        "battery, MRI)\n"
+        "  TechnologyConcept - engineered devices / systems (semiconductor, "
+        "AI system, battery, MRI); techniques belong under Method\n"
         "  EconomicConcept - market phenomena (price, demand, subsidy, "
         "tariff, inflation)\n"
         "  PolicyConcept   - rules / frameworks (regulation, treaty, ban, "
         "law)\n"
+        "  Agreement       - binding arrangements (supply contract, joint "
+        "venture, trade agreement)\n"
+        "  IntellectualProperty - patents, trademarks, copyrights\n"
+        "  Plan            - intended courses of action (roadmap, contingency "
+        "plan)\n"
+        "  Classification  - stages / categories in a scheme (trial phase, "
+        "transport mode)\n"
+        "  InformationArtifact - kinds of document (financial statements, "
+        "audit report, drug label, bill of materials)\n"
         "  SupplyChainConcept - logistics + trade flows (route, freight "
         "corridor)\n"
         "  GeographicFeature - places named only by location, no event/role "

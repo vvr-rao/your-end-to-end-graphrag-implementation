@@ -45,6 +45,8 @@ HEAD_ROOTS = (
     "Quantity", "Metric", "Measure", "Condition", "Process", "Method",
     "Intervention", "Outcome", "Material", "PolicyConcept", "EconomicConcept",
     "TechnologyConcept", "Industry", "Infrastructure", "SupplyChainConcept",
+    "Agreement", "IntellectualProperty", "Plan", "Classification", "InformationArtifact",
+    "ReportingDocument",
 )
 # The judge's only choices, and the root each maps to (None = not a concept
 # head, so rejected). Choosing among 15 broad roots let it force nearly anything
@@ -64,6 +66,11 @@ HEAD_KINDS: tuple[tuple[str, str | None, str], ...] = (
     ("economic", "EconomicConcept", "an economic or financial item that is not an amount (loan, asset, subsidy, market)"),
     ("industry", "Industry", "an industry or sector (mining, healthcare)"),
     ("supply_chain", "SupplyChainConcept", "a supply-chain concept (procurement, logistics, supplier network)"),
+    ("agreement", "Agreement", "a binding arrangement between parties (contract, partnership, licensing deal), not the signing of one"),
+    ("intellectual_property", "IntellectualProperty", "a legally protected intangible (patent, trademark, copyright)"),
+    ("plan", "Plan", "an intended course of action set out in advance (roadmap, contingency plan, budget plan)"),
+    ("classification", "Classification", "a stage or category in an established scheme (trial phase, credit rating, transport mode)"),
+    ("report", "ReportingDocument", "a kind of formal report an organization publishes (annual report, audit report, financial statement), not a part of one"),
     ("body_part", None, "a body part or anatomical structure (CoronaryArtery / RenalArtery under Artery)"),
     ("document_item", None, "part of a document, page or website, or a site category (AuthorByline under Byline, TableFootnote under Footnote)"),
     ("descriptor", None, "an adjective, participle or vague abstraction, not a concrete kind of thing (Reported, Pending, Essence)"),
