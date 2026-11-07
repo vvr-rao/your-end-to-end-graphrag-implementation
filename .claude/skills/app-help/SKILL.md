@@ -224,7 +224,7 @@ plainly which do not.
   matching a question's relation. Lower fires the relation-matched hop more often
   on weaker matches; at 0.55 it fires on roughly 10% of questions and the rest
   fall back to the broad walk.
-- `k_chunks` / `k_documents` -- the ordinary breadth dials.
+- `k_chunks` / `document_arm_fraction` -- the ordinary breadth dials.
 
 **Documented but measured NEUTRAL -- do not suggest these as fixes.**
 - `graph_score_weighting` (false) and `rrf_weight_graph_walk` (1.0). Both weight
@@ -392,8 +392,8 @@ Other things worth knowing:
 `uv run python -m backend.app.cli <subcommand>`. Discover everything with
 `uv run python -m backend.app.cli --help`. Groups: ontology (`merge`, `prune`,
 `expand`, `prune-expand`, `build`), DB (`db-migrate`, `db-status`, `db-size`, `graph-stats`,
-`enrich-geo`, `embed-relationships`, `relink-artifact-entities`,
-`db-init`, `clear-corpus`), corpus (`register-documents`, `list-documents`,
+`enrich-geo`, `embed-relationships`, `relink-artifact-entities`, `classify-concepts`,
+`db-init`, `clear-corpus`), evaluation (`eval-corpus`, `eval-questions`, `eval-dataset`; Recall@K/Precision@K/MRR on `eval_questions/testsets/`; optional LangSmith upload; see `backend/app/evals/README.md`), corpus (`register-documents`, `list-documents`,
 `update-document`, `delete-document`), enrichment (`extract-entities`,
 `enrich-time`, `generate-artifacts`), retrieval (`query`, `evaluate-queries`,
 `conversation start|turn|show`), deploy (`render-*`).

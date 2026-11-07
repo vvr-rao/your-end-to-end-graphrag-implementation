@@ -107,12 +107,14 @@ async def _run_multihop(sample: list[dict], titles: dict[str, str], mode: str, c
     from backend.app.services.retrieval import retrieve_and_answer
 
     sem = asyncio.Semaphore(conc)
+    traced: list[tuple] = []
 
     async def one(q: dict) -> dict:
         async with sem:
             t0 = time.monotonic()
             try:
                 r = await retrieve_and_answer(q["query"], mode=mode, persist=False, max_cost_usd=1.0)
+                traced.append((q["query"], r))
                 ans, ev, cost = r.answer, r.evidence, r.cost_usd
                 err = None
             except Exception as exc:
@@ -124,7 +126,12 @@ async def _run_multihop(sample: list[dict], titles: dict[str, str], mode: str, c
                 "cost_usd": cost, "seconds": round(time.monotonic() - t0, 1), "error": err,
             }
 
-    return await asyncio.gather(*[one(q) for q in sample])
+    rows = await asyncio.gather(*[one(q) for q in sample])
+    # Standing question evaluation (backend/app/evals); fails soft.
+    from backend.app.evals.question_eval import report_from_results
+
+    await report_from_results(traced, label="bench-multihop", mode=mode)
+    return rows
 
 
 def summarise(rows: list[dict]) -> dict:

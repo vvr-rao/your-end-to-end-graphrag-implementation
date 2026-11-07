@@ -243,44 +243,32 @@ def deepseek_class_synonym_judge(pairs: list[dict[str, str]]) -> tuple[str, str]
 
 
 def deepseek_concept_head_judge(
-    groups: list[dict[str, Any]], roots: list[str]
+    groups: list[dict[str, Any]], kinds: list[tuple[str, str]]
 ) -> tuple[str, str]:
-    """Stage 3c for the deepinfra preset: confirm a generic HEAD parent for a
-    group of qualified concept classes and pick its domain-neutral root.
+    """Stage 3c for the deepinfra preset: classify the generic HEAD of each
+    group of qualified concept classes. Code maps the kind to a root.
 
     `groups`: [{"id", "head", "members": [{"label", "description"}]}].
-    Returns JSON {"decisions": [{"id", "accept", "root", "description",
+    Returns JSON {"decisions": [{"id", "kind", "description",
     "rejected_members"}]}.
     """
+    kind_lines = "\n".join(f"- {k}: {d}" for k, d in kinds)
     system = (
         "You review groups of ontology CLASS names that end in the same HEAD "
-        "word. For each group decide whether HEAD is a generic concept that "
-        "every member is a KIND of, so HEAD can become their parent class. "
-        "Return ONE JSON object and nothing else.\n\n"
-        "ACCEPT: Revenue for SemiconductorRevenue / RelatedPartyRevenue; "
-        "ResponseRate for ObjectiveResponseRate / OverallResponseRate; "
-        "Defect for WeldDefect / PaintDefect; Therapy for InsulinTherapy / "
-        "CombinationTherapy.\n"
-        "REJECT: heads that group companies, people, places, products or "
-        "documents (Manufacturer for BatteryManufacturer / EVManufacturer), "
-        "and heads where the members only share a word, not a kind.\n"
-        "REJECT kinds of people or groups of people (Patient for "
-        "GeriatricPatient / PediatricPatient; Population): they are not "
-        "concepts.\n"
-        "Members must share ONE sense of HEAD: DebtConsolidation and "
-        "BatteryConsolidation do not; reject the group, or list the odd "
-        "members in rejected_members.\n"
-        "Put any member that is NOT a kind of HEAD in rejected_members "
-        "(RevenueRecognitionPolicy is a policy, not a revenue).\n"
-        "When unsure, REJECT: a wrong parent misplaces every member.\n\n"
-        "root (only when accepted) is ONE of: " + ", ".join(roots) + ". "
-        "Measure = a directly reported amount (revenue, dose, output volume); "
-        "Metric = a derived ratio or rate (margin, response rate, defect "
-        "rate); Condition = a state (disease, defect, insolvency); Outcome = a "
-        "result (side effect, loss); Material = a physical or biological "
-        "substance or agent (drug, inhibitor, agonist, receptor, cell type, "
-        "steel, resin); TechnologyConcept = an engineered device, system or "
-        "technique (battery, chip, software), never a drug class.\n"
+        "word. For each group, say what KIND of thing HEAD is, as the members "
+        "use it. Return ONE JSON object and nothing else.\n\n"
+        "kind is exactly one of:\n" + kind_lines + "\n\n"
+        "Use none for heads that group companies, people, places or products "
+        "(Manufacturer for BatteryManufacturer / EVManufacturer; Patient for "
+        "GeriatricPatient / PediatricPatient) and when members use HEAD in "
+        "different senses (DebtConsolidation and BatteryConsolidation).\n"
+        "When unsure, or when HEAD is an everyday word that names no one clear "
+        "kind of thing, use none or descriptor: a wrong parent misplaces every "
+        "member.\n"
+        "Put any member that is NOT a kind of HEAD in rejected_members. Ending "
+        "in the head word is not enough: RevenueRecognitionPolicy is not a "
+        "Revenue, EarningsBeforeInterest is not an Interest, ChangeInInventory "
+        "is not an Inventory, BloodSupply is not a Supply of goods.\n"
         "description: one domain-neutral sentence about HEAD.\n"
         "Write the JSON on ONE line."
     )
@@ -291,8 +279,96 @@ def deepseek_concept_head_judge(
     )
     user = (
         f"GROUPS:\n{lines}\n\n"
-        'Return JSON: {"decisions": [{"id": ..., "accept": ..., "root": ..., '
+        'Return JSON: {"decisions": [{"id": ..., "kind": ..., '
         '"description": ..., "rejected_members": [...]}]}'
+    )
+    return system, user
+
+
+def deepseek_concept_review(
+    chunk_text: str,
+    candidate_classes: list[dict[str, str]],
+    items: list[dict[str, Any]],
+) -> tuple[str, str]:
+    """`concept_review.py` for the deepinfra preset: another model proposed these
+    concepts, so check each against the passage.
+
+    `items`: [{"id", "name", "class_iri", "class_label"}]. Returns JSON
+    {"verdicts": [{"id", "verdict", "better_class_iri", "reason"}]}.
+    """
+    system = (
+        "Check concepts another model extracted from a passage. Return ONE JSON "
+        "object and nothing else. For each concept, work in this order.\n\n"
+        "Step 1, class_passes: is \"<concept> is a kind of <class>\" literally "
+        "true, from the class label and description? First ask what the thing "
+        "IS: an amount or score you report a number for, a state, an activity, "
+        "a technique, a rule, a result, a property or ability, an occurrence. "
+        "It only fits a class of that same sort. Bed occupancy rate is an "
+        "amount, not a state. A hospital visiting rule is a rule, not a market "
+        "phenomenon. Port dredging oversight is an activity, not a kind of "
+        "Port. A sentence that is only loosely true is false.\n\n"
+        "Step 2, verdict:\n"
+        "keep = class_passes is true and the passage says something about it.\n"
+        "move = class_passes is false and the same sentence is literally true "
+        "for another listed class; or class_passes is true and it is also true "
+        "for a narrower listed class. Copy that class into better_class_iri "
+        "verbatim. Test the new class the same way first: being related to the "
+        "topic is not enough.\n"
+        "no_class = class_passes is false and no listed class passes.\n"
+        "drop = too vague to mean anything alone (importance, progress), or only "
+        "mentioned with nothing said about it. Never drop because the class is "
+        "wrong.\n\n"
+        "Named things (a product, trial, law, facility) are handled elsewhere: "
+        "never drop one for being named, only check its class. Give a reason of "
+        "at most 12 words for anything but keep. Answer every id."
+    )
+    classes = "\n".join(
+        f'- {c["iri"]} | {(c.get("label") or "").strip()} | '
+        f'{(c.get("description") or "").strip()[:100]}'
+        for c in candidate_classes
+    )
+    lines = "\n".join(
+        f'{i["id"]}. {i["name"]} | class: {i["class_iri"]} ({i["class_label"]})'
+        for i in items
+    )
+    user = (
+        f"CLASSES:\n{classes}\n\nPASSAGE:\n{chunk_text}\n\nCONCEPTS:\n{lines}\n\n"
+        'Return JSON: {"verdicts": [{"id": ..., "class_passes": true|false, "verdict": '
+        '"keep"|"move"|"drop"|"no_class", "better_class_iri": ..., "reason": ...}]}'
+    )
+    return system, user
+
+
+def deepseek_concept_kind_judge(items: list[dict[str, Any]]) -> tuple[str, str]:
+    """`concept_kinds.py` for the deepinfra preset: is each entity a NAMED thing
+    or a CONCEPT?
+
+    `items`: [{"id", "name", "class"}].
+    Returns JSON {"decisions": [{"id", "kind": "named"|"concept"}]}.
+    """
+    system = (
+        "Label each item NAMED or CONCEPT. The class is only a hint: one class "
+        "can hold both. Return ONE JSON object and nothing else.\n\n"
+        "named = one specific, identifiable thing with its own name or "
+        "identifier: a product or model (iPhone 15, Boeing 737), a facility or "
+        "project (Hoover Dam, Line 4 press), a specific study (RECOVERY trial, "
+        "Study 301, NCT01234567), a specific law, standard or filing (Basel "
+        "III, ISO 9001, Form 20-F), a specific drug or compound (atorvastatin, "
+        "Lipitor), a fund or programme.\n"
+        "concept = a general kind, quantity, condition, process or type of rule "
+        "that many different things can have or be: operating margin, defect "
+        "rate, hypertension, statin, clinical trial, tariff, injection molding, "
+        "pension liability, electric vehicle.\n\n"
+        "Capitalization is not evidence: Net Income and Heart Failure are "
+        "concept; atorvastatin is named. A disease is concept even when named "
+        "after a person (Alzheimer's disease). A category of drugs or products "
+        "is concept; one member of it is named. If unsure: concept.\n"
+        "Answer every id."
+    )
+    lines = "\n".join(f'{i["id"]}. {i["name"]} (class: {i["class"]})' for i in items)
+    user = (
+        f"ITEMS:\n{lines}\n\n"
+        'Return JSON: {"decisions": [{"id": ..., "kind": "named"|"concept"}]}'
     )
     return system, user
 

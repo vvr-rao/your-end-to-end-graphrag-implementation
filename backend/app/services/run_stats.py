@@ -30,6 +30,7 @@ WITH concept_cls AS (""" + _CONCEPT_CLASS_IDS_SQL.text + """),
 concept_ent AS (
     SELECT e.id FROM graphrag.entities e
      WHERE e.status = 'ACTIVE' AND e.class_id IN (SELECT id FROM concept_cls)
+       AND e.extra_metadata->>'concept_kind' IS DISTINCT FROM 'named'
 )
 SELECT
   (SELECT count(*) FROM graphrag.ontology_classes)                        AS ontology_classes,
@@ -37,6 +38,9 @@ SELECT
   (SELECT count(*) FROM concept_cls)                                      AS concept_classes,
   (SELECT count(*) FROM graphrag.entities WHERE status = 'ACTIVE')        AS entities,
   (SELECT count(*) FROM concept_ent)                                      AS concept_entities,
+  (SELECT count(*) FROM graphrag.entities e
+    WHERE e.status = 'ACTIVE' AND e.class_id IN (SELECT id FROM concept_cls)
+      AND e.extra_metadata->>'concept_kind' = 'named')                    AS named_under_concept_classes,
   (SELECT count(*) FROM graphrag.graph_relationships
     WHERE source_node_type = 'entity' AND target_node_type = 'entity')    AS entity_entity_edges,
   (SELECT count(*) FROM graphrag.graph_relationships
@@ -51,6 +55,7 @@ GRAPH_KEYS = (
     ("concept_entity_edges", "  of which touch a concept"),
     ("concept_classes", "concept classes"),
     ("concept_entities", "concept entities"),
+    ("named_under_concept_classes", "  named things under concept classes (not counted)"),
     ("ontology_classes", "ontology classes"),
     ("ontology_instances", "ontology instances"),
 )

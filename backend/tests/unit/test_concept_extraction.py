@@ -171,12 +171,12 @@ def test_concept_pass_ships_on_by_default(path: str) -> None:
 
 @pytest.mark.parametrize("path", ["config/config.example.yaml"])
 def test_concept_roots_exclude_the_other_passes_territory(path: str) -> None:
-    """Event holds named events ("Super Bowl") and belongs to the entity pass;
-    TimePeriod belongs to enrich-time; FinancialTable to the table pass.
-    Including them would have the concept pass compete for their rows."""
+    """TimePeriod belongs to enrich-time; FinancialTable to the table pass.
+    Including them would have the concept pass compete for their rows. Event is
+    a root: concept_kind_judge tells a named event from a kind of event."""
     roots = yaml.safe_load(open(path, encoding="utf-8"))["extraction"]["concept_class_roots"]
     assert "EconomicConcept" in roots
-    assert "Event" not in roots
+    assert "Event" in roots
     assert "TimePeriod" not in roots
     assert "FinancialTable" not in roots
 

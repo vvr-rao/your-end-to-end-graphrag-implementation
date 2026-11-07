@@ -95,6 +95,8 @@ suggested_new_classes.json
 # users copy them to a local .txt file (gitignored) before editing.
 eval_questions/*.txt
 !eval_questions/*.example.txt
+# Per-corpus test sets (questions + gold documents) stay private
+eval_questions/testsets/
 
 # Reference materials (notebooks, scratch) — local-only, not part of source code
 reference/

@@ -93,6 +93,11 @@ not cover — compare them and say whether they moved.
 ```
 uv run python -m backend.app.cli graph-stats
 ```
+Then the corpus evaluation, so coverage is compared before and after (free;
+`extract-entities` and `enrich-geo` also print it themselves):
+```
+uv run python -m backend.app.cli eval-corpus
+```
 Report all six with their change since the last report: entities created,
 entity-to-entity edges created, concept classes, concept entities created,
 ontology classes, ontology instances. Do the same after an update or a delete --

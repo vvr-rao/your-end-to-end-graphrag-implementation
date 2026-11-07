@@ -543,18 +543,21 @@ not have to know they exist. They are cheap and fast; run them in the foreground
 (2026-10-19: a benchmark build that skipped them gave a graph with 1,764 entity
 edges and no place containment; enrich-geo then added 664 edges for $0.05.)
 
-**`enrich-geo`** mints geographic containment (`Bangalore -> Republic of India`)
-between places the corpus ALREADY names. Prose never states these, so extraction
-never finds them: a 40-document news corpus had exactly ONE `locatedin` edge, and
-"which cities are in India" had no edge to walk. It adds EDGES, NEVER NODES -- a
-container the corpus does not name is skipped -- and the edges are marked
-`evidence_kind: world_knowledge`, so an answer may use them but they are labelled
-rather than presented as something a document said.
+**`enrich-geo`** builds the place hierarchy that retrieval expands down, as
+`enrich-time` does for periods, so a question about Europe reaches Germany. Prose
+never states containment, so extraction never finds it: a 40-document news corpus
+had exactly ONE `locatedin` edge. First, with no model, places matching a geography
+class follow its `partOfClass` chain, and the containers on it become entities
+(`Japan -> East Asia -> Asia`). Then a cheap model links cities and other names
+between existing entities (`Bangalore -> Republic of India`); it never adds a node.
+The edges are marked `evidence_kind: world_knowledge`, so an answer may use them but
+they are labelled rather than presented as something a document said. On a graph
+that already ran it, `--ontology-only` adds the hierarchy without the model step.
 ```
-uv run python -m backend.app.cli enrich-geo [--dry-run] [--limit N]
+uv run python -m backend.app.cli enrich-geo [--dry-run] [--limit N] [--ontology-only]
 ```
-Report `created` and `rejected_by_level`. A high `unresolved` count means the
-model named containers the corpus has no entity for -- expected, not a fault. If
+Report `containers`, `created` and `rejected_by_level`. A high `unresolved` count
+means the model named containers that are not entities -- expected, not a fault. If
 `places=` is near zero on a corpus full of places, the ontology's place classes
 are named something this pass does not recognise; set
 `geo_enrichment.class_labels`.
@@ -594,8 +597,24 @@ Report what's now queryable (documents, entities, artifacts), the final `db-size
 total cost, and the final graph counts from
 `uv run python -m backend.app.cli graph-stats`
 (entities, entity-to-entity edges, concept classes, concept entities, ontology
-classes and instances). The corpus is now a knowledge graph — the user can `query` /
+classes and instances). `extract-entities` ends by marking named things filed
+under concept classes (`BMW iX3`, `SUSTAIN 6`) so retrieval stops treating them as
+concepts; `graph-stats` shows them on their own line and leaves them out of the
+concept count. For a graph built before this existed, backfill with
+`uv run python -m backend.app.cli classify-concepts` (~1 cheap call per 25
+entities; try `--limit 25 --dry-run` first). The corpus is now a knowledge graph — the user can `query` /
 `conversation`, or proceed to the **deploy** skill (which needs a **cloud** DB).
+
+**Corpus evaluation (always report it).** `extract-entities` prints a CORPUS
+EVALUATION block at its end; after the later steps run it again so the numbers
+match the finished graph, and include them in the hand-back:
+`uv run python -m backend.app.cli eval-corpus`
+(entities and concepts per chunk, chunks with none, relationships by type,
+entities per class and classes with >50, entities and concepts by relationship
+count; free, saved under `.build/evals/`). Definitions:
+`backend/app/evals/README.md`. If the user has an evaluation question set, also
+run `uv run python -m backend.app.cli eval-questions <file>` (question parse
+cost only) and report what the questions tie to and what the walk finds.
 
 Before handing back, confirm Step 4b ran -- both commands are silent when
 skipped. `build_state.py` must show an `enrich-geo` record for this build, and

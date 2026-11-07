@@ -1,5 +1,13 @@
 # Evaluation framework
 
+> **Test sets and standing evaluations.** Each corpus has a test set in
+> `testsets/<corpus>.json` (questions plus the documents that answer them).
+> When you create or change a test set, run
+> `uv run python -m backend.app.cli eval-questions testsets/<corpus>.json`
+> and check what the questions tie to in the graph and their Recall@K,
+> Precision@K and MRR. Format, metrics and the optional LangSmith upload:
+> [`backend/app/evals/README.md`](../backend/app/evals/README.md).
+
 What we measure when we say "the retrieval layer is working" — and
 how to run the evaluator yourself against your corpus.
 

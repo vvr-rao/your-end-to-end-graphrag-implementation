@@ -706,6 +706,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_dbsize.set_defaults(func=_cmd_db_size)
 
+    # ---------- named things vs concepts among concept-typed entities ----------
+    p_ckinds = sub.add_parser(
+        "classify-concepts",
+        help=(
+            "Mark entities typed under the concept roots as named things "
+            "(BMW iX3, SUSTAIN 6) or real concepts (operating margin, "
+            "hypoglycemia). Named things stop being treated as concepts by "
+            "retrieval. Runs automatically after extract-entities; use this to "
+            "backfill an existing graph. Only entities with no verdict are "
+            "sent, ~1 cheap call per 25."
+        ),
+    )
+    p_ckinds.add_argument("--limit", type=int, default=None,
+                          help="Classify at most N entities (smoke test).")
+    p_ckinds.add_argument("--recheck", action="store_true",
+                          help="Also re-judge entities that already have a verdict.")
+    p_ckinds.add_argument("--dry-run", action="store_true",
+                          help="Make the LLM calls and print the result; save nothing.")
+    p_ckinds.add_argument("--show", type=int, default=50,
+                          help="How many named things to print (default 50).")
+    p_ckinds.set_defaults(func=_cmd_classify_concepts)
+
     # ---------- run counts reported after every build step ----------
     p_gstats = sub.add_parser(
         "graph-stats",
@@ -722,6 +744,79 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Skip the database report (ontology folder only).")
     p_gstats.add_argument("--json", action="store_true", help="Print JSON instead of text.")
     p_gstats.set_defaults(func=_cmd_graph_stats)
+
+    # ---------- standing evaluations (backend/app/evals) ----------
+    p_ecorp = sub.add_parser(
+        "eval-corpus",
+        help=(
+            "Corpus evaluation: entities and concepts per chunk, chunks with "
+            "none, relationships by type, entities per class, and entities and "
+            "concepts by relationship count. Free (database only). Saved under "
+            ".build/evals/<database>/."
+        ),
+    )
+    p_ecorp.add_argument("--out", type=Path, default=None, help="Write the JSON report here.")
+    p_ecorp.add_argument("--json", action="store_true", help="Print JSON instead of text.")
+    p_ecorp.set_defaults(func=_cmd_eval_corpus)
+
+    p_eq = sub.add_parser(
+        "eval-questions",
+        help=(
+            "Question evaluation: the entities, concepts, places, time periods "
+            "and their classes each question ties to, and the summary chunks the "
+            "graph walk finds. With a question file it runs retrieval without "
+            "the answer call (question parse cost only); with --run-ids/--logs "
+            "it reads finished query runs (free)."
+        ),
+    )
+    p_eq.add_argument("questions", type=Path, nargs="?", default=None,
+                      help="A test set (.json, eval_questions/testsets/) or a question "
+                           "file, one per line (# comments allowed).")
+    p_eq.add_argument("--dataset", default=None,
+                      help="Read the test set from this LangSmith dataset.")
+    p_eq.add_argument("--testset", type=Path, default=None,
+                      help="Gold documents for --run-ids/--logs (a test set .json).")
+    p_eq.add_argument("--k", type=int, default=None,
+                      help="Cut-off for Recall@K, Precision@K, MRR@K (default evals.k, 10).")
+    p_eq.add_argument("--answer", action="store_true",
+                      help="Also generate answers (paid synthesis call per question).")
+    p_eq.add_argument("--no-langsmith", action="store_true",
+                      help="Do not upload this run. (With LANGSMITH_API_KEY set, every run "
+                           "is uploaded as an experiment on the test set's dataset; "
+                           "without it nothing is sent.)")
+    p_eq.add_argument("--run-ids", nargs="+", default=None,
+                      help="retrieval_runs ids of finished queries.")
+    p_eq.add_argument("--logs", type=Path, nargs="+", default=None,
+                      help="`query` output files; their RUN_ID lines are read.")
+    p_eq.add_argument("--mode", default="simple_qa", choices=["simple_qa", "deep_research"])
+    p_eq.add_argument("--out", type=Path, default=None, help="Write the JSON report here.")
+    p_eq.add_argument("--json", action="store_true", help="Print JSON instead of text.")
+    p_eq.add_argument("--batch-size", type=int, default=None,
+                      help="Questions per child process (default evals.batch_size, 25; "
+                           "0 = all in this process). Keeps memory flat on long sets.")
+    p_eq.add_argument("--traces-dir", type=Path, default=None,
+                      help="Where batches save their traces. Re-run with the same "
+                           "directory to resume after a crash (finished batches are "
+                           "skipped). Default: a new folder under .build/evals/<db>/.")
+    p_eq.add_argument("--batch-questions", type=Path, default=None, help=argparse.SUPPRESS)
+    p_eq.add_argument("--batch-out", type=Path, default=None, help=argparse.SUPPRESS)
+    p_eq.set_defaults(func=_cmd_eval_questions)
+
+    p_eds = sub.add_parser(
+        "eval-dataset",
+        help="Test sets in LangSmith: push a test set .json, pull a dataset back "
+             "into a test set, or list datasets. Needs LANGSMITH_API_KEY in .env "
+             "and langsmith.user in config.yaml.",
+    )
+    eds = p_eds.add_subparsers(dest="eds_cmd", required=True)
+    p_push = eds.add_parser("push", help="Create/extend the dataset for a test set.")
+    p_push.add_argument("testset", type=Path)
+    p_pull = eds.add_parser("pull", help="Write a LangSmith dataset as a test set .json.")
+    p_pull.add_argument("name", help="LangSmith dataset name.")
+    p_pull.add_argument("--out", type=Path, default=None,
+                        help="Default eval_questions/testsets/<name>.json")
+    eds.add_parser("list", help="List the LangSmith datasets.")
+    p_eds.set_defaults(func=_cmd_eval_dataset)
 
     # ---------- Phase 2: migrate (wraps `alembic upgrade head`) ----------
     p_migrate = sub.add_parser(
@@ -1411,12 +1506,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_geo = sub.add_parser(
         "enrich-geo",
         help=(
-            "Mint geographic containment edges (Frankfurt -> Germany) between "
-            "places the corpus ALREADY names, so a walk can answer 'which "
-            "company in Germany'. Prose never states these, so extraction "
-            "never finds them. Adds edges, never nodes. The edges are world "
-            "knowledge, not corpus evidence: they are marked as such and kept "
-            "OUT of answer citations. ~1 cheap call per 40 places."
+            "Build the place hierarchy a region question walks down. First, "
+            "with no model: places matching a geography class follow its "
+            "partOfClass chain, and the containers on it become entities "
+            "(Japan -> East Asia -> Asia). Then a cheap model links cities and "
+            "other names between existing entities (Frankfurt -> Germany). The "
+            "edges are world knowledge, not corpus evidence: they are labelled "
+            "as such and never cited. ~1 cheap call per 40 places."
         ),
     )
     p_geo.add_argument(
@@ -1426,6 +1522,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_geo.add_argument("--limit", type=int, default=None,
                        help="Consider at most N place entities (smoke test).")
+    p_geo.add_argument(
+        "--ontology-only", action="store_true",
+        help="Stop before the model step. Costs only the embedding of any new "
+             "containers; for adding the hierarchy to an existing graph.",
+    )
     p_geo.add_argument(
         "--class-labels", nargs="+", default=None,
         help="Ontology class labels that denote a place (subclasses included). "
@@ -2082,6 +2183,147 @@ def _cmd_graph_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _run_corpus_eval() -> dict[str, Any]:
+    from backend.app.db.session import session_scope
+    from backend.app.evals.corpus_eval import corpus_eval
+
+    async with session_scope() as session:
+        return await corpus_eval(session)
+
+
+def _print_corpus_eval(report: dict[str, Any], out: Path | None = None) -> None:
+    from backend.app.evals.common import save_report
+    from backend.app.evals.corpus_eval import format_corpus_eval
+
+    print("CORPUS EVALUATION")
+    print(format_corpus_eval(report))
+    print(f"[eval-corpus] saved {save_report('corpus', report, out)}")
+
+
+def _cmd_eval_corpus(args: argparse.Namespace) -> int:
+    report = asyncio.run(_run_corpus_eval())
+    if args.json:
+        print(json.dumps(report, indent=2, default=str))
+        return 0
+    _print_corpus_eval(report, args.out)
+    return 0
+
+
+def _cmd_eval_questions(args: argparse.Namespace) -> int:
+    from backend.app.evals.common import save_report
+    from backend.app.evals.question_eval import (
+        describe,
+        format_question_eval,
+        runs_from_logs,
+        traces_by_retrieval,
+        traces_from_runs,
+    )
+    from backend.app.evals.testset import load_testset
+
+    if args.batch_questions:  # child of a batched run (traces_in_batches)
+        from backend.app.evals.question_eval import run_batch_file
+
+        asyncio.run(run_batch_file(args.batch_questions, args.batch_out,
+                                   mode=args.mode, answer=args.answer))
+        return 0
+
+    runs = [(r, "") for r in (args.run_ids or [])]
+    runs += runs_from_logs(args.logs) if args.logs else []
+    if not runs and args.questions is None and not args.dataset:
+        print("eval-questions: give a test set or question file, --dataset, "
+              "--run-ids or --logs", file=sys.stderr)
+        return 2
+    try:
+        if args.dataset:
+            from backend.app.evals.langsmith_sync import pull_testset
+
+            testset = pull_testset(args.dataset)
+        else:
+            path = args.testset or (args.questions if not runs else None)
+            testset = load_testset(path) if path else None
+    except Exception as exc:
+        print(f"eval-questions: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+
+    from datetime import UTC, datetime
+
+    from backend.app.evals.common import REPORT_ROOT, configured_batch_size, database_name
+    from backend.app.evals.question_eval import traces_in_batches
+
+    batch_size = args.batch_size if args.batch_size is not None else configured_batch_size()
+    questions = [] if runs else [q.question for q in testset.questions]
+    batched = bool(questions) and batch_size > 0 and len(questions) > batch_size
+    pre: tuple[list[dict[str, Any]], float] | None = None
+    if batched:
+        traces_dir = args.traces_dir or (
+            REPORT_ROOT / database_name()
+            / f"traces-{testset.name}-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}")
+        print(f"[eval-questions] {len(questions)} questions in batches of {batch_size}; "
+              f"traces in {traces_dir}")
+        try:
+            pre = traces_in_batches(questions, mode=args.mode, answer=args.answer,
+                                    batch_size=batch_size, traces_dir=traces_dir)
+        except (RuntimeError, ValueError) as exc:
+            print(f"eval-questions: {exc}", file=sys.stderr)
+            return 1
+
+    async def _go() -> dict[str, Any]:
+        cost = 0.0
+        if pre is not None:
+            traces, cost = pre
+        elif runs:
+            traces = await traces_from_runs(runs)
+        else:
+            traces, cost = await traces_by_retrieval(
+                questions, mode=args.mode, answer=args.answer)
+        report = await describe(traces, testset, args.k)
+        report["summary"]["cost_usd"] = round(cost, 4)
+        return report
+
+    report = asyncio.run(_go())
+    if args.json:
+        print(json.dumps(report, indent=2, default=str))
+    else:
+        print("QUESTION EVALUATION")
+        print(format_question_eval(report))
+        print(f"[eval-questions] cost ${report['summary']['cost_usd']:.4f}; "
+              f"saved {save_report('questions', report, args.out)}")
+    if not args.no_langsmith:
+        from backend.app.evals.langsmith_sync import maybe_upload
+        from backend.app.evals.question_eval import _testset_for
+
+        # Finished runs carry their own mode; label the experiment with it.
+        modes = {r.get("mode") for r in report["questions"]} - {None}
+        mode = modes.pop() if len(modes) == 1 else args.mode
+        maybe_upload(report, _testset_for([r["question"] for r in report["questions"]],
+                                          testset, "query-runs"), mode=mode)
+    return 0
+
+
+def _cmd_eval_dataset(args: argparse.Namespace) -> int:
+    from backend.app.evals import langsmith_sync as ls
+    from backend.app.evals.testset import load_testset
+
+    try:
+        if args.eds_cmd == "push":
+            out = ls.push_testset(load_testset(args.testset))
+            print(f"[eval-dataset] {out['dataset']}: "
+                  f"{'created, ' if out['created'] else ''}{out['added']} question(s) added, "
+                  f"{out.get('updated', 0)} updated, {out['already_there']} already there")
+        elif args.eds_cmd == "pull":
+            ts = ls.pull_testset(args.name)
+            path = args.out or Path("eval_questions/testsets") / f"{ts.name}.json"
+            ts.save(path)
+            print(f"[eval-dataset] {len(ts.questions)} question(s) -> {path}")
+        else:
+            for d in ls.list_datasets():
+                print(f"{d['name']}\t{d['examples']}\t{d['description'][:60]}")
+    except Exception as exc:
+        print(f"[eval-dataset] {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _cmd_db_migrate(args: argparse.Namespace) -> int:
     """Wraps `alembic upgrade <revision>`."""
     from alembic import command
@@ -2347,8 +2589,8 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
     _runner = extract_entities_streamed if _batch > 0 else extract_entities
     _batch_kw = {"batch_size": _batch} if _batch > 0 else {}
 
-    asyncio.run(
-        _runner(
+    async def _extract_then_classify() -> None:
+        await _runner(
             **_batch_kw,
             scope_document_iri=args.scope_iri,
             limit=args.limit,
@@ -2384,7 +2626,41 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
             orphan_batch_size=int(_resolve_extraction_opt(
                 args, "orphan_batch_size", "orphan_batch_size", 8)),
         )
-    )
+        if _concepts:
+            from backend.app.services.concept_areas import retype_entities_by_term
+            from backend.app.services.concept_kinds import classify_concept_kinds
+            from backend.app.services.llm_router import LLMRouter
+
+            await retype_entities_by_term(_concept_roots_from_config())
+            # Fails soft: extraction is already saved, and an entity with no
+            # verdict stays a concept. `classify-concepts` picks up the rest.
+            try:
+                await classify_concept_kinds(LLMRouter(), _concept_roots_from_config())
+            except Exception as exc:
+                print(f"[concept-kinds] skipped: {type(exc).__name__}: {exc}")
+        # Standing corpus evaluation after every build (database queries only).
+        # Fails soft: extraction is already saved.
+        try:
+            _print_corpus_eval(await _run_corpus_eval())
+        except Exception as exc:
+            print(f"[eval-corpus] skipped: {type(exc).__name__}: {exc}")
+
+    asyncio.run(_extract_then_classify())
+    return 0
+
+
+def _cmd_classify_concepts(args: argparse.Namespace) -> int:
+    from backend.app.services.concept_areas import retype_entities_by_term
+    from backend.app.services.concept_kinds import classify_concept_kinds
+    from backend.app.services.llm_router import LLMRouter
+
+    asyncio.run(retype_entities_by_term(_concept_roots_from_config(), dry_run=args.dry_run))
+    stats = asyncio.run(classify_concept_kinds(
+        LLMRouter(), _concept_roots_from_config(),
+        limit=args.limit, recheck=args.recheck, dry_run=args.dry_run,
+    ))
+    for name in sorted(stats["named_sample"])[:args.show]:
+        print(f"  named: {name}")
     return 0
 
 
@@ -2411,7 +2687,13 @@ def _cmd_enrich_geo(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
             limit=args.limit,
             verbose=True,
+            ontology_only=args.ontology_only,
         )
+    )
+    print(
+        f"[enrich-geo] ontology: matched={summary.ontology_matched} "
+        f"containers={summary.ontology_nodes} edges={summary.ontology_edges} "
+        f"embedding_cost=${summary.embedding_cost_usd:.5f}"
     )
     print(
         f"[enrich-geo] places={summary.place_entities} "
@@ -2426,9 +2708,15 @@ def _cmd_enrich_geo(args: argparse.Namespace) -> int:
     if summary.unresolved:
         print(
             f"[enrich-geo] {summary.unresolved} containment(s) named a place "
-            f"the corpus does not have as an entity and were skipped -- this "
-            f"pass adds edges, never nodes."
+            f"that is not an entity and were skipped -- the model never adds "
+            f"a node."
         )
+    # Places and containment edges changed: standing corpus evaluation (free).
+    if not args.dry_run:
+        try:
+            _print_corpus_eval(asyncio.run(_run_corpus_eval()))
+        except Exception as exc:
+            print(f"[eval-corpus] skipped: {type(exc).__name__}: {exc}")
     return 0
 
 

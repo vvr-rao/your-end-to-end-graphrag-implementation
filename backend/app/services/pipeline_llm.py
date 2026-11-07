@@ -1853,6 +1853,7 @@ async def _dedup(
 
 
 _CONCEPT_GROUPING_BATCH_SIZE = 150
+_CONCEPT_GROUPING_MIN_SPLIT = 10
 
 
 async def _propose_concept_grouping(
@@ -1896,25 +1897,31 @@ async def _propose_concept_grouping(
 
     sem = asyncio.Semaphore(max(1, concurrency))
 
-    async def _one(i: int, batch: list[dict[str, Any]]) -> dict[str, Any] | None:
+    async def _one(i: int, batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Replies for one batch. A failed or unparseable reply, usually cut off
+        at the token limit, is retried as two halves, so a batch is only lost
+        once it is too small to split. Losing one left a third of the orphans
+        ungrouped in 4 of 8 replays (2026-11-03)."""
         system, user = PROMPTS["concept_grouping"](batch, roots)
+        parsed = None
         async with sem:
             try:
                 result = await router.chat("concept_grouping", system=system, user=user)
+                parsed = extract_json_from_output(result.text)
             except Exception as exc:
-                print(f"[stage4-G] batch {i+1}/{len(batches)} LLM call failed: {exc} — skipping batch")
-                return None
-        parsed = extract_json_from_output(result.text)
-        if not isinstance(parsed, dict):
-            print(f"[stage4-G] batch {i+1}/{len(batches)} response was not parseable JSON — skipping batch")
-            return None
-        return parsed
+                print(f"[stage4-G] batch {i+1}/{len(batches)} LLM call failed: {exc}")
+        if isinstance(parsed, dict):
+            return [parsed]
+        if len(batch) < _CONCEPT_GROUPING_MIN_SPLIT:
+            print(f"[stage4-G] batch {i+1}/{len(batches)}: {len(batch)} orphan(s) lost, no usable reply")
+            return []
+        print(f"[stage4-G] batch {i+1}/{len(batches)}: no usable reply for {len(batch)} orphans, splitting")
+        mid = len(batch) // 2
+        halves = await asyncio.gather(_one(i, batch[:mid]), _one(i, batch[mid:]))
+        return [*halves[0], *halves[1]]
 
     results = await asyncio.gather(*[_one(i, b) for i, b in enumerate(batches)])
-    for parsed in results:                       # batch order: first label wins, as before
-        if parsed is None:
-            continue
-
+    for parsed in (reply for replies in results for reply in replies):  # batch order: first label wins
         # Merge concepts (case-insensitive dedup by LABEL).
         for entry in (list(parsed.get("NEW_SUBCONCEPTS") or [])
                       + list(parsed.get("TOP_LEVEL_CONCEPTS") or [])):

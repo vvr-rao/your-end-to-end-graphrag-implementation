@@ -20,6 +20,7 @@ Returns a sorted list of (uuid, rrf_score) tuples.
 """
 from __future__ import annotations
 
+import math
 import uuid
 from collections import defaultdict
 
@@ -139,3 +140,19 @@ def cap_per_source(
             seen[src] += 1
             kept.append((cid, score))
     return kept
+
+
+def documents_for_fraction(fraction: float, total: int, *, minimum: int = 3) -> int:
+    """How many documents a share of the corpus is, never below `minimum`: a fixed
+    count is most of a small corpus and almost none of a large one."""
+    if total <= 0 or fraction <= 0:
+        return 0
+    return min(total, max(minimum, math.ceil(fraction * total)))
+
+
+def dead_end_seeds_trigger(dead_ends: int, seeds: int, share: float) -> bool:
+    """True if the seeds with no relationships reach `share` of the seeds. A share
+    of 0 means any one dead end is enough."""
+    if dead_ends <= 0 or seeds <= 0:
+        return False
+    return share <= 0 or dead_ends / seeds >= share

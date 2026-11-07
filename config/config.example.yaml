@@ -500,8 +500,7 @@ extraction:
   # old proper-noun-only rule prevented. Restricting the menu makes those
   # picks impossible rather than merely discouraged.
   #
-  # Deliberately EXCLUDED: Event (holds named events like "Super Bowl" -- the
-  # entity pass's job), TimePeriod (the temporal pass), FinancialTable (the
+  # Deliberately EXCLUDED: TimePeriod (the temporal pass), FinancialTable (the
   # StructuredTable pass). Empty list disables the concept pass entirely.
   concept_class_roots:
     # Domain-neutral roots (any corpus: pharma, finance, manufacturing, news).
@@ -520,6 +519,10 @@ extraction:
     - Infrastructure
     - SupplyChainConcept
     - FinancialObservation
+    # Concept areas and events. A named event ("Super Bowl") is told apart from a
+    # kind of event ("acquisition") by concept_kind_judge, as other named things are.
+    - ConceptArea
+    - Event
   # Candidate-menu quality filter. Withholds instance-shaped class labels
   # ("Cholla Unit 4") and disjunction labels ("SegmentOperatingExpense or
   # SegmentAsset") from the top-K menu handed to the extractor. Neither is a
@@ -695,10 +698,13 @@ qa:
   # probe_dist_band: 0.10
 
   # --- document-level recall arm ----------------------------------------------
-  # Top-k documents by whole-document embedding similarity, whose chunks join
-  # the candidate pool. Surfaces documents that are ABOUT the topic even when no
-  # individual chunk matches the query's wording. 0 disables the arm.
-  k_documents: 10
+  # Top documents by whole-document embedding similarity, whose chunks join the
+  # candidate pool. Surfaces documents that are ABOUT the topic even when no
+  # individual chunk matches the query's wording. A share of the corpus, rounded
+  # up, so it means the same on 20 documents and on 2,000; never fewer than
+  # document_arm_min_documents. 0 disables the arm.
+  document_arm_fraction: 0.25
+  document_arm_min_documents: 3
 
   # --- evidence diversification -------------------------------------------------
   # Max evidence chunks any ONE document may contribute after rank fusion. RRF's
@@ -852,6 +858,23 @@ qa:
   # of 66 documents -- the whole corpus -- and a question whose answer ranked
   # fine among 186 candidates could not be found among 650. 0 = unbounded.
   fulltext_bridge_max_documents: 10
+  # Which documents the limit keeps: "graph" ranks by the chunks the graph
+  # routes found in each document, so the document arm (up to 50 chunks per
+  # document) cannot push graph documents out; "all" counts every candidate
+  # chunk (before 2026-11-07).
+  fulltext_bridge_rank_by: graph
+  # Full-text bridge (services/fulltext_bridge.py). Which documents it expands:
+  # count = most graph-found summary chunks (original; long documents win),
+  # best = best-scored graph-found chunk, count as tie-break.
+  fulltext_bridge_document_rank: count
+  # Which passages of a kept document: question = nearest the question, up to
+  # max_fulltext_chunks_per_document (original); anchors = nearest each
+  # graph-found summary chunk of that document (the passage it was likely
+  # summarized from) plus a few nearest the question.
+  fulltext_bridge_passages: question
+  fulltext_bridge_anchors_per_document: 5   # anchors mode: summary chunks used per document
+  fulltext_bridge_per_anchor: 5             # anchors mode: passages per anchor
+  fulltext_bridge_question_chunks: 3        # anchors mode: question-nearest backstop per document
   fulltext_bridge_limit: 500
   # ---- Artifact -> chunk bridge. `artifact_sources` records which chunk each
   # artifact was distilled from (1,277 of 1,278 artifacts on the
@@ -957,19 +980,35 @@ qa:
   relation_class_seed_similarity: 0.40
   relation_class_seed_limit: 25
   # ---- Document arm. "conditional" (default) runs it only where the graph
-  # cannot answer: a seed entity with no relationships at all, or a graph arm
-  # returning fewer than document_arm_min_chunks_factor x k_chunks candidates.
+  # cannot answer: a graph arm returning fewer than
+  # document_arm_min_chunks_factor x k_chunks candidate chunks.
   # Measured: running it on every query cost precision (41% vs 46%) and bought
   # no gold documents or fact-bearing chunks. "always" = pre-2026-09-20
-  # behaviour; "off" = disabled, same as k_documents: 0.
+  # behaviour; "off" = disabled, same as document_arm_fraction: 0.
   document_arm: conditional
   document_arm_min_chunks_factor: 3
+  # Fire also when a seed has no relationships. Off since 2026-11-07: with
+  # concept seeds some seed always has none, so it fired on 19 of 21 questions
+  # while the graph had returned plenty. document_arm_orphan_share narrows it.
+  document_arm_dead_end_trigger: false
   # ---- Temporal. Question time terms are parsed with the same function
   # ingestion used on chunk text, so Q3 2023 / October 2023 / 2023-10-15 all
   # match the rows enrich-time minted (the old query path matched bare years
   # only). A matched period expands DOWN its hierarchy at full weight and one
   # level UP at half weight; depth caps the descent.
   time_expansion_depth: 3
+  # ---- Geographic. A place the question names expands DOWN the locatedInPlace
+  # edges enrich-geo made, whatever relation is asked about, so a question about
+  # Europe reaches Germany. Never up, and the broad walk stops crossing these
+  # edges, so a Germany question does not reach Spain. false restores the walk.
+  place_expansion: true
+  place_expansion_depth: 3
+  # ---- Concept areas. A conceptTerm in the question ("financial information")
+  # expands down the class tree to the chunks about the entities under it, as its
+  # own ranking vote. false turns the route off.
+  concept_areas: true
+  concept_area_chunk_limit: 100
+  rrf_weight_concept_area: 1.0
   # Search ALL artifacts by vector on every query (not only artifact_only mode)
   # and add them as candidates alongside the entity-linked ones. Candidates
   # only -- never graph seeds; they share the existing artifact evidence slots.
@@ -1028,6 +1067,23 @@ tables:
   page_vision_min_figure_lines: 8
   page_vision_max_pages_per_doc: 80
   page_vision_max_ungrounded: 0.1
+
+# --- evaluations (backend/app/evals; README there) ----------------------------
+# k: the cut-off for Recall@K, Precision@K and MRR@K (`--k` overrides it).
+evals:
+  k: 10
+  # eval-questions runs this many questions per child process, so memory stays
+  # flat on long test sets and a crash loses one batch (resume with --traces-dir).
+  batch_size: 25
+
+# --- LangSmith (eval-dataset, eval-questions --langsmith) ----------------------
+# The API key is LANGSMITH_API_KEY in .env. `user` is required to upload: it is
+# stamped on every dataset and experiment. Datasets are named
+# <dataset_prefix>-<test set name>. Nothing is sent unless asked.
+langsmith:
+  user: ""
+  endpoint: https://api.smith.langchain.com
+  dataset_prefix: graphrag
 
 # ---- enrich-geo. Contained places per LLM call, and how many containers
 # ride along in every call. Small on purpose: at ~109 places per call the

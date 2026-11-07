@@ -1343,7 +1343,8 @@ def add_new_classes_from_match_not_found(
     # A "new class" whose LABEL is an identifier is a reference to an existing
     # class, never a new one; minting it creates an "http_..." junk class.
     entries = [e for e in entries
-               if not (isinstance(e, dict) and looks_like_iri(e.get("LABEL")))]
+               if not (isinstance(e, dict) and (looks_like_iri(e.get("LABEL"))
+                                                or _never_a_class(e.get("LABEL"))))]
     pending = entries[:]  # entries whose parent isn't yet resolved
     max_passes = max(len(entries) + 1, 2)
     idx = _ClassIndexes(classes_dict)
@@ -1627,8 +1628,8 @@ def make_property_iri(base_iri: str, label: str) -> str:
 def create_new_object_property_entry(
     label: str,
     description: str,
-    domain_iri: str,
-    range_iri: str,
+    domain_iri: str | None,
+    range_iri: str | None,
     new_property_base_iri: str,
 ) -> tuple[str, dict]:
     """
@@ -1658,14 +1659,14 @@ def create_new_object_property_entry(
             "iri": domain_iri,
             "python_name": None,
             "type": "ThingClass",
-        }],
+        }] if domain_iri else [],
         "range": [{
             "kind": "entity",
             "name": safe_name_from_iri(range_iri),
             "iri": range_iri,
             "python_name": None,
             "type": "ThingClass",
-        }],
+        }] if range_iri else [],
         "inverse_property": None,
         "characteristics": [],
         "python_name": None,
@@ -2451,9 +2452,24 @@ def _is_garbage_endpoint(text: str) -> bool:
         return True
     if split_disjunction_label(text):
         return True
-    if looks_like_iri(text):
+    if looks_like_iri(text) or _never_a_class(text):
         return True
     return False
+
+
+def _is_open_endpoint(value: Any) -> bool:
+    """A relation endpoint the model left as NONE: no restriction on that side."""
+    from backend.app.services.class_junk_filter import non_class_reason
+
+    return non_class_reason(normalize_to_string(value)) == "placeholder"
+
+
+def _never_a_class(label: Any) -> bool:
+    """A value, placeholder or bare verb (`6.5`, `NONE`, `Lowers`). Imported
+    here because class_junk_filter only imports this module inside a function."""
+    from backend.app.services.class_junk_filter import non_class_reason
+
+    return non_class_reason(label) is not None
 
 
 def looks_like_iri(text: Any) -> bool:
@@ -2670,8 +2686,8 @@ def add_new_relations_from_match_results(
             # Best-effort: augment the existing predicate's domain/range
             # if the LLM's relation resolved to known classes that weren't
             # already listed. Never overwrite existing endpoint metadata.
-            d_iri, _, _ = _try_resolve(item.get("DOMAIN"))
-            r_iri, _, _ = _try_resolve(item.get("RANGE"))
+            d_iri = None if _is_open_endpoint(item.get("DOMAIN")) else _try_resolve(item.get("DOMAIN"))[0]
+            r_iri = None if _is_open_endpoint(item.get("RANGE")) else _try_resolve(item.get("RANGE"))[0]
             existing_entry = obj_props_dict[existing_iri]
             for end_key, end_iri in (("domain", d_iri), ("range", r_iri)):
                 if not end_iri:
@@ -2682,15 +2698,19 @@ def add_new_relations_from_match_results(
             reused_existing += 1
             continue
 
-        d_iri, d_text, _ = _try_resolve(item.get("DOMAIN"))
-        r_iri, r_text, _ = _try_resolve(item.get("RANGE"))
+        # NONE means "any class": the predicate is real (Material causes NONE),
+        # it just has no restriction on that side, so nothing gets minted.
+        d_open = _is_open_endpoint(item.get("DOMAIN"))
+        r_open = _is_open_endpoint(item.get("RANGE"))
+        d_iri, d_text = (None, None) if d_open else _try_resolve(item.get("DOMAIN"))[:2]
+        r_iri, r_text = (None, None) if r_open else _try_resolve(item.get("RANGE"))[:2]
 
         # If RANGE is unresolved but DOMAIN resolved, infer parent from DOMAIN
         # (and vice versa) so auto-minted endpoint inherits the right ontology.
         d_parent = _first_super_iri(classes_dict.get(d_iri, {})) if d_iri else None
         r_parent = _first_super_iri(classes_dict.get(r_iri, {})) if r_iri else None
 
-        if d_iri is None:
+        if d_iri is None and not d_open:
             if _is_garbage_endpoint(d_text):
                 _why = (
                     "unresolvable disjunction"
@@ -2711,7 +2731,7 @@ def add_new_relations_from_match_results(
             )
             idx.added(d_iri)
 
-        if r_iri is None:
+        if r_iri is None and not r_open:
             if _is_garbage_endpoint(r_text):
                 _why = (
                     "unresolvable disjunction"
