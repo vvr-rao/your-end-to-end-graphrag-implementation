@@ -346,6 +346,36 @@ def test_sec_user_agent_header_is_used(tmp_path, monkeypatch):
     assert sess.headers["User-Agent"] == "Test Org test@org.test"
 
 
+
+def test_sec_fsds_quoted_tab_in_segments_is_one_field(tmp_path, monkeypatch):
+    # Real 2024q1 shape: NUM.segments holds a tab inside double quotes.
+    monkeypatch.setenv("SEC_USER_AGENT", "Test Org test@org.test")
+    head = "adsh\ttag\tversion\tddate\tqtrs\tuom\tsegments\tcoreg\tvalue\tfootnote\n"
+    plain = "".join(f"0000000001-24-{i:06d}\tAssets\tus-gaap/2023\t20231231\t0\tUSD"
+                    f"\t\t\t{i}.0000\t\n" for i in range(20))
+    quoted = ('0001379785-24-000015\tInvestmentOwnedAtCost\tus-gaap/2023\t20231231\t0\tUSD'
+              '\t"InvestmentIdentifier=Ocular Therapeutix\tPharma-ceuticals;"\t\t3817000.0000\t\n')
+    payload = _zip_bytes({"num.txt": head + plain + quoted, "sub.txt": "adsh\tcik\n"
+                          "0001379785-24-000015\t0001379785\n"})
+
+    def handler(method, url, params, headers, body):
+        if method == "HEAD":
+            return FakeResponse(200, b"", {})
+        return FakeResponse(200, payload)
+
+    rc = run_cli(["sec", "bulk", "--dataset", "fsds", "--period", "2024q1", "--format", "csv",
+                  "-o", str(tmp_path)], FakeSession(handler))
+    assert rc == 0
+    m = load_manifest(tmp_path)
+    assert m["status"] == "complete" and not m["warnings"]
+    assert not [f for f in m["files"] if f["role"] == "rejected"]
+    rows = read_csv(only_root(tmp_path) / "normalized" / "num.csv")
+    assert len(rows) == 21
+    assert rows[-1]["segments"] == "InvestmentIdentifier=Ocular Therapeutix\tPharma-ceuticals;"
+    assert rows[-1]["value"] == "3817000.0000"
+    sub = read_csv(only_root(tmp_path) / "normalized" / "sub.csv")
+    assert sub[0]["cik"] == "0001379785"
+
 # -------------------------------------------------------------------- FRED
 
 

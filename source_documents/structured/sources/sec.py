@@ -12,6 +12,7 @@ readme.htm).
 from __future__ import annotations
 
 import argparse
+import csv
 import re
 from datetime import date
 from pathlib import Path
@@ -277,10 +278,16 @@ class SecSource(Source):
             ctx.manifest.warn("nightly SEC file is overwritten daily by the SEC; the snapshot "
                               "folder is named by download date")
             return
+        # The SEC readme says only "tab-delimited", but values that contain a tab
+        # (e.g. NUM.segments "InvestmentIdentifier=...\t...") are double-quoted, so
+        # parse with standard quoting: QUOTE_NONE would split them into extra fields.
+        # Checked on 2024q1: every SUB/NUM/TAG/PRE row parses, no embedded newlines.
         ingest_archive(ctx, archive, delimiter="\t", table_suffixes=(".txt", ".tsv"),
-                       convert=ctx.want_csv, description=f"SEC {ctx.args.dataset} archive")
+                       quoting=csv.QUOTE_MINIMAL, convert=ctx.want_csv,
+                       description=f"SEC {ctx.args.dataset} archive")
         ctx.manifest.transformations.append(
-            "SUB/NUM/TAG/PRE (and notes) tables kept in their original tab-delimited form")
+            "SUB/NUM/TAG/PRE (and notes) tables kept in their original tab-delimited form; "
+            "parsed with standard double-quote rules (SEC quotes values containing a tab)")
 
 
 def _fact_row(cik: str, name: str, taxonomy: str, tag: str, unit: str, e: dict) -> dict:
