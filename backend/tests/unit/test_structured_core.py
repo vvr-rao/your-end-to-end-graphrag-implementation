@@ -157,6 +157,31 @@ def test_resume_restarts_when_ranges_not_supported(tmp_path):
     assert not res.resumed and (tmp_path / "f.zip").read_bytes() == ZIP_BYTES
 
 
+
+def test_download_asks_for_identity_encoding(tmp_path):
+    # GLEIF compresses on the fly when gzip is accepted and then ignores Range.
+    seen = []
+    client, _ = make_client(lambda m, u, p, headers, b: (seen.append(headers.copy()),
+                                                         FakeResponse(200, ZIP_BYTES))[1])
+    client.download("https://x.test/f.zip", tmp_path / "f.zip", expect="zip")
+    assert seen[-1]["Accept-Encoding"] == "identity"
+
+
+def test_resume_logs_when_server_ignores_range(tmp_path):
+    (tmp_path / "f.zip.part").write_bytes(ZIP_BYTES[:2000])
+    logs = []
+
+    def handler(method, url, params, headers, body):
+        if method == "HEAD":
+            return FakeResponse(200, b"", {"Accept-Ranges": "bytes"})
+        return FakeResponse(200, ZIP_BYTES)
+
+    client = HttpClient(contact="test", session=FakeSession(handler), log=logs.append,
+                        sleep=lambda s: None)
+    res = client.download("https://x.test/f.zip", tmp_path / "f.zip", expect="zip", resume=True)
+    assert not res.resumed and (tmp_path / "f.zip").read_bytes() == ZIP_BYTES
+    assert any("ignored the byte range" in m for m in logs)
+
 # ------------------------------------------------------------------ archives
 
 

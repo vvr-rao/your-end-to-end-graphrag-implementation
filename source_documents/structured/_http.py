@@ -305,7 +305,10 @@ class HttpClient:
         dest.parent.mkdir(parents=True, exist_ok=True)
         part = dest.with_name(dest.name + ".part")
         offset = part.stat().st_size if (resume and part.exists()) else 0
-        headers: dict[str, str] = {}
+        # Ask for the raw bytes. Some servers (GLEIF Golden Copy) compress files on
+        # the fly when gzip is accepted, and then ignore Range and drop
+        # Content-Length, which breaks both resume and the length check.
+        headers: dict[str, str] = {"Accept-Encoding": "identity"}
         if offset:
             head = self.head(url, params=params)
             if head is not None and head.headers.get("Accept-Ranges", "").lower() == "bytes":
@@ -317,6 +320,8 @@ class HttpClient:
                             ok_statuses=(200, 206))
         resumed = bool(offset) and resp.status_code == 206
         if offset and not resumed:
+            self.log(f"  server ignored the byte range (HTTP {resp.status_code}); "
+                     f"restarting {dest.name} from zero")
             offset = 0
         digest = hashlib.sha256()
         if resumed:

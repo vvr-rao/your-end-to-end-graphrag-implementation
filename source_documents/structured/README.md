@@ -51,7 +51,7 @@ Parquet → CSV conversion (Open Targets bulk `--format csv`) needs pyarrow:
 | `--format native\|csv` | `native` keeps provider files only. `csv` keeps them **and** adds normalized CSV under `normalized/`. Each source states what it supports, and unsupported combinations are rejected. |
 | `--limit N`, `--max-pages N` | Bounded API samples. A capped run is always marked `truncated: true`, status `sample`. **For bulk archives `--limit` is not offered**: an archive downloads whole, and a row cap would not reduce its size. |
 | `--dry-run` | Prints the plan (redacted URLs, expected sizes, release) and exits. It may make small metadata lookups, such as a HEAD request, a release listing or openFDA's `download.json`. |
-| `--resume` | Reuses an existing snapshot folder. Files whose size and SHA-256 match its manifest are skipped, and `.part` transfers continue where the server supports byte ranges. |
+| `--resume` | Reuses an existing snapshot folder. Files whose size and SHA-256 match its manifest are skipped, and `.part` transfers continue where the server supports byte ranges (live-tested 2026-11-08 on GLEIF and ChEMBL after an interrupted transfer). Downloads request `Accept-Encoding: identity`, because GLEIF compresses on the fly otherwise and then ignores ranges. If a server ignores the range, the log says so and the file restarts from zero. |
 | `--overwrite` | Replaces an existing snapshot folder of the same name. Without `--resume` or `--overwrite`, an existing snapshot is never touched. |
 | `-o DIR` | Output root. The default is `source_documents/structured_<source>/`, which git ignores. |
 | `--timeout`, `--max-retries` | Read timeout per request, and retries on 429/5xx/connection errors (exponential backoff, honours `Retry-After`). |
