@@ -1093,3 +1093,11 @@ def deepseek_eval_definition_judge(items: list[dict[str, Any]]) -> tuple[str, st
 
     system, user = eval_definition_judge(items)
     return system + "\nReturn ONE JSON object and nothing else.", user
+
+
+def deepseek_endpoint_class_review(items: list[dict[str, Any]],
+                                   roots: list[dict[str, str]]) -> tuple[str, str]:
+    from backend.app.services.prompts import endpoint_class_review
+
+    system, user = endpoint_class_review(items, roots)
+    return system + "\nReturn ONE JSON object and nothing else.", user

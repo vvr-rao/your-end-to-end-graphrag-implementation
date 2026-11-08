@@ -579,6 +579,19 @@ tasks:
     temperature: 0.0
     max_tokens: 4096
 
+  # prune-expand: review classes created from relation endpoints (parent was
+  # copied from the other end, definition a placeholder): keep/drop, pick a
+  # root parent, write a definition (endpoint_class_review.py). Remove this
+  # task or set enabled: false to skip. ~100-150 classes per build.
+  endpoint_class_review:
+    provider: anthropic
+    model: claude-haiku-4-5
+    items_per_call: 20
+    concurrency: 8
+    timeout: 300
+    temperature: 0.0
+    max_tokens: 4096        # 20 decisions with one-sentence definitions ~2k tokens
+
 
   # Stage 3c: generic parent for qualified concept classes
   # (SemiconductorRevenue, RelatedPartyRevenue -> Revenue < Measure). Groups

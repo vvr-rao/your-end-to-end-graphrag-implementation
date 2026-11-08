@@ -116,6 +116,18 @@ is created. The account needs a DeepInfra display name (username) first —
 4. User sets `DEEPINFRA_FLASH_MODEL=<username>/<printed model_name>` in `.env`;
    re-run `select_llm_mode.py deepinfra`. Record:
    `uv run python scripts/build_state.py record sizing applied=<yes|custom|kept>`.
+   **Check the concurrency actually in use before the first paid step.**
+   `--apply-concurrency` writes `config/config.yaml`; any OTHER config the
+   build reads (`APP_CONFIG_PATH`, a copied bench config, a config from an
+   earlier, smaller GPU) keeps its old values. Compare its `concurrency:`
+   block with the sizing output for the GPU that won (`active` in the sizing
+   file). Measured 2026-11-07: a copied config held class_proposal 24 /
+   dedup 16 / summarization 64 against the 2x H200 sizing of 48 / 48 / 96;
+   with the sized values, two corpora (318k tokens, 41 docs) built in ONE
+   1.31 h window for $7.05 of 27B time (prune-expand 27 min and 20 min).
+   The sizing printout also says where the time goes: when "most billed
+   time is spin-up + pipeline gaps", batch the corpora into one window
+   rather than adding GPUs.
 5. Optional (~5 GPU-minutes): `uv run python scripts/deepinfra_sizing.py --probe`
    measures the real throughput knee on the running deployment; `--apply`
    writes it. Worth it for a long build; skip for a short one.
@@ -166,7 +178,8 @@ of weights; DeepInfra bills **per GPU**, so N GPUs = N x the per-GPU rate):
 | 2x H200-141GB | 282 GB | 5.38 | **FAILS** — `wont-start: couldn't start model` after ~10 min (~$0.85 billed), 2026-11-07 |
 | 1x B300-270GB | 270 GB | 4.89 | do not try: less headroom than the failed 2x H200 |
 | **2x B200-180GB** | 360 GB | **7.38** | **recommended, WORKS** (2026-11-07): ~12 min to load; 3 fin-gen PDFs (LGES 58 p, SDI 99 p, 24220c53 55 p) -> 206 tables in **337 s** with 24 pages in flight (40-70 s per dense statement page), 0 failed / 0 partial; **$2.18 billed in total** (~18 min) |
-| 4x H100-80GB | 320 GB | 8.80 ($2.20 per H100; 2x H100 is $4.40) | works on paper; dearer and tighter than 2x B200 |
+| 4x H200-141GB | 564 GB | 10.76 | **WORKS, first fallback** (2026-11-07, when 2x B200 had no capacity for ~20 min): ~10 min to load; 5 pharma-12 PDFs (incl. a 125-page label) -> 129 tables in **566 s** at 24 pages in flight, 0 failed; **$3.57 billed in total** |
+| 4x H100-80GB | 320 GB | 8.80 ($2.20 per H100; 2x H100 is $4.40) | untested; second fallback (tighter than 4x H200) |
 
 Cost for 3 audited filings: **$2.18 measured** on 2x B200 (load dominates;
 extraction itself ~6 min), vs ~$0.26 serverless on a good day — and serverless
@@ -177,16 +190,23 @@ them from overlapping.
 Procedure:
 1. Run it as a SEPARATE deployment, **before** the Qwen3.8-27B deployment
    exists (tables need no 27B; otherwise the 27B bills idle while pages run).
-   Sizing file (`deepinfra_deploy.py create --from-sizing <file> --name qwenvl235 --no-fallback --yes`):
-   `{"option": {"gpu": "B200-180GB", "num_gpus": 2, "instances": 1, "precision": "fp8",
-   "repo": "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8", "usd_hr": 7.38,
-   "label": "2x B200-180GB fp8 (Qwen3-VL-235B-A22B)"}, "max_batch_size": 24, "fallbacks": []}`.
+   **Hosting order: 2x B200 first, then 4x H200, then 4x H100** — shipped as
+   `config/deepinfra_vl235.sizing.example.json` (B200 + both fallbacks):
+   `uv run python scripts/deepinfra_deploy.py create --from-sizing config/deepinfra_vl235.sizing.example.json --name qwenvl235 --wait-min 25 --yes`
+   No `--no-fallback`: a 409 "no capacity" (B200 had none for ~20 min on
+   2026-11-07) or a failed start is deleted at once and the next entry is
+   tried. Never add 2x H200 to this chain (the 235B does not start on it).
+   If nothing has capacity (exit 3), retry every ~4-10 min; when the corpus
+   also has non-PDF work, start the 27B build of a txt-only corpus meanwhile
+   and keep the PDF corpus waiting for the tables (bench recipe:
+   `benchmarks/2026-11-07/ep/vl_retry.sh` + the pharma gate in `ep/arm.py`).
    Give it a hard time cap and delete it on exit (the bench recipe
    `benchmarks/2026-11-07/dcv2/vl_phase.sh` traps EXIT and deletes).
 2. Point BOTH `table_extract_vision` and `table_extract_page_vision` in
    `config/models.yaml` at `<username>/<printed model_name>` (provider stays
-   `deepinfra`), set `concurrency.table_page_vision` to ~8 (pages in flight per
-   PDF, memory-bound — see tpm_check; keep PDFs x pages <= `max_batch_size`),
+   `deepinfra`), set `concurrency.table_page_vision` to **24** on the hosted
+   235B (measured on 2x B200 and 4x H200: 0 failures; use ~8 serverless) with
+   `concurrency.table_extraction: 3` PDFs at a time (memory-bound — see tpm_check),
    and warm the table cache: run the `--tables` step (or extract tables on
    their own) with the deployment up.
 3. Delete the VL deployment as soon as extraction finishes.

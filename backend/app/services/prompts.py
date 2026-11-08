@@ -4223,3 +4223,44 @@ def eval_definition_judge(items: list[dict[str, Any]]) -> tuple[str, str]:
     user = (f"CLASSES:\n{lines}\n\n"
             'Return JSON: {"decisions": [{"id": ..., "verdict": "yes"|"no", "reason": "..."}]}')
     return system, user
+
+
+def endpoint_class_review(items: list[dict[str, Any]], roots: list[dict[str, str]]) -> tuple[str, str]:
+    """prune-expand: review classes created from relation endpoints
+    (`endpoint_class_review.py`). Each one was minted because a proposed
+    relation named it; its parent was copied from the other end of the
+    relation and its definition is a placeholder.
+
+    `items`: [{"id", "class", "parent", "relations"}]; `roots`: [{LABEL,
+    DESCRIPTION}]. Returns JSON {"decisions": [{"id", "verdict":
+    "keep"|"drop", "parent": "<root label>|CURRENT", "definition"}]}.
+    """
+    menu = "\n".join(f"- {r['LABEL']}: {r.get('DESCRIPTION') or ''}".rstrip() for r in roots)
+    system = (
+        "You review new classes of an OWL ontology. Each class was created "
+        "because a relation extracted from a document named it.\n\n"
+        "For each class decide:\n"
+        "verdict: keep = a reusable KIND of thing, measure, event, process or "
+        "concept that documents talk about (CostOfSales, MineSite, "
+        "TradePayable, BatterySwapping). drop = not a class: an opinion or "
+        "slogan (BestForYou, BetterCars), a comparison or change "
+        "(LowerPrices, PriceHike), a value, date range or bucket "
+        "(LaterThanFiveYears, WithinOneYear), an adjective or state "
+        "(Impaired), a verb, or a name glued to arbitrary words.\n"
+        "parent (keep only): the ONE label from ROOTS that the class is a "
+        "kind of, or CURRENT when its current parent is already right and "
+        "more specific. A financial amount or ratio is a quantity, never an "
+        "agent or organisation; a site or facility is not a debt.\n"
+        "definition (keep only): one plain sentence saying what the class is, "
+        "in general terms, not about one document. Do not repeat the label "
+        "as the whole definition.\n"
+        "Answer every id."
+    )
+    lines = "\n".join(
+        f'{i["id"]}. class: {i["class"]} | current parent: {i["parent"] or "(none)"}'
+        f'\n   relations: {i["relations"] or "(none)"}'
+        for i in items)
+    user = (f"ROOTS:\n{menu}\n\nCLASSES:\n{lines}\n\n"
+            'Return JSON: {"decisions": [{"id": ..., "verdict": "keep"|"drop", '
+            '"parent": "<ROOT label or CURRENT>", "definition": "..."}]}')
+    return system, user

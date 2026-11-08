@@ -622,6 +622,20 @@ tasks:
     max_tokens: 4096
     response_format: json_object
 
+  # prune-expand: review classes created from relation endpoints (parent was
+  # copied from the other end, definition a placeholder): keep/drop, pick a
+  # root parent, write a definition (endpoint_class_review.py). Remove this
+  # task or set enabled: false to skip. ~100-150 classes per build.
+  endpoint_class_review:
+    provider: openai
+    model: gpt-4o-mini
+    items_per_call: 20
+    concurrency: 8
+    timeout: 300
+    temperature: 0.0
+    max_tokens: 4096        # 20 decisions with one-sentence definitions ~2k tokens
+    response_format: json_object
+
 
   # Stage 3c: generic parent for qualified concept classes
   # (SemiconductorRevenue, RelatedPartyRevenue -> Revenue < Measure). Groups

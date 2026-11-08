@@ -459,7 +459,7 @@ Other things worth knowing:
     = whole-page vision calls in flight inside one PDF (serverless Qwen3-VL-235B:
     ~60-250 s per page, 3-12 min on a slow day). In DeepInfra mode the
     recommended route is a HOSTED Qwen3-VL deployment (~6-7x faster, same
-    output), Qwen3-VL-235B on 2x B200 ($7.38/h; it fails on 2x H200), run
+    output), Qwen3-VL-235B on 2x B200 ($7.38/h), falling back to 4x H200 then 4x H100 (never 2x H200, where it fails), run
     before the 27B deployment; never the weaker 30B. See choose-llm-mode. `tpm_check.py` (and `deepinfra_sizing.py`) size both
     from free RAM — workers x (200 + 5 x pages) MB within free minus 600 MB.
   - See the README's "Tuning throughput" section.
