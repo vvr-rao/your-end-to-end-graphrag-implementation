@@ -323,8 +323,9 @@ def test_isolated_ragged_row_is_quarantined_not_repaired(tmp_path):
     good = [f"{i}\t2\t21949{i}\tORIG\thttp://x/{i}.pdf\t2026-01-05" for i in range(200)]
     bad = "84630\t2\t206627\tSUPPL\thttp://x/b.pdf\t\t2026-01-06"
     src = tmp_path / "ApplicationDocs.txt"
-    src.write_text("ID\tType\tApplNo\tSub\tURL\tDate\r\n"
-                   + "\r\n".join([*good[:100], bad, *good[100:]]) + "\r\n")
+    # write_bytes: text mode on Windows would turn "\r\n" into "\r\r\n".
+    src.write_bytes(("ID\tType\tApplNo\tSub\tURL\tDate\r\n"
+                     + "\r\n".join([*good[:100], bad, *good[100:]]) + "\r\n").encode())
     rej = tmp_path / "ApplicationDocs.rejects.csv"
     conv = _tabular.convert_delimited(src, tmp_path / "out.csv", delimiter="\t", rejects=rej)
     assert (conv.rows, conv.rejected) == (200, 1)
