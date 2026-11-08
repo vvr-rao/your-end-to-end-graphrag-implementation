@@ -141,8 +141,8 @@ the error.
   `start`/`end`/`duration_days`/`fp`. Bulk SUB/NUM/TAG/PRE tables stay in their
   original tab-delimited form.
 - **FRED:** `observations.csv` and `series.csv` are separate. The `.` missing marker
-  becomes an empty cell only in `observations.csv`. Real-time and vintage fields are
-  kept.
+  becomes an empty cell only in `observations.csv`. Real-time fields are kept, and
+  vintage requests produce one row per (`vintage_date`, `date`).
 - **GLEIF:** `relationships.csv` (start_lei → end_lei, type, status, periods in
   `relationship_periods.csv`) and `reporting_exceptions.csv` are separate tables.
 - **ClinicalTrials.gov:** `studies.csv` is a **selected-field** table. The native JSON
@@ -171,8 +171,8 @@ the error.
 |---|---|
 | ClinicalTrials.gov API, Drugs@FDA API, Orange Book API, GLEIF API (+ relationships), ChEMBL API, Open Targets GraphQL | **Live-tested** with bounded samples (`YEGI_LIVE_TESTS=1 uv run pytest -m live`), plus fixture tests. |
 | GLEIF Golden Copy, ChEMBL release, Open Targets release, openFDA `download.json`, FDA Orange Book zip | Live `--dry-run` (listings, HEAD, manifest) only. Bulk transfers are **fixture-tested**; no bulk file was downloaded during development. |
-| SEC EDGAR API and bulk | **Not live-verified.** `data.sec.gov` answered 403 to a generic development User-Agent. Set `SEC_USER_AGENT` to your organisation and contact email. URL patterns and the FSDS archive contents (`sub/num/tag/pre.txt`, `readme.htm`) were checked against sec.gov. |
-| FRED / ALFRED | **Fixture-tested only** (no API key was available). Endpoints and parameters follow the current FRED docs. |
+| SEC EDGAR API (companyfacts, submissions) | **Live-tested** 2026-11-08 with a real `SEC_USER_AGENT`. Bulk FSDS: live `--dry-run` only (2024q1.zip, 124 MB); archive contents checked by range request; transfer fixture-tested. |
+| FRED / ALFRED | **Live-tested** 2026-11-08 (observations, series metadata, vintage dates). Vintage responses (output_type 2/3) come back wide and are unpivoted to `vintage_date` rows. Zipped-CSV native type is fixture-tested. |
 | FFIEC CDR REST API | **Fixture-tested only** (no PWS account). It follows spec CDR-PDD-SIS-611 v1.10. The facsimile response decoding accepts base64 or byte-array JSON, because the spec only says "byte stream array"; an unrecognised shape is saved raw with a warning. |
 | FFIEC CDR bulk, Federal Reserve NIC, AACT | No documented automated download: the CDR bulk page is an ASP.NET form, NIC uses a CAPTCHA, and AACT requires sign-in. Supported as `archive` mode on a file you download; fixture-tested. AACT pipe files are parsed with standard quoting rules. If a table fails the field-count check, report the line it names. |
 | Open Targets GraphQL | The schema changes between releases: 26.09 renamed drug fields to `maximumClinicalStage` / `maxClinicalStage`. Use `--query-file` for custom queries. The query used is saved in `native/query.graphql`. |

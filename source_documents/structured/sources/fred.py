@@ -36,7 +36,9 @@ SERIES_COLUMNS = ["id", "title", "units", "units_short", "frequency", "frequency
                   "seasonal_adjustment", "seasonal_adjustment_short", "observation_start",
                   "observation_end", "last_updated", "popularity", "notes", "realtime_start",
                   "realtime_end"]
-OBS_COLUMNS = ["series_id", "realtime_start", "realtime_end", "date", "value"]
+OBS_COLUMNS = ["series_id", "realtime_start", "realtime_end", "vintage_date", "date", "value"]
+# output_type 2/3 return one column per vintage, named <SERIES>_<YYYYMMDD>.
+_VINTAGE_COL = re.compile(r"(.+)_(\d{4})(\d{2})(\d{2})")
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
@@ -251,20 +253,30 @@ class FredSource(Source):
         for path in obs_files:
             sid = path.parent.name
             for rec in iter_json_records([path], "observations"):
-                value = rec.get("value")
-                if value == ".":
-                    value = None
-                    nulls += 1
-                obs.write({"series_id": sid, "realtime_start": rec.get("realtime_start"),
-                           "realtime_end": rec.get("realtime_end"), "date": rec.get("date"),
-                           "value": value})
+                if "value" in rec:                      # output_type 1 / 4: long already
+                    cells = [(None, rec.get("value"))]
+                else:                                   # output_type 2 / 3: wide vintages
+                    cells = []
+                    for col, val in rec.items():
+                        m = _VINTAGE_COL.fullmatch(col)
+                        if m and m.group(1).upper() == sid:
+                            cells.append((f"{m.group(2)}-{m.group(3)}-{m.group(4)}", val))
+                for vintage, value in cells:
+                    if value == ".":
+                        value = None
+                        nulls += 1
+                    obs.write({"series_id": sid, "realtime_start": rec.get("realtime_start"),
+                               "realtime_end": rec.get("realtime_end"), "vintage_date": vintage,
+                               "date": rec.get("date"), "value": value})
         obs.close()
         ctx.register_tables({"series": series}, meta_files, description="FRED series metadata")
         ctx.register_tables({"observations": obs}, obs_files,
                             description="FRED observations (long format)")
         ctx.manifest.transformations.append(
             f"observations JSON -> observations.csv; FRED missing marker '.' -> empty "
-            f"({nulls} cells); values otherwise copied as text")
+            f"({nulls} cells); values otherwise copied as text; vintage responses "
+            f"(output_type 2/3, one <SERIES>_<YYYYMMDD> column per vintage) unpivoted to one "
+            f"row per (vintage_date, date)")
 
 
 def _rt(a) -> dict:

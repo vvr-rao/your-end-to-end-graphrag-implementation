@@ -353,6 +353,28 @@ def test_fred_observations_paging_and_missing_marker(tmp_path, monkeypatch):
     assert "abc123" not in json.dumps(m)
 
 
+def test_fred_vintage_columns_unpivoted(tmp_path, monkeypatch):
+    monkeypatch.setenv("FRED_API_KEY", "abc123")
+
+    def handler(method, url, params, headers, body):
+        if url.endswith("/series"):
+            return FakeResponse(200, {"seriess": [{"id": "GDP"}]})
+        assert params["vintage_dates"] == "2024-01-01,2025-01-01"
+        assert params["output_type"] == 2
+        return FakeResponse(200, {"count": 2, "output_type": 2, "observations": [
+            {"date": "2022-01-01", "GDP_20240101": "25029.116", "GDP_20250101": "25215.491"},
+            {"date": "2022-04-01", "GDP_20240101": ".", "GDP_20250101": "25805.791"}]})
+
+    rc = run_cli(["fred", "api", "--series-id", "GDP", "--vintage-dates",
+                  "2024-01-01,2025-01-01", "--format", "csv", "-o", str(tmp_path)],
+                 FakeSession(handler))
+    assert rc == 0
+    obs = read_csv(only_root(tmp_path) / "normalized" / "observations.csv")
+    assert [(o["vintage_date"], o["date"], o["value"]) for o in obs] == [
+        ("2024-01-01", "2022-01-01", "25029.116"), ("2025-01-01", "2022-01-01", "25215.491"),
+        ("2024-01-01", "2022-04-01", ""), ("2025-01-01", "2022-04-01", "25805.791")]
+
+
 def test_fred_csv_native_zip_is_extracted(tmp_path, monkeypatch):
     monkeypatch.setenv("FRED_API_KEY", "abc123")
     payload = _zip_bytes({"GDP.csv": "observation_date,GDP\n2020-01-01,1\n",
