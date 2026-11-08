@@ -346,7 +346,8 @@ class BuildStore:
         while True:
             async with session_scope() as s:
                 rows = (await s.execute(text(f"""
-                    SELECT id, kind, label, parent, description, iri, occurrences, status, status_reason, extra
+                    SELECT id, kind, label, parent, description, iri, occurrences, status, status_reason,
+                           merged_into, extra
                     FROM {SCHEMA}.label_vectors
                     WHERE run_id = :r AND kind = :k AND status = :st AND id > :last
                     ORDER BY id LIMIT :n

@@ -18,6 +18,14 @@ and it does not depend on the entity walk or a capped list of seeds, so a broad 
 keeps all its children. Databases built before v2 nest areas with subClassOf; the
 subclass step still covers them.
 
+One step sideways, before going down: a matched CONCEPT also brings in the concepts
+it names with `skos:related` (AdverseDrugReaction -> AdverseEvent, Revenue -> Sales).
+These links are curated: they mark what people asking about one usually want, without
+merging the two. The step is never chained, never taken from or to an area, and
+never to a type root (TrialEndpoint -> Outcome would pull every outcome). Tree
+siblings are not used: under a broad parent they are noise (Toxicity's siblings
+under Condition include StorageCondition and Retinopathy).
+
 Membership is never stored as an edge and never links two entities: two companies
 reporting Revenue share an area, and that is not a fact about them.
 
@@ -47,6 +55,9 @@ TERM_KEY = DC_NS + "conceptTerm"
 IN_AREA_KEY = DC_NS + "inConceptArea"
 _SKOS = "http://www.w3.org/2004/02/skos/core#"
 BROADER_KEY = _SKOS + "broader"
+RELATED_KEY = _SKOS + "related"
+CONCEPT_AREA_IRI = DC_NS + "ConceptArea"
+OWL_THING = "http://www.w3.org/2002/07/owl#Thing"
 PREF_LABEL_KEY = _SKOS + "prefLabel"
 ALT_LABEL_KEY = _SKOS + "altLabel"
 # Names that mean different things in different contexts ("margin" of profit,
@@ -197,20 +208,104 @@ def expand_topics(
     return out
 
 
+def related_step(
+    class_ids: Iterable[Any],
+    related_of: dict[Any, Iterable[str]],
+    targets: dict[str, tuple[Any, bool]],
+    areas: set[Any],
+) -> list[Any]:
+    """`class_ids` plus, ONE step sideways, the classes each names with
+    `skos:related`. `related_of`: class id -> related IRIs. `targets`: related
+    IRI -> (class id, is a type root). `areas`: ids of concept areas, which
+    neither give nor receive the step. Order kept, no duplicates."""
+    out = list(dict.fromkeys(class_ids))
+    for cid in list(out):
+        if cid in areas:
+            continue
+        for iri in related_of.get(cid, ()):
+            hit = targets.get(iri)
+            if hit is None:
+                continue
+            tid, is_root = hit
+            if is_root or tid in areas or tid in out:
+                continue
+            out.append(tid)
+    return out
+
+
+_RELATED_SQL = sql_text("""
+    SELECT id, extra_metadata -> 'annotations' -> :related
+      FROM graphrag.ontology_classes
+     WHERE id = ANY(CAST(:ids AS uuid[]))
+       AND extra_metadata -> 'annotations' ? :related
+""")
+
+# A related target's id, whether it is a type root (no parent but owl:Thing),
+# and whether it is a legacy area (a direct subclass of ConceptArea).
+_RELATED_TARGETS_SQL = sql_text("""
+    SELECT oc.id, oc.iri,
+           NOT EXISTS (
+             SELECT 1 FROM graphrag.graph_relationships gr
+               JOIN graphrag.ontology_classes p ON p.id = gr.target_node_id
+              WHERE gr.source_node_id = oc.id
+                AND gr.source_node_type = 'ontology_class'
+                AND gr.target_node_type = 'ontology_class'
+                AND gr.predicate_label = 'rdfs:subClassOf'
+                AND p.iri <> :thing) AS is_root,
+           EXISTS (
+             SELECT 1 FROM graphrag.graph_relationships gr
+               JOIN graphrag.ontology_classes p ON p.id = gr.target_node_id
+              WHERE gr.source_node_id = oc.id
+                AND gr.predicate_label = 'rdfs:subClassOf'
+                AND p.iri = :area_root) AS is_area
+      FROM graphrag.ontology_classes oc
+     WHERE oc.iri = ANY(CAST(:iris AS text[])) OR oc.id = ANY(CAST(:ids AS uuid[]))
+""")
+
+
+async def with_related(session: AsyncSession, class_ids: list[Any],
+                       area_iris: set[str]) -> list[Any]:
+    """`related_step` on the database: the matched classes plus their curated
+    `skos:related` neighbours (see the module docstring)."""
+    if not class_ids:
+        return []
+    rows = await session.execute(_RELATED_SQL, {"ids": [str(c) for c in class_ids],
+                                                "related": RELATED_KEY})
+    related_of = {cid: _values(raw) for cid, raw in rows.all()}
+    iris = sorted({i for v in related_of.values() for i in v})
+    if not iris:
+        return list(class_ids)
+    info = await session.execute(_RELATED_TARGETS_SQL, {
+        "iris": iris, "ids": [str(c) for c in class_ids],
+        "thing": OWL_THING, "area_root": CONCEPT_AREA_IRI})
+    targets: dict[str, tuple[Any, bool]] = {}
+    areas: set[Any] = set()
+    for cid, iri, is_root, is_area in info.all():
+        targets[iri] = (cid, bool(is_root))
+        if is_area or iri in area_iris:
+            areas.add(cid)
+    return related_step(class_ids, related_of, targets, areas)
+
+
 async def area_chunks(
     session: AsyncSession,
     class_ids: list[Any],
     named_ids: list[uuid.UUID],
     *,
     limit: int = 100,
+    related: bool = True,
 ) -> list[tuple[uuid.UUID, float]]:
     """Chunks about anything the matched classes cover, best first: those also
     mentioning an entity the question names, then by how many different kinds
-    they cover. Coverage = the topic layer (narrower areas and their member
-    concepts) and then every subclass."""
+    they cover. Coverage = one step along `skos:related` (when `related`), then
+    the topic layer (narrower areas and their member concepts), then every
+    subclass."""
     if not class_ids:
         return []
     links = await topic_links(session)
+    if related:
+        area_iris = {a for _cid, _iri, _b, areas in links for a in areas}
+        class_ids = await with_related(session, class_ids, area_iris)
     iris = await session.execute(sql_text(
         "SELECT id, iri FROM graphrag.ontology_classes WHERE id = ANY(CAST(:ids AS uuid[]))"
     ), {"ids": [str(c) for c in class_ids]})

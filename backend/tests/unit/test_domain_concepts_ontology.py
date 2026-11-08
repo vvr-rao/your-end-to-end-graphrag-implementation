@@ -17,6 +17,7 @@ from backend.app.services.concept_areas import (
     classes_in_question,
     expand_topics,
     plan_retype,
+    related_step,
 )
 from backend.app.services.db_entity_extract import _normalize_name
 
@@ -365,6 +366,72 @@ def _reach(question: str) -> set[str]:
         if ancestors(c) & set(topic):
             out.add(c)
     return {name(c) for c in out}
+
+
+def _related(hit: list) -> list:
+    """`related_step` on the shipped file: roots are classes with no parent but
+    owl:Thing (or none), areas are the ConceptArea subclasses."""
+    g = graph()
+    related_of = {c: [str(r) for r in g.objects(c, SKOS.related)] for c in hit}
+    targets = {str(c): (c, not (parents(c) - {OWL.Thing})) for c in classes()}
+    return related_step(hit, related_of, targets, areas())
+
+
+def _reach_sideways(question: str) -> set[str]:
+    hit = _related(classes_in_question(question, _term_classes()))
+    topic = expand_topics(hit, _links(), {c: str(c) for c in hit})
+    out = set(topic)
+    for c in classes():
+        if ancestors(c) & set(topic):
+            out.add(c)
+    return {name(c) for c in out}
+
+
+def test_side_effects_reach_adverse_events_one_step_sideways():
+    assert "AdverseEvent" not in _reach("What are the side effects of ARBs?")
+    got = _reach_sideways("What are the side effects of ARBs?")
+    assert {"AdverseDrugReaction", "AdverseEvent", "SeriousAdverseEvent"} <= got
+
+
+def test_toxicity_reaches_adverse_events_and_fetal_harm():
+    got = _reach_sideways("Which drugs list toxicity in their warnings?")
+    assert {"Toxicity", "AdverseEvent", "SeriousAdverseEvent", "FetalHarm"} <= got
+    fetal = _reach_sideways("Which blood pressure medicines carry a fetal toxicity warning?")
+    assert {"FetalHarm", "Toxicity"} <= fetal
+    assert "AdverseEvent" not in fetal          # one step only: FetalHarm -> Toxicity, no further
+
+
+def test_related_step_is_one_step_and_symmetric_links_do_not_loop():
+    assert _related([DC.AdverseDrugReaction]) == [DC.AdverseDrugReaction, DC.AdverseEvent]
+    # EarningsCall -> EarningsRelease, QuarterlyResults; not their related in turn
+    got = _related([DC.EarningsCall])
+    assert got[0] == DC.EarningsCall and set(got[1:]) == {DC.EarningsRelease, DC.QuarterlyResults}
+
+
+def test_related_step_never_reaches_a_type_root():
+    assert DC.Outcome in set(graph().objects(DC.TrialEndpoint, SKOS.related))
+    assert DC.Outcome not in _related([DC.TrialEndpoint])
+    assert DC.Efficacy in _related([DC.TrialEndpoint])
+
+
+def test_related_step_skips_areas():
+    # DrugProperties (an area) names three areas as related: none is taken.
+    assert set(graph().objects(DC.DrugProperties, SKOS.related))
+    assert _related([DC.DrugProperties]) == [DC.DrugProperties]
+
+
+def test_gross_profit_sideways_adds_gross_margin_not_net_income():
+    got = _reach_sideways("What was Geely's gross profit in 2023?")
+    assert {"GrossProfit", "GrossMargin"} <= got
+    assert "NetIncome" not in got and "Profit" not in got
+
+
+def test_related_step_pure_rules():
+    targets = {"r#A": ("A", False), "r#Root": ("Root", True), "r#Area": ("Area", False)}
+    got = related_step(["X", "Y"], {"X": ["r#A", "r#Root", "r#Area", "r#missing"], "Y": ["r#A"]},
+                       targets, {"Area"})
+    assert got == ["X", "Y", "A"]
+    assert related_step(["Area"], {"Area": ["r#A"]}, targets, {"Area"}) == ["Area"]
 
 
 def test_financial_performance_reaches_revenue_cost_profit_and_margins():

@@ -992,6 +992,7 @@ async def retrieve_and_answer(
                 session, _area_classes,
                 [e for e in seed_entity_ids if e not in _concept_ids],
                 limit=int(_qa_cfg("concept_area_chunk_limit", 100)),
+                related=_qa_flag("concept_area_related", True),
             )
         if verbose and _area_classes:
             _labels = {c: label for c, label, _ in _term_classes}
