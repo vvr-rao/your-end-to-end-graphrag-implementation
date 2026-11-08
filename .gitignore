@@ -86,6 +86,16 @@ source_documents/*
 !source_documents/websearch_download.py
 !source_documents/financial_report_download.py
 !source_documents/salvage_mangled_pdfs.py
+!source_documents/structured_download.py
+# structured/ package: only code + README are tracked. Anything else written
+# inside it (e.g. downloads via -o source_documents/structured/...) stays ignored.
+!source_documents/structured/
+source_documents/structured/*
+!source_documents/structured/*.py
+!source_documents/structured/README.md
+!source_documents/structured/sources/
+source_documents/structured/sources/*
+!source_documents/structured/sources/*.py
 
 # User-supplied class suggestions are local config (domain-specific hints).
 # Repo ships a *.example.json template; the real file is gitignored.

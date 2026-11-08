@@ -1,0 +1,32 @@
+{
+  "totalCount": 2,
+  "studies": [
+    {
+      "protocolSection": {
+        "identificationModule": {"nctId": "NCT00000001", "orgStudyIdInfo": {"id": "0042"}, "briefTitle": "Trial A"},
+        "statusModule": {"overallStatus": "COMPLETED", "startDateStruct": {"date": "2020-01"}},
+        "sponsorCollaboratorsModule": {"leadSponsor": {"name": "Sponsor One", "class": "INDUSTRY"},
+                                       "collaborators": [{"name": "Uni Two", "class": "OTHER"}]},
+        "conditionsModule": {"conditions": ["Obesity", "Type 2 Diabetes"]},
+        "designModule": {"studyType": "INTERVENTIONAL", "phases": ["PHASE3"],
+                         "enrollmentInfo": {"count": 120, "type": "ACTUAL"}},
+        "armsInterventionsModule": {"interventions": [{"type": "DRUG", "name": "Drug X"}]},
+        "outcomesModule": {"primaryOutcomes": [{"measure": "Weight change", "timeFrame": "68 weeks"}],
+                           "secondaryOutcomes": [{"measure": "HbA1c", "timeFrame": "68 weeks"}]},
+        "contactsLocationsModule": {"locations": [
+          {"facility": "Site 1", "city": "Boston", "country": "United States", "zip": "02115"},
+          {"facility": "Site 2", "city": "Lyon", "country": "France"},
+          {"facility": "Site 3", "city": "Osaka", "country": "Japan"}]}
+      },
+      "hasResults": true,
+      "resultsSection": {"outcomeMeasuresModule": {"outcomeMeasures": []}}
+    },
+    {
+      "protocolSection": {
+        "identificationModule": {"nctId": "NCT00000002", "briefTitle": "Trial B"},
+        "conditionsModule": {"conditions": ["Obesity"]}
+      },
+      "hasResults": false
+    }
+  ]
+}

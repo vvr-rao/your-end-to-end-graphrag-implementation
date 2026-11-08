@@ -1,0 +1,23 @@
+{
+  "cik": 320193,
+  "entityName": "Example Corp",
+  "facts": {
+    "us-gaap": {
+      "Revenues": {
+        "label": "Revenues", "description": "Amount of revenue.",
+        "units": {"USD": [
+          {"start": "2023-10-01", "end": "2023-12-30", "val": 100, "accn": "0000320193-24-000006", "fy": 2024, "fp": "Q1", "form": "10-Q", "filed": "2024-02-02"},
+          {"start": "2023-10-01", "end": "2024-03-30", "val": 190, "accn": "0000320193-24-000069", "fy": 2024, "fp": "Q2", "form": "10-Q", "filed": "2024-05-03"},
+          {"start": "2023-10-01", "end": "2023-12-30", "val": 100, "accn": "0000320193-24-000069", "fy": 2024, "fp": "Q2", "form": "10-Q", "filed": "2024-05-03"},
+          {"start": "2023-10-01", "end": "2023-12-30", "val": 101, "accn": "0000320193-24-000099", "fy": 2024, "fp": "Q1", "form": "10-Q/A", "filed": "2024-06-01"}
+        ]}
+      },
+      "Assets": {
+        "label": "Assets", "description": "Total assets.",
+        "units": {"USD": [
+          {"end": "2023-12-30", "val": 5000, "accn": "0000320193-24-000006", "fy": 2024, "fp": "Q1", "form": "10-Q", "filed": "2024-02-02", "frame": "CY2023Q4I"}
+        ]}
+      }
+    }
+  }
+}

@@ -58,6 +58,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# source_documents/structured_download.py: Parquet -> CSV for Open Targets bulk
+# (`uv sync --extra structured`). Kept optional so the deployed image stays small.
+structured = [
+    "pyarrow>=15",
+]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
@@ -95,13 +100,15 @@ ignore = ["E501"]                        # handled by formatter
 
 [tool.ruff.lint.per-file-ignores]
 "backend/app/helpers/*" = ["N802", "N803", "N806"]   # ported helpers may use non-PEP-8 names
+"source_documents/structured/**" = ["RUF012"]  # source registry metadata: read-only class attributes
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["backend/tests"]
-addopts = "-q --strict-markers -m 'not slow'"
+addopts = "-q --strict-markers -m 'not slow and not live'"
 markers = [
     "slow: deselect by default; runs the multi-ontology deterministic merge across all sample ontologies",
+    "live: real network calls to public data APIs (opt-in: pytest -m live with YEGI_LIVE_TESTS=1)",
 ]
 
 [tool.coverage.run]

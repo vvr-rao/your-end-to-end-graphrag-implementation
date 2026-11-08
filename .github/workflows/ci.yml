@@ -70,6 +70,19 @@ jobs:
       - name: Test skill commands are shell-neutral
         run: uv run --python 3.12 pytest backend/tests/unit/test_skills_shell_neutral.py -v
 
+      # source_documents/structured_download.py and its structured/ package are
+      # run directly by users on any OS (paths, atomic .part renames, archive
+      # extraction, CSV newline/encoding handling). Fixture-only, no network.
+      # The EDGAR HTML->PDF test is deselected: WeasyPrint needs GTK system
+      # libraries (libgobject) that the macOS/Windows runners do not ship.
+      - name: Test structured-data downloaders (cross-platform)
+        run: >-
+          uv run --python 3.12 pytest -v
+          backend/tests/unit/test_structured_core.py
+          backend/tests/unit/test_structured_sources.py
+          backend/tests/unit/test_source_doc_downloaders.py
+          --deselect backend/tests/unit/test_source_doc_downloaders.py::test_edgar_html_to_pdf_returns_pdf_bytes
+
       # The ontology-build units the DeepInfra/scaling work added (junk rules,
       # pairwise dedup, audit, Stage-4 class indexes, concept-grouping batches,
       # GPU + memory sizing, the alias miner + LLM judge) are pure Python, so
