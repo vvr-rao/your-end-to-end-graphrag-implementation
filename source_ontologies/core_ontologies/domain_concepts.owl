@@ -2616,6 +2616,7 @@
         <skos:scopeNote xml:lang="en">Not attributed to the drug. Attributed effects are AdverseDrugReaction, a narrower kind; never merge the two.</skos:scopeNote>
         <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
         <skos:related rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#AdverseDrugReaction"/>
+        <skos:related rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Toxicity"/>
         <inConceptArea rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DrugSafety"/>
         <conceptTerm>adverse event</conceptTerm>
         <conceptTerm>adverse events</conceptTerm>
@@ -2664,7 +2665,27 @@
         <skos:definition>The degree to which a substance harms an organism.</skos:definition>
         <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
         <inConceptArea rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DrugSafety"/>
+        <skos:related rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#AdverseEvent"/>
+        <skos:related rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#FetalHarm"/>
         <conceptTerm>toxicity</conceptTerm>
+    </owl:Class>
+
+    <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#FetalHarm">
+        <rdf:type rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
+        <rdfs:subClassOf rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Condition"/>
+        <rdfs:label>FetalHarm</rdfs:label>
+        <skos:prefLabel xml:lang="en">fetal harm</skos:prefLabel>
+        <skos:altLabel xml:lang="en">fetal toxicity</skos:altLabel>
+        <skos:altLabel xml:lang="en">embryo-fetal toxicity</skos:altLabel>
+        <rdfs:comment>Injury or death of a developing fetus caused by exposure to a substance during pregnancy, as named in drug-label fetal toxicity warnings.</rdfs:comment>
+        <skos:definition>Injury or death of a developing fetus caused by exposure to a substance during pregnancy, as named in drug-label fetal toxicity warnings.</skos:definition>
+        <skos:scopeNote>Harm to the fetus only. Birth defects found after birth and maternal toxicity are separate; a contraindication in pregnancy is a Contraindication.</skos:scopeNote>
+        <skos:inScheme rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DomainConceptsScheme"/>
+        <inConceptArea rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#DrugSafety"/>
+        <skos:related rdf:resource="https://veerla-ramrao.ai/ontology/domain-concepts#Toxicity"/>
+        <conceptTerm>fetal harm</conceptTerm>
+        <conceptTerm>fetal toxicity</conceptTerm>
+        <conceptTerm>embryo-fetal toxicity</conceptTerm>
     </owl:Class>
 
     <owl:Class rdf:about="https://veerla-ramrao.ai/ontology/domain-concepts#Contraindication">

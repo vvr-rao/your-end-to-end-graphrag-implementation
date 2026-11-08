@@ -109,3 +109,71 @@ def test_streamed_stage2_matches_in_memory_merge(monkeypatch, tmp_path) -> None:
     assert ("operates", "x#Company", "Refineries") not in got["relations"]
     # InflationRate was proposed under Metric and x#EconomicConcept: the existing class wins.
     assert ("InflationRate", "x#EconomicConcept") in got["classes"]
+
+
+JUDGED = [
+    {"MATCH NOT FOUND": [
+        {"LABEL": "WeightLossDrug", "PARENT_LABEL": "x#Drug", "DESCRIPTION": "A drug for obesity."},
+        {"LABEL": "Refinery Unit", "PARENT_LABEL": "x#Facility", "DESCRIPTION": "Part of a refinery."}],
+     "MATCH NOT FOUND RELATIONS": [{"LABEL": "sells", "DOMAIN": "x#Company", "RANGE": "WeightLossDrug"}]},
+    {"MATCH NOT FOUND": [
+        {"LABEL": "WeightLossMedication", "PARENT_LABEL": "x#Drug", "DESCRIPTION": "A medicine for weight loss."},
+        {"LABEL": "Glp1Pen", "PARENT_LABEL": "WeightLossMedication", "DESCRIPTION": "An injector pen."},
+        {"LABEL": "Refining Plant", "PARENT_LABEL": "x#Facility", "DESCRIPTION": "A refinery."}],
+     "MATCH NOT FOUND RELATIONS": [{"LABEL": "treats", "DOMAIN": "WeightLossMedication", "RANGE": "x#Obesity"}],
+     "MATCH NOT FOUND INSTANCES": [{"LABEL": "Wegovy", "TYPE_LABEL": "WeightLossMedication"}]},
+]
+
+
+class _SameRouter(_Router):
+    """The pair judge calls every pair the same."""
+    async def chat(self, task, system, user):
+        return SimpleNamespace(text=json.dumps({"decisions": [{"id": i, "same": True} for i in range(50)]}))
+
+
+class _GroupEmb(_Emb):
+    """Weight-loss labels share one vector, refinery labels another."""
+    async def embed(self, texts):
+        out = []
+        for t in texts:
+            v = [0.0] * 1024
+            low = t.lower()
+            v[0 if "weight" in low else 1 if "refin" in low else 2 + sum(map(ord, t)) % 1000] = 1.0
+            out.append(v)
+        return out
+
+
+@pytest.mark.skipif(not DSN, reason="set ONTOLOGY_BUILD_TEST_DSN to a migrated database")
+def test_judged_merge_redirects_every_reference(monkeypatch, tmp_path) -> None:
+    """A merge the JUDGE made (labels that do not fold together) must redirect
+    relation endpoints, instance types and child parents to the surviving
+    class, and a merge onto an existing class must become a match. Before
+    2026-11-08 the rebuild read rows without `merged_into`, so only same-
+    spelling folds were redirected and prune-expand re-created the merged-away
+    class from the relation endpoint (WeightLossMedication in the pharma build)."""
+    monkeypatch.setenv("DATABASE_URL", DSN)
+    from backend.app.db.engine import reset_engine_cache
+
+    reset_engine_cache()
+    import backend.app.services.embeddings as emb_mod
+    import backend.app.services.pipeline_llm as pl
+    from backend.app.helpers.ontology_pruning import merge_llm_jsons_recursive
+
+    monkeypatch.setattr(emb_mod, "Embedder", _GroupEmb)
+    onto = {"classes_dict": {f"x#{n}": {"labels": [n], "name": n}
+                             for n in ("Drug", "Company", "Obesity", "Facility", "Refinery")}}
+    out = asyncio.run(pl._pairwise_stage3(_SameRouter(), merge_llm_jsons_recursive(copy.deepcopy(JUDGED)),
+                                          onto, tmp_path / "llm_audit.jsonl"))
+    got = _canon(out)
+    labels = [c[0] for c in got["classes"]]
+    assert labels.count("WeightLossDrug") + labels.count("WeightLossMedication") == 1
+    survivor = "WeightLossDrug" if "WeightLossDrug" in labels else "WeightLossMedication"
+    gone = "WeightLossMedication" if survivor == "WeightLossDrug" else "WeightLossDrug"
+    flat = json.dumps(got)
+    assert f'"{gone}"' not in flat
+    assert ("treats", survivor, "x#Obesity") in got["relations"]
+    assert ("Wegovy", survivor) in got["instances"]
+    assert ("Glp1Pen", survivor) in got["classes"]
+    # Refinery Unit / Refining Plant were judged the same as the EXISTING x#Refinery.
+    assert not {"Refinery Unit", "Refining Plant"} & set(labels)
+    assert "x#Refinery" in got["matches"]

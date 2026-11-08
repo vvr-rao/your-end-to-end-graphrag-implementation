@@ -1018,6 +1018,10 @@ qa:
   # own ranking vote. false turns the route off.
   concept_areas: true
   concept_area_chunk_limit: 100
+  # One step sideways first: a matched concept also brings the concepts it names
+  # with skos:related (side effects -> AdverseDrugReaction -> AdverseEvent).
+  # Never chained, never from/to an area, never to a type root.
+  concept_area_related: true
   rrf_weight_concept_area: 1.0
   # Search ALL artifacts by vector on every query (not only artifact_only mode)
   # and add them as candidates alongside the entity-linked ones. Candidates
