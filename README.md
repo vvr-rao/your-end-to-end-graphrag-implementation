@@ -1059,6 +1059,25 @@ uv run python source_documents/financial_report_download.py \
 
 Edit the `CONTACT` constant at the top of `financial_report_download.py` before running — SEC EDGAR blocks generic User-Agents.
 
+### Structured data (finance + pharma datasets)
+
+`source_documents/structured_download.py` downloads public structured datasets as
+provider-native files plus optional normalized CSV, with a `manifest.json` per run.
+This is acquisition only; ingestion comes in a later upgrade. Sources: SEC EDGAR,
+FRED/ALFRED, GLEIF, FFIEC CDR / Fed NIC, ClinicalTrials.gov / AACT, Drugs@FDA, FDA
+Orange Book, ChEMBL, Open Targets.
+
+```bash
+uv run python source_documents/structured_download.py list
+uv run python source_documents/structured_download.py gleif api --name "Apple Inc" --limit 2 --relationships --format csv
+uv run python source_documents/structured_download.py orangebook bulk --dataset flatfiles --dry-run
+```
+
+Credentials (`SEC_USER_AGENT`, `FRED_API_KEY`, optional `OPENFDA_API_KEY`,
+`FFIEC_USER_ID`/`FFIEC_TOKEN`) go in `.env`. Full options, output layout, and the
+live-tested vs fixture-tested status of each source are in
+[`source_documents/structured/README.md`](source_documents/structured/README.md).
+
 You can also download standard ontologies into `source_ontologies/`:
 
 ```bash

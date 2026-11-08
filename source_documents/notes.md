@@ -32,5 +32,18 @@ skipped. With `--allow-html`, the primary 10-K HTML body is fetched and
 rendered to PDF via WeasyPrint; if conversion fails the raw `.htm` is
 saved instead so the filing content isn't lost.
 
+## Structured data (CSV / TSV / JSON / Parquet)
+
+`structured_download.py` fetches bounded samples, or explicit bulk snapshots, of
+public finance data (SEC EDGAR, FRED, GLEIF, FFIEC/NIC) and pharma data
+(ClinicalTrials.gov/AACT, Drugs@FDA, Orange Book, ChEMBL, Open Targets). Each run
+writes a `manifest.json`. See `structured/README.md`.
+
+```bash
+uv run python source_documents/structured_download.py list
+uv run python source_documents/structured_download.py clinicaltrials api \
+  --condition obesity --limit 3 --format csv
+```
+
 Other useful sources of information
 - HKEX for Hong Kong listed securities. No API Available that I know of but you can go to their site and do a keyword search (e.g. "Annual Report") - https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&lang=EN&market=SEHK&stockId=130186
