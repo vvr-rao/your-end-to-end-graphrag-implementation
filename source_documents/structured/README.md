@@ -133,8 +133,14 @@ the error.
 ## What normalization preserves
 
 - **All values are text.** Leading zeros in CIKs, application and product numbers,
-  ZIP codes and NCT ids survive. Delimiters are explicit (tab, `~`, `|`). A row with
-  the wrong field count stops the conversion; a misaligned CSV is never written.
+  ZIP codes and NCT ids survive. Delimiters are explicit (tab, `~`, `|`). A misaligned
+  CSV is never written. In bulk/archive conversion, an isolated row with the wrong
+  field count (a provider data error) is moved to `normalized/<table>.rejects.csv`
+  (line number, field counts, raw fields), left out of the CSV, and reported as a
+  manifest warning; the native file is unchanged. If more than 1% of rows (and more
+  than 10) are wrong, the conversion fails instead, since that points to a wrong
+  delimiter or quoting rule. Example: Drugs@FDA `ApplicationDocs.txt` had one row with
+  an extra tab in the 2026-11 snapshot.
 - **SEC:** one row per reported fact. Amended (`10-Q/A`) and repeated observations
   are all kept, along with accession numbers, form, filed date, fy/fp, frame and
   unit. Year-to-date durations are **not** turned into quarterly values; use
@@ -170,7 +176,7 @@ the error.
 | Source / path | Status |
 |---|---|
 | ClinicalTrials.gov API, Drugs@FDA API, Orange Book API, GLEIF API (+ relationships), ChEMBL API, Open Targets GraphQL | **Live-tested** with bounded samples (`YEGI_LIVE_TESTS=1 uv run pytest -m live`), plus fixture tests. |
-| GLEIF Golden Copy, ChEMBL release, Open Targets release, openFDA `download.json`, FDA Orange Book zip | Live `--dry-run` (listings, HEAD, manifest) only. Bulk transfers are **fixture-tested**; no bulk file was downloaded during development. |
+| GLEIF Golden Copy, ChEMBL release, Open Targets release, openFDA `download.json`, FDA Drugs@FDA + Orange Book zips | **Bulk live-tested 2026-11-08**: Orange Book + Drugs@FDA flat files `--format csv`, openFDA Orange Book JSON, GLEIF lei2 IntraDay delta and rr full (492,776 rows, matches the published count), ChEMBL 37 chemreps (SHA-256 matched `checksums.txt`), Open Targets 26.09 `target` `--max-files 1 --format csv` (sample). Peak memory 37-311 MB. Other datasets/assets of these sources: `--dry-run` only. |
 | SEC EDGAR API (companyfacts, submissions) | **Live-tested** 2026-11-08 with a real `SEC_USER_AGENT`. Bulk FSDS: live `--dry-run` only (2024q1.zip, 124 MB); archive contents checked by range request; transfer fixture-tested. |
 | FRED / ALFRED | **Live-tested** 2026-11-08 (observations, series metadata, vintage dates). Vintage responses (output_type 2/3) come back wide and are unpivoted to `vintage_date` rows. Zipped-CSV native type is fixture-tested. |
 | FFIEC CDR REST API | **Fixture-tested only** (no PWS account). It follows spec CDR-PDD-SIS-611 v1.10. The facsimile response decoding accepts base64 or byte-array JSON, because the spec only says "byte stream array"; an unrecognised shape is saved raw with a warning. |

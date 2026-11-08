@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import tarfile
 import zipfile
 
@@ -275,8 +276,9 @@ def test_delimited_conversion_keeps_leading_zeros(tmp_path, delim, name):
     src = tmp_path / f"t.{name}.txt"
     src.write_text(delim.join(["Appl_No", "Product_No", "Name"]) + "\n"
                    + delim.join(["004567", "001", 'Brand "X", 5mg']) + "\n", encoding="utf-8")
-    rows, header, _ = _tabular.convert_delimited(src, tmp_path / "t.csv", delimiter=delim)
-    assert rows == 1 and header == ["Appl_No", "Product_No", "Name"]
+    conv = _tabular.convert_delimited(src, tmp_path / "t.csv", delimiter=delim)
+    assert conv.rows == 1 and conv.header == ["Appl_No", "Product_No", "Name"]
+    assert conv.rejected == 0
     with (tmp_path / "t.csv").open(newline="", encoding="utf-8") as fh:
         data = list(csv.reader(fh))
     assert data[1] == ["004567", "001", 'Brand "X", 5mg']
@@ -290,11 +292,39 @@ def test_wrong_delimiter_fails_loudly(tmp_path):
     assert not (tmp_path / "t.csv").exists()
 
 
+def test_isolated_ragged_row_is_quarantined_not_repaired(tmp_path):
+    # Real case (Drugs@FDA ApplicationDocs.txt, 2026-11-06): one row of 81k carries
+    # an extra empty field between URL and date. Never shift it; quarantine it.
+    good = [f"{i}\t2\t21949{i}\tORIG\thttp://x/{i}.pdf\t2026-01-05" for i in range(200)]
+    bad = "84630\t2\t206627\tSUPPL\thttp://x/b.pdf\t\t2026-01-06"
+    src = tmp_path / "ApplicationDocs.txt"
+    src.write_text("ID\tType\tApplNo\tSub\tURL\tDate\r\n"
+                   + "\r\n".join([*good[:100], bad, *good[100:]]) + "\r\n")
+    rej = tmp_path / "ApplicationDocs.rejects.csv"
+    conv = _tabular.convert_delimited(src, tmp_path / "out.csv", delimiter="\t", rejects=rej)
+    assert (conv.rows, conv.rejected) == (200, 1)
+    with rej.open(newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    assert rows[0]["line_number"] == "102" and rows[0]["field_count"] == "7"
+    assert json.loads(rows[0]["fields_json"])[0] == "84630"
+    out = (tmp_path / "out.csv").read_text()
+    assert "84630" not in out and out.count("\n") == 201
+
+
+def test_widespread_ragged_rows_still_fail(tmp_path):
+    src = tmp_path / "t.txt"
+    src.write_text("a~b~c\n" + "1~2\n" * 50 + "1~2~3\n" * 50)
+    with pytest.raises(ValueError, match="misaligned"):
+        _tabular.convert_delimited(src, tmp_path / "t.csv", delimiter="~",
+                                   rejects=tmp_path / "r.csv")
+    assert not (tmp_path / "t.csv").exists() and not (tmp_path / "r.csv").exists()
+
+
 def test_cp1252_input_detected(tmp_path):
     src = tmp_path / "t.txt"
     src.write_bytes("Name\tCity\nCaf\xe9\tS\xe3o\n".encode("cp1252"))
-    _rows, _, enc = _tabular.convert_delimited(src, tmp_path / "t.csv", delimiter="\t")
-    assert enc == "cp1252" and "Café" in (tmp_path / "t.csv").read_text(encoding="utf-8")
+    conv = _tabular.convert_delimited(src, tmp_path / "t.csv", delimiter="\t")
+    assert conv.encoding == "cp1252" and "Café" in (tmp_path / "t.csv").read_text(encoding="utf-8")
 
 
 def test_null_markers_only_in_conversion(tmp_path):

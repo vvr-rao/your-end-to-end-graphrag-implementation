@@ -15,7 +15,7 @@ import os
 import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 DELIMITERS = {"comma": ",", "tab": "\t", "tilde": "~", "pipe": "|"}
 DELIMITER_NAMES = {v: k for k, v in DELIMITERS.items()}
@@ -61,6 +61,13 @@ def iter_rows(path: Path, delimiter: str, *, quoting: int = csv.QUOTE_NONE,
         yield from csv.reader(fh, delimiter=delimiter, quoting=quoting)
 
 
+class Conversion(NamedTuple):
+    rows: int                 # data rows written
+    header: list[str]
+    encoding: str             # source encoding used
+    rejected: int = 0         # misaligned rows quarantined (never repaired)
+
+
 def convert_delimited(
     src: Path,
     dst: Path,
@@ -70,20 +77,42 @@ def convert_delimited(
     null_markers: Iterable[str] = (),
     encoding: str | None = None,
     strip_trailing_empty: bool = True,
-) -> tuple[int, list[str], str]:
+    rejects: Path | None = None,
+    max_reject_fraction: float = 0.01,
+    min_reject_limit: int = 10,
+) -> Conversion:
     """Convert a native delimited table to RFC-4180 CSV (UTF-8, ``\\n``).
 
     Values are copied verbatim (strings), except that cells equal to one of
-    ``null_markers`` become empty. Returns ``(data_rows, header, encoding)``.
-    A ragged row (wrong field count) raises ValueError naming the line, so a
-    wrong delimiter is never silently accepted.
+    ``null_markers`` become empty.
+
+    A ragged row (wrong field count) is never shifted or repaired:
+
+    * without ``rejects`` it raises ValueError naming the line;
+    * with ``rejects`` it is written, untouched, to that quarantine CSV
+      (line number, field count, original fields as JSON) and skipped. If the
+      rejects exceed ``max(min_reject_limit, max_reject_fraction * rows)`` the
+      conversion still fails -- that pattern means a wrong delimiter or
+      quoting rule, not an isolated provider error.
     """
+    import json as _json
+
     enc = encoding or detect_encoding(src)
     nulls = set(null_markers)
     dst.parent.mkdir(parents=True, exist_ok=True)
     part = dst.with_name(dst.name + ".part")
+    rej_part = rejects.with_name(rejects.name + ".part") if rejects else None
+    rej_fh = None
+    rej_writer = None
     rows = 0
+    rejected = 0
     header: list[str] = []
+
+    def too_many(final: bool) -> bool:
+        if rejected <= min_reject_limit:
+            return False
+        return rejected > rows if not final else rejected > max_reject_fraction * (rows + rejected)
+
     try:
         with _open_text(src, enc) as fin, part.open("w", encoding="utf-8", newline="") as fout:
             reader = csv.reader(fin, delimiter=delimiter, quoting=quoting)
@@ -101,19 +130,44 @@ def convert_delimited(
                 if not row or (len(row) == 1 and row[0] == ""):
                     continue
                 if len(row) != len(header):
-                    raise ValueError(
-                        f"{src.name} line {lineno}: {len(row)} fields, header has "
-                        f"{len(header)} (delimiter {delimiter_name(delimiter)}). "
-                        f"Refusing to write a misaligned CSV.")
+                    msg = (f"{src.name} line {lineno}: {len(row)} fields, header has "
+                           f"{len(header)} (delimiter {delimiter_name(delimiter)})")
+                    if rej_part is None:
+                        raise ValueError(msg + ". Refusing to write a misaligned CSV.")
+                    if rej_writer is None:
+                        rej_part.parent.mkdir(parents=True, exist_ok=True)
+                        rej_fh = rej_part.open("w", encoding="utf-8", newline="")
+                        rej_writer = csv.writer(rej_fh, lineterminator="\n")
+                        rej_writer.writerow(["line_number", "field_count", "expected_fields",
+                                             "fields_json"])
+                    rej_writer.writerow([lineno, len(row), len(header),
+                                         _json.dumps(row, ensure_ascii=False)])
+                    rejected += 1
+                    if too_many(final=False):
+                        raise ValueError(msg + f"; {rejected} misaligned rows so far -- "
+                                         f"wrong delimiter or quoting? Refusing to convert.")
+                    continue
                 if nulls:
                     row = ["" if v in nulls else v for v in row]
                 writer.writerow(row)
                 rows += 1
+        if too_many(final=True):
+            raise ValueError(f"{src.name}: {rejected} of {rows + rejected} rows misaligned "
+                             f"(> {max_reject_fraction:.0%}); refusing to convert -- check the "
+                             f"delimiter / quoting rule.")
+        if rej_fh is not None:
+            rej_fh.close()
+            rej_fh = None
+            os.replace(rej_part, rejects)
         os.replace(part, dst)
     except BaseException:
+        if rej_fh is not None:
+            rej_fh.close()
         part.unlink(missing_ok=True)
+        if rej_part is not None:
+            rej_part.unlink(missing_ok=True)
         raise
-    return rows, header, enc
+    return Conversion(rows, header, enc, rejected)
 
 
 def count_data_rows(path: Path, delimiter: str, *, quoting: int = csv.QUOTE_NONE,

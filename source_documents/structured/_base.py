@@ -248,13 +248,24 @@ def ingest_archive(ctx: Context, archive: Path, *, delimiter: str | None,
         out.append(f)
         if convert and is_table:
             dst = ctx.path("normalized") / (f.stem + ".csv")
-            n, _hdr, enc = convert_delimited(f, dst, delimiter=delimiter, quoting=q,
-                                             null_markers=null_markers)
+            rej = ctx.path("normalized") / (f.stem + ".rejects.csv")
+            conv = convert_delimited(f, dst, delimiter=delimiter, quoting=q,
+                                     null_markers=null_markers, rejects=rej)
             ctx.manifest.add_file(ctx.root, dst, role="normalized", format="csv",
-                                  delimiter="comma", rows=n, derived_from=[f])
+                                  delimiter="comma", rows=conv.rows, derived_from=[f])
             ctx.manifest.transformations.append(
                 f"{f.name}: {delimiter_name(delimiter)} -> CSV (values copied as strings; "
-                f"source encoding {enc})")
+                f"source encoding {conv.encoding})")
+            if conv.rejected:
+                ctx.manifest.add_file(
+                    ctx.root, rej, role="rejected", format="csv", delimiter="comma",
+                    rows=conv.rejected, derived_from=[f],
+                    description="provider rows with the wrong field count, kept verbatim "
+                                "and NOT included in the normalized table")
+                ctx.manifest.warn(
+                    f"{f.name}: {conv.rejected} of {conv.rows + conv.rejected} rows have the "
+                    f"wrong field count (provider data error); quarantined in {rej.name}, "
+                    f"left out of {dst.name}; the native file is unchanged")
     return out
 
 

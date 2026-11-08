@@ -250,6 +250,30 @@ def test_orange_book_flatfiles_tilde_to_csv(tmp_path):
     assert any(f["path"] == "native/orangebook_flatfiles.zip" for f in m["files"])
 
 
+def test_bulk_flatfile_with_one_bad_row_completes_with_warning(tmp_path):
+    good = "".join(f"{i}\tORIG\thttp://x/{i}.pdf\t2026-01-05\n" for i in range(50))
+    payload = _zip_bytes({"ApplicationDocs.txt": "ID\tSub\tURL\tDate\n" + good
+                          + "9\tSUPPL\thttp://x/9.pdf\t\t2026-01-06\n",
+                          "Products.txt": "ApplNo\tProductNo\n004567\t001\n"})
+
+    def handler(method, url, params, headers, body):
+        if method == "HEAD":
+            return FakeResponse(200, b"", {})
+        return FakeResponse(200, payload)
+
+    rc = run_cli(["drugsfda", "bulk", "--dataset", "flatfiles", "--format", "csv",
+                  "-o", str(tmp_path)], FakeSession(handler))
+    assert rc == 0
+    m = load_manifest(tmp_path)
+    assert m["status"] == "complete"
+    assert any("1 of 51 rows" in w for w in m["warnings"])
+    rej = next(f for f in m["files"] if f["role"] == "rejected")
+    assert rej["rows"] == 1 and rej["path"] == "normalized/ApplicationDocs.rejects.csv"
+    root = only_root(tmp_path)
+    assert read_csv(root / "normalized" / "Products.csv")[0]["ApplNo"] == "004567"
+    assert len(read_csv(root / "normalized" / "ApplicationDocs.csv")) == 50
+
+
 def test_bulk_snapshot_not_overwritten_silently_and_resume_skips(tmp_path, capsys):
     payload = _zip_bytes({"Products.txt": "a\tb\n1\t2\n"})
     gets = []
