@@ -1,0 +1,86 @@
+{
+  "option": {
+    "gpu": "B200-180GB",
+    "num_gpus": 2,
+    "instances": 1,
+    "precision": "fp8",
+    "repo": "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8",
+    "usd_hr": 7.38,
+    "label": "2x B200-180GB fp8 (Qwen3-VL-235B-A22B)",
+    "weights_gb": 236.0
+  },
+  "estimate": {
+    "hours": 0.5,
+    "usd": 3.69
+  },
+  "concurrency": {
+    "table_extraction": 3
+  },
+  "max_batch_size": 24,
+  "fallbacks": [
+    {
+      "option": {
+        "gpu": "H200-141GB",
+        "num_gpus": 4,
+        "instances": 1,
+        "precision": "fp8",
+        "repo": "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8",
+        "usd_hr": 10.76,
+        "label": "4x H200-141GB fp8 (Qwen3-VL-235B-A22B)",
+        "weights_gb": 236.0
+      },
+      "estimate": {
+        "hours": 0.5,
+        "usd": 5.38
+      },
+      "concurrency": {
+        "table_extraction": 3
+      },
+      "max_batch_size": 24
+    },
+    {
+      "option": {
+        "gpu": "H100-80GB",
+        "num_gpus": 4,
+        "instances": 1,
+        "precision": "fp8",
+        "repo": "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8",
+        "usd_hr": 8.8,
+        "label": "4x H100-80GB fp8 (Qwen3-VL-235B-A22B)",
+        "weights_gb": 236.0
+      },
+      "estimate": {
+        "hours": 0.5,
+        "usd": 4.4
+      },
+      "concurrency": {
+        "table_extraction": 3
+      },
+      "max_batch_size": 24
+    }
+  ],
+  "active": {
+    "option": {
+      "gpu": "H200-141GB",
+      "num_gpus": 4,
+      "instances": 1,
+      "precision": "fp8",
+      "repo": "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8",
+      "usd_hr": 10.76,
+      "label": "4x H200-141GB fp8 (Qwen3-VL-235B-A22B)",
+      "weights_gb": 236.0
+    },
+    "estimate": {
+      "hours": 0.5,
+      "usd": 5.38
+    },
+    "concurrency": {
+      "table_extraction": 3
+    },
+    "max_batch_size": 24,
+    "deploy_id": "D9CTePbpfKqZ8JGu",
+    "model_name": "qwenvl235-ep-11071916-h200-11071916",
+    "state": "running",
+    "at": "2026-11-07T19:26:45"
+  }
+}

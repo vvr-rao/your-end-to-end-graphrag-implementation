@@ -111,8 +111,8 @@ another model.
 > concurrency and written by `--apply` / `--apply-concurrency`. Read both out:
 > pages in flight are what shortens a long filing. In DeepInfra mode **host
 > the table-vision model** (recommended; serverless Qwen3-VL ran ~60-250 s per
-> page, 3-12 min on a slow day, vs ~6-7x faster hosted; the 235B needs 2x B200,
-> it does not start on 2x H200) — see choose-llm-mode,
+> page, 3-12 min on a slow day, vs ~6-7x faster hosted; the 235B runs on 2x B200, falling back to 4x H200 then 4x H100;
+> never 2x H200, where it does not start) — see choose-llm-mode,
 > "Table vision: HOST it", for the separate deployment and the cache-key rule.
 >
 > **Verify this machine's memory first** (the one these skills and the detached

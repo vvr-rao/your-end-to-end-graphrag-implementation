@@ -614,7 +614,29 @@ async def _propose_for_chunk(
                 reasons[d["reason"]] = reasons.get(d["reason"], 0) + 1
             print(f"[stage2] chunk #{chunk.index} ({chunk.source_name}) junk rules dropped "
                   f"{len(drops)}: " + ", ".join(f"{k}={v}" for k, v in sorted(reasons.items())))
+    parsed = _ground_relation_endpoints(parsed, spec, chunk, loaded_ontology)
     return _apply_class_budget(parsed, spec, chunk)
+
+
+def _ground_relation_endpoints(parsed: dict[str, Any] | None, spec: dict[str, Any],
+                               chunk: TextChunk, loaded_ontology: dict[str, Any]) -> dict[str, Any] | None:
+    """Drop relations whose would-be-new endpoint class is not in the chunk
+    text (see relation_endpoint_grounding). On unless the task sets
+    `ground_relation_endpoints: false`; `max_new_endpoint_classes` caps the
+    new endpoint classes one chunk can create."""
+    if not parsed or spec.get("ground_relation_endpoints") is False:
+        return parsed
+    from backend.app.services import relation_endpoint_grounding as reg
+
+    parsed, stats = reg.ground_relations(
+        parsed, chunk.text, reg.known_labels(loaded_ontology),
+        max_new=int(spec.get("max_new_endpoint_classes") or reg.DEFAULT_MAX_NEW_ENDPOINTS),
+    )
+    if stats["ungrounded"] or stats["over_cap"]:
+        print(f"[stage2] chunk #{chunk.index} ({chunk.source_name}) relations dropped: "
+              f"{stats['ungrounded']} with an endpoint not in the text, {stats['over_cap']} over the "
+              f"{spec.get('max_new_endpoint_classes') or reg.DEFAULT_MAX_NEW_ENDPOINTS} new-endpoint cap")
+    return parsed
 
 
 def _apply_class_budget(parsed: dict[str, Any] | None, spec: dict[str, Any],
@@ -4532,6 +4554,22 @@ async def _run(
         if skipped_rels:
             for s in skipped_rels:
                 print(f"[stage4]   skipped relation: {s.get('reason')} -> {s.get('relation')}")
+
+        # Endpoint-class review: classes minted from relation endpoints carry a
+        # parent copied from the other end and a placeholder definition. One
+        # batched call keeps/drops each, picks a root parent and defines it.
+        # Runs when models.yaml defines `endpoint_class_review`.
+        from backend.app.services.endpoint_class_review import review_endpoint_classes
+
+        ecr = await review_endpoint_classes(
+            out_ontology, router, only=list(created), created_props=list(created_props))
+        if ecr and ecr.get("items"):
+            _append_audit(audit_path, -1, "endpoint_class_review", None, ecr)
+            gone = set(created) - set(out_ontology.get("classes_dict", {}))
+            if gone:
+                created = [c for c in created if c not in gone]
+                created_props = [p for p in created_props
+                                 if p in out_ontology.get("object_properties_dict", {})]
 
         # Layer G: top-level concept grouping (one LLM call). Collects the
         # remaining orphan classes (still parented at owl:Thing after the
