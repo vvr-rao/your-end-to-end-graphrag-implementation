@@ -123,3 +123,13 @@ def test_list_param_written_as_text_is_parsed():
     got = coerce_params({"fys": "['2022', '2023']", "tags": "Revenue, ProfitLoss"},
                         [{"name": "fys", "type": "integer[]"}, {"name": "tags", "type": "text[]"}])
     assert got == {"fys": [2022, 2023], "tags": ["Revenue", "ProfitLoss"]}
+
+
+def test_year_of_a_text_period_uses_its_first_four_characters():
+    cols = {"prices": {"period": "text", "value": "numeric"}}
+    b = build_sql({"select": [{"agg": "avg", "column": "value", "as": "avg"}],
+                   "where": [{"column": {"column": "period", "fn": "year"}, "op": "=", "param": "year"}]},
+                  "prices", cols)
+    assert 'CAST(substr(CAST("period" AS text), 1, 4) AS integer) = CAST(:year AS bigint)' in b.sql
+    with pytest.raises(QuerySpecError, match="needs a date column"):
+        build_sql({"select": [{"column": "period", "fn": "month"}]}, "prices", cols)

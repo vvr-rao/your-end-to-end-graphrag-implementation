@@ -131,9 +131,15 @@ class _Ctx:
                 raise QuerySpecError(f"fn must be one of {', '.join(FNS)} (got {fn!r})")
             if fn == "lower":
                 sql, ctype = f"lower({sql})", "text"
+            elif ctype in {"date", "timestamp"}:
+                sql, ctype = f"CAST(EXTRACT({fn.upper()} FROM {sql}) AS integer)", "integer"
+            elif fn == "year" and ctype in {"text", "integer"}:
+                # Text periods come as '2024', '2024-03', '2024M03', '2024Q1':
+                # the year is always the first four characters.
+                sql, ctype = f"CAST(substr(CAST({sql} AS text), 1, 4) AS integer)", "integer"
             else:
-                arg = sql if ctype in {"date", "timestamp"} else f"CAST({sql} AS date)"
-                sql, ctype = f"CAST(EXTRACT({fn.upper()} FROM {arg}) AS integer)", "integer"
+                raise QuerySpecError(f"fn {fn} needs a date column ('{name}' is {ctype}); "
+                                     "filter the period text with between instead")
             out = f"{fn}_{name}"
         return sql, ctype, table, out
 
