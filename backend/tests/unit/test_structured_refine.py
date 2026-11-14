@@ -179,6 +179,12 @@ async def test_refine_defines_measures_tests_queries_and_caches(db, tmp_path):
     assert qr.result.error is None
     vals = [(str(r[1]), float(r[2])) for r in qr.result.rows]
     assert vals == [(f"{y}-12-31", _value("A", "Sales", y)) for y in (2021, 2022, 2023, 2024)]
+    # the entity param is optional: left out, the measure lists EVERY entity
+    assert next(p for p in meta["measures"][0]["params"] if p["name"] == "entity")["optional"] is True
+    every = await qrun.run("reports", {"period_end_from": "2024-01-01", "period_end_to": "2024-12-31"},
+                           query_id="measure_sales")
+    assert every.result.error is None
+    assert len({r[0] for r in every.result.rows}) > 1
 
     # Markdown round-trip keeps the measure definition and usage notes
     back = apply_markdown(meta, to_markdown(meta))
@@ -189,6 +195,13 @@ async def test_refine_defines_measures_tests_queries_and_caches(db, tmp_path):
     again = FakeRouter({})
     assert await refine_registered(again, cache=cache, embed=_fake_embed, log=lambda *_: None) == []
     assert again.calls == []
+    # relink rebuilds the measure queries from their definitions, still no LLM
+    sql_before = meta["measures"][0]["sql"]
+    await refine_registered(again, cache=cache, embed=_fake_embed, relink=True, log=lambda *_: None)
+    assert again.calls == []
+    async with db() as s:
+        relinked = (await registered_tables(s))["reports"]["meta"]
+    assert relinked["measures"][0]["sql"] == sql_before
     cached = cache.get(meta["cache_key"], "reports")
     assert cached["refined"]["version"] == REFINE_VERSION and cached.get("profile")
     assert json.dumps(cached["measures"][0]["query"])          # stored spec, not SQL text only

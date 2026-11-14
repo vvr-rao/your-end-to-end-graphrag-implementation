@@ -159,12 +159,23 @@ def measure_item(m: dict, meta: dict) -> dict:
         where.append({"column": m["item"]["column"], "op": "in" if len(vals) > 1 else "=",
                       "value": vals if len(vals) > 1 else vals[0]})
     where.append({"column": m["value_column"], "op": "not_null"})
-    where.append({"column": key, "op": "=", "param": key})
+    # entity + item parameters are optional: leaving them out lists the
+    # measure for EVERY entity/item (qualifiers and the period stay required,
+    # so a listing never mixes units, bases or granularities)
+    where.append({"column": key, "op": "=", "param": key, "optional": True})
     for d in m.get("param_columns") or []:
-        where.append({"column": d, "op": "=", "param": d})
+        where.append({"column": d, "op": "=", "param": d, "optional": True})
+    # a qualifier the entity/item column (nearly) determines -- each item has
+    # its own unit, say -- is optional too: fixing it would drop the other
+    # items from a listing, and leaving it out mixes nothing (it is per item)
+    an = meta.get("analysis") or {}
+    described = {d for c in [key, *(m.get("param_columns") or [])]
+                 for d in [*(an.get("dependencies") or {}).get(c, []),
+                           *(an.get("near_dependencies") or {}).get(c, [])]}
     for q in m["qualifier_columns"]:
         if len((domains.get(q) or {}).get("values") or []) > 1:
-            where.append({"column": q, "op": "=", "param": q})
+            where.append({"column": q, "op": "=", "param": q,
+                          **({"optional": True} if q in described else {})})
     if m["period_columns"]:
         p = m["period_columns"][-1]
         where.append({"column": p, "op": "between", "param": [f"{p}_from", f"{p}_to"]})
@@ -184,6 +195,23 @@ def measure_item(m: dict, meta: dict) -> dict:
                             + ".").strip(),
             "columns": sel, "class_iri": None, "class_label": None,
             "query": spec, "params": [], "sql": "", "measure": m}
+
+
+def rebuild_measures(meta: dict, all_types: dict[str, dict[str, str]]) -> list[dict]:
+    """Re-derive every measure query from its stored definition (no LLM), so
+    a change to how measures are built reaches already-refined tables. A
+    measure that no longer compiles keeps its previous query."""
+    out = []
+    for it in meta.get("measures") or []:
+        m = it.get("measure")
+        if not isinstance(m, dict):
+            out.append(it)
+            continue
+        new = measure_item(m, meta)
+        for k in ("class_iri", "class_label"):
+            new[k] = it.get(k)
+        out.append(new if finalize_item(meta, "measures", new, all_types) is None else it)
+    return out
 
 
 # ------------------------------------------------------------------ tests
@@ -565,6 +593,9 @@ async def refine_registered(router, *, tables: list[str] | None = None, refresh:
                 continue
             # no LLM: re-derive tags and graph links (classes, entities, periods, places)
             async with session_scope() as s:
+                meta["analysis"] = await analyze_table(s, meta)       # SQL only
+            meta["measures"] = rebuild_measures(meta, all_types)
+            async with session_scope() as s:
                 await _measure_classes(s, meta)
             tag_items(meta)
             rep = {"relinked": True, "llm_calls": 0}
@@ -594,6 +625,13 @@ async def refine_registered(router, *, tables: list[str] | None = None, refresh:
     return reports
 
 
-__all__ = ["REFINE_VERSION", "measure_item", "normalize_measure", "refine_registered", "refine_table",
-           "test_item"]
+__all__ = [
+    "REFINE_VERSION",
+    "measure_item",
+    "normalize_measure",
+    "rebuild_measures",
+    "refine_registered",
+    "refine_table",
+    "test_item",
+]
 _ = SECTIONS  # measures is one of the item sections

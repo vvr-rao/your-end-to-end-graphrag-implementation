@@ -17,6 +17,8 @@ Spec shape::
       "join":     {"table": "other", "on": [{"column": "a", "other_column": "b"}]},
       "where":    [{"column": COL, "op": OP, "param": "name" | ["from", "to"]}
                    | {"column": COL, "op": OP, "value": literal}],
+                                         # "optional": true on a single-param filter: a null /
+                                         # omitted value drops the filter (every value)
       "group_by": [COL],                 # optional: derived from select
       "order_by": [{"column": COL | "alias", "dir": "asc|desc"}],
       "limit":    10 | {"param": "n"}
@@ -92,6 +94,7 @@ class _Ctx:
                 raise QuerySpecError("a table cannot join itself")
             self.other = other
         self.params: dict[str, dict] = {}
+        self._seen: set[str] = set()
         self.aliases: set[str] = set()
         self.fn_alias: dict[str, str] = {}     # raw column sql -> alias of fn(column) in select
 
@@ -143,7 +146,7 @@ class _Ctx:
             out = f"{fn}_{name}"
         return sql, ctype, table, out
 
-    def param(self, name, ptype: str, column: str) -> str:
+    def param(self, name, ptype: str, column: str, *, optional: bool = False) -> str:
         name = str(name or "").lstrip(":")
         if not _NAME.match(name):
             raise QuerySpecError(f"bad parameter name {name!r} (use snake_case)")
@@ -154,6 +157,11 @@ class _Ctx:
         if prev and prev["type"] != ptype:
             raise QuerySpecError(f"parameter '{name}' is used as {prev['type']} and as {ptype}")
         self.params.setdefault(name, {"name": name, "type": ptype, "column": column})
+        if not optional:
+            self.params[name].pop("optional", None)      # required anywhere -> required
+        elif name not in self._seen:
+            self.params[name]["optional"] = True
+        self._seen.add(name)
         base = ptype[:-2] if ptype.endswith("[]") else ptype
         pg = PG_TYPES.get(base, "text") + ("[]" if ptype.endswith("[]") else "")
         return f"CAST(:{name} AS {pg})"
@@ -221,12 +229,21 @@ def _where(ctx: _Ctx, cond: dict) -> str:
         lo, hi = ((ctx.param(p, ctype, out) for p in pair) if has_param else (_lit(v) for v in pair))
         return f"{sql} BETWEEN {lo} AND {hi}"
     if op == "in":
+        if has_param and cond.get("optional"):
+            rhs = ctx.param(cond["param"], ctype + "[]", out, optional=True)
+            return f"({rhs} IS NULL OR {sql} = ANY({rhs}))"
         if has_param:
             return f"{sql} = ANY({ctx.param(cond['param'], ctype + '[]', out)})"
         vals = cond["value"] if isinstance(cond["value"], list) else [cond["value"]]
         if not vals:
             raise QuerySpecError(f"in on '{out}' needs at least one value")
         return f"{sql} IN ({', '.join(_lit(v) for v in vals)})"
+    if has_param and cond.get("optional"):
+        if not isinstance(cond["param"], str) or op not in {"=", "in"}:
+            raise QuerySpecError(f"optional on '{out}': only a single '=' or 'in' param can be optional")
+    if op == "=" and has_param and cond.get("optional"):
+        rhs = ctx.param(cond["param"], ctype, out, optional=True)
+        return f"({rhs} IS NULL OR {sql} = {rhs})"
     rhs = ctx.param(cond["param"], ctype, out) if has_param else _lit(cond["value"])
     return f"{sql} {COMPARE[op]} {rhs}"
 
@@ -368,7 +385,8 @@ def merge_params(built: Built, declared: list[dict] | None) -> list[dict]:
         ex = d.get("example")
         out.append({"name": p["name"], "type": p["type"], "column": p["column"] or None,
                     "description": str(d.get("description") or ""),
-                    "example": None if ex in (None, "") else (ex if isinstance(ex, list) else str(ex))})
+                    "example": None if ex in (None, "") else (ex if isinstance(ex, list) else str(ex)),
+                    **({"optional": True} if p.get("optional") else {})})
     return out
 
 
@@ -382,7 +400,7 @@ def spec_join_for(item: dict) -> dict | None:
 
 
 _ORDER = ["from", "select", "distinct", "distinct_on", "join", "where", "group_by", "order_by", "limit",
-          "table", "column", "fn", "agg", "op", "param", "value", "as", "dir", "on", "other_column"]
+          "table", "column", "fn", "agg", "op", "param", "optional", "value", "as", "dir", "on", "other_column"]
 
 
 def canonical(node):

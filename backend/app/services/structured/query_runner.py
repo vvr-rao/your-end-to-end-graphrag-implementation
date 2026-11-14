@@ -73,7 +73,7 @@ async def prepare(table: str, *, query_id: str | None = None, spec: dict | None 
 async def run(table: str, params: dict[str, Any], *, query_id: str | None = None,
               spec: dict | None = None, max_rows: int = 50, timeout_ms: int = 5000) -> QueryRun:
     qr = await prepare(table, query_id=query_id, spec=spec)
-    missing = [p["name"] for p in qr.built.params if p["name"] not in params]
+    missing = [p["name"] for p in qr.built.params if p["name"] not in params and not p.get("optional")]
     if missing:
         raise QueryRunError(f"missing --param value(s): {', '.join(missing)}")
     qr.result = await run_sql(qr.built.sql, params, qr.built.tables, max_rows=max_rows,

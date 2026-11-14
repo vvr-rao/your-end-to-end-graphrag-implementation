@@ -38,6 +38,8 @@ REPEAT_MIN_SHARE = 0.75       # of multi-row groups where the measure is constan
 REPEAT_MIN_GROUPS = 0.02      # multi-row groups / all groups, to count at all
 TOP_VALUES = 60
 TIMEOUT_MS = 30000
+NEAR_DEP_MIN_VALUES = 50     # near-dependency only over columns this varied
+NEAR_DEP_SHARE = 0.02         # ... and at most this share of exceptions
 SPARSE_NULL_SHARE = 0.3       # columns this often null are annotations, not identity
 
 
@@ -85,7 +87,7 @@ async def analyze_table(session, meta: dict) -> dict[str, Any]:
     ref = f"graphrag.{_q(table)}"
     rows = await _scalar(session, f"SELECT COUNT(*) FROM {ref}") or 0
     out: dict[str, Any] = {"row_count": rows, "grain": [], "grain_unique": False,
-                           "dependencies": {}, "repeats": {}, "item_columns": {}}
+                           "dependencies": {}, "near_dependencies": {}, "repeats": {}, "item_columns": {}}
     if rows == 0:
         return out
 
@@ -123,6 +125,7 @@ async def analyze_table(session, meta: dict) -> dict[str, Any]:
 
     # ---- functional dependencies a -> b (only where |b| <= |a|)
     deps: dict[str, list[str]] = {}
+    near: dict[str, list[str]] = {}
     for a in usable:
         for b in usable:
             if a == b or distinct[b] > distinct[a]:
@@ -130,7 +133,13 @@ async def analyze_table(session, meta: dict) -> dict[str, Any]:
             n = await _distinct(session, ref, [a, b])
             if n is not None and n == distinct[a]:
                 deps.setdefault(a, []).append(b)
+            elif (n is not None and distinct[a] >= NEAR_DEP_MIN_VALUES
+                  and n - distinct[a] <= NEAR_DEP_SHARE * distinct[a]):
+                # all but a few values of a have one b (a spelling variant, a
+                # one-off change): b describes a, it does not split it
+                near.setdefault(a, []).append(b)
     out["dependencies"] = deps
+    out["near_dependencies"] = near
 
     # ---- repeated measure values across report/version columns.
     # A mostly-null column can be an annotation set in only ONE of the reports
@@ -231,6 +240,8 @@ def summary_for_prompt(analysis: dict) -> dict:
             for m, found in analysis["repeats"].items()}
     if analysis.get("dependencies"):
         out["determines"] = analysis["dependencies"]
+    if analysis.get("near_dependencies"):
+        out["mostly_determines"] = analysis["near_dependencies"]
     if analysis.get("item_columns"):
         out["item_columns"] = analysis["item_columns"]
     return out

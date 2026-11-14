@@ -280,7 +280,8 @@ def catalog_for_prompt(meta: dict, max_items: int = 40,
         cat["queries"].append({**combo_ref,
             "id": it["id"], "kind": sec[:-1] if sec != "queries" else "query",
             "label": it.get("label"), "description": it.get("description"),
-            "params": [{k: p.get(k) for k in ("name", "type", "column", "example")}
+            "params": [{k: p.get(k) for k in ("name", "type", "column", "example", "optional")
+                        if k != "optional" or p.get(k)}
                        for p in it.get("params") or []],
             **({"query": it["query"]} if isinstance(it.get("query"), dict) else {"sql": it.get("sql")}),
             **({"other_table": it["other_table"]} if it.get("other_table") else {}),

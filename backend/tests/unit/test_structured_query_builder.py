@@ -177,3 +177,34 @@ def test_period_granularity_column_becomes_a_qualifier():
                                 "period_columns": ["period"], "qualifier_columns": []},
                                meta, {"dependencies": {"period": ["frequency"]}})
     assert err is None and m["qualifier_columns"] == ["frequency"]
+
+
+def test_optional_params_drop_their_filter_when_null():
+    b = _b({"select": ["cik", "val"],
+            "where": [{"column": "cik", "op": "=", "param": "cik", "optional": True},
+                      {"column": "tag", "op": "in", "param": "tags", "optional": True},
+                      {"column": "unit", "op": "=", "param": "unit"}]})
+    assert '(CAST(:cik AS text) IS NULL OR "cik" = CAST(:cik AS text))' in b.sql
+    assert '(CAST(:tags AS text[]) IS NULL OR "tag" = ANY(CAST(:tags AS text[])))' in b.sql
+    opt = {p["name"]: p.get("optional", False) for p in merge_params(b, [])}
+    assert opt == {"cik": True, "tags": True, "unit": False}
+    with pytest.raises(QuerySpecError):
+        _b({"select": ["cik"], "where": [{"column": "val", "op": ">", "param": "v", "optional": True}]})
+    # the same param required elsewhere stays required
+    b = _b({"select": ["cik"], "where": [{"column": "cik", "op": "=", "param": "c", "optional": True},
+                                         {"column": "form", "op": "=", "param": "c"}]})
+    assert merge_params(b, [])[0].get("optional") is None
+
+
+def test_measure_params_for_items_and_their_own_qualifiers_are_optional():
+    from backend.app.services.structured.refine import measure_item
+
+    meta = {"table_name": "prices",
+            "value_domains": {"unit": {"values": ["$/t", "$/bbl"]}, "basis": {"values": ["real", "nominal"]}},
+            "analysis": {"dependencies": {}, "near_dependencies": {"item": ["unit"]}}}
+    m = {"id": "price", "label": "Price", "description": "", "value_column": "value", "item": None,
+         "entity_columns": ["item"], "period_columns": ["period"], "qualifier_columns": ["unit", "basis"],
+         "latest_by": None, "param_columns": []}
+    where = {w["column"]: w for w in measure_item(m, meta)["query"]["where"] if "param" in w}
+    assert where["item"].get("optional") and where["unit"].get("optional")
+    assert not where["basis"].get("optional") and not where["period"].get("optional")

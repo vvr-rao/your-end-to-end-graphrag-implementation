@@ -143,6 +143,9 @@ async def run_sql(
         res.error = f"rejected: {exc}"
         return res
     bound = coerce_params(params or {}, declared_params)
+    for p in declared_params or []:            # an omitted optional filter = every value
+        if p.get("optional") and p.get("name") not in bound:
+            bound[p["name"]] = None
     missing = [p for p in checked.params if p not in bound]
     if missing:
         res.error = f"missing parameter value(s): {', '.join(missing)}"
