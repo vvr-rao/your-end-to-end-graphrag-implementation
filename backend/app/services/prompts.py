@@ -2587,7 +2587,11 @@ _SQL_RESULT_NOTE = (
     "span they cover. If that span covers several periods, the number is NOT the "
     "value of a single period -- say what it combines, or use a row that holds "
     "the single period's value. Never add up values yourself across rows that "
-    "differ only in a report/version column.)"
+    "differ only in a report/version column. A result marked LISTING holds every "
+    "row the query returned (header first, rows separated by ';;'): when the "
+    "question asks for a list, give the whole list faithfully, as a table when "
+    "it is long, and state how many rows it has; if it says capped or 'more in "
+    "the returned data', say the list is partial.)"
 )
 
 
@@ -4097,7 +4101,7 @@ _QUERY_SPEC_RULES = (
     "- \"params\" lists each parameter once: {\"name\", \"description\", \"example\"}. The "
     "example must be a real value from the profile (keep leading zeros).\n"
     + _QUALIFIER_RULE +
-    "- Results are capped at a few dozen rows. A time series or 'latest rows' query must "
+    "- Results are capped at a few dozen rows (a call marked listing: a few thousand). A time series or 'latest rows' query must "
     "take a period range as params (between) or order the time column desc (newest first) "
     "-- never oldest first over the whole history.\n"
     "- Order results sensibly (time ascending for ranges, largest first for rankings). "
@@ -4289,7 +4293,8 @@ def table_refine(table: dict[str, Any]) -> tuple[str, str]:
 
 
 def table_query_select(question: str, catalogs: list[dict[str, Any]],
-                       failures: list[dict[str, Any]] | None = None) -> tuple[str, str]:
+                       failures: list[dict[str, Any]] | None = None, *,
+                       max_calls: int = 4) -> tuple[str, str]:
     """Decide whether a question needs table data and which stored query to run."""
     system = (
         "You answer questions from database tables, but you may ONLY read them through "
@@ -4319,6 +4324,13 @@ def table_query_select(question: str, catalogs: list[dict[str, Any]],
         "listed most relevant first: \"matched\" says which of the question's "
         "concepts, entities/places or periods (reached through the knowledge graph) a "
         "query is tagged with -- prefer those queries when they fit.\n"
+        f"   Use at most {max_calls} calls in total.\n"
+        "   LISTS: a question that asks to list, show or compare MANY items (every item of "
+        "a kind, all entities, a full table for some periods) is ONE call -- a query that "
+        "filters only by what the items share (period, qualifiers) and returns one row per "
+        "item and period -- marked \"listing\": true; never one call per item. Select only "
+        "the columns the answer needs and fix each qualifier to one value, so the rows "
+        "stay short. A listing returns up to a few thousand rows.\n"
         "3. ONLY when no catalog query can answer a part, give a new \"query\" spec for it "
         "(same JSON shape as the catalog's, rules below), and say in why_not_catalog which "
         "catalog ids you considered and why each cannot answer it (a catalog query with "
@@ -4335,9 +4347,9 @@ def table_query_select(question: str, catalogs: list[dict[str, Any]],
     user = (f"QUESTION: {question}\n\nCANDIDATE TABLES:\n"
             + json.dumps(catalogs, ensure_ascii=False, indent=1) + fail_block + "\n\n"
             'Return JSON: {"needed": true|false, "reason": "...", "calls": [{"table": "...", '
-            '"query_id": "<catalog id>", "params": {"name": value}} | {"table": "...", '
-            '"query": {QUERY SPEC}, "params": {"name": value}, "purpose": "...", '
-            '"why_not_catalog": "..."}]}')
+            '"query_id": "<catalog id>", "params": {"name": value}, "listing": false} | '
+            '{"table": "...", "query": {QUERY SPEC}, "params": {"name": value}, "listing": false, '
+            '"purpose": "...", "why_not_catalog": "..."}]}')
     return system, user
 
 PROMPTS = {

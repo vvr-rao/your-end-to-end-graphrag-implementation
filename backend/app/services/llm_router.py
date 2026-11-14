@@ -814,7 +814,7 @@ class LLMRouter:
 
     async def chat(
         self, task: str, *, system: str, user: str, cache_prefix: str | None = None,
-        model: str | None = None,
+        model: str | None = None, max_tokens: int | None = None,
     ) -> ChatResult:
         """`model` overrides the task's model for this call only (same
         provider and settings) -- e.g. a dedicated deployment with a
@@ -828,7 +828,7 @@ class LLMRouter:
             )
         provider = self._providers[provider_name]
         model = model or spec["model"]
-        max_tokens = int(spec.get("max_tokens", 4096))
+        max_tokens = int(max_tokens or spec.get("max_tokens", 4096))
         timeout = int(spec.get("timeout", 120))
         retryer = self._make_retryer(task, provider_name, model)
 

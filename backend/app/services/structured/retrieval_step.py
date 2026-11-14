@@ -423,12 +423,36 @@ async def combination_hints(checks: list[dict]) -> list[dict]:
     return out
 
 
+def _listing_text(head: str, res: SqlResult, char_cap: int) -> str:
+    """Compact layout for a LISTING result: the header once, then one line of
+    values per row (about half the size of name=value pairs)."""
+    def cell(v) -> str:
+        return "" if v is None else str(v).replace("|", "/")
+    lines = [" | ".join(res.columns)]
+    used = len(head) + len(lines[0])
+    shown = 0
+    for r in res.rows:
+        row = " | ".join(cell(v) for v in r)
+        if used + len(row) + 3 > char_cap - 160:
+            break
+        lines.append(row)
+        used += len(row) + 3
+        shown += 1
+    note = f"{res.row_count} row(s)" + (f" of {res.total_rows if res.total_rows is not None else 'more'}"
+                                         " (capped)" if res.truncated else "")
+    if shown < len(res.rows):
+        note += f"; {shown} shown here, {len(res.rows) - shown} more in the returned data"
+    return head + f"LISTING, {note}. Rows: " + " ;; ".join(lines)
+
+
 def _evidence_text(rec: dict, res: SqlResult, meta: dict, char_cap: int) -> str:
     head = (f"SQL result from table {rec['table']}"
             + (f" ({rec['label']})" if rec.get("label") else "")
             + (f" [{(meta.get('source') or {}).get('rel_path')}]" if meta else "") + ". ")
     if rec.get("params"):
         head += "Parameters: " + ", ".join(f"{k}={v}" for k, v in rec["params"].items()) + ". "
+    if rec.get("listing"):
+        return _listing_text(head, res, char_cap)
     cols = res.columns
     body = []
     used = len(head)
@@ -461,6 +485,8 @@ async def structured_evidence(
     vector_max_distance: float | None = None,
     verbose: bool = False,
     time_ids: list[uuid.UUID] | None = None,
+    listing_max_rows: int = 2000,
+    listing_char_cap: int = 60000,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Evidence items (``kind='sql_result'``) + a plan record for persistence."""
     from backend.app.services.prompts import PROMPTS
@@ -504,9 +530,22 @@ async def structured_evidence(
                 rec["value_combinations"] = combos
         return missing
 
-    system, user = PROMPTS["table_query_select"](question, catalogs)
+    system, user = PROMPTS["table_query_select"](question, catalogs, max_calls=max_calls)
     out = await router.chat("table_query_select", system=system, user=user)
     choice = _parse(out.text)
+    if "needed" not in choice:
+        # cut off at max_tokens or not JSON: an error, never a silent "not needed"
+        plan["select_error"] = (f"selection reply unreadable (finish_reason={getattr(out, "finish_reason", None)}, "
+                                f"{len(out.text or '')} chars)")
+        plan["retried"] = True
+        system, user = PROMPTS["table_query_select"](question, catalogs, [{
+            "error": "your previous reply was cut off or was not valid JSON. Reply again with FEWER "
+                     "calls: one call per part of the question; a question that lists many items is "
+                     "ONE listing query, never one call per item."}], max_calls=max_calls)
+        out = await router.chat("table_query_select", system=system, user=user)
+        choice = _parse(out.text)
+        if "needed" not in choice:
+            plan["select_error"] += f"; retry also unreadable (finish_reason={getattr(out, "finish_reason", None)})"
     plan["needed"] = bool(choice.get("needed"))
     plan["reason"] = choice.get("reason")
     if not plan["needed"]:
@@ -515,9 +554,13 @@ async def structured_evidence(
     calls = [c for c in (choice.get("calls") or []) if isinstance(c, dict)][:max_calls]
     results: list[tuple[dict, SqlResult]] = []
     failures = []
+    def _rows_for(call: dict) -> int:
+        return listing_max_rows if call.get("listing") else max_rows
+
     for call in calls:
-        rec, res, err = await _execute(call, by_table, max_rows=max_rows, timeout_ms=timeout_ms,
+        rec, res, err = await _execute(call, by_table, max_rows=_rows_for(call), timeout_ms=timeout_ms,
                                        all_tables=all_tables, types=types)
+        rec["listing"] = bool(call.get("listing"))
         missing = await _value_failures(rec, res)
         if missing:
             rec["missing_values"] = missing
@@ -536,13 +579,14 @@ async def structured_evidence(
 
     if failures:
         plan["retried"] = True
-        system, user = PROMPTS["table_query_select"](question, catalogs, failures)
+        system, user = PROMPTS["table_query_select"](question, catalogs, failures, max_calls=max_calls)
         out = await router.chat("table_query_select", system=system, user=user)
         retry = _parse(out.text)
         for call in [c for c in (retry.get("calls") or []) if isinstance(c, dict)][:max_calls]:
-            rec, res, err = await _execute(call, by_table, max_rows=max_rows, timeout_ms=timeout_ms,
+            rec, res, err = await _execute(call, by_table, max_rows=_rows_for(call), timeout_ms=timeout_ms,
                                            all_tables=all_tables, types=types)
             rec["retry"] = True
+            rec["listing"] = bool(call.get("listing"))
             missing = await _value_failures(rec, res)
             if missing:
                 rec["missing_values"] = missing
@@ -574,7 +618,9 @@ async def structured_evidence(
             "node_id": node,
             "iri": f"{VIAO_NS}#{re.sub(r'[^A-Za-z0-9_]', '_', frag)}",
             "rank": i, "score": 1.0,
-            "text": _evidence_text(rec, res, meta, char_cap),
+            "text": _evidence_text(rec, res, meta, listing_char_cap if rec.get("listing") else char_cap),
+            "char_cap": listing_char_cap if rec.get("listing") else char_cap,
+            "listing": bool(rec.get("listing")),
             "document_title": f"table {rec['table']}",
             "table": rec["table"], "query_id": rec.get("query_id"), "sql": res.sql,
             "params": res.params, "columns": res.columns, "rows": res.rows,

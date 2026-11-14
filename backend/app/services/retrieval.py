@@ -1778,12 +1778,14 @@ async def retrieve_and_answer(
                 char_cap=int(_qa_cfg("structured_char_cap", 5000)),
                 verbose=verbose,
                 time_ids=list(expanded_time_ids) if seed_time_ids else [],
+                listing_max_rows=int(_qa_cfg("structured_listing_max_rows", 2000)),
+                listing_char_cap=int(_qa_cfg("structured_listing_char_cap", 60000)),
             )
         except Exception as exc:  # never lose the text answer to a table problem
             log.warning("structured-data step failed: %s", exc)
             _sd_ev, _sd_plan = [], {"error": str(exc)[:500]}
         for _ev in _sd_ev:
-            _ev["char_cap"] = int(_qa_cfg("structured_char_cap", 5000))
+            _ev.setdefault("char_cap", int(_qa_cfg("structured_char_cap", 5000)))
         # Ahead of the text evidence: exact figures first.
         evidence[:0] = _sd_ev
         parsed["structured_data"] = _sd_plan
@@ -1827,7 +1829,11 @@ async def retrieve_and_answer(
         answer = ""
     else:
         try:
-            out = await router.chat(answer_task_name, system=sys_p, user=user_p)
+            # A listing result is answered in full: give the answer room for it.
+            _listing = any(ev.get("kind") == "sql_result" and ev.get("listing") for ev in evidence)
+            out = await (router.chat(answer_task_name, system=sys_p, user=user_p,
+                                     max_tokens=int(_qa_cfg("structured_listing_answer_max_tokens", 4096)))
+                         if _listing else router.chat(answer_task_name, system=sys_p, user=user_p))
             answer = out.text.strip()
         except Exception as exc:
             answer = f"(answer generation failed: {exc})"

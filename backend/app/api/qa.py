@@ -101,6 +101,7 @@ class QAEvidenceItem(BaseModel):
     total_rows: int | None = None
     source_file: str | None = None
     sql_source: str | None = None
+    listing: bool | None = None
 
 
 class QAResponse(BaseModel):

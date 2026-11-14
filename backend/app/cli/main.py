@@ -3443,6 +3443,17 @@ def _cmd_query(args: argparse.Namespace) -> int:
                      + (f" of {ev.get('total_rows') or 'more'} (capped)" if ev.get("truncated") else ""))
             line += "\n        sql: " + " ".join((ev.get("sql") or "").split())[:200]
         print(line)
+    # A listing is returned in full, not only through the written answer.
+    for ev in result.evidence:
+        if ev.get("kind") == "sql_result" and ev.get("listing") and ev.get("rows"):
+            print()
+            print(f"DATA: table {ev.get('table')} -- {ev.get('row_count')} row(s)"
+                  + (f" of {ev.get('total_rows') or 'more'} (capped)" if ev.get("truncated") else ""))
+            cols = ev.get("columns") or []
+            print("| " + " | ".join(cols) + " |")
+            print("|" + "---|" * len(cols))
+            for r in ev["rows"]:
+                print("| " + " | ".join("" if v is None else str(v) for v in r) + " |")
     return 0
 
 

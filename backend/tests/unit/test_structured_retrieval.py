@@ -312,3 +312,40 @@ def test_carried_sql_evidence_reaches_the_final_round():
     src = inspect.getsource(retrieval.retrieve_and_answer)
     assert '_carry_sql_evidence=[ev for ev in r1.evidence if ev.get("kind") == "sql_result"]' in src
     assert "if _carry_sql_evidence:" in src
+
+
+async def test_unreadable_selection_reply_is_retried_not_read_as_not_needed(patched):
+    calls, _ = patched
+    router = FakeRouter({"table_query_select": [
+        '{"needed": true, "calls": [{"table": "prices", "query_id": "avg_pr',       # cut off
+        {"needed": True, "calls": [{"table": "prices", "query_id": "avg_price", "params": {"c": "Copper"}}]}]})
+    ev, plan = await _go(router)
+    assert len(router.calls) == 2 and "cut off or was not valid JSON" in router.calls[1][1]
+    assert plan["select_error"].startswith("selection reply unreadable") and plan["needed"]
+    assert len(ev) == 1 and len(calls) == 1
+
+
+async def test_listing_call_gets_the_listing_budget_and_compact_rows(patched, monkeypatch):
+    seen = {}
+
+    async def fake_run(sql, params, allowed, *, max_rows=50, timeout_ms=5000, declared_params=None):
+        seen["max_rows"] = max_rows
+        rows = [[f"c{i}", "2024", str(100 + i)] for i in range(120)]
+        return SqlResult(sql=sql, params=dict(params or {}), columns=["commodity", "period", "value"],
+                         rows=rows, row_count=120)
+
+    monkeypatch.setattr(rs, "run_sql", fake_run)
+    router = FakeRouter({"table_query_select": [{"needed": True, "calls": [
+        {"table": "prices", "listing": True, "purpose": "all prices",
+         "query": {"select": ["commodity", "period", "value"]}, "params": {}}]}]})
+    ev, plan = await _go(router, max_rows=50, listing_max_rows=2000, listing_char_cap=60000)
+    assert seen["max_rows"] == 2000 and plan["calls"][0]["listing"]
+    e = ev[0]
+    assert e["listing"] and e["char_cap"] == 60000 and len(e["rows"]) == 120
+    assert "LISTING, 120 row(s)" in e["text"] and "commodity | period | value ;; c0 | 2024 | 100" in e["text"]
+    assert "c119 | 2024 | 219" in e["text"]                      # every row fits the listing budget
+    ev2, _ = await _go(FakeRouter({"table_query_select": [{"needed": True, "calls": [
+        {"table": "prices", "listing": True, "query": {"select": ["commodity", "period", "value"]},
+         "params": {}}]}]}), listing_char_cap=600)
+    assert "more in the returned data" in ev2[0]["text"]          # shown part is cut; data is not
+    assert len(ev2[0]["rows"]) == 120
