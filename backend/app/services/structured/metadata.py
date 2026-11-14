@@ -250,6 +250,9 @@ def catalog_for_prompt(meta: dict, max_items: int = 40,
             out["range"] = [d["min"], d["max"]]
         elif c.get("examples"):
             out["examples"] = c["examples"][:5]
+        periods = ((meta.get("column_stats") or {}).get(c["name"]) or {}).get("periods")
+        if periods:
+            out["periods"] = periods            # earliest..latest per granularity
         return out
 
     cat = {"table": meta["table_name"], "description": meta.get("description"),

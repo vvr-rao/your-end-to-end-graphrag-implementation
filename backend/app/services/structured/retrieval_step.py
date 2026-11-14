@@ -25,6 +25,7 @@ import json
 import re
 import time
 import uuid
+from datetime import date
 from typing import Any
 
 from sqlalchemy import text as sql_text
@@ -35,6 +36,7 @@ from backend.app.services.structured.metadata import (
     column_types,
     compile_item,
     find_item,
+    item_spec,
 )
 from backend.app.services.structured.query_builder import QuerySpecError, build_sql
 from backend.app.services.structured.sql_exec import SqlResult, run_sql
@@ -170,6 +172,130 @@ def _parse(text: str) -> dict:
         except json.JSONDecodeError:
             obj = {}
     return obj if isinstance(obj, dict) else {}
+
+
+async def table_inventory() -> dict[str, dict]:
+    """Every ACTIVE table: {table: {id, iri, meta}} (for the ALL TABLES list
+    and for describing a table that is not a candidate)."""
+    from backend.app.db.session import session_scope
+
+    async with session_scope() as s:
+        rows = (await s.execute(sql_text("""
+            SELECT id, artifact_identifier, extra_metadata FROM graphrag.intelligence_artifacts
+             WHERE artifact_type = 'TableMetadata' AND status = 'ACTIVE'
+             ORDER BY extra_metadata->>'table_name'
+        """))).all()
+    return {m["table_name"]: {"id": aid, "iri": iri, "meta": m}
+            for aid, iri, m in rows if (m or {}).get("table_name")}
+
+
+def inventory_for_prompt(inv: dict[str, dict], limit: int = 60) -> list[dict]:
+    out = []
+    for name, rec in list(inv.items())[:limit]:
+        desc = str(rec["meta"].get("description") or "").strip()
+        first = re.split(r"(?<=[.!?])\s", desc, maxsplit=1)[0][:220]
+        out.append({"table": name, "rows": rec["meta"].get("row_count"), "about": first})
+    return out
+
+
+# ------------------------------------------------------------ relative periods
+
+_RELATIVE = re.compile(
+    r"\b(past|last|previous|recent|latest|trailing|preceding)\b|\b(this|current)\s+(year|quarter|month)\b"
+    r"|\byear[- ]to[- ]date\b|\bytd\b|\bso far\b", re.I)
+_CURRENT_YEAR = re.compile(r"\b(?:current|present)\s+year\s+is\s+(\d{4})|\b(?:it|today)\s+is\s+(?:\w+\s+)*?(\d{4})", re.I)
+
+
+def relative_period_question(question: str, today_year: int) -> bool:
+    """The question counts periods back from 'now' and names no period of its
+    own (a year other than the stated current one fixes the window itself)."""
+    if not _RELATIVE.search(question or ""):
+        return False
+    current = {today_year} | {int(y) for m in _CURRENT_YEAR.finditer(question) for y in m.groups() if y}
+    named = {int(y) for y in re.findall(r"\b(1[6-9]\d\d|2[01]\d\d)\b", question)}
+    return not (named - current)
+
+
+def _period_index(value: Any) -> tuple[str, int] | None:
+    from backend.app.services.structured.column_stats import granularity
+    from backend.app.services.structured.graph_links import period_of
+
+    g, p = granularity(value), period_of(value)
+    if p is None or g not in {"year", "quarter", "month"}:
+        return None
+    y, q, m = p
+    return g, (y if g == "year" else y * 4 + (q - 1) if g == "quarter" else y * 12 + (m - 1))
+
+
+def _period_value(like: Any, gran: str, idx: int) -> Any:
+    """Render period index ``idx`` in the spelling of ``like``."""
+    s = str(like).strip()
+    if gran == "year":
+        return idx if isinstance(like, int) else str(idx)
+    if gran == "quarter":
+        y, q = divmod(idx, 4)
+        m = re.match(r"^(\d{4})(\D*)([1-4])$", s)
+        return f"{y}{m.group(2)}{q + 1}" if m else f"{y}Q{q + 1}"
+    y, mo = divmod(idx, 12)
+    m = re.match(r"^\d{4}(\D*)\d{1,2}$", s)
+    sep = m.group(1) if m else "-"
+    return f"{y}{sep}{mo + 1:02d}"
+
+
+def between_params(spec: dict | None) -> list[tuple[str, str, str]]:
+    """(column, from-param, to-param) of the spec's parameterised ranges."""
+    out = []
+    for w in (spec or {}).get("where") or []:
+        if (isinstance(w, dict) and str(w.get("op") or "").lower() == "between"
+                and isinstance(w.get("param"), list) and len(w["param"]) == 2
+                and isinstance(w.get("column"), str)):
+            out.append((w["column"].split(".")[-1], str(w["param"][0]), str(w["param"][1])))
+    return out
+
+
+def anchor_relative_periods(question: str, call: dict, meta: dict, *, today_year: int) -> dict | None:
+    """When the question counts back from 'now' ('past 3 years', 'recent'),
+    move a call's period window so it ends at the LATEST period the table
+    holds at that granularity, keeping its length. Returns the adjustment
+    (and changes ``call['params']``) or None. Deterministic; any table."""
+    from backend.app.services.structured.column_stats import latest_period
+
+    if not relative_period_question(question, today_year):
+        return None
+    if call.get("query_id"):
+        found = find_item(meta, call["query_id"])
+        spec = item_spec(found[0], found[1]) if found else None
+    else:
+        spec = call.get("query")
+    params = call.get("params") or {}
+    for col, p_from, p_to in between_params(spec):
+        lo, hi = params.get(p_from), params.get(p_to)
+        if lo is None or hi is None:
+            continue
+        a, b = _period_index(lo), _period_index(hi)
+        latest = latest_period(meta, col, hi)
+        c = _period_index(latest) if latest is not None else None
+        if not a or not b or not c or a[0] != b[0] or b[0] != c[0] or b[1] == c[1] or b[1] < a[1]:
+            continue
+        span = b[1] - a[1]
+        new_lo, new_hi = _period_value(lo, a[0], c[1] - span), _period_value(hi, a[0], c[1])
+        call["params"] = {**params, p_from: new_lo, p_to: new_hi}
+        return {"column": col, "was": [lo, hi], "now": [new_lo, new_hi], "latest": latest}
+    return None
+
+
+def describe_evidence(names: list[str], inv: dict[str, dict], start_rank: int) -> list[dict]:
+    from backend.app.services.structured.column_stats import metadata_card
+
+    out = []
+    for i, name in enumerate(n for n in dict.fromkeys(names) if n in inv):
+        rec = inv[name]
+        iri = rec.get("iri") or f"{VIAO_NS}#TableMetadata_{re.sub(r'[^A-Za-z0-9_]', '_', name)}"
+        out.append({"kind": "table_metadata", "node_id": rec["id"], "iri": iri,
+                    "rank": start_rank + i, "score": 1.0, "text": metadata_card(rec["meta"]),
+                    "char_cap": 12000, "document_title": f"table {name}", "table": name,
+                    "source_file": (rec["meta"].get("source") or {}).get("rel_path")})
+    return out
 
 
 async def table_metas(names: set[str]) -> dict[str, dict]:
@@ -528,6 +654,8 @@ async def structured_evidence(
     types = {c["table"]: column_types(c["meta"]) for c in cands}
     types.update({n: column_types(m) for n, m in partners.items()})
     catalogs = [catalog_for_prompt(c["meta"], ranking=rankings.get(c["table"])) for c in cands]
+    inv = await table_inventory()
+    inventory = inventory_for_prompt(inv)
     col_types = {c["table"]: {col["name"].lower(): (col.get("type") or "text")
                               for col in c["meta"].get("columns") or []} for c in cands}
     id_cols = {c["table"]: {col["name"].lower() for col in c["meta"].get("columns") or []
@@ -544,7 +672,8 @@ async def structured_evidence(
                 rec["value_combinations"] = combos
         return missing
 
-    system, user = PROMPTS["table_query_select"](question, catalogs, max_calls=max_calls)
+    system, user = PROMPTS["table_query_select"](question, catalogs, max_calls=max_calls,
+                                                  inventory=inventory)
     out = await router.chat("table_query_select", system=system, user=user)
     choice = _parse(out.text)
     if "needed" not in choice:
@@ -555,17 +684,26 @@ async def structured_evidence(
         system, user = PROMPTS["table_query_select"](question, catalogs, [{
             "error": "your previous reply was cut off or was not valid JSON. Reply again with FEWER "
                      "calls: one call per part of the question; a question that lists many items is "
-                     "ONE listing query, never one call per item."}], max_calls=max_calls)
+                     "ONE listing query, never one call per item."}], max_calls=max_calls,
+            inventory=inventory)
         out = await router.chat("table_query_select", system=system, user=user)
         choice = _parse(out.text)
         if "needed" not in choice:
             plan["select_error"] += f"; retry also unreadable (finish_reason={getattr(out, "finish_reason", None)})"
-    plan["needed"] = bool(choice.get("needed"))
+    describe = [t for t in (choice.get("describe") or []) if isinstance(t, str) and t in inv]
+    plan["describe"] = describe
+    plan["needed"] = bool(choice.get("needed")) or bool(describe)
     plan["reason"] = choice.get("reason")
     if not plan["needed"]:
         return [], plan
 
     calls = [c for c in (choice.get("calls") or []) if isinstance(c, dict)][:max_calls]
+    today_year = date.today().year
+    for call in calls:   # 'past 3 years' ends at the table's latest period, not the model's guess
+        meta_c = (by_table.get(call.get("table")) or {}).get("meta")
+        adj = anchor_relative_periods(question, call, meta_c, today_year=today_year) if meta_c else None
+        if adj:
+            plan.setdefault("period_adjustments", []).append({"table": call.get("table"), **adj})
     results: list[tuple[dict, SqlResult]] = []
     failures = []
     def _rows_for(call: dict) -> int:
@@ -593,10 +731,15 @@ async def structured_evidence(
 
     if failures:
         plan["retried"] = True
-        system, user = PROMPTS["table_query_select"](question, catalogs, failures, max_calls=max_calls)
+        system, user = PROMPTS["table_query_select"](question, catalogs, failures, max_calls=max_calls,
+                                                     inventory=inventory)
         out = await router.chat("table_query_select", system=system, user=user)
         retry = _parse(out.text)
         for call in [c for c in (retry.get("calls") or []) if isinstance(c, dict)][:max_calls]:
+            meta_c = (by_table.get(call.get("table")) or {}).get("meta")
+            adj = anchor_relative_periods(question, call, meta_c, today_year=today_year) if meta_c else None
+            if adj:
+                plan.setdefault("period_adjustments", []).append({"table": call.get("table"), **adj})
             rec, res, err = await _execute(call, by_table, max_rows=_rows_for(call), timeout_ms=timeout_ms,
                                            all_tables=all_tables, types=types)
             rec["retry"] = True
@@ -644,6 +787,7 @@ async def structured_evidence(
             "source_file": (meta.get("source") or {}).get("rel_path"),
             "sql_source": rec.get("source"),
         })
+    evidence += describe_evidence(describe, inv, len(evidence) + 1)
     plan["seconds"] = round(time.monotonic() - t0, 3)
     if verbose:
         print(f"[query] structured data: {len(cands)} candidate table(s) "

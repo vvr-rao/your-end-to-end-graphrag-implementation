@@ -88,6 +88,7 @@ class QAEvidenceItem(BaseModel):
     # the chunk carries no `time:hasTime` edge.
     times: str = ""
     # kind='sql_result' only (`--use-structured-data`): the data table, the
+    # (kind='table_metadata' sets only `table`: the item describes that table)
     # stored query id (None when the model had to write new SQL), the SQL
     # actually run with its bound parameters, and the capped rows.
     table: str | None = None

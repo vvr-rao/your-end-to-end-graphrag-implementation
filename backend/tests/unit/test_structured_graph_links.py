@@ -191,5 +191,7 @@ async def test_table_links_to_minted_places_and_time_instances(db, tmp_path):
             "ON t.id = r.target_node_id WHERE r.relationship_type = 'tableTime'"))).scalars().all())
         assert times == ["YEAR_2022", "YEAR_2023"]
         meta = (await registered_tables(s))["hq"]["meta"]
+    stats = meta["column_stats"]                       # measured on the loaded table
+    assert stats["year"]["periods"] == {"year": [2022, 2023]} and stats["name"]["distinct"] == 3
     tags = next(it["tags"] for it in meta["filters"] if it["id"] == "by_country")
     assert tags["place_columns"] == ["hq_country"]

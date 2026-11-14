@@ -113,6 +113,9 @@ async def attach_value_domains(session, meta: dict, *, max_values: int = MAX_VAL
         if not d.get("empty"):
             domains[c["name"]] = d
     meta["value_domains"] = domains
+    from backend.app.services.structured.column_stats import compute_column_stats
+
+    await compute_column_stats(session, meta)       # counts, ranges, period ranges
 
     stats = {"listed_columns": sum(1 for d in domains.values() if "values" in d),
              "params_with_values": 0, "items_with_combinations": 0}

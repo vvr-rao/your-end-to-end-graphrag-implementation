@@ -58,8 +58,13 @@ def patched(monkeypatch):
     async def fake_metas(names):
         return {"companies": COMPANIES} if "companies" in names else {}
 
+    async def fake_inventory():
+        return {"companies": {"id": uuid.uuid4(), "iri": "https://x/o#TableMetadata_companies_1", "meta": COMPANIES},
+                "prices": {"id": NODE, "iri": "https://x/o#TableMetadata_prices_1", "meta": META}}
+
     monkeypatch.setattr(rs, "candidate_tables", fake_cands)
     monkeypatch.setattr(rs, "table_metas", fake_metas)
+    monkeypatch.setattr(rs, "table_inventory", fake_inventory)
     monkeypatch.setattr(rs, "run_sql", fake_run)
     return calls, results
 
@@ -310,7 +315,7 @@ def test_carried_sql_evidence_reaches_the_final_round():
     from backend.app.services import retrieval
 
     src = inspect.getsource(retrieval.retrieve_and_answer)
-    assert '_carry_sql_evidence=[ev for ev in r1.evidence if ev.get("kind") == "sql_result"]' in src
+    assert 'if ev.get("kind") in ("sql_result", "table_metadata")],' in src   # SQL results + table cards
     assert "if _carry_sql_evidence:" in src
 
 
@@ -349,3 +354,17 @@ async def test_listing_call_gets_the_listing_budget_and_compact_rows(patched, mo
          "params": {}}]}]}), listing_char_cap=600)
     assert "more in the returned data" in ev2[0]["text"]          # shown part is cut; data is not
     assert len(ev2[0]["rows"]) == 120
+
+
+async def test_questions_about_the_tables_get_their_metadata_not_sql(patched):
+    calls, _ = patched
+    router = FakeRouter({"table_query_select": [
+        {"needed": False, "reason": "about the tables", "describe": ["prices", "companies", "nope"]}]})
+    ev, plan = await _go(router)
+    assert calls == []                                            # no SQL at all
+    assert [e["kind"] for e in ev] == ["table_metadata", "table_metadata"]
+    assert ev[0]["iri"] == "https://x/o#TableMetadata_prices_1" and ev[0]["node_id"] == NODE
+    assert "Table prices" in ev[0]["text"] and "worldbank/pink-sheet" in ev[0]["text"]
+    assert plan["needed"] and plan["describe"] == ["prices", "companies"]   # unknown table dropped
+    user = router.calls[0][1]
+    assert "ALL TABLES" in user and '"table": "companies"' in user       # every table is offered

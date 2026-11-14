@@ -595,6 +595,10 @@ async def refine_registered(router, *, tables: list[str] | None = None, refresh:
             async with session_scope() as s:
                 meta["analysis"] = await analyze_table(s, meta)       # SQL only
             meta["measures"] = rebuild_measures(meta, all_types)
+            from backend.app.services.structured.value_domains import attach_value_domains
+
+            async with session_scope() as s:
+                await attach_value_domains(s, meta)              # SQL only (domains + stats)
             async with session_scope() as s:
                 await _measure_classes(s, meta)
             tag_items(meta)

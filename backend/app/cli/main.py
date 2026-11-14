@@ -3449,6 +3449,8 @@ def _cmd_query(args: argparse.Namespace) -> int:
                      f"  rows: {ev.get('row_count')}"
                      + (f" of {ev.get('total_rows') or 'more'} (capped)" if ev.get("truncated") else ""))
             line += "\n        sql: " + " ".join((ev.get("sql") or "").split())[:200]
+        elif kind == "table_metadata":
+            line += f"\n        table: {ev.get('table')}  (metadata: description, columns, measured ranges)"
         print(line)
     # A listing is returned in full, not only through the written answer.
     for ev in result.evidence:

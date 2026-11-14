@@ -550,7 +550,8 @@ async def retrieve_and_answer(
                 # The prior-research block cites round 1's SQL results; table
                 # rows are not re-retrieved by text search, so hand them over
                 # or the final synthesis cannot cite them.
-                _carry_sql_evidence=[ev for ev in r1.evidence if ev.get("kind") == "sql_result"],
+                _carry_sql_evidence=[ev for ev in r1.evidence
+                                     if ev.get("kind") in ("sql_result", "table_metadata")],
                 _table_question=resolved_query,
             )
             # Merge: r2 is the final answer; fold in round-1 evidence + all cost.
@@ -3135,7 +3136,7 @@ async def _persist_run(
                 # A SQL result is persisted against its table's metadata
                 # node (an intelligence artifact); the SQL itself is in
                 # retrieval_plan.structured_data.
-                "evidence_kind": "artifact" if ev["kind"] == "sql_result" else ev["kind"],
+                "evidence_kind": "artifact" if ev["kind"] in ("sql_result", "table_metadata") else ev["kind"],
                 "evidence_uuid": node_id,
                 "evidence_iri": ev["iri"],
                 "rank": ev["rank"],

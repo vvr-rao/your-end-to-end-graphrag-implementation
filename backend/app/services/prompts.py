@@ -2595,6 +2595,15 @@ _SQL_RESULT_NOTE = (
 )
 
 
+_TABLE_METADATA_NOTE = (
+    "  (Items whose id contains TableMetadata_ describe a loaded data table: what it "
+    "holds, its source, what one row means, and each column's meaning with counts, "
+    "ranges and value lists MEASURED on the table -- exact, cite them like any other "
+    "item. Use them for questions about the data itself (which tables exist, what they "
+    "contain, the columns, the periods covered, how many items).)"
+)
+
+
 def _format_evidence_block(evidence_items: list[dict], char_cap: int = 600) -> str:
     """Compact textual rendering of evidence items for stuffing into
     answer-synthesis prompts. Each item: {iri, kind, text}, optionally
@@ -2615,6 +2624,8 @@ def _format_evidence_block(evidence_items: list[dict], char_cap: int = 600) -> s
         # Only when `--use-structured-data` produced results, so every other
         # prompt is byte-identical to before.
         lines.append(_SQL_RESULT_NOTE)
+    if any(it.get("kind") == "table_metadata" for it in evidence_items):
+        lines.append(_TABLE_METADATA_NOTE)
     for it in evidence_items:
         text = (it.get("text") or "").strip().replace("\n", " ")
         # SQL results carry their own (larger) cap: they are already bounded
@@ -4388,8 +4399,10 @@ def table_refine(table: dict[str, Any]) -> tuple[str, str]:
 
 def table_query_select(question: str, catalogs: list[dict[str, Any]],
                        failures: list[dict[str, Any]] | None = None, *,
-                       max_calls: int = 4) -> tuple[str, str]:
-    """Decide whether a question needs table data and which stored query to run."""
+                       max_calls: int = 4,
+                       inventory: list[dict[str, Any]] | None = None) -> tuple[str, str]:
+    """Decide whether a question needs table data and which stored query to run,
+    or which tables' metadata describes them (questions about the tables)."""
     from datetime import date
 
     today = date.today().isoformat()
@@ -4402,6 +4415,14 @@ def table_query_select(question: str, catalogs: list[dict[str, Any]],
         "1. Decide if the question needs data from these tables (numbers, lists, dates, "
         "counts or records they hold). If the question is about something the tables do "
         "not contain, answer needed=false.\n"
+        "   TABLE QUESTIONS: a question about the tables THEMSELVES -- which tables or data "
+        "exist, what a table holds or where it comes from, its columns and what they mean, "
+        "the period or range it covers, how many rows or distinct items it has, which values "
+        "a column takes -- is answered from the tables' METADATA, which already holds exact "
+        "measured counts, ranges and value lists. Name those tables in \"describe\" (any "
+        "table from the candidates or from ALL TABLES; every table for a question about all "
+        "the data) and add calls only for what metadata cannot tell (a specific value, a "
+        "total, a top or bottom item). A question with describe is needed=true.\n"
         "2. If needed, pick the catalog queries that answer it and fill every one of their "
         "params, except that a param marked \"optional\": true may be left out: its filter "
         "then covers EVERY value of its column. VALID VALUES: a column that lists \"values\" holds exactly those values "
@@ -4435,7 +4456,8 @@ def table_query_select(question: str, catalogs: list[dict[str, Any]],
         "items covers EVERY item the table holds -- answer it with one listing query over "
         "all items, never with a sample of items you choose.\n"
         "   RELATIVE PERIODS ('past N years', 'recent', 'latest', 'this year') count back "
-        "from the LATEST period the table holds (see the period column's range), not from "
+        "from the LATEST period the table holds (a period column's \"periods\" gives the "
+        "earliest..latest value per granularity), not from "
         "your own knowledge of the date; complete periods first (a partial current year "
         f"only when the question asks for it). Today is {today}.\n"
         "3. ONLY when no catalog query can answer a part, give a new \"query\" spec for it "
@@ -4451,9 +4473,12 @@ def table_query_select(question: str, catalogs: list[dict[str, Any]],
                       "from allowed_values / valid_combinations below --, another catalog "
                       "query, or a new query spec):\n"
                       + json.dumps(failures, ensure_ascii=False, indent=1))
+    inv_block = ("\n\nALL TABLES (every loaded table; describe any of them):\n"
+                 + json.dumps(inventory, ensure_ascii=False)) if inventory else ""
     user = (f"QUESTION: {question}\n\nCANDIDATE TABLES:\n"
-            + json.dumps(catalogs, ensure_ascii=False, indent=1) + fail_block + "\n\n"
-            'Return JSON: {"needed": true|false, "reason": "...", "calls": [{"table": "...", '
+            + json.dumps(catalogs, ensure_ascii=False, indent=1) + inv_block + fail_block + "\n\n"
+            'Return JSON: {"needed": true|false, "reason": "...", "describe": ["<table>"], '
+            '"calls": [{"table": "...", '
             '"query_id": "<catalog id>", "params": {"name": value}, "listing": false} | '
             '{"table": "...", "query": {QUERY SPEC}, "params": {"name": value}, "listing": false, '
             '"purpose": "...", "why_not_catalog": "..."}]}')
