@@ -647,6 +647,35 @@ tasks:
     max_tokens: 2048
     response_format: json_object
 
+  # Structured data (prune-expand / extract-entities --structured-data):
+  # one call per table writes its metadata + metrics/filters/queries SQL, and
+  # also repairs SQL the validator rejected (services/structured/profiler.py).
+  table_profile:
+    provider: openai
+    model: gpt-4.1
+    timeout: 900
+    temperature: 0.0
+    max_tokens: 16384
+    response_format: json_object
+
+  # One call over all tables: shared keys -> LOOKUP join queries.
+  table_lookups:
+    provider: openai
+    model: gpt-4.1
+    timeout: 600
+    temperature: 0.0
+    max_tokens: 8192
+    response_format: json_object
+
+  # query --use-structured-data: is a table needed, and which stored SQL to run.
+  table_query_select:
+    provider: openai
+    model: gpt-4.1-mini
+    timeout: 120
+    temperature: 0.0
+    max_tokens: 2048
+    response_format: json_object
+
 # =============================================================================
 # Retry / backoff defaults (applied by the router via tenacity unless overridden
 # at the task level above).

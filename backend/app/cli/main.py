@@ -433,6 +433,35 @@ def _add_suggestions_flag(p: argparse.ArgumentParser) -> None:
     )
 
 
+
+def _add_structured_profile_flags(p: argparse.ArgumentParser) -> None:
+    """--structured-data for prune-expand/build (profiling + new classes)."""
+    p.add_argument(
+        "--structured-data", type=Path, default=None, metavar="DIR",
+        help=(
+            "Opt-in: a folder of structured tables (CSV/TSV/JSON/Parquet, or "
+            "downloader snapshots -- newest snapshot's normalized/ files). After "
+            "Stage 4 an LLM writes per-table metadata (column descriptions, "
+            "metrics, filters, Postgres SQL, cross-table lookups) and their "
+            "concepts become ontology classes. Metadata is cached and reused by "
+            "extract-entities --structured-data. One table_profile call per "
+            "table (~$0.05-0.08 on gpt-4.1). Default: OFF."
+        ),
+    )
+    p.add_argument(
+        "--structured-limit", type=int, default=None, metavar="N",
+        help="Profile only the first N tables (alphabetical) -- smoke testing.",
+    )
+    p.add_argument(
+        "--table-profile-concurrency", type=int, default=None, metavar="N",
+        help="Concurrent table_profile calls. Unset => concurrency.table_profile in config.yaml (4).",
+    )
+    p.add_argument(
+        "--refresh-table-metadata", action="store_true",
+        help=("Re-profile tables even when cached metadata exists (hand-edited "
+              "metadata from table-metadata-import is kept)."),
+    )
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ypo",
@@ -546,6 +575,7 @@ def build_parser() -> argparse.ArgumentParser:
              "evaluated summarizer (see prune-expand --single-pass-summaries).",
     )
     for _p in (p_pe, p_build):
+        _add_structured_profile_flags(_p)
         _p.add_argument(
             "--summarization-concurrency", type=int, default=None, metavar="N",
             help=(
@@ -2067,6 +2097,10 @@ def _cmd_prune_expand(args: argparse.Namespace) -> int:
             classification_concurrency=getattr(args, "classification_concurrency", None),
             proposal_concurrency=getattr(args, "proposal_concurrency", None),
             dedup_concurrency=getattr(args, "dedup_concurrency", None),
+            structured_data=getattr(args, "structured_data", None),
+            structured_limit=getattr(args, "structured_limit", None),
+            table_profile_concurrency=getattr(args, "table_profile_concurrency", None),
+            refresh_table_metadata=getattr(args, "refresh_table_metadata", False),
         )
     )
     print(f"\nPRUNED+EXPANDED ontology written to: {version_dir}")
@@ -2102,6 +2136,10 @@ def _cmd_build(args: argparse.Namespace) -> int:
             classification_concurrency=getattr(args, "classification_concurrency", None),
             proposal_concurrency=getattr(args, "proposal_concurrency", None),
             dedup_concurrency=getattr(args, "dedup_concurrency", None),
+            structured_data=getattr(args, "structured_data", None),
+            structured_limit=getattr(args, "structured_limit", None),
+            table_profile_concurrency=getattr(args, "table_profile_concurrency", None),
+            refresh_table_metadata=getattr(args, "refresh_table_metadata", False),
         )
     )
     print(f"\nBUILT ontology written to: {version_dir}")

@@ -861,3 +861,28 @@ def qwen_alias_judge(pairs: list[dict[str, str]]) -> tuple[str, str]:
     )
     user = f'PAIRS:\n{lines}\n\nReturn: {{"same":[ids],"different":[ids]}}'
     return system, user
+
+
+# ---------------------------------------------------------------------------
+# Structured data: table_profile (selected by `prompt_set: qwen`).
+# Same task as prompts.table_profile; Qwen gets the output-shape rules that
+# kept its class_proposal replies parseable (compact JSON, short fields, no
+# markdown, no restating the input).
+# ---------------------------------------------------------------------------
+
+_QWEN_TABLE_OUTPUT_RULES = (
+    "\n\nOUTPUT FORMAT (strict):\n"
+    "- Reply with ONE compact JSON object and nothing else: no markdown, no "
+    "```json fences, no reasoning, no restating the profile or sample rows.\n"
+    "- Keep every description under 40 words and every label under 8 words.\n"
+    "- Write each column exactly once, in the order listed.\n"
+    "- Put the JSON keys in this order: description, grain, columns, metrics, "
+    "filters, queries -- so a reply cut off at the end loses only queries."
+)
+
+
+def qwen_table_profile(profile_md: str, candidate_classes: list[dict[str, str]]) -> tuple[str, str]:
+    from backend.app.services.prompts import table_profile
+
+    system, user = table_profile(profile_md, candidate_classes)
+    return system + _QWEN_TABLE_OUTPUT_RULES, user

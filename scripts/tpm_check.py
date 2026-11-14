@@ -79,6 +79,7 @@ STAGE_TASKS: dict[str, tuple[str, ...]] = {
     "class_proposal": ("class_proposal",),
     "dedup": ("match_dedup", "class_synonym_judge"),
     "table_mining": ("table_concept_grouping",),
+    "structured_data": ("table_profile", "table_lookups"),
     "entity_extraction": (
         "entity_extract", "concept_extract", "entity_validate",
         "relationship_extract", "relationship_verify",
@@ -94,7 +95,7 @@ STAGE_TASKS: dict[str, tuple[str, ...]] = {
         "judge_comprehensiveness", "judge_no_hallucination",
         "judge_gap_detection", "judge_consistency",
         "question_parse", "query_decompose", "entity_probes",
-        "answer_simple_qa", "answer_deep_research",
+        "answer_simple_qa", "answer_deep_research", "table_query_select",
     ),
 }
 

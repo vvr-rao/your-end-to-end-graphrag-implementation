@@ -4081,6 +4081,10 @@ async def prune_and_expand_async(
     proposal_concurrency: int | None = None,
     dedup_concurrency: int | None = None,
     compact_descriptions: bool = True,
+    structured_data: Path | None = None,
+    structured_limit: int | None = None,
+    table_profile_concurrency: int | None = None,
+    refresh_table_metadata: bool = False,
 ) -> Path:
     return await _run(
         "prune-expand",
@@ -4107,6 +4111,10 @@ async def prune_and_expand_async(
         proposal_concurrency=proposal_concurrency,
         dedup_concurrency=dedup_concurrency,
         compact_descriptions=compact_descriptions,
+        structured_data=structured_data,
+        structured_limit=structured_limit,
+        table_profile_concurrency=table_profile_concurrency,
+        refresh_table_metadata=refresh_table_metadata,
     )
 
 
@@ -4135,6 +4143,10 @@ async def build_async(
     proposal_concurrency: int | None = None,
     dedup_concurrency: int | None = None,
     compact_descriptions: bool = True,
+    structured_data: Path | None = None,
+    structured_limit: int | None = None,
+    table_profile_concurrency: int | None = None,
+    refresh_table_metadata: bool = False,
 ) -> Path:
     # build = merge + prune-expand chained. Merge first (sync), then drive the
     # async LLM pipeline against the just-written version folder.
@@ -4166,6 +4178,10 @@ async def build_async(
         proposal_concurrency=proposal_concurrency,
         dedup_concurrency=dedup_concurrency,
         compact_descriptions=compact_descriptions,
+        structured_data=structured_data,
+        structured_limit=structured_limit,
+        table_profile_concurrency=table_profile_concurrency,
+        refresh_table_metadata=refresh_table_metadata,
     )
 
 
@@ -4195,6 +4211,10 @@ async def _run(
     proposal_concurrency: int | None = None,
     dedup_concurrency: int | None = None,
     compact_descriptions: bool = True,
+    structured_data: Path | None = None,
+    structured_limit: int | None = None,
+    table_profile_concurrency: int | None = None,
+    refresh_table_metadata: bool = False,
 ) -> Path:
     settings = get_settings()
     app_cfg = settings.app_config
@@ -4203,6 +4223,12 @@ async def _run(
     effective_cost_cap = (
         max_cost_usd if max_cost_usd is not None else float(expansion_cfg.get("max_cost_usd", 25.0))
     )
+
+    if structured_data is not None and not dry_run:
+        # Fail before any paid stage when the folder is wrong.
+        from backend.app.services.structured.prune_expand_hook import check_folder
+
+        check_folder(Path(structured_data), structured_limit)
 
     output_root.mkdir(parents=True, exist_ok=True)
     version_dir = versioning.new_version_dir(output_root, operation)
@@ -4628,6 +4654,33 @@ async def _run(
     timer.record("stage4-apply", time.monotonic() - _stage4_started)
     print(f"[stage4-apply] wall={format_duration(time.monotonic() - _stage4_started)}")
 
+    # Structured data (opt-in): profile the tables AFTER the ontology is final
+    # so their columns/metrics/filters can match or add classes. The metadata
+    # files are cached for extract-entities --structured-data.
+    structured_summary: dict[str, Any] | None = None
+    if structured_data is not None and not dry_run:
+        from backend.app.services.structured.prune_expand_hook import (
+            resolve_concurrency,
+            run_structured_profile,
+        )
+
+        _sd_started = time.monotonic()
+        _onto_cfg = app_cfg.get("ontology", {}) or {}
+        structured_summary = await run_structured_profile(
+            folder=Path(structured_data),
+            ontology=out_ontology,
+            router=router,
+            version_dir=version_dir,
+            audit=lambda task, payload: _append_audit(audit_path, -1, task, "structured_data", payload),
+            base_iri=_onto_cfg.get("default_base_iri") or "https://veerla-ramrao.ai/ontology/merged#",
+            parent_iri=_onto_cfg.get("default_parent_iri"),
+            limit=structured_limit,
+            concurrency=resolve_concurrency(table_profile_concurrency, app_cfg),
+            refresh=refresh_table_metadata,
+        )
+        created.extend(structured_summary["created_classes"])
+        timer.record("structured-data", time.monotonic() - _sd_started)
+
     counts_after = folder_io.count_entities(out_ontology)
     print(f"[{operation}] entity counts: before={counts_before}, after={counts_after}")
 
@@ -4654,6 +4707,7 @@ async def _run(
             "after": counts_after,
             "created_classes": created,
             "llm_total_cost_usd": round(router.total_cost_usd, 6),
+            **({"structured_data": structured_summary} if structured_summary else {}),
         },
     )
     # Per-task spend breakdown. manifest/stats already carry the TOTAL, but a

@@ -206,6 +206,9 @@ concurrency:
   # batch count scales with proposals, not chunks: a 30-doc run produced 32
   # batches taking ~15-18 min at 4.
   dedup: 4
+  # prune-expand / extract-entities --structured-data: concurrent table_profile
+  # calls (one per table, gpt-4.1 @ max_tokens 16384 in the OpenAI presets).
+  table_profile: 4
   # prune-expand --tables / register-documents --tables: how many PDFs are
   # extracted CONCURRENTLY. Each PDF runs in its own subprocess
   # (table_extract_worker) so the kernel reclaims its memory on exit -- the

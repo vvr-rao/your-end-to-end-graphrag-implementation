@@ -691,6 +691,39 @@ tasks:
     max_tokens: 2048
     response_format: json_object
 
+  # Structured data (prune-expand / extract-entities --structured-data):
+  # one call per table writes its metadata + metrics/filters/queries SQL, and
+  # also repairs SQL the validator rejected (services/structured/profiler.py).
+  table_profile:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 300
+    temperature: 0.0
+    max_tokens: 16384
+    response_format: json_object
+    stream: true            # timeout = max gap between tokens (see class_proposal)
+    prompt_set: qwen        # prompts_qwen.qwen_table_profile
+    salvage_truncated: true # keep the complete part of a cut-off reply
+
+  # One call over all tables: shared keys -> LOOKUP join queries.
+  table_lookups:
+    provider: deepinfra
+    model: __DEEPINFRA_FLASH_MODEL__
+    timeout: 300
+    temperature: 0.0
+    max_tokens: 8192
+    response_format: json_object
+    stream: true
+
+  # query --use-structured-data: is a table needed, and which stored SQL to run.
+  table_query_select:
+    provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4.1-Flash
+    timeout: 120
+    temperature: 0.0
+    max_tokens: 2048
+    response_format: json_object
+
   # mine-aliases judge (alias_judge.py, migration 0013): drops mined synonym
   # pairs that are not two names for one thing -- on the 2026-10-19 web-search
   # build ~440 of 614 judged pairs were false (Refinery <-> PetroChina, Energy <-> DoE).

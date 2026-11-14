@@ -40,6 +40,7 @@ STAGE_MODULES = {
     ],
     "summarization": ["backend/app/services/evaluated_summarizer.py"],
     "evaluation": ["backend/app/services/eval_judge.py"],
+    "structured_data": ["backend/app/services/structured/profiler.py"],
 }
 
 
