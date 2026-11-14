@@ -250,3 +250,36 @@ async def test_export_edit_import_updates_node_edges_and_cache(db, data, tmp_pat
                   encoding="utf-8")
     (bad,) = await import_markdown([md], cache=cache)
     assert not bad.applied and any("no_such_col" in e for e in bad.errors)
+
+
+async def test_load_stores_valid_values_and_retrieval_checks_them(db, data, tmp_path):
+    from backend.app.services.structured.db_load import load_and_link, registered_tables
+    from backend.app.services.structured.metadata import find_item
+    from backend.app.services.structured.retrieval_step import structured_evidence
+
+    await load_and_link(await _profile(data, tmp_path), root_name="data", log=lambda *_: None)
+    async with db() as s:
+        meta = (await registered_tables(s))["prices"]["meta"]
+    dom = meta["value_domains"]
+    assert dom["commodity"] == {"values": ["Copper", "Crude oil"]}
+    assert dom["value"] == {"min": 80.5, "max": 8500}
+    _sec, item = find_item(meta, "by_first")
+    assert item["params"][0]["allowed_values"] == ["Copper", "Crude oil"]   # travels with the query
+
+    async def ids():
+        from sqlalchemy import text
+        async with db() as s:
+            return [(await s.execute(text(
+                "SELECT id FROM graphrag.entities WHERE normalized_name = 'copper'"))).scalar()]
+
+    router = FakeRouter({"table_query_select": [
+        {"needed": True, "calls": [{"table": "prices", "query_id": "by_first", "params": {"v": "COPPER"}},
+                                   {"table": "prices", "query_id": "by_first", "params": {"v": "Gold"}}]},
+        {"needed": False}]})
+    ev, plan = await structured_evidence("copper?", router=router, entity_ids=await ids(),
+                                         class_ids=[], qvec=None)
+    assert len(ev) == 1 and ev[0]["params"] == {"v": "Copper"}
+    assert plan["calls"][0]["substituted"] == [{"param": "v", "from": "COPPER", "to": "Copper"}]
+    bad = plan["calls"][1]
+    assert bad["invalid_values"][0]["allowed_values"] == ["Copper", "Crude oil"] and "sql" not in bad
+    assert "Crude oil" in router.calls[1][1]                    # valid values reached the retry

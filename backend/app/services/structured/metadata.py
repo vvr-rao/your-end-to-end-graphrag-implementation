@@ -221,18 +221,44 @@ def metadata_text(meta: dict) -> str:
 
 
 def catalog_for_prompt(meta: dict, max_items: int = 40) -> dict:
-    """Compact view the retrieval model chooses queries from."""
+    """Compact view the retrieval model chooses queries from.
+
+    Columns carry their VALID VALUES (every distinct value when there are few,
+    else the min/max) from ``value_domains``; value combinations that occur
+    together are listed once per table and referenced by index from the
+    queries that filter on them."""
+    domains = meta.get("value_domains") or {}
+
+    def _col(c: dict) -> dict:
+        d = domains.get(c["name"]) or {}
+        out = {"name": c["name"], "type": c.get("type"), "role": c.get("role"),
+               "description": c.get("description")}
+        if "values" in d:
+            out["values"] = d["values"]
+        elif "min" in d:
+            out["range"] = [d["min"], d["max"]]
+        elif c.get("examples"):
+            out["examples"] = c["examples"][:5]
+        return out
+
     cat = {"table": meta["table_name"], "description": meta.get("description"),
            "grain": meta.get("grain"), "row_count": meta.get("row_count"),
-           "columns": [{"name": c["name"], "type": c.get("type"), "role": c.get("role"),
-                        "description": c.get("description"),
-                        **({"examples": c["examples"][:5]} if c.get("examples") else {})}
-                       for c in meta.get("columns") or []],
+           "columns": [_col(c) for c in meta.get("columns") or []],
            "queries": []}
+    combos: list[dict] = []
     for sec, it in items(meta):
         if len(cat["queries"]) >= max_items:
             break
-        cat["queries"].append({
+        combo_ref = {}
+        ac = it.get("allowed_combinations")
+        if ac and ac.get("rows"):
+            cols = [next((p.get("column") for p in it.get("params") or [] if p.get("name") == n), n)
+                    for n in ac["params"]]
+            key = {"columns": cols, "rows": ac["rows"]}
+            if key not in combos:
+                combos.append(key)
+            combo_ref = {"valid_combinations": {"params": ac["params"], "see": combos.index(key)}}
+        cat["queries"].append({**combo_ref,
             "id": it["id"], "kind": sec[:-1] if sec != "queries" else "query",
             "label": it.get("label"), "description": it.get("description"),
             "params": [{k: p.get(k) for k in ("name", "type", "column", "example")}
@@ -240,6 +266,8 @@ def catalog_for_prompt(meta: dict, max_items: int = 40) -> dict:
             **({"query": it["query"]} if isinstance(it.get("query"), dict) else {"sql": it.get("sql")}),
             **({"other_table": it["other_table"]} if it.get("other_table") else {}),
         })
+    if combos:
+        cat["value_combinations"] = combos
     return cat
 
 

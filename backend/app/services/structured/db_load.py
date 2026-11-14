@@ -458,6 +458,12 @@ async def load_and_link(run, *, root_name: str, cache=None, embed: EmbedFn | Non
                     summary.rows += n
                     summary.loaded.append(name)
                     existing_id = None
+                # Valid values per filter column / parameter, read from the
+                # table just loaded (no LLM): the selection model sees them and
+                # parameter values are checked against them before SQL runs.
+                from backend.app.services.structured.value_domains import attach_value_domains
+
+                await attach_value_domains(s, meta)
                 vec = None
                 if embed is not None:
                     vec = (await embed([metadata_text(meta)]))[0]

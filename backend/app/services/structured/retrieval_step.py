@@ -39,6 +39,7 @@ from backend.app.services.structured.metadata import (
 from backend.app.services.structured.query_builder import QuerySpecError, build_sql
 from backend.app.services.structured.sql_exec import SqlResult, run_sql
 from backend.app.services.structured.sql_guard import SqlGuardError
+from backend.app.services.structured.value_domains import check_params, spec_declared
 
 _TABLE_EDGE_KINDS = ("tableEntity", "tableColumn", "tableMetric", "tableFilter")
 
@@ -160,10 +161,15 @@ async def _execute(call: dict, by_table: dict[str, dict], *, max_rows: int, time
         except (QuerySpecError, SqlGuardError) as exc:
             err = f"stored query does not compile: {exc}"
             return {**rec, "error": err}, None, err
-        declared = item.get("params") if isinstance(item.get("query"), dict) else None
+        declared = (item.get("params") if isinstance(item.get("query"), dict) else None) or built.params
+        params, bad, subs = check_params(params, declared, item.get("allowed_combinations"))
+        if subs:
+            rec["substituted"] = subs
+        if bad:
+            err = "parameter value(s) not in the column's valid values (see invalid_values)"
+            return {**rec, "params": params, "invalid_values": bad, "error": err}, None, err
         res = await run_sql(built.sql, params, built.tables & (all_tables | {meta["table_name"]}),
-                            max_rows=max_rows, timeout_ms=timeout_ms,
-                            declared_params=declared or built.params)
+                            max_rows=max_rows, timeout_ms=timeout_ms, declared_params=declared)
     elif isinstance(call.get("query"), dict):
         rec = {"table": table, "query_id": None, "label": call.get("purpose") or "new query spec",
                "source": "spec", "query": call["query"], "why_not_catalog": call.get("why_not_catalog")}
@@ -175,8 +181,16 @@ async def _execute(call: dict, by_table: dict[str, dict], *, max_rows: int, time
         except QuerySpecError as exc:
             err = f"query spec does not compile: {exc}"
             return {**rec, "error": err}, None, err
+        domains = ((by_table.get(table) or {}).get("meta") or {}).get("value_domains") or {}
+        declared = spec_declared(built.params, domains)
+        params, bad, subs = check_params(params, declared)
+        if subs:
+            rec["substituted"] = subs
+        if bad:
+            err = "parameter value(s) not in the column's valid values (see invalid_values)"
+            return {**rec, "params": params, "invalid_values": bad, "error": err}, None, err
         res = await run_sql(built.sql, params, built.tables, max_rows=max_rows, timeout_ms=timeout_ms,
-                            declared_params=built.params)
+                            declared_params=declared)
     else:
         err = "call has neither query_id nor query"
         return {"table": table, "error": err}, None, err
@@ -449,6 +463,7 @@ async def structured_evidence(
         if err or missing:
             failures.append({"call": call, "sql": rec.get("sql"),
                              "error": err or "value(s) not found in their column (see missing_values)",
+                             **({"invalid_values": rec["invalid_values"]} if rec.get("invalid_values") else {}),
                              **({"missing_values": missing} if missing else {}),
                              **({"value_combinations": rec["value_combinations"]}
                                 if rec.get("value_combinations") else {})})

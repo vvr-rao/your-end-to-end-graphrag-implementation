@@ -206,6 +206,9 @@ async def import_markdown(
         new["edited"] = True
         vec = (await embed([metadata_text(new)]))[0] if embed is not None else None
         async with session_scope() as s:
+            from backend.app.services.structured.value_domains import attach_value_domains
+
+            await attach_value_domains(s, new)
             gv = await current_version(s)
             node_id: uuid.UUID = await upsert_node(s, new, vec, gv, cur["id"])
             rep.class_edges, rep.entity_edges = await rebuild_edges(
