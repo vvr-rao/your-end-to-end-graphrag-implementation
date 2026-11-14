@@ -388,6 +388,28 @@ Other things worth knowing:
   declares no object property whose domain AND range both match this corpus's
   classes -- not that the documents assert nothing.
 
+## Structured data (data files as SQL tables)
+Data files (CSV/TSV/JSON/JSONL/Parquet) can sit beside the documents:
+1. `prune-expand --structured-data <DIR>` — an LLM writes each table's metadata
+   (descriptions, metrics, filters, Postgres SQL, cross-table lookups) and adds
+   the concepts as ontology classes. Cached by file content.
+2. `extract-entities --structured-data <DIR>` (or `--structured-only`) — loads
+   the tables into the `graphrag` schema and links each table's metadata node to
+   classes and to existing entities found in key columns. Reads the cache: no
+   new LLM calls when prune-expand already profiled the files.
+3. `query --use-structured-data` (simple_qa / deep_research; also the
+   `use_structured_data` field of `POST /qa` and conversation turns) — tables
+   reached through the graph walk are offered to one selection call that picks
+   STORED queries and fills their parameters; it writes new SQL only when none
+   fits. Every statement runs read-only, with a timeout, and at most
+   `qa.structured_max_rows` (50) rows reach the prompt — aggregates still run
+   over the whole table; the cap only bounds what the model reads, and a capped
+   result says "N of M rows". Results are cited as `viao:SqlResult_…`. Off by
+   default (`qa.use_structured_data: false`); without it answers are unchanged.
+4. Review: `table-metadata-export -o <MD_DIR>`, edit, then
+   `table-metadata-import <MD_DIR> [--dry-run]` (validates SQL with EXPLAIN,
+   shows a diff, rebuilds the table's graph edges, keeps the edit in the cache).
+
 ## CLI (single entrypoint)
 `uv run python -m backend.app.cli <subcommand>`. Discover everything with
 `uv run python -m backend.app.cli --help`. Groups: ontology (`merge`, `prune`,
@@ -395,7 +417,8 @@ Other things worth knowing:
 `enrich-geo`, `embed-relationships`, `relink-artifact-entities`, `classify-concepts`,
 `db-init`, `clear-corpus`), evaluation (`eval-corpus`, `eval-typing` and `eval-ontology` (LLM-as-judge yes/no on entity typing and class definitions), `eval-questions`, `eval-dataset`; Recall@K/Precision@K/MRR on `eval_questions/testsets/`; optional LangSmith upload; see `backend/app/evals/README.md`), corpus (`register-documents`, `list-documents`,
 `update-document`, `delete-document`), enrichment (`extract-entities`,
-`enrich-time`, `generate-artifacts`), retrieval (`query`, `evaluate-queries`,
+`enrich-time`, `generate-artifacts`), structured data (`table-metadata-export`,
+`table-metadata-import`), retrieval (`query`, `evaluate-queries`,
 `conversation start|turn|show`), deploy (`render-*`).
 
 ## Serving surfaces

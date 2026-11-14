@@ -176,6 +176,36 @@ domain check an earlier build filed `Nausea` and `NonFatalStroke` as siblings of
 Retrieval does NOT need this flag — StructuredTable artifacts reach Phase 2 from
 `--tables` alone.
 
+### `--structured-data DIR` — data files (CSV / TSV / JSON / JSONL / Parquet)
+Ask about this when the user has **data files** next to the documents, e.g. a
+folder made by `source_documents/structured_download.py`,
+`supplementary_download.py` or `hf_dataset.py pull` (snapshot layouts are
+understood: the newest snapshot per dataset, `normalized/` files only). It is
+separate from `--tables`, which is about tables INSIDE PDFs.
+
+What it does, after Stage 4: one `table_profile` LLM call per table (column
+profile + 20 sample rows, never the whole file) writes the table's metadata —
+table/column descriptions, metrics, filters, Postgres SQL queries — plus one
+`table_lookups` call over all tables for shared keys (join queries stored in
+both tables). Every statement is checked (one SELECT, own table only, real
+columns); a failing one gets one repair call, then is dropped and logged.
+Concepts behind columns/metrics/filters become ontology classes (parents
+default to Metric / Measure / Dimension / TimePeriod).
+
+- **Cost (estimate, not yet measured on a full run):** ~$0.05–0.08 per table on
+  gpt-4.1 (claude-sonnet-4-6 in Anthropic mode, the 27B in DeepInfra mode).
+  ~25 tables ≈ $1.50–2; ~63 tables ≈ $4–5.
+- **Cache:** keyed on the file's bytes, not the model. Results land in the run
+  folder (`structured/<table>.metadata.json`) and the user cache, so a re-run —
+  and `extract-entities --structured-data` later — makes **zero** profiling
+  calls. `--refresh-table-metadata` forces a re-profile (hand-edited entries
+  are still kept).
+- **Smoke-test first:** add `--structured-limit 2` (first N tables
+  alphabetically), check the two metadata files and the `table_class_added`
+  audit records, then ask before the full folder.
+- Flags: `--structured-data <DIR> [--structured-limit N] [--table-profile-concurrency N] [--refresh-table-metadata]`.
+  Without `--structured-data` the run is unchanged.
+
 ## Step 2b — Compact the class descriptions first (cheap; cuts the big step)
 **This is a default step.** prune-expand (and expand / build) compacts any
 class in its input that has no `compact_description` yet, writes the result

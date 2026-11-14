@@ -1063,7 +1063,8 @@ Edit the `CONTACT` constant at the top of `financial_report_download.py` before 
 
 `source_documents/structured_download.py` downloads public structured datasets as
 provider-native files plus optional normalized CSV, with a `manifest.json` per run.
-This is acquisition only; ingestion comes in a later upgrade. Sources: SEC EDGAR,
+Loading the files into the graph is described in
+[Using structured data in the graph](#using-structured-data-in-the-graph). Sources: SEC EDGAR,
 FRED/ALFRED, GLEIF, FFIEC CDR / Fed NIC, ClinicalTrials.gov / AACT, Drugs@FDA, FDA
 Orange Book, ChEMBL, Open Targets.
 
@@ -1077,6 +1078,38 @@ Credentials (`SEC_USER_AGENT`, `FRED_API_KEY`, optional `OPENFDA_API_KEY`,
 `FFIEC_USER_ID`/`FFIEC_TOKEN`) go in `.env`. Full options, output layout, and the
 live-tested vs fixture-tested status of each source are in
 [`source_documents/structured/README.md`](source_documents/structured/README.md).
+
+#### Using structured data in the graph
+
+Any folder of data files (CSV/TSV/JSON/JSONL/Parquet; the downloaders' snapshot
+layout is understood) can join the pipeline. Every flag is opt-in; without them
+nothing changes.
+
+```bash
+# 1. Profile each table with an LLM: table/column descriptions, metrics, filters,
+#    Postgres SQL queries, cross-table lookups; concepts become ontology classes.
+#    Cached by file content (run folder structured/ + user cache).
+uv run python -m backend.app.cli prune-expand --input output_ontologies/v<TS>-merge/ --documents <DOCS> \
+  --structured-data <DATA_DIR> --structured-limit 2      # smoke test first
+
+# 2. Load the tables into the graphrag schema (one table per file) and link each
+#    table's TableMetadata node to classes and to existing entities in key
+#    columns. Reads the cache -- no profiling calls when step 1 ran.
+uv run python -m backend.app.cli extract-entities --structured-only --structured-data <DATA_DIR>
+
+# 3. Answer from the tables via SQL only (stored queries first; new SQL only when
+#    none fits; read-only, timed out, at most qa.structured_max_rows rows shown).
+uv run python -m backend.app.cli query --mode simple_qa --use-structured-data "..."
+
+# 4. Review / edit the metadata as Markdown.
+uv run python -m backend.app.cli table-metadata-export -o review/
+uv run python -m backend.app.cli table-metadata-import review/ --dry-run
+uv run python -m backend.app.cli table-metadata-import review/
+```
+
+Models: `table_profile` / `table_lookups` use gpt-4.1 (claude-sonnet-4-6 in
+Anthropic mode, the dedicated Qwen 27B in DeepInfra mode); `table_query_select`
+uses each mode's retrieval model. Code: `backend/app/services/structured/`.
 
 #### Supplementary sources
 

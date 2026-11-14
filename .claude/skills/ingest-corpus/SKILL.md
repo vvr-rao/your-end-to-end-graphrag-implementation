@@ -526,6 +526,37 @@ What to tell the user afterwards:
   fragmentation was repaired. Zero on a large corpus is suspicious.
 - An EXISTING graph has none of these edges until extract-entities re-runs.
 
+## Step 3b — Load structured tables (optional; only with `--structured-data`)
+If prune-expand was run with `--structured-data <DIR>`, load the same folder now.
+This creates one Postgres table per data file in the `graphrag` schema (named
+after the file; a source-folder prefix on clashes such as `fred_observations`),
+one `TableMetadata` node per table, and edges from that node to ontology
+classes (columns/metrics/filters) and to EXISTING entities whose names appear
+in key columns. No new entities are created.
+
+It reads the metadata cache written by prune-expand, so it should make **zero**
+profiling calls — confirm the line `metadata: N from cache, 0 profiled now`.
+Anything profiled now means the cache was missed (different files, or a
+different machine); say so before continuing on a large folder.
+
+Smoke-test, then the full folder (ask before the full run). Either run it with
+extract-entities, or on its own after it:
+```
+uv run python -m backend.app.cli extract-entities --structured-only --structured-data <DIR> --structured-limit 2
+uv run python -m backend.app.cli extract-entities --structured-only --structured-data <DIR>
+uv run python -m backend.app.cli db-size
+uv run python scripts/build_state.py record structured-tables tables=<n> rows=<n>
+```
+Report: tables loaded / unchanged / failed, rows, class edges, entity edges,
+and the `db-size` delta (data tables count toward the database size).
+Re-running is safe: an unchanged file is not reloaded; a changed file is
+reloaded and its old metadata node marked STALE.
+
+Review loop (optional): `table-metadata-export -o <MD_DIR>` writes one
+Markdown file per table; after editing, `table-metadata-import <MD_DIR> --dry-run`
+validates every SQL statement (guard + EXPLAIN) and shows the diff, then
+`table-metadata-import <MD_DIR>` applies it (node, embedding, edges, cache).
+
 ## Step 4 — enrich-time (short)
 Temporal enrichment (Year/Quarter/Month/Day, parent creation + gap-fill). Fast and
 cheap — run in the foreground. Chunk kind is automatic (follows the corpus); the
