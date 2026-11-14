@@ -144,7 +144,8 @@ def stats_table(st: dict, cite: str = "", *, plain: bool = False) -> str:
     ``plain`` lines (item: first -> last, change %) for plain-text answers."""
     ordered = sorted(st["items"], key=lambda it: (it["pct"] is None, -(it["pct"] or 0)))
     if plain:
-        out = [f"ALL ITEMS ({len(st['items'])}, {st['value_column']} by {st['period_column']})"
+        out = [f"ALL ITEMS ({len(st['items'])}, {st['value_column']} by {st['period_column']}, "
+               f"{st['periods'][0]}..{st['periods'][1]})"
                + (f" {cite}" if cite else "")]
         for it in ordered:
             pct = "n/a" if it["pct"] is None else f"{it['pct']:+.1f}%"

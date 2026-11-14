@@ -56,10 +56,13 @@ class TestSet:
     questions: list[TestQuestion]
     corpus: str = ""
     description: str = ""
+    # run the questions with --use-structured-data (tables via SQL)
+    use_structured_data: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {"format": FORMAT, "name": self.name, "corpus": self.corpus,
                 "description": self.description,
+                **({"use_structured_data": True} if self.use_structured_data else {}),
                 "questions": [asdict(q) for q in self.questions]}
 
     def save(self, path: Path) -> None:
@@ -130,7 +133,8 @@ def from_dict(data: dict[str, Any]) -> TestSet:
             answer_strings=_strings(q.get("answer_strings"), f"question {i} answer_strings"),
             answer_match=match))
     return TestSet(name=name, questions=questions, corpus=str(data.get("corpus") or ""),
-                   description=str(data.get("description") or ""))
+                   description=str(data.get("description") or ""),
+                   use_structured_data=bool(data.get("use_structured_data")))
 
 
 def load_testset(path: Path) -> TestSet:

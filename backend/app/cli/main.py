@@ -860,6 +860,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_eq.add_argument("--logs", type=Path, nargs="+", default=None,
                       help="`query` output files; their RUN_ID lines are read.")
     p_eq.add_argument("--mode", default="simple_qa", choices=["simple_qa", "deep_research"])
+    p_eq.add_argument("--use-structured-data", action="store_true",
+                      help="Run the questions with structured data (tables via SQL). "
+                           "A test set with \"use_structured_data\": true does this "
+                           "without the flag.")
     p_eq.add_argument("--out", type=Path, default=None, help="Write the JSON report here.")
     p_eq.add_argument("--json", action="store_true", help="Print JSON instead of text.")
     p_eq.add_argument("--batch-size", type=int, default=None,
@@ -2453,7 +2457,8 @@ def _cmd_eval_questions(args: argparse.Namespace) -> int:
         from backend.app.evals.question_eval import run_batch_file
 
         asyncio.run(run_batch_file(args.batch_questions, args.batch_out,
-                                   mode=args.mode, answer=args.answer))
+                                   mode=args.mode, answer=args.answer,
+                                   structured=args.use_structured_data))
         return 0
 
     runs = [(r, "") for r in (args.run_ids or [])]
@@ -2480,6 +2485,7 @@ def _cmd_eval_questions(args: argparse.Namespace) -> int:
     from backend.app.evals.question_eval import traces_in_batches
 
     batch_size = args.batch_size if args.batch_size is not None else configured_batch_size()
+    structured = bool(args.use_structured_data or (testset and testset.use_structured_data))
     questions = [] if runs else [q.question for q in testset.questions]
     batched = bool(questions) and batch_size > 0 and len(questions) > batch_size
     pre: tuple[list[dict[str, Any]], float] | None = None
@@ -2491,7 +2497,8 @@ def _cmd_eval_questions(args: argparse.Namespace) -> int:
               f"traces in {traces_dir}")
         try:
             pre = traces_in_batches(questions, mode=args.mode, answer=args.answer,
-                                    batch_size=batch_size, traces_dir=traces_dir)
+                                    batch_size=batch_size, traces_dir=traces_dir,
+                                    structured=structured)
         except (RuntimeError, ValueError) as exc:
             print(f"eval-questions: {exc}", file=sys.stderr)
             return 1
@@ -2504,7 +2511,7 @@ def _cmd_eval_questions(args: argparse.Namespace) -> int:
             traces = await traces_from_runs(runs)
         else:
             traces, cost = await traces_by_retrieval(
-                questions, mode=args.mode, answer=args.answer)
+                questions, mode=args.mode, answer=args.answer, structured=structured)
         report = await describe(traces, testset, args.k)
         report["summary"]["cost_usd"] = round(cost, 4)
         return report

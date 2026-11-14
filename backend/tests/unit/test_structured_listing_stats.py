@@ -63,7 +63,24 @@ def test_plain_table_for_deep_research_and_its_prompt():
 
     st = change_stats(COLS, ROWS, "period", "value")
     lines = stats_table(st, "[viao:S]", plain=True).splitlines()
-    assert lines[0] == "ALL ITEMS (4, value by period) [viao:S]"
+    assert lines[0] == "ALL ITEMS (4, value by period, 2023..2025) [viao:S]"
     assert lines[1] == "  A / u1: 2023 100.0 -> 2025 120.0 (+20.0%)" and "|" not in "".join(lines)
     ev = [{"kind": "sql_result", "listing": True, "iri": "x", "text": "t", "change_stats": st}]
     assert "appended after KEY INSIGHTS" in PROMPTS["answer_deep_research"]("q", ev)[0]
+
+
+def test_testset_flag_and_trace_carry_structured_calls():
+    from types import SimpleNamespace
+
+    from backend.app.evals.question_eval import trace_from_result
+    from backend.app.evals.testset import from_dict
+
+    ts = from_dict({"name": "s", "use_structured_data": True, "questions": [{"question": "q"}]})
+    assert ts.use_structured_data and ts.to_dict()["use_structured_data"] is True
+    assert "use_structured_data" not in from_dict({"name": "s", "questions": [{"question": "q"}]}).to_dict()
+    call = {"table": "t", "query_id": "m", "params": {"p_from": "2023"}, "listing": True,
+            "row_count": 3, "error": None, "sql": "SELECT 1"}
+    res = SimpleNamespace(evidence=[], answer="a", retrieval_run_id=None,
+                          parsed={"structured_data": {"calls": [call]}})
+    tr = trace_from_result("q", res)
+    assert tr["structured_calls"] == [{k: v for k, v in call.items() if k != "sql"}]
