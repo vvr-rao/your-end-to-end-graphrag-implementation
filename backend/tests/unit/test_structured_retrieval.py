@@ -21,12 +21,19 @@ META = {
     "columns": [{"name": "commodity", "type": "text"}, {"name": "period", "type": "date"},
                 {"name": "value", "type": "numeric"}],
     "metrics": [{"id": "avg_price", "label": "Average price",
-                 "params": [{"name": "c", "type": "text", "column": "commodity"}],
-                 "sql": "SELECT AVG(value) AS avg_value FROM prices WHERE commodity = :c"}],
+                 "query": {"select": [{"agg": "avg", "column": "value", "as": "avg_value"}],
+                           "where": [{"column": "commodity", "op": "=", "param": "c"}]},
+                 "params": [{"name": "c", "type": "text", "column": "commodity", "example": "Copper"}],
+                 "sql": "(compiled at run time)"}],
     "filters": [], "queries": [],
     "lookups": [{"id": "company_prices", "other_table": "companies", "params": [],
-                 "sql": "SELECT c.company, p.value FROM companies c JOIN prices p ON p.commodity = c.commodity"}],
+                 "join": [{"column": "commodity", "other_column": "commodity"}],
+                 "query": {"select": ["companies.company", "value"]}}],
 }
+AVG_SQL = ('SELECT AVG("value") AS "avg_value" FROM "prices" '
+           'WHERE "commodity" = CAST(:c AS text)')
+COMPANIES = {"table_name": "companies", "columns": [{"name": "company", "type": "text"},
+                                                    {"name": "commodity", "type": "text"}]}
 NODE = uuid.uuid4()
 
 
@@ -46,7 +53,11 @@ def patched(monkeypatch):
         r.params = r.params or dict(params or {})
         return r
 
+    async def fake_metas(names):
+        return {"companies": COMPANIES} if "companies" in names else {}
+
     monkeypatch.setattr(rs, "candidate_tables", fake_cands)
+    monkeypatch.setattr(rs, "table_metas", fake_metas)
     monkeypatch.setattr(rs, "run_sql", fake_run)
     return calls, results
 
@@ -63,7 +74,7 @@ async def test_catalog_query_is_used_and_becomes_cited_evidence(patched):
             {"table": "prices", "query_id": "avg_price", "params": {"c": "Copper"}}]}]})
     ev, plan = await _go(router)
     assert [c[0] for c in router.calls] == ["table_query_select"]
-    assert calls == [(META["metrics"][0]["sql"], {"c": "Copper"}, {"prices"})]
+    assert calls == [(AVG_SQL, {"c": "Copper"}, {"prices"})]   # built from the spec, not stored text
     assert len(ev) == 1 and ev[0]["kind"] == "sql_result" and ev[0]["node_id"] == NODE
     assert ev[0]["query_id"] == "avg_price" and ev[0]["sql_source"] == "catalog"
     assert "avg_value=8500" in ev[0]["text"] and "Parameters: c=Copper" in ev[0]["text"]
@@ -78,19 +89,33 @@ async def test_not_needed_runs_no_sql(patched):
     assert ev == [] and calls == [] and plan["needed"] is False
 
 
-async def test_failed_catalog_query_gets_one_retry_with_new_sql(patched):
+async def test_failed_catalog_query_gets_one_retry_with_a_query_spec(patched):
     calls, results = patched
     results.append(SqlResult(sql="", error="column \"x\" does not exist"))
     router = FakeRouter({"table_query_select": [
         {"needed": True, "calls": [{"table": "prices", "query_id": "avg_price", "params": {"c": "Cu"}}]},
-        {"needed": True, "calls": [{"table": "prices", "new_sql": "SELECT MAX(value) AS m FROM prices",
-                                    "params": {}, "purpose": "max price"}]},
+        {"needed": True, "calls": [{"table": "prices", "purpose": "max price",
+                                    "query": {"select": [{"agg": "max", "column": "value", "as": "m"}]},
+                                    "params": {}}]},
     ]})
     ev, plan = await _go(router)
     assert len(router.calls) == 2 and "PREVIOUS ATTEMPT FAILED" in router.calls[1][1]
     assert 'column \\"x\\" does not exist' in router.calls[1][1]
-    assert plan["retried"] and len(ev) == 1 and ev[0]["sql_source"] == "generated"
-    assert ev[0]["query_id"] is None and calls[1][2] == {"prices", "companies"}
+    assert plan["retried"] and len(ev) == 1 and ev[0]["sql_source"] == "spec"
+    assert ev[0]["query_id"] is None
+    assert calls[1][0] == 'SELECT MAX("value") AS "m" FROM "prices"' and calls[1][2] == {"prices"}
+
+
+async def test_model_written_sql_is_never_run(patched):
+    calls, _ = patched
+    router = FakeRouter({"table_query_select": [
+        {"needed": True, "calls": [{"table": "prices", "new_sql": "SELECT 1 FROM prices", "params": {}}]},
+        {"needed": True, "calls": [{"table": "prices", "query": {"select": ["nope"]}, "params": {}}]},
+    ]})
+    ev, plan = await _go(router)
+    assert ev == [] and calls == []
+    assert "neither query_id nor query" in plan["calls"][0]["error"]
+    assert "does not compile" in plan["calls"][1]["error"]
 
 
 async def test_empty_result_also_retries_and_only_once(patched):

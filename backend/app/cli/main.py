@@ -1473,6 +1473,23 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Rebuild only the class edges (skip matching key values to entities).")
     p_tmi.set_defaults(func=_cmd_table_metadata_import)
 
+    p_tq = sub.add_parser(
+        "table-query",
+        help="Build and run one table query with no LLM: a stored metric/filter/"
+             "query/lookup by id, or a JSON query spec. The SQL is compiled "
+             "deterministically from the spec and runs read-only.",
+    )
+    p_tq.add_argument("table", help="Loaded table name (see table-metadata-export).")
+    g_tq = p_tq.add_mutually_exclusive_group(required=True)
+    g_tq.add_argument("--query-id", help="Stored item id from the table's metadata.")
+    g_tq.add_argument("--spec", type=Path, help="JSON file holding a query spec.")
+    p_tq.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
+                      help="Parameter value (repeatable). Lists: comma-separated.")
+    p_tq.add_argument("--sql-only", action="store_true", help="Print the compiled SQL; do not run it.")
+    p_tq.add_argument("--max-rows", type=int, default=50)
+    p_tq.add_argument("--json", action="store_true", help="Print the result as JSON.")
+    p_tq.set_defaults(func=_cmd_table_query)
+
     # ---------- Phase 2: Milestone E (artifacts) ----------
     p_art = sub.add_parser(
         "generate-artifacts",
@@ -2917,6 +2934,47 @@ def _cmd_table_metadata_import(args: argparse.Namespace) -> int:
         print("[table-metadata-import] no .md files found")
         return 2
     return 1 if bad else 0
+
+
+def _cmd_table_query(args: argparse.Namespace) -> int:
+    from backend.app.services.structured import query_runner as qrun
+    from backend.app.services.structured.query_builder import QuerySpecError
+    from backend.app.services.structured.sql_guard import SqlGuardError
+
+    try:
+        params = qrun.parse_param_args(args.param)
+        spec = None
+        if args.spec is not None:
+            spec = json.loads(args.spec.read_text(encoding="utf-8"))
+        if args.sql_only:
+            qr = asyncio.run(qrun.prepare(args.table, query_id=args.query_id, spec=spec))
+        else:
+            qr = asyncio.run(qrun.run(args.table, params, query_id=args.query_id, spec=spec,
+                                      max_rows=args.max_rows))
+    except (qrun.QueryRunError, QuerySpecError, SqlGuardError, json.JSONDecodeError, OSError) as exc:
+        print(f"[table-query] {exc}")
+        return 2
+    res = qr.result
+    if args.json:
+        print(json.dumps({"table": qr.table, "query_id": qr.query_id, "sql": qr.built.sql,
+                          "params": qr.built.params, **({} if res is None else {
+                              "bound": res.params, "columns": res.columns, "rows": res.rows,
+                              "row_count": res.row_count, "truncated": res.truncated,
+                              "total_rows": res.total_rows, "error": res.error,
+                              "seconds": res.seconds})}, indent=2, default=str))
+        return 1 if res is not None and res.error else 0
+    print(f"[table-query] {qr.table}" + (f" / {qr.query_id}" if qr.query_id else " / spec"))
+    print("  params: " + (", ".join(f"{p['name']} ({p['type']}, {p['column'] or '-'})"
+                                    for p in qr.built.params) or "none"))
+    print("  sql:    " + qr.built.sql)
+    if res is None:
+        return 0
+    if res.error:
+        print(f"  error:  {res.error}")
+        return 1
+    print(f"  bound:  {res.params}  ({res.seconds}s)")
+    print(res.as_markdown())
+    return 0
 
 
 def get_settings_app_config() -> dict:

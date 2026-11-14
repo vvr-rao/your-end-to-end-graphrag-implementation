@@ -3,7 +3,11 @@
 
 The Markdown is meant to be edited: table description and grain, the column
 descriptions/roles/units/entity kinds/classes, and every metric, filter, query
-and lookup (label, description, columns, class, parameters, SQL). Items can be
+and lookup (label, description, columns, class, parameter descriptions and
+examples, and the JSON query spec). Each item shows its query spec in a
+```json block (the one to edit) and the SQL compiled from it in a ```sql
+block (read-only: it is rebuilt from the spec on import, edits to it are
+ignored). Parameter names, types and columns are rebuilt from the spec too. Items can be
 added or deleted by adding or deleting their ``### `id` — label`` block. Column
 names and types are fixed by the loaded table and must not change.
 
@@ -14,10 +18,12 @@ and nothing is applied.
 from __future__ import annotations
 
 import copy
+import json
 import re
 from dataclasses import dataclass, field
 
 from backend.app.services.structured.metadata import SECTION_TITLES, SECTIONS
+from backend.app.services.structured.query_builder import canonical
 
 MARKER_RE = re.compile(r"^<!-- yegi-table-metadata format=(\d+) cache_key=([0-9a-f]+) -->$")
 TITLE_RE = re.compile(r"^# Table `([^`]+)`\s*$")
@@ -113,10 +119,21 @@ def to_markdown(meta: dict) -> str:
                         _code(p.get("name")), _cell(p.get("type")), _code(p.get("column")),
                         _cell(p.get("description")), _cell(p.get("example")),
                     ]) + " |")
-            w("")
-            w("```sql")
-            w((it.get("sql") or "").strip())
-            w("```")
+            if isinstance(it.get("query"), dict):
+                w("")
+                w("```json")
+                w(json.dumps(canonical(it["query"]), ensure_ascii=False, indent=2))
+                w("```")
+                w("")
+                w("```sql")
+                w("-- compiled from the query spec above (read-only)")
+                w((it.get("sql") or "").strip())
+                w("```")
+            else:
+                w("")
+                w("```sql")
+                w((it.get("sql") or "").strip())
+                w("```")
     w("")
     return "\n".join(out)
 
@@ -335,8 +352,9 @@ def parse_markdown(text: str) -> _Doc:
             continue
         if s.startswith("```"):
             fence_line = i + 1
+            lang = s[3:].strip().lower()
             if item is None:
-                err(fence_line, "SQL block outside an item")
+                err(fence_line, "code block outside an item")
             i += 1
             buf = []
             while i < n and not lines[i].strip().startswith("```"):
@@ -346,17 +364,35 @@ def parse_markdown(text: str) -> _Doc:
                 err(fence_line, "unterminated ``` block")
             i += 1
             if item is not None:
-                if item["sql"]:
-                    err(fence_line, f"item `{item['id']}` has more than one SQL block")
-                item["sql"] = "\n".join(buf).strip()
+                body = "\n".join(buf).strip()
+                if lang == "json":
+                    if "query" in item:
+                        err(fence_line, f"item `{item['id']}` has more than one ```json block")
+                    try:
+                        spec = json.loads(body)
+                    except json.JSONDecodeError as exc:
+                        err(fence_line + 1 + exc.lineno - 1, f"query spec is not valid JSON: {exc.msg}")
+                        spec = {}
+                    if not isinstance(spec, dict):
+                        err(fence_line, "query spec must be a JSON object")
+                        spec = {}
+                    item["query"] = spec
+                elif lang == "sql":
+                    if item["sql"]:
+                        err(fence_line, f"item `{item['id']}` has more than one SQL block")
+                    item["sql"] = body
+                else:
+                    err(fence_line, "code blocks must be ```json (query spec) or ```sql")
             continue
         err(i + 1, f"unexpected text: {s[:60]}")
         i += 1
 
     for sec in SECTIONS:
         for it in doc.sections.get(sec, []):
-            if not it["sql"]:
-                err(it["_line"], f"item `{it['id']}` has no ```sql block")
+            if "query" in it:
+                it["sql"] = ""          # compiled from the spec on import
+            elif not it["sql"]:
+                err(it["_line"], f"item `{it['id']}` has no ```json query spec")
     ids = [it["id"] for sec in SECTIONS for it in doc.sections.get(sec, [])]
     dups = sorted({x for x in ids if ids.count(x) > 1})
     if dups:

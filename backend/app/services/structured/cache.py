@@ -25,8 +25,8 @@ from pathlib import Path
 from backend.app.core.config import cache_root
 
 # Bump when the profile prompt or metadata shape changes so old entries miss.
-PROFILE_VERSION = "tp-1"
-FORMAT = 1
+PROFILE_VERSION = "tp-2"   # tp-2: queries are JSON specs compiled to SQL
+FORMAT = 2
 
 
 def user_cache_dir() -> Path:

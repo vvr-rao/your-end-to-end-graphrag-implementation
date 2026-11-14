@@ -1,6 +1,6 @@
 """The per-table METADATA FILE (a JSON dict) and helpers around it.
 
-Shape (``format`` 1)::
+Shape (``format`` 2)::
 
     {
       "format": 1, "status": "complete", "cache_key": "...", "profile_version": "tp-1",
@@ -17,16 +17,22 @@ Shape (``format`` 1)::
       "profile": {TableProfile}
     }
 
-Every ITEM is one well-formed Postgres statement with named ``:params``::
+Every ITEM keeps its query as a JSON SPEC with the parameters in a separate
+list; the SQL is compiled from the spec by :mod:`query_builder` (deterministic,
+no LLM)::
 
-    {"id", "label", "description", "sql",
+    {"id", "label", "description",
+     "query": {QUERY SPEC},                      # the source of truth
      "params": [{"name", "type", "column", "description", "example"}],
+     "sql": "SELECT ...",                         # compiled from "query", for reading only
      "columns": [...], "class_iri", "class_label",
      # lookups only:
      "other_table", "join": [{"column", "other_column"}]}
 
-Metric/filter/query items read only their own table; a lookup reads its own
-table and ``other_table``. Each lookup is stored in BOTH tables' files.
+An item without ``query`` (metadata written before format 2) runs its stored
+``sql`` as before. Metric/filter/query items read only their own table; a
+lookup reads its own table and ``other_table``. Each lookup is stored in BOTH
+tables' files.
 """
 
 from __future__ import annotations
@@ -34,6 +40,12 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 
+from backend.app.services.structured.query_builder import (
+    Built,
+    QuerySpecError,
+    build_sql,
+    spec_join_for,
+)
 from backend.app.services.structured.sql_guard import SqlGuardError, check_sql, rename_tables
 
 SECTIONS = ("metrics", "filters", "queries", "lookups")
@@ -62,12 +74,81 @@ def item_tables(meta: dict, section: str, item: dict) -> set[str]:
     return tables
 
 
+def column_types(meta: dict) -> dict[str, str]:
+    return {c["name"]: c.get("type") or "text" for c in meta.get("columns") or []}
+
+
+def item_spec(section: str, item: dict) -> dict | None:
+    """The item's query spec, with a lookup's join filled in from the item."""
+    spec = item.get("query")
+    if not isinstance(spec, dict):
+        return None
+    if section == "lookups" and not spec.get("join") and not spec.get("from"):
+        join = spec_join_for(item)
+        if join:
+            spec = {**spec, "join": join}
+    return spec
+
+
+def compile_item(meta: dict, section: str, item: dict,
+                 types_by_table: dict[str, dict[str, str]]) -> Built:
+    """Deterministic SQL for one item (raises QuerySpecError/SqlGuardError).
+    ``types_by_table``: table -> {column: type} for the item's table(s)."""
+    spec = item_spec(section, item)
+    tables = item_tables(meta, section, item)
+    if spec is None:  # legacy item: stored SQL
+        res = check_sql(item.get("sql") or "", tables)
+        return Built(sql=res.sql, params=[{"name": p, "type": "text", "column": None}
+                                          for p in res.params], tables=res.tables)
+    types = {t: types_by_table[t] for t in tables if t in types_by_table}
+    types.setdefault(meta["table_name"], column_types(meta))
+    built = build_sql(spec, meta["table_name"], types)
+    check_sql(built.sql, tables)      # defence in depth: the guard still applies
+    return built
+
+
+def finalize_item(meta: dict, section: str, item: dict,
+                  types_by_table: dict[str, dict[str, str]]) -> str | None:
+    """Compile a spec item in place: ``sql`` <- compiled statement, ``params``
+    <- the parameters it binds (names/types/columns from the compiler,
+    descriptions/examples kept). Returns an error message instead on failure."""
+    from backend.app.services.structured.query_builder import merge_params
+
+    if not isinstance(item.get("query"), dict):
+        return "item has no query spec"
+    try:
+        built = compile_item(meta, section, item, types_by_table)
+    except (QuerySpecError, SqlGuardError) as exc:
+        return str(exc)
+    item["params"] = merge_params(built, item.get("params"))
+    item["sql"] = built.sql
+    return None
+
+
 def validate_item(meta: dict, section: str, item: dict,
-                  columns_by_table: dict[str, set[str]]) -> str | None:
-    """Return an error message, or None when the item's SQL is acceptable."""
+                  columns_by_table: dict[str, set[str]] | dict[str, dict[str, str]]) -> str | None:
+    """Return an error message, or None when the item compiles and passes the
+    guard. ``columns_by_table`` may map to column sets or {column: type}."""
+    if isinstance(item.get("query"), dict):
+        types = {t: (c if isinstance(c, dict) else {n: "text" for n in c})
+                 for t, c in columns_by_table.items()}
+        types[meta["table_name"]] = column_types(meta) or types.get(meta["table_name"], {})
+        try:
+            built = compile_item(meta, section, item, types)
+        except (QuerySpecError, SqlGuardError) as exc:
+            return str(exc)
+        declared = [p.get("name") for p in item.get("params") or []]
+        missing = [p["name"] for p in built.params if p["name"] not in declared]
+        if missing:
+            return f"parameter(s) used in the query but not in params: {', '.join(missing)}"
+        unused = [p for p in declared if p not in {b["name"] for b in built.params}]
+        if unused:
+            return f"declared param(s) not used in the query: {', '.join(unused)}"
+        return None
     sql = item.get("sql") or ""
     try:
-        res = check_sql(sql, item_tables(meta, section, item), columns=columns_by_table)
+        res = check_sql(sql, item_tables(meta, section, item),
+                        columns={t: set(c) for t, c in columns_by_table.items()})
     except SqlGuardError as exc:
         return str(exc)
     declared = [p.get("name") for p in item.get("params") or []]
@@ -97,7 +178,28 @@ def rename_table(meta: dict, old: str, new: str) -> dict:
             it["sql"] = rename_tables(it["sql"], {old: new})
         if it.get("other_table") == old:
             it["other_table"] = new
+        spec = it.get("query")
+        if isinstance(spec, dict):
+            _rename_spec(spec, old, new)
     return out
+
+
+def _rename_spec(node, old: str, new: str) -> None:
+    """Rewrite ``table`` keys and ``table.column`` strings inside a spec."""
+    if isinstance(node, dict):
+        for k, v in list(node.items()):
+            if k == "table" and v == old:
+                node[k] = new
+            elif isinstance(v, str) and v.startswith(old + "."):
+                node[k] = new + v[len(old):]
+            else:
+                _rename_spec(v, old, new)
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            if isinstance(v, str) and v.startswith(old + "."):
+                node[i] = new + v[len(old):]
+            else:
+                _rename_spec(v, old, new)
 
 
 def metadata_text(meta: dict) -> str:
@@ -135,7 +237,7 @@ def catalog_for_prompt(meta: dict, max_items: int = 40) -> dict:
             "label": it.get("label"), "description": it.get("description"),
             "params": [{k: p.get(k) for k in ("name", "type", "column", "example")}
                        for p in it.get("params") or []],
-            "sql": it.get("sql"),
+            **({"query": it["query"]} if isinstance(it.get("query"), dict) else {"sql": it.get("sql")}),
             **({"other_table": it["other_table"]} if it.get("other_table") else {}),
         })
     return cat

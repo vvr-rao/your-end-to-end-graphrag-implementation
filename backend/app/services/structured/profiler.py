@@ -6,9 +6,11 @@ Stage 4, with the final ontology so new classes can be added) and by
 cache and makes no LLM call at all).
 
 Per table (task ``table_profile``): description, grain, column descriptions
-and roles, METRICS, FILTERS, QUERIES as parameterised Postgres SQL, and the
-ontology concept behind each column/metric/filter. SQL that fails the guard
-gets one repair call; what still fails is dropped and recorded.
+and roles, METRICS, FILTERS, QUERIES as JSON query specs (parameters listed
+separately), and the ontology concept behind each column/metric/filter. The
+model never writes SQL: :mod:`query_builder` compiles each spec. A spec that
+does not compile gets one repair call; what still fails is dropped and
+recorded.
 Across tables (task ``table_lookups``): shared keys -> LOOKUP join queries,
 stored in BOTH tables' metadata.
 """
@@ -28,12 +30,14 @@ from backend.app.services.structured.discovery import TableSource, discover_tabl
 from backend.app.services.structured.metadata import (
     COLUMN_ROLES,
     SECTIONS,
+    column_types,
+    finalize_item,
     rename_table,
-    validate_item,
 )
 from backend.app.services.structured.profiling import ProfileError, profile_markdown, profile_table
+from backend.app.services.structured.query_builder import compact
 
-PROMPT_VERSION = "table_profile@v1"
+PROMPT_VERSION = "table_profile@v2"
 ANCHOR_LABELS = ("Metric", "Measure", "Dimension", "TimePeriod")
 _MAX_CANDIDATES = 40
 _STOP = {"the", "of", "and", "a", "an", "in", "for", "to", "by", "id", "no", "nr", "num",
@@ -181,7 +185,7 @@ def _concept(raw) -> dict | None:
 
 
 def _norm_item(raw: dict, used: set[str], *, with_concept: bool) -> dict | None:
-    if not isinstance(raw, dict) or not str(raw.get("sql") or "").strip():
+    if not isinstance(raw, dict) or not isinstance(raw.get("query"), dict):
         return None
     item = {
         "id": _norm_id(raw.get("id") or raw.get("label"), used),
@@ -189,8 +193,9 @@ def _norm_item(raw: dict, used: set[str], *, with_concept: bool) -> dict | None:
         "description": str(raw.get("description") or "").strip(),
         "columns": [str(c) for c in raw.get("columns") or [] if c],
         "class_iri": None, "class_label": None,
+        "query": raw["query"],
         "params": _norm_params(raw.get("params")),
-        "sql": str(raw["sql"]).strip().rstrip(";").strip(),
+        "sql": "",
     }
     if with_concept:
         item["_concept"] = _concept(raw.get("concept"))
@@ -240,12 +245,12 @@ def _columns_md(meta: dict) -> str:
 
 
 async def _validate_and_repair(meta: dict, router, audit: AuditFn | None, salvage: bool) -> int:
-    """Validate every item; one repair call for failures; drop what still fails."""
-    cols = {meta["table_name"]: {c["name"] for c in meta["columns"]}}
+    """Compile every item's spec; one repair call for failures; drop what still fails."""
+    types = {meta["table_name"]: column_types(meta)}
     failures = []
     for sec in ("metrics", "filters", "queries"):
         for it in meta[sec]:
-            err = validate_item(meta, sec, it, cols)
+            err = finalize_item(meta, sec, it, types)
             if err:
                 failures.append((sec, it, err))
     calls = 0
@@ -254,7 +259,7 @@ async def _validate_and_repair(meta: dict, router, audit: AuditFn | None, salvag
 
         system, user = PROMPTS["table_sql_repair"](
             meta["table_name"], _columns_md(meta),
-            [{"id": it["id"], "error": err, "params": it["params"], "sql": it["sql"]}
+            [{"id": it["id"], "error": err, "params": it["params"], "query": it["query"]}
              for _s, it, err in failures])
         try:
             res = await router.chat("table_profile", system=system, user=user)
@@ -268,17 +273,17 @@ async def _validate_and_repair(meta: dict, router, audit: AuditFn | None, salvag
         for sec, it, err in failures:
             fx = fixed.get(it["id"])
             new_err = err
-            if fx and fx.get("sql"):
-                trial = {**it, "sql": str(fx["sql"]).strip().rstrip(";").strip(),
+            if fx and isinstance(fx.get("query"), dict):
+                trial = {**it, "query": fx["query"],
                          "params": _norm_params(fx.get("params")) if fx.get("params") is not None
                          else it["params"]}
-                new_err = validate_item(meta, sec, trial, cols)
+                new_err = finalize_item(meta, sec, trial, types)
                 if not new_err:
                     it.update(trial)
                     it["repaired"] = True
                     continue
             meta[sec].remove(it)
-            meta["dropped"].append({"id": it["id"], "section": sec, "sql": it["sql"],
+            meta["dropped"].append({"id": it["id"], "section": sec, "query": compact(it["query"]),
                                     "error": new_err or err})
     return calls
 
@@ -351,8 +356,14 @@ def _lookup_summary(meta: dict) -> dict:
 
 
 def _flip_lookup(lk: dict) -> dict:
-    return {**lk, "other_table": lk["table"],
-            "join": [{"column": j["other_column"], "other_column": j["column"]} for j in lk["join"]]}
+    out = {**lk, "other_table": lk["table"],
+           "join": [{"column": j["other_column"], "other_column": j["column"]} for j in lk["join"]]}
+    if isinstance(lk.get("query"), dict):
+        # Same statement from the partner's side: pin the original base table
+        # and join so the compiled SQL is identical in both files.
+        out["query"] = {**lk["query"], "from": lk["table"],
+                        "join": lk["query"].get("join") or {"table": lk["other_table"], "on": lk["join"]}}
+    return out
 
 
 def _attach_lookups(metas: dict[str, dict], lookups: list[dict]) -> None:
@@ -377,6 +388,7 @@ async def _profile_lookups(metas: dict[str, dict], router, audit: AuditFn | None
     res = await router.chat("table_lookups", system=system, user=user)
     reply = _parse_json(res.text, salvage=True) or {}
     cols = {n: {c["name"] for c in m["columns"]} for n, m in metas.items()}
+    types = {n: column_types(m) for n, m in metas.items()}
     used: set[str] = set()
     for m in metas.values():
         used |= {it["id"] for s in ("metrics", "filters", "queries") for it in m[s]}
@@ -396,10 +408,13 @@ async def _profile_lookups(metas: dict[str, dict], router, audit: AuditFn | None
         it = {"id": _norm_id(raw.get("id") or f"{a}_{b}", used, prefix="lk_"),
               "label": raw.get("label") or f"{a} ↔ {b}", "description": str(raw.get("description") or ""),
               "columns": [j["column"] for j in joins], "class_iri": None, "class_label": None,
-              "params": _norm_params(raw.get("params")),
-              "sql": str(raw.get("sql") or "").strip().rstrip(";").strip(),
+              "query": raw.get("query") if isinstance(raw.get("query"), dict) else None,
+              "params": _norm_params(raw.get("params")), "sql": "",
               "table": a, "other_table": b, "join": joins}
-        err = validate_item(metas[a], "lookups", it, cols)
+        if it["query"] is not None:
+            it["query"] = {**it["query"], "from": a,
+                           "join": it["query"].get("join") or {"table": b, "on": joins}}
+        err = finalize_item(metas[a], "lookups", it, types)
         if err:
             dropped.append({"lookup": raw, "error": err})
             continue

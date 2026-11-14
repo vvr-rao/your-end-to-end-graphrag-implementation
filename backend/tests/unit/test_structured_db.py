@@ -188,13 +188,13 @@ async def test_retrieval_finds_table_via_entity_and_runs_stored_sql(db, data, tm
 
     router = FakeRouter({"table_query_select": [{"needed": True, "calls": [
         {"table": "prices", "query_id": "by_first", "params": {"v": "Copper"}},
-        {"table": "prices", "new_sql": "DELETE FROM prices", "params": {}}]},
+        {"table": "prices", "new_sql": "DELETE FROM prices", "params": {}}]},   # never run
         {"needed": False}]})
     ev, plan = await structured_evidence("copper price?", router=router, entity_ids=[copper],
                                          class_ids=[], qvec=None)
     assert len(ev) == 1 and ev[0]["rows"] == [["Copper", "2024-01-01", "8500"]]
-    assert plan["retried"] and "rejected" in plan["calls"][1]["error"]
-    async with db() as s:                                 # the guard blocked the write
+    assert plan["retried"] and "neither query_id nor query" in plan["calls"][1]["error"]
+    async with db() as s:                                 # model-written SQL is never run
         assert (await s.execute(text('SELECT count(*) FROM graphrag."prices"'))).scalar() == 3
 
 
@@ -211,19 +211,20 @@ async def test_export_edit_import_updates_node_edges_and_cache(db, data, tmp_pat
     assert [p.name for p in written] == ["prices.md"] and missing == ["nope"]
     md = written[0]
     original = md.read_text(encoding="utf-8")
-    assert "SELECT * FROM prices WHERE commodity = :v" in original
+    spec_sel = '"select": [\n    "commodity",\n    "period",\n    "value"\n  ],'
+    assert spec_sel in original and "```json" in original
+    assert 'SELECT "commodity", "period", "value" FROM "prices" WHERE "commodity" = CAST(:v AS text)' in original
 
     # Unchanged file: nothing to do.
     (rep,) = await import_markdown([md], cache=cache)
     assert not rep.changed and not rep.applied and rep.errors == []
 
     edited = original.replace("prices table", "Monthly commodity spot prices", 1).replace(
-        "SELECT * FROM prices WHERE commodity = :v",
-        "SELECT period, value FROM prices WHERE commodity = :v ORDER BY period")
+        spec_sel, '"select": ["period", "value"], "order_by": [{"column": "period", "dir": "asc"}],')
     md.write_text(edited, encoding="utf-8")
     (dry,) = await import_markdown([md], dry_run=True, cache=cache)
     assert dry.errors == [] and dry.changed and not dry.applied
-    assert "+" in dry.diff and "ORDER BY period" in dry.diff
+    assert "+" in dry.diff and 'ORDER BY "period" ASC' in dry.diff       # SQL rebuilt from the spec
     async with db() as s:
         before = (await s.execute(text("SELECT text FROM graphrag.intelligence_artifacts "
                                        "WHERE artifact_type = 'TableMetadata' AND title = 'prices'"))).scalar()
@@ -242,9 +243,10 @@ async def test_export_edit_import_updates_node_edges_and_cache(db, data, tmp_pat
     assert n_edges == rep.class_edges + rep.entity_edges        # rebuilt, not duplicated
     entry = cache.get(row[1]["cache_key"], "prices")
     assert entry["edited"] is True and entry.get("profile")      # profile kept from the cache
-    assert "ORDER BY period" in next(f for f in entry["filters"] if f["id"] == "by_first")["sql"]
+    assert 'ORDER BY "period" ASC' in next(f for f in entry["filters"] if f["id"] == "by_first")["sql"]
 
-    # A statement that parses but cannot run is refused by EXPLAIN; nothing applied.
-    md.write_text(edited.replace("ORDER BY period", "ORDER BY no_such_fn(period)"), encoding="utf-8")
+    # A spec that does not compile is refused; nothing applied.
+    md.write_text(edited.replace('"select": ["period", "value"]', '"select": ["period", "no_such_col"]'),
+                  encoding="utf-8")
     (bad,) = await import_markdown([md], cache=cache)
-    assert not bad.applied and any("no_such_fn" in e for e in bad.errors)
+    assert not bad.applied and any("no_such_col" in e for e in bad.errors)

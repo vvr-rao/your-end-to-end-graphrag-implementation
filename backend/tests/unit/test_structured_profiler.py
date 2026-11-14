@@ -49,7 +49,6 @@ COMPANIES = b"company,cik,commodity\nAcme Corp,0000320193,Copper\n"
 
 
 def _profile_reply(table: str, cols: list[str], *, bad_sql: bool = False) -> dict:
-    sql_ok = f"SELECT {cols[0]}, COUNT(*) AS n FROM {table} GROUP BY {cols[0]}"
     return {
         "description": f"{table} table", "grain": "one row per thing",
         "columns": [{"name": c, "description": f"the {c}", "role": "dimension",
@@ -57,14 +56,15 @@ def _profile_reply(table: str, cols: list[str], *, bad_sql: bool = False) -> dic
                     for c in cols],
         "metrics": [{"id": "count by first", "label": "Count", "description": "rows per value",
                      "columns": [cols[0]], "concept": {"iri": None, "label": "RowCount", "parent_label": "Metric"},
-                     "params": [], "sql": sql_ok}],
+                     "params": [], "query": {"select": [cols[0], {"agg": "count", "as": "n"}]}}],
         "filters": [{"id": "by_first", "label": "By first", "description": "filter",
                      "columns": [cols[0]], "concept": None,
-                     "params": [{"name": "v", "type": "text", "column": cols[0], "description": "", "example": "x"}],
-                     "sql": f"SELECT * FROM {table} WHERE {cols[0]} = :v"}],
+                     "params": [{"name": "v", "type": "integer", "description": "the value", "example": "x"}],
+                     "query": {"select": cols, "where": [{"column": cols[0], "op": "=", "param": "v"}]}}],
         "queries": [{"id": "bad" if bad_sql else "all_distinct", "label": "q", "description": "",
                      "params": [],
-                     "sql": f"DELETE FROM {table}" if bad_sql else f"SELECT DISTINCT {cols[0]} FROM {table}"}],
+                     "query": {"select": ["no_such_column"]} if bad_sql
+                     else {"select": [cols[0]], "distinct": True}}],
     }
 
 
@@ -82,11 +82,12 @@ def _router(bad_sql=False, lookup=True, repair_ok=True):
         "id": "company_prices", "label": "Prices of a company's commodity", "description": "",
         "table": "companies", "other_table": "prices",
         "join": [{"column": "commodity", "other_column": "commodity"}],
-        "params": [{"name": "company", "type": "text", "column": "company", "description": "", "example": "Acme"}],
-        "sql": "SELECT c.company, p.period, p.value FROM companies c JOIN prices p ON p.commodity = c.commodity "
-               "WHERE c.company = :company"}]} if lookup else {"lookups": []}
-    repair = {"items": [{"id": "bad", "params": [], "sql": "SELECT COUNT(*) FROM prices"}]} if repair_ok \
-        else {"items": [{"id": "bad", "params": [], "sql": "DROP TABLE prices"}]}
+        "params": [{"name": "company", "description": "", "example": "Acme"}],
+        "query": {"select": ["company", "prices.period", "prices.value"],
+                  "where": [{"column": "company", "op": "=", "param": "company"}]}}]} \
+        if lookup else {"lookups": []}
+    repair = {"items": [{"id": "bad", "params": [], "query": {"select": [{"agg": "count"}]}}]} if repair_ok \
+        else {"items": [{"id": "bad", "params": [], "query": {"select": ["still_wrong"]}}]}
     # profile calls run concurrently -> answer by table name in the prompt
     return FakeRouter({"table_lookups": [lookups], "table_profile": []}), \
         _profile_reply("companies", ["company", "cik", "commodity"]), \
@@ -120,12 +121,21 @@ async def test_profile_builds_metadata_and_lookups(folder, tmp_path):
     m = run.by_name()["prices"]
     assert m["row_count"] == 3 and [c["type"] for c in m["columns"]] == ["text", "date", "numeric"]
     assert m["metrics"][0]["id"] == "count_by_first"
+    assert m["metrics"][0]["sql"] == ('SELECT "commodity", COUNT(*) AS "n" FROM "prices" '
+                                      'GROUP BY "commodity"')
+    f = m["filters"][0]                     # params: names/types from the spec, text from the model
+    assert f["params"] == [{"name": "v", "type": "text", "column": "commodity",
+                            "description": "the value", "example": "x"}]
     assert m["source"]["dataset"] == "worldbank/pink-sheet"
     # lookup stored in BOTH tables, flipped for the other side
     lk_c = run.by_name()["companies"]["lookups"][0]
     lk_p = m["lookups"][0]
     assert lk_c["other_table"] == "prices" and lk_p["other_table"] == "companies"
     assert lk_p["join"] == [{"column": "commodity", "other_column": "commodity"}]
+    assert lk_c["sql"] == lk_p["sql"] == (
+        'SELECT "companies"."company", "prices"."period", "prices"."value" FROM "companies" '
+        'JOIN "prices" ON "companies"."commodity" = "prices"."commodity" '
+        'WHERE "companies"."company" = CAST(:company AS text)')
     assert (tmp_path / "run" / "structured" / "prices.metadata.json").exists()
     assert (tmp_path / "run" / "structured" / "lookups.json").exists()
     assert [t for t, _ in router.calls].count("table_profile") == 2
@@ -149,20 +159,20 @@ async def test_cache_survives_llm_mode_switch(folder, tmp_path):
     assert other_mode.calls == [] and len(run.cached) == 2
 
 
-async def test_bad_sql_is_repaired_once(folder, tmp_path):
+async def test_bad_query_spec_is_repaired_once(folder, tmp_path):
     router = _make(bad_sql=True)
     run = await profile_folder(folder, router, cache=tc.MetadataCache(user_dir=tmp_path / "c"), log=lambda *_: None)
     q = run.by_name()["prices"]["queries"]
-    assert q[0]["sql"] == "SELECT COUNT(*) FROM prices" and q[0]["repaired"]
+    assert q[0]["sql"] == 'SELECT COUNT(*) AS "row_count" FROM "prices"' and q[0]["repaired"]
     assert sum("REJECTED STATEMENTS" in u for _t, u in router.calls) == 1
 
 
-async def test_unrepairable_sql_is_dropped_and_recorded(folder, tmp_path):
+async def test_unrepairable_query_spec_is_dropped_and_recorded(folder, tmp_path):
     run = await profile_folder(folder, _make(bad_sql=True, repair_ok=False),
                                cache=tc.MetadataCache(user_dir=tmp_path / "c"), log=lambda *_: None)
     meta = run.by_name()["prices"]
     assert meta["queries"] == [] and meta["dropped"][0]["id"] == "bad"
-    assert "only SELECT" in meta["dropped"][0]["error"]
+    assert "unknown column 'still_wrong'" in meta["dropped"][0]["error"]
 
 
 async def test_llm_disabled_reports_miss(folder, tmp_path):

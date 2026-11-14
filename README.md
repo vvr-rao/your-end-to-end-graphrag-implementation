@@ -1087,7 +1087,9 @@ nothing changes.
 
 ```bash
 # 1. Profile each table with an LLM: table/column descriptions, metrics, filters,
-#    Postgres SQL queries, cross-table lookups; concepts become ontology classes.
+#    queries, cross-table lookups; concepts become ontology classes. Each query is
+#    a JSON query spec + a separate parameter list; SQL is compiled from the spec
+#    deterministically (query_builder.py) -- the LLM never writes SQL.
 #    Cached by file content (run folder structured/ + user cache).
 uv run python -m backend.app.cli prune-expand --input output_ontologies/v<TS>-merge/ --documents <DOCS> \
   --structured-data <DATA_DIR> --structured-limit 2      # smoke test first
@@ -1097,14 +1099,20 @@ uv run python -m backend.app.cli prune-expand --input output_ontologies/v<TS>-me
 #    columns. Reads the cache -- no profiling calls when step 1 ran.
 uv run python -m backend.app.cli extract-entities --structured-only --structured-data <DATA_DIR>
 
-# 3. Answer from the tables via SQL only (stored queries first; new SQL only when
-#    none fits; read-only, timed out, at most qa.structured_max_rows rows shown).
+# 3. Answer from the tables via SQL only: the model picks stored queries and fills
+#    their parameters (or returns a new JSON spec when none fits); the SQL is
+#    compiled from the spec, run read-only, timed out, at most
+#    qa.structured_max_rows rows shown.
 uv run python -m backend.app.cli query --mode simple_qa --use-structured-data "..."
 
 # 4. Review / edit the metadata as Markdown.
 uv run python -m backend.app.cli table-metadata-export -o review/
 uv run python -m backend.app.cli table-metadata-import review/ --dry-run
 uv run python -m backend.app.cli table-metadata-import review/
+
+# 5. Build and run one query by hand -- no LLM (--sql-only prints the SQL).
+uv run python -m backend.app.cli table-query prices --query-id latest_price_for_commodity \
+  --param commodity="Copper" --param frequency=monthly --param price_basis=nominal_usd --param unit='($/mt)'
 ```
 
 Models: `table_profile` / `table_lookups` use gpt-4.1 (claude-sonnet-4-6 in

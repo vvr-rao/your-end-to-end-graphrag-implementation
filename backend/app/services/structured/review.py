@@ -6,9 +6,10 @@ TableMetadata node). Import reads edited files back and, per table:
 
 1. applies the edits strictly (:func:`md_io.apply_markdown` -- column names
    and types are fixed by the loaded table);
-2. validates every SQL statement with the guard and ``EXPLAIN`` against the
-   loaded table (read-only transaction), so a statement that would fail at
-   question time is refused now;
+2. compiles every item's JSON query spec to SQL (:mod:`query_builder`),
+   then checks it with the guard and ``EXPLAIN`` against the loaded table
+   (read-only transaction), so a query that would fail at question time is
+   refused now;
 3. shows a unified diff of the Markdown;
 4. unless ``dry_run``: updates the node (text, metadata, embedding), rebuilds
    its class/entity edges from the edited metadata, and writes the edited
@@ -41,9 +42,17 @@ from backend.app.services.structured.md_io import (
     parse_markdown,
     to_markdown,
 )
-from backend.app.services.structured.metadata import item_tables, items, metadata_text, validate_all
+from backend.app.services.structured.metadata import (
+    column_types,
+    compile_item,
+    finalize_item,
+    items,
+    metadata_text,
+    validate_all,
+)
+from backend.app.services.structured.query_builder import QuerySpecError, example_value
 from backend.app.services.structured.sql_exec import _db_error, coerce_params
-from backend.app.services.structured.sql_guard import SqlGuardError, check_sql
+from backend.app.services.structured.sql_guard import SqlGuardError
 
 EmbedFn = Callable[[list[str]], Awaitable[list[list[float]]]]
 
@@ -87,37 +96,42 @@ async def export_tables(out_dir: Path, tables: list[str] | None = None) -> tuple
     return written, missing
 
 
-def _example_params(item: dict) -> dict:
+def _example_params(item: dict, built_params: list[dict]) -> dict:
+    declared = {p.get("name"): p for p in item.get("params") or []}
     vals = {}
-    for p in item.get("params") or []:
-        ex = p.get("example")
-        vals[p.get("name")] = ex if ex not in ("", None) else None
-    return coerce_params(vals, item.get("params"))
+    for p in built_params:
+        ex = (declared.get(p["name"]) or {}).get("example")
+        vals[p["name"]] = ex if ex not in ("", None) else example_value(p.get("type") or "text")
+    return coerce_params(vals, built_params)
 
 
-async def explain_errors(meta: dict, allowed: set[str]) -> list[str]:
-    """``EXPLAIN`` each statement (example values bound, NULL when none) in a
-    read-only transaction. Catches what the static guard cannot: wrong
-    functions, type mismatches, a lookup partner that is not loaded."""
+async def explain_errors(meta: dict, allowed: set[str],
+                         types_by_table: dict[str, dict[str, str]] | None = None) -> list[str]:
+    """Compile each item and ``EXPLAIN`` it (example values bound) in a
+    read-only transaction. Catches what the compiler cannot: type mismatches,
+    a lookup partner that is not loaded."""
     from backend.app.db.engine import get_sessionmaker
 
+    types = dict(types_by_table or {})
+    types.setdefault(meta["table_name"], column_types(meta))
     errors = []
     for section, item in items(meta):
         try:
-            checked = check_sql(item.get("sql") or "", item_tables(meta, section, item) & allowed
-                                if section == "lookups" else {meta["table_name"]})
-        except SqlGuardError as exc:
+            built = compile_item(meta, section, item, types)
+        except (QuerySpecError, SqlGuardError) as exc:
             errors.append(f"{section} `{item.get('id')}`: {exc}")
             continue
-        bound = {k: v for k, v in _example_params(item).items() if k in checked.params}
-        for k in checked.params:
-            bound.setdefault(k, None)
+        missing = sorted(built.tables - allowed - {meta["table_name"]})
+        if missing:
+            errors.append(f"{section} `{item.get('id')}`: table(s) not loaded: {', '.join(missing)}")
+            continue
+        bound = _example_params(item, built.params)
         async with get_sessionmaker()() as s:
             try:
                 await s.execute(sql_text("SET TRANSACTION READ ONLY"))
                 await s.execute(sql_text("SET LOCAL statement_timeout = 5000"))
                 await s.execute(sql_text("SET LOCAL search_path TO graphrag"))
-                await s.execute(sql_text("EXPLAIN " + checked.sql), bound)
+                await s.execute(sql_text("EXPLAIN " + built.sql), bound)
             except Exception as exc:
                 errors.append(f"{section} `{item.get('id')}`: {_db_error(exc)}")
             finally:
@@ -171,6 +185,14 @@ async def import_markdown(
         except MetadataParseError as exc:
             rep.errors.extend(exc.errors)
             continue
+        types = {n: column_types(r["meta"]) for n, r in reg.items()}
+        for sec, it in items(new):
+            if isinstance(it.get("query"), dict):
+                err = finalize_item(new, sec, it, types)
+                if err:
+                    rep.errors.append(f"{sec} `{it.get('id')}`: {err}")
+        if rep.errors:
+            continue
         rep.diff = "".join(difflib.unified_diff(
             to_markdown(old).splitlines(keepends=True), to_markdown(new).splitlines(keepends=True),
             fromfile=f"{rep.table} (database)", tofile=f"{rep.table} ({path.name})"))
@@ -178,7 +200,7 @@ async def import_markdown(
             continue
         rep.errors.extend(f"{sec} `{it.get('id')}`: {err}" for sec, it, err in validate_all(new, cols))
         if not rep.errors:
-            rep.errors.extend(await explain_errors(new, set(reg)))
+            rep.errors.extend(await explain_errors(new, set(reg), types))
         if rep.errors or dry_run:
             continue
         new["edited"] = True

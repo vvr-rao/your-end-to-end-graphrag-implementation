@@ -391,8 +391,10 @@ Other things worth knowing:
 ## Structured data (data files as SQL tables)
 Data files (CSV/TSV/JSON/JSONL/Parquet) can sit beside the documents:
 1. `prune-expand --structured-data <DIR>` — an LLM writes each table's metadata
-   (descriptions, metrics, filters, Postgres SQL, cross-table lookups) and adds
-   the concepts as ontology classes. Cached by file content.
+   (descriptions, metrics, filters, queries, cross-table lookups) and adds the
+   concepts as ontology classes. Each query is stored as a JSON query spec with
+   its parameters listed separately; a deterministic compiler builds the SQL
+   (the LLM never writes SQL). Cached by file content.
 2. `extract-entities --structured-data <DIR>` (or `--structured-only`) — loads
    the tables into the `graphrag` schema and links each table's metadata node to
    classes and to existing entities found in key columns. Reads the cache: no
@@ -400,15 +402,19 @@ Data files (CSV/TSV/JSON/JSONL/Parquet) can sit beside the documents:
 3. `query --use-structured-data` (simple_qa / deep_research; also the
    `use_structured_data` field of `POST /qa` and conversation turns) — tables
    reached through the graph walk are offered to one selection call that picks
-   STORED queries and fills their parameters; it writes new SQL only when none
-   fits. Every statement runs read-only, with a timeout, and at most
+   STORED queries and fills their parameters; when none fits it may return a
+   new JSON query spec, never SQL. The SQL is compiled from the spec with no
+   LLM. Every statement runs read-only, with a timeout, and at most
    `qa.structured_max_rows` (50) rows reach the prompt — aggregates still run
    over the whole table; the cap only bounds what the model reads, and a capped
    result says "N of M rows". Results are cited as `viao:SqlResult_…`. Off by
    default (`qa.use_structured_data: false`); without it answers are unchanged.
 4. Review: `table-metadata-export -o <MD_DIR>`, edit, then
-   `table-metadata-import <MD_DIR> [--dry-run]` (validates SQL with EXPLAIN,
-   shows a diff, rebuilds the table's graph edges, keeps the edit in the cache).
+   `table-metadata-import <MD_DIR> [--dry-run]` (edit the ```json query specs;
+   compiles them, validates with EXPLAIN, shows a diff, rebuilds the table's
+   graph edges, keeps the edit in the cache).
+5. `table-query <TABLE> --query-id <ID> --param name=value [--sql-only]` (or
+   `--spec FILE.json`) builds and runs one table query with no LLM.
 
 ## CLI (single entrypoint)
 `uv run python -m backend.app.cli <subcommand>`. Discover everything with

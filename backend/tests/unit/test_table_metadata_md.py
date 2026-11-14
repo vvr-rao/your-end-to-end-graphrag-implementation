@@ -78,3 +78,25 @@ def test_bad_edits_are_reported_with_lines(mutate, msg):
 def test_crlf_markdown_parses():
     m = _meta()
     assert apply_markdown(m, to_markdown(m).replace("\n", "\r\n")) == m
+
+
+def test_query_spec_round_trips_and_compiled_sql_is_ignored_on_import():
+    from backend.app.services.structured.metadata import finalize_item
+
+    meta = _meta()
+    it = {"id": "latest", "label": "Latest price", "description": "newest first", "columns": ["period"],
+          "class_iri": None, "class_label": None,
+          "query": {"where": [{"param": "c", "op": "=", "column": "commodity"}],
+                    "select": ["period", "value"], "order_by": [{"column": "period", "dir": "desc"}],
+                    "limit": 1},
+          "params": [{"name": "c", "description": "commodity name", "example": "Copper"}], "sql": ""}
+    assert finalize_item(meta, "queries", it, {"prices": {"commodity": "text", "period": "date",
+                                                          "value": "numeric"}}) is None
+    meta["queries"] = [it]
+    md = to_markdown(meta)
+    assert md.index('"select"') < md.index('"where"')          # reading order, not JSONB order
+    assert "```json" in md and 'ORDER BY "period" DESC NULLS LAST LIMIT 1' in md
+    # Editing the read-only SQL block changes nothing; the spec is what counts.
+    tampered = md.replace('LIMIT 1\n```', 'LIMIT 1; DROP TABLE prices\n```')
+    back = apply_markdown(meta, tampered)
+    assert back["queries"][0]["query"] == it["query"] and back["queries"][0]["sql"] == ""

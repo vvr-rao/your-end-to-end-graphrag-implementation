@@ -8,10 +8,12 @@ Runs after the graph walk, before answer synthesis:
    a vector search over the metadata nodes fills the remaining slots.
 2. **Decide and pick** (task ``table_query_select``, one call): is table data
    needed, and which STORED metric/filter/query/lookup answers it, with which
-   parameter values. New SQL is written only when no stored statement fits.
-3. **Run** each statement through the guard (``sql_exec``): read-only, timed
-   out, rows capped. A stored statement that errors or returns nothing gets
-   one retry call, which is told the error and may write new SQL.
+   parameter values. The model never writes SQL: when no stored query fits it
+   may return a new JSON query spec.
+3. **Build and run** deterministically: :mod:`query_builder` compiles the
+   stored (or new) spec to SQL, which then runs through the guard
+   (``sql_exec``): read-only, timed out, rows capped. A query that errors or
+   returns nothing gets one retry call, which is told the error.
 4. Each result becomes an evidence item ``kind="sql_result"`` with its own
    citation id. Table data reaches the prompt ONLY through these results.
 """
@@ -27,8 +29,15 @@ from typing import Any
 from sqlalchemy import text as sql_text
 
 from backend.app.services.predicates import VIAO_NS
-from backend.app.services.structured.metadata import catalog_for_prompt, find_item, item_tables
+from backend.app.services.structured.metadata import (
+    catalog_for_prompt,
+    column_types,
+    compile_item,
+    find_item,
+)
+from backend.app.services.structured.query_builder import QuerySpecError, build_sql
 from backend.app.services.structured.sql_exec import SqlResult, run_sql
+from backend.app.services.structured.sql_guard import SqlGuardError
 
 _TABLE_EDGE_KINDS = ("tableEntity", "tableColumn", "tableMetric", "tableFilter")
 
@@ -107,9 +116,26 @@ def _parse(text: str) -> dict:
     return obj if isinstance(obj, dict) else {}
 
 
+async def table_metas(names: set[str]) -> dict[str, dict]:
+    """ACTIVE metadata of the named tables (lookup partners outside the
+    candidate set need their column types to compile)."""
+    if not names:
+        return {}
+    from backend.app.db.session import session_scope
+
+    async with session_scope() as s:
+        rows = (await s.execute(sql_text("""
+            SELECT extra_metadata FROM graphrag.intelligence_artifacts
+             WHERE artifact_type = 'TableMetadata' AND status = 'ACTIVE'
+               AND extra_metadata->>'table_name' = ANY(CAST(:t AS text[]))
+        """), {"t": sorted(names)})).scalars().all()
+    return {m["table_name"]: m for m in rows if isinstance(m, dict) and m.get("table_name")}
+
+
 async def _execute(call: dict, by_table: dict[str, dict], *, max_rows: int, timeout_ms: int,
-                   all_tables: set[str]) -> tuple[dict, SqlResult | None, str | None]:
-    """Run one selected call. Returns (record, result, error)."""
+                   all_tables: set[str], types: dict[str, dict[str, str]],
+                   ) -> tuple[dict, SqlResult | None, str | None]:
+    """Build (deterministically) and run one selected call. Returns (record, result, error)."""
     table = call.get("table")
     params = call.get("params") if isinstance(call.get("params"), dict) else {}
     if call.get("query_id"):
@@ -126,17 +152,32 @@ async def _execute(call: dict, by_table: dict[str, dict], *, max_rows: int, time
             err = f"unknown query_id {call['query_id']!r}"
             return {"table": table, "query_id": call["query_id"], "error": err}, None, err
         section, item = hit
-        res = await run_sql(item["sql"], params, item_tables(meta, section, item) & all_tables
-                            if section == "lookups" else {meta["table_name"]},
-                            max_rows=max_rows, timeout_ms=timeout_ms, declared_params=item.get("params"))
         rec = {"table": meta["table_name"], "query_id": item["id"], "label": item.get("label"),
                "source": "catalog", "section": section}
-    elif call.get("new_sql"):
-        res = await run_sql(str(call["new_sql"]), params, all_tables, max_rows=max_rows, timeout_ms=timeout_ms)
-        rec = {"table": table, "query_id": None, "label": call.get("purpose") or "generated query",
-               "source": "generated", "why_not_catalog": call.get("why_not_catalog")}
+        try:
+            built = compile_item(meta, section, item, types)
+        except (QuerySpecError, SqlGuardError) as exc:
+            err = f"stored query does not compile: {exc}"
+            return {**rec, "error": err}, None, err
+        declared = item.get("params") if isinstance(item.get("query"), dict) else None
+        res = await run_sql(built.sql, params, built.tables & (all_tables | {meta["table_name"]}),
+                            max_rows=max_rows, timeout_ms=timeout_ms,
+                            declared_params=declared or built.params)
+    elif isinstance(call.get("query"), dict):
+        rec = {"table": table, "query_id": None, "label": call.get("purpose") or "new query spec",
+               "source": "spec", "query": call["query"], "why_not_catalog": call.get("why_not_catalog")}
+        if table not in by_table:
+            err = f"table {table!r} is not a candidate table"
+            return {**rec, "error": err}, None, err
+        try:
+            built = build_sql(call["query"], table, {t: c for t, c in types.items() if t in all_tables})
+        except QuerySpecError as exc:
+            err = f"query spec does not compile: {exc}"
+            return {**rec, "error": err}, None, err
+        res = await run_sql(built.sql, params, built.tables, max_rows=max_rows, timeout_ms=timeout_ms,
+                            declared_params=built.params)
     else:
-        err = "call has neither query_id nor new_sql"
+        err = "call has neither query_id nor query"
         return {"table": table, "error": err}, None, err
     rec.update({"sql": res.sql, "params": res.params, "row_count": res.row_count,
                 "truncated": res.truncated, "total_rows": res.total_rows, "seconds": res.seconds,
@@ -182,6 +223,9 @@ def compared_values(sql: str, params: dict, columns: dict[str, dict[str, str]],
         return owners[0] if len(owners) == 1 else None
 
     def _vals(node) -> list[str]:
+        # Compiled specs bind as CAST(:p AS text) and lists as = ANY(CAST(:p AS text[])).
+        while isinstance(node, (exp.Cast, exp.Any, exp.Paren)):
+            node = node.this
         if isinstance(node, exp.Literal) and node.is_string:
             return [node.this]
         if isinstance(node, exp.Placeholder) and node.name:
@@ -362,6 +406,10 @@ async def structured_evidence(
         for it in c["meta"].get("lookups") or []:
             if it.get("other_table"):
                 all_tables.add(it["other_table"])
+    partners = await table_metas(all_tables - set(by_table)) if all_tables - set(by_table) else {}
+    all_tables = set(by_table) | set(partners)   # a partner that is not loaded cannot be read
+    types = {c["table"]: column_types(c["meta"]) for c in cands}
+    types.update({n: column_types(m) for n, m in partners.items()})
     catalogs = [catalog_for_prompt(c["meta"]) for c in cands]
     col_types = {c["table"]: {col["name"].lower(): (col.get("type") or "text")
                               for col in c["meta"].get("columns") or []} for c in cands}
@@ -392,7 +440,7 @@ async def structured_evidence(
     failures = []
     for call in calls:
         rec, res, err = await _execute(call, by_table, max_rows=max_rows, timeout_ms=timeout_ms,
-                                       all_tables=all_tables)
+                                       all_tables=all_tables, types=types)
         missing = await _value_failures(rec, res)
         if missing:
             rec["missing_values"] = missing
@@ -415,7 +463,7 @@ async def structured_evidence(
         retry = _parse(out.text)
         for call in [c for c in (retry.get("calls") or []) if isinstance(c, dict)][:max_calls]:
             rec, res, err = await _execute(call, by_table, max_rows=max_rows, timeout_ms=timeout_ms,
-                                           all_tables=all_tables)
+                                           all_tables=all_tables, types=types)
             rec["retry"] = True
             missing = await _value_failures(rec, res)
             if missing:

@@ -4055,45 +4055,53 @@ def document_subject(document_opening: str, file_name: str) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 _QUALIFIER_RULE = (
-    "- QUALIFIERS: before aggregating a measure (SUM/AVG/MIN/MAX), find the columns that "
+    "- QUALIFIERS: before aggregating a measure (sum/avg/min/max), find the columns that "
     "qualify it -- unit, currency, price basis (nominal vs real), frequency, scale, period "
     "start/end, period type, scenario, filing/version/form. Rows that differ in any qualifier "
-    "are DIFFERENT quantities: filter each qualifier to one value or GROUP BY it, and return "
-    "the qualifier columns in the SELECT. Never add or average across them. A table that "
-    "repeats the same value in several reports (restatements, comparative periods) must be "
-    "filtered to one row per period, not summed. For 'the value for year X' select the "
-    "row(s) whose period is X (e.g. the period end date falls in X) instead of aggregating "
-    "every row tagged X.\n"
+    "are DIFFERENT quantities: filter each qualifier to one value (a where entry) or select "
+    "it as a plain column (it is then grouped by), so it appears in the result. Never add "
+    "or average across them. A table that repeats the same value in several reports "
+    "(restatements, comparative periods) must be reduced to one row per period with "
+    "distinct_on (e.g. distinct_on the period end, ordered by filing date desc), not "
+    "summed. For 'the value for year X' select the row(s) whose period is X (e.g. "
+    "{\"column\": {\"column\": \"end\", \"fn\": \"year\"}, \"op\": \"=\", \"param\": "
+    "\"year\"}) instead of aggregating every row tagged X.\n"
 )
 
 
-_TABLE_SQL_RULES = (
-    "SQL RULES (every statement is checked by a parser before it is stored):\n"
-    "- Postgres dialect. Exactly ONE read-only SELECT (WITH ... SELECT allowed). "
-    "No INSERT/UPDATE/DELETE/DDL, no SELECT INTO, no FOR UPDATE, no semicolons.\n"
-    "- Read ONLY the table(s) named in the task, unqualified (prices, not graphrag.prices). "
-    "Use only the column names listed; never the original headers. Double-quote a column "
-    "whose name is an SQL key word (\"end\", \"user\", \"order\", \"group\").\n"
-    "- Parameters are named placeholders like :company or :start_year. Declare every "
-    "placeholder in \"params\" and use every declared param. Every param is REQUIRED "
-    "(no optional `:x IS NULL OR ...` patterns). Cast when the type is not obvious from "
-    "the comparison: CAST(:start_date AS date), CAST(:year AS integer). For a list use "
-    "col = ANY(CAST(:names AS text[])). For case-insensitive text match use "
-    "col ILIKE :pattern and say in the param description that it takes % wildcards.\n"
-    "- Text columns hold the values exactly as shown in the profile (keep leading zeros). "
-    "A numeric value stored in a text column must be cast before arithmetic.\n"
+_QUERY_SPEC_RULES = (
+    "QUERY SPECS: you never write SQL. Each statement is a JSON \"query\" object that a "
+    "program compiles to one read-only Postgres SELECT; parameters are listed separately "
+    "in \"params\". Shape:\n"
+    '  {"select": [COL | {"agg": "sum|avg|min|max|count|count_distinct", "column": COL, '
+    '"as": "snake_alias"}],\n'
+    '   "distinct": false, "distinct_on": [COL],\n'
+    '   "where": [{"column": COL, "op": OP, "param": "name"} | {"column": COL, "op": OP, '
+    '"value": constant}],\n'
+    '   "group_by": [COL], "order_by": [{"column": COL or alias, "dir": "asc|desc"}],\n'
+    '   "limit": 10 | {"param": "n"}}\n'
+    '  COL = "column_name" | {"column": "column_name", "fn": "year|month|quarter|lower"}\n'
+    "  OP = = != < <= > >= between (param is [\"from\", \"to\"]) in (param is a list) "
+    "contains (case-insensitive substring) ilike (% wildcards) is_null not_null\n"
+    "- Use only the column names listed; never the original headers. count with no column "
+    "is count(*). Plain columns in a select that has aggregates are grouped by "
+    "automatically. order_by may name a select alias.\n"
+    "- Parameter types and casts come from the column they are compared with -- do not "
+    "write casts. Every param is REQUIRED (no optional filters); use a constant \"value\" "
+    "for a fixed filter (e.g. form = '10-K').\n"
+    "- \"params\" lists each parameter once: {\"name\", \"description\", \"example\"}. The "
+    "example must be a real value from the profile (keep leading zeros).\n"
     + _QUALIFIER_RULE +
     "- Results are capped at a few dozen rows. A time series or 'latest rows' query must "
-    "take a period range as params (:start_period, :end_period) or ORDER BY the time "
-    "column DESC (newest first) -- never oldest first over the whole history.\n"
-    "- Aggregates must GROUP BY every non-aggregated column. Order results sensibly "
-    "(time ascending, largest values first for rankings). Do NOT add LIMIT unless the "
-    "query is a top-N ranking (then use a :n param cast to integer).\n"
+    "take a period range as params (between) or order the time column desc (newest first) "
+    "-- never oldest first over the whole history.\n"
+    "- Order results sensibly (time ascending for ranges, largest first for rankings). "
+    "Add limit only for a top-N ranking or 'latest' (then use {\"param\": \"n\"} or 1).\n"
 )
 
 
 def table_profile(profile_md: str, candidate_classes: list[dict[str, str]]) -> tuple[str, str]:
-    """Describe ONE table and write its metrics, filters and queries as SQL.
+    """Describe ONE table and write its metrics, filters and queries as JSON specs.
 
     The model sees a column profile (types, counts, ranges, top values) and a
     small random sample of rows -- never the whole table. ``candidate_classes``
@@ -4102,7 +4110,7 @@ def table_profile(profile_md: str, candidate_classes: list[dict[str, str]]) -> t
     menu = "\n".join(f"- {c['iri']} | {c['label']}" for c in candidate_classes) or "(none)"
     system = (
         "You are a data analyst documenting a database table for a question-answering "
-        "system that may ONLY read it through the SQL you write. Base every statement "
+        "system that may ONLY read it through the queries you define. Base every query "
         "on the profile and sample rows; do not invent columns.\n\n"
         "DESCRIBE\n"
         "- description: 2-4 sentences: what the table holds, its source if evident, "
@@ -4117,10 +4125,10 @@ def table_profile(profile_md: str, candidate_classes: list[dict[str, str]]) -> t
         "name real-world things (company, drug, country, commodity, clinical_trial, "
         "person, ...), else null.\n\n"
         "METRICS: aggregates worth asking for: totals, averages, MIN/MAX ranges, counts "
-        "per category, latest value, growth between periods. One SQL statement each, "
-        "usually parameterised by the main dimension(s) (e.g. :company, :commodity).\n"
+        "per category, latest value, values for two periods to compare. One query each, "
+        "usually parameterised by the main dimension(s) (e.g. company, commodity).\n"
         "FILTERS: the columns users would filter on (company, country, date range, "
-        "category, status). One SQL statement each that returns the matching rows' key "
+        "category, status). One query each that returns the matching rows' key "
         "columns with that filter applied as a parameter.\n"
         "QUERIES: other useful retrievals: lookup of one record by key, latest rows for "
         "an entity, time series for an entity, top-N rankings, distinct values of a "
@@ -4141,7 +4149,7 @@ def table_profile(profile_md: str, candidate_classes: list[dict[str, str]]) -> t
         "candidate class of the thing it identifies (e.g. LegalEntity) or concept null. "
         "A metric's concept is the quantity it measures (CommodityPrice, Revenue), never "
         "the aggregation (no TotalPrice, AveragePrice, RowCount, NumberOfFacts).\n\n"
-        + _TABLE_SQL_RULES +
+        + _QUERY_SPEC_RULES +
         "\nReturn JSON only, no markdown fences."
     )
     user = (
@@ -4151,8 +4159,8 @@ def table_profile(profile_md: str, candidate_classes: list[dict[str, str]]) -> t
         ' "columns": [{"name": "...", "description": "...", "role": "...", "unit": null, '
         '"entity_kind": null, "concept": {"iri": null, "label": "...", "parent_label": "..."}}],\n'
         ' "metrics": [{"id": "...", "label": "...", "description": "...", "columns": ["..."], '
-        '"concept": {...} | null, "params": [{"name": "...", "type": "text|integer|numeric|date|boolean|text[]", '
-        '"column": "...", "description": "...", "example": "..."}], "sql": "SELECT ..."}],\n'
+        '"concept": {...} | null, "query": {QUERY SPEC}, '
+        '"params": [{"name": "...", "description": "...", "example": "..."}]}],\n'
         ' "filters": [same shape as metrics],\n'
         ' "queries": [same shape as metrics, concept omitted]}'
     )
@@ -4160,78 +4168,79 @@ def table_profile(profile_md: str, candidate_classes: list[dict[str, str]]) -> t
 
 
 def table_sql_repair(table_name: str, columns_md: str, failures: list[dict[str, Any]]) -> tuple[str, str]:
-    """Fix SQL statements the parser/guard rejected (one attempt)."""
+    """Fix query specs the compiler rejected (one attempt)."""
     system = (
-        "You fix Postgres SQL statements that a validator rejected. Keep each statement's "
-        "purpose; change as little as possible.\n\n" + _TABLE_SQL_RULES +
+        "You fix JSON query specs that the query compiler rejected. Keep each query's "
+        "purpose; change as little as possible.\n\n" + _QUERY_SPEC_RULES +
         "\nReturn JSON only."
     )
     lines = "\n\n".join(
         f"id: {f['id']}\nerror: {f['error']}\nparams: {json.dumps(f.get('params') or [], ensure_ascii=False)}\n"
-        f"sql: {f['sql']}" for f in failures)
+        f"query: {json.dumps(f.get('query'), ensure_ascii=False)}" for f in failures)
     user = (f"TABLE {table_name}\nCOLUMNS:\n{columns_md}\n\nREJECTED STATEMENTS:\n{lines}\n\n"
-            'Return JSON: {"items": [{"id": "...", "params": [...], "sql": "SELECT ..."}]}')
+            'Return JSON: {"items": [{"id": "...", "params": [...], "query": {QUERY SPEC}}]}')
     return system, user
 
 
 def table_lookups(tables: list[dict[str, Any]]) -> tuple[str, str]:
-    """Find join keys shared by tables and write a LOOKUP query for each pair."""
+    """Find join keys shared by tables and write a LOOKUP query spec for each pair."""
     system = (
         "You connect database tables. Find pairs of tables that share a key: the same "
         "identifier or name in both (SEC CIK, LEI, NCT id, FDA application number, ticker, "
         "drug or company name, country, series id, commodity). Compare column meanings AND "
         "example values; equal names are not enough and different names can still match. "
         "Only propose joins whose values would actually match (same format, e.g. both "
-        "zero-padded). For each pair write ONE SQL lookup that joins the two tables on the "
-        "key and returns the useful columns of both, filtered by one parameter on the key "
-        "or a name column. A table may join several others. Skip pairs with no real key.\n\n"
-        + _TABLE_SQL_RULES.replace("Read ONLY the table(s) named in the task",
-                                   "Read ONLY the two tables of the pair") +
+        "zero-padded). For each pair define ONE lookup query that joins the two tables on "
+        "the key and returns the useful columns of both, filtered by one parameter on the "
+        "key or a name column. A table may join several others. Skip pairs with no real key.\n\n"
+        + _QUERY_SPEC_RULES +
+        "- In a lookup, the join is given by \"join\" (do not repeat it in the query). "
+        "Name a column of the other table as \"<other_table>.<column>\"; an unqualified "
+        "name means the first table's column.\n"
         "\nReturn JSON only."
     )
     user = ("TABLES:\n" + json.dumps(tables, ensure_ascii=False, indent=1) + "\n\n"
             'Return JSON: {"lookups": [{"id": "lk_<short_snake>", "label": "...", '
             '"description": "...", "table": "<table A>", "other_table": "<table B>", '
             '"join": [{"column": "<column of A>", "other_column": "<column of B>"}], '
-            '"params": [{"name": "...", "type": "...", "column": "...", "description": "...", '
-            '"example": "..."}], "sql": "SELECT ... FROM A JOIN B ON ..."}]}')
+            '"query": {QUERY SPEC over A joined to B}, '
+            '"params": [{"name": "...", "description": "...", "example": "..."}]}]}')
     return system, user
 
 
 def table_query_select(question: str, catalogs: list[dict[str, Any]],
                        failures: list[dict[str, Any]] | None = None) -> tuple[str, str]:
-    """Decide whether a question needs table data and which stored SQL to run."""
+    """Decide whether a question needs table data and which stored query to run."""
     system = (
-        "You answer questions from database tables, but you may ONLY read them through SQL. "
-        "You get the question and, for each candidate table, its description, columns and "
-        "a CATALOG of stored, tested SQL statements (metrics, filters, queries, lookups) "
-        "with their parameters.\n\n"
+        "You answer questions from database tables, but you may ONLY read them through "
+        "stored queries. You get the question and, for each candidate table, its "
+        "description, columns and a CATALOG of stored, tested queries (metrics, filters, "
+        "queries, lookups), each with its parameters. A program builds and runs the SQL; "
+        "you never write SQL.\n\n"
         "1. Decide if the question needs data from these tables (numbers, lists, dates, "
         "counts or records they hold). If the question is about something the tables do "
         "not contain, answer needed=false.\n"
-        "2. If needed, pick the catalog statements that answer it and fill their params "
-        "with values taken from the question, matching the column's stored values (see "
-        "examples). PREFER catalog statements; pick several when the question has several "
-        "parts. Fewer, aggregated results are better than raw rows.\n"
-        "3. ONLY when no catalog statement can answer a part, write new_sql for it, and say "
-        "in why_not_catalog which catalog ids you considered and why each cannot answer it "
-        "(a catalog statement with the right filters/params DOES answer it -- fill its params "
-        "instead). "
-        + _TABLE_SQL_RULES.replace("Read ONLY the table(s) named in the task",
-                                   "Read ONLY the candidate tables") +
-        "Results are capped at a few dozen rows, so aggregate or filter instead of "
-        "listing whole tables.\n"
+        "2. If needed, pick the catalog queries that answer it and fill EVERY one of their "
+        "params with values taken from the question, matching the column's stored values "
+        "(see examples). Pick several when the question has several parts. Fewer, "
+        "aggregated results are better than raw rows.\n"
+        "3. ONLY when no catalog query can answer a part, give a new \"query\" spec for it "
+        "(same JSON shape as the catalog's, rules below), and say in why_not_catalog which "
+        "catalog ids you considered and why each cannot answer it (a catalog query with "
+        "the right filters/params DOES answer it -- fill its params instead).\n\n"
+        + _QUERY_SPEC_RULES +
         "Return JSON only."
     )
     fail_block = ""
     if failures:
-        fail_block = ("\n\nPREVIOUS ATTEMPT FAILED (fix it; write new_sql if the catalog "
-                      "cannot do it):\n" + json.dumps(failures, ensure_ascii=False, indent=1))
+        fail_block = ("\n\nPREVIOUS ATTEMPT FAILED (fix it: other param values, another "
+                      "catalog query, or a new query spec):\n"
+                      + json.dumps(failures, ensure_ascii=False, indent=1))
     user = (f"QUESTION: {question}\n\nCANDIDATE TABLES:\n"
             + json.dumps(catalogs, ensure_ascii=False, indent=1) + fail_block + "\n\n"
             'Return JSON: {"needed": true|false, "reason": "...", "calls": [{"table": "...", '
             '"query_id": "<catalog id>", "params": {"name": value}} | {"table": "...", '
-            '"new_sql": "SELECT ...", "params": {"name": value}, "purpose": "...", '
+            '"query": {QUERY SPEC}, "params": {"name": value}, "purpose": "...", '
             '"why_not_catalog": "..."}]}')
     return system, user
 

@@ -153,4 +153,5 @@ jobs:
           backend/tests/unit/test_table_metadata_md.py
           backend/tests/unit/test_structured_profiler.py
           backend/tests/unit/test_structured_retrieval.py
+          backend/tests/unit/test_structured_query_builder.py
           backend/tests/unit/test_structured_db.py

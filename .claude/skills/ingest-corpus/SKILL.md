@@ -553,8 +553,9 @@ Re-running is safe: an unchanged file is not reloaded; a changed file is
 reloaded and its old metadata node marked STALE.
 
 Review loop (optional): `table-metadata-export -o <MD_DIR>` writes one
-Markdown file per table; after editing, `table-metadata-import <MD_DIR> --dry-run`
-validates every SQL statement (guard + EXPLAIN) and shows the diff, then
+Markdown file per table; edit the ```json query specs (the ```sql blocks are
+compiled from them and read-only). `table-metadata-import <MD_DIR> --dry-run`
+compiles every spec, validates it (guard + EXPLAIN) and shows the diff, then
 `table-metadata-import <MD_DIR>` applies it (node, embedding, edges, cache).
 
 ## Step 4 — enrich-time (short)
