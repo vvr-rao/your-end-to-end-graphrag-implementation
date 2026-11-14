@@ -1426,6 +1426,24 @@ def build_parser() -> argparse.ArgumentParser:
             "`embed-relationships` can backfill later."
         ),
     )
+    p_ext.add_argument(
+        "--structured-data", type=Path, default=None, metavar="DIR",
+        help=(
+            "Opt-in: after extraction, load the structured tables in DIR as "
+            "Postgres tables (graphrag.<table>) and link each table's metadata "
+            "node to ontology classes and existing entities. Metadata comes from "
+            "the cache written by prune-expand --structured-data (no LLM calls); "
+            "a table missing from the cache is profiled now. Default: OFF."
+        ),
+    )
+    p_ext.add_argument("--structured-limit", type=int, default=None, metavar="N",
+                       help="Load only the first N tables (alphabetical) -- smoke testing.")
+    p_ext.add_argument("--table-profile-concurrency", type=int, default=None, metavar="N",
+                       help="Concurrent table_profile calls for cache misses (default config).")
+    p_ext.add_argument("--refresh-table-metadata", action="store_true",
+                       help="Re-profile tables even when cached metadata exists.")
+    p_ext.add_argument("--structured-only", action="store_true",
+                       help="Skip entity extraction; only load/link --structured-data.")
     p_ext.set_defaults(func=_cmd_extract_entities)
 
     # ---------- Phase 2: Milestone E (artifacts) ----------
@@ -2767,8 +2785,42 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
         except Exception as exc:
             print(f"[eval-corpus] skipped: {type(exc).__name__}: {exc}")
 
-    asyncio.run(_extract_then_classify())
+    _sd = getattr(args, "structured_data", None)
+    if _sd is not None:
+        # Fail before the paid extraction when the folder is wrong.
+        from backend.app.services.structured.prune_expand_hook import check_folder
+
+        check_folder(Path(_sd), getattr(args, "structured_limit", None))
+
+    async def _structured() -> None:
+        from backend.app.services.structured.graph_hook import run_structured_load
+        from backend.app.services.structured.prune_expand_hook import resolve_concurrency
+
+        await run_structured_load(
+            Path(_sd),
+            limit=getattr(args, "structured_limit", None),
+            concurrency=resolve_concurrency(getattr(args, "table_profile_concurrency", None),
+                                            get_settings_app_config()),
+            refresh=getattr(args, "refresh_table_metadata", False),
+        )
+
+    async def _all() -> None:
+        if not getattr(args, "structured_only", False):
+            await _extract_then_classify()
+        if _sd is not None:
+            await _structured()
+
+    if getattr(args, "structured_only", False) and _sd is None:
+        print("[extract-entities] --structured-only needs --structured-data DIR")
+        return 2
+    asyncio.run(_all())
     return 0
+
+
+def get_settings_app_config() -> dict:
+    from backend.app.core.config import get_settings
+
+    return get_settings().app_config
 
 
 def _cmd_classify_concepts(args: argparse.Namespace) -> int:

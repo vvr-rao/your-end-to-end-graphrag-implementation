@@ -34,7 +34,7 @@ class IntelligenceArtifact(Base):
     __table_args__ = (
         CheckConstraint(
             "artifact_type IN ('Summary','Claim','Finding','Observation',"
-            "'Insight','Recommendation','StructuredTable','Event')",
+            "'Insight','Recommendation','StructuredTable','Event','TableMetadata')",
             name="intel_artifacts_type_check",
         ),
         CheckConstraint(

@@ -132,6 +132,15 @@ async def wipe_corpus(*, confirm: bool = False) -> dict[str, int]:
         for tbl in _CORPUS_TABLES:
             await session.execute(text(f"DELETE FROM graphrag.{tbl}"))
 
+        # Structured-data tables loaded by extract-entities --structured-data
+        # (identified by their table comment, never by name).
+        from backend.app.services.structured.db_load import drop_data_tables
+
+        dropped = await drop_data_tables(session)
+        if dropped:
+            print(f"[clear-corpus] dropped {len(dropped)} structured-data table(s): "
+                  + ", ".join(dropped[:10]) + (" ..." if len(dropped) > 10 else ""))
+
     # Verify after.
     after: dict[str, int] = {}
     async with session_scope() as session:
