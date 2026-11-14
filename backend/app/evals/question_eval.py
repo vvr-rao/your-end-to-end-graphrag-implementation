@@ -273,6 +273,7 @@ def _row(t: dict[str, Any], tq: Any, kinds: dict, levels: dict, names: dict,
         "bridge": t.get("fulltext_bridge") or {},
         "ranked_documents": ranked[:max(k, 20)],
         "evidence_chunk_ids": t.get("evidence_chunk_ids") or [],
+        **({"structured_calls": t["structured_calls"]} if t.get("structured_calls") else {}),
         "gold_documents": gold,
         "retrieval": retrieval_metrics(ranked, gold, k) if gold else None,
         "answers": (answer_metrics(

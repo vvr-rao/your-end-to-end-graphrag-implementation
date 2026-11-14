@@ -84,3 +84,12 @@ def test_testset_flag_and_trace_carry_structured_calls():
                           parsed={"structured_data": {"calls": [call]}})
     tr = trace_from_result("q", res)
     assert tr["structured_calls"] == [{k: v for k, v in call.items() if k != "sql"}]
+
+
+def test_report_rows_keep_the_structured_calls():
+    from backend.app.evals.question_eval import _row
+
+    calls = [{"table": "t", "query_id": "m", "params": {"p_from": "2021"}, "listing": True,
+              "row_count": 3, "error": None}]
+    row = _row({"question": "q", "answer": "", "structured_calls": calls}, None, {}, {}, {}, {}, 10)
+    assert row["structured_calls"] == calls
