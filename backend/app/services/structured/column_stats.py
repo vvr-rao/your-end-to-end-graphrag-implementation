@@ -157,7 +157,7 @@ def metadata_card(meta: dict, *, max_values: int = 40) -> str:
             cov.append(f"range {s['min']}..{s['max']}")
         vals = (domains.get(name) or {}).get("values")
         if vals:
-            shown = ", ".join(map(str, vals[:max_values]))
+            shown = " | ".join(map(str, vals[:max_values]))
             cov.append(f"values: {shown}" + (f" (+{len(vals) - max_values} more)" if len(vals) > max_values else ""))
         lines.append(f"- {name} ({', '.join(b for b in bits if b)}): {str(c.get('description') or '').strip()}"
                      + (f" [{'; '.join(cov)}]" if cov else ""))

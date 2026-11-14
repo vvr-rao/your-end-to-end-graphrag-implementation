@@ -55,7 +55,7 @@ META = {
 def test_metadata_card_carries_meaning_and_measured_coverage():
     card = metadata_card(META)
     assert card.startswith("Table prices (source file wb/prices.csv): 100 rows. Commodity prices.")
-    assert "- item (text, dimension): the item [2 distinct value(s) in 100 non-empty row(s); values: A, B]" in card
+    assert "- item (text, dimension): the item [2 distinct value(s) in 100 non-empty row(s); values: A | B]" in card
     assert "periods year 1960..2025; month 1960M01..2026M10" in card
     assert "range 0.5..900" in card and "Measures: Price." in card
     assert latest_period(META, "period", "2021") == "2025"
