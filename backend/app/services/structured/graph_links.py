@@ -238,7 +238,7 @@ def resolve_place(value: str, level: int) -> dict | None:
         sub = pycountry.subdivisions.get(code=v)
         if sub is not None:
             country = pycountry.countries.get(alpha_2=v[:2])
-            return {"name": sub.name, "level": 2, "code": v,
+            return {"name": re.sub(r"\s*\[[^\]]*\]\s*$", "", sub.name), "level": 2, "code": v,
                     "country": _country_name(country) if country else None}
     if re.fullmatch(r"[A-Z]{2}|[A-Z]{3}", v) and level >= 2:
         c = pycountry.countries.get(**({"alpha_2": v} if len(v) == 2 else {"alpha_3": v}))
