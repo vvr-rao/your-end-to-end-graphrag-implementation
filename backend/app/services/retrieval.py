@@ -1807,6 +1807,11 @@ async def retrieve_and_answer(
     # -------- step 12: answer generation --------
     answer_task_name = _ANSWER_TASK_BY_MODE[mode]
     answer_prompt_fn = PROMPTS[answer_task_name]
+    # A listing (a table result over many items) gets an analysis-style answer
+    # in simple_qa: 1-3 sentences can only name a few examples. Same task/model.
+    _listing = any(ev.get("kind") == "sql_result" and ev.get("listing") for ev in evidence)
+    if _listing and answer_task_name == "answer_simple_qa":
+        answer_prompt_fn = PROMPTS["answer_listing_analysis"]
     _evidence_cap = int(
         get_settings().app_config.get("qa", {}).get("evidence_char_cap", 600)
     )
@@ -1830,9 +1835,8 @@ async def retrieve_and_answer(
     else:
         try:
             # A listing result is answered in full: give the answer room for it.
-            _listing = any(ev.get("kind") == "sql_result" and ev.get("listing") for ev in evidence)
             out = await (router.chat(answer_task_name, system=sys_p, user=user_p,
-                                     max_tokens=int(_qa_cfg("structured_listing_answer_max_tokens", 4096)))
+                                     max_tokens=int(_qa_cfg("structured_listing_answer_max_tokens", 8192)))
                          if _listing else router.chat(answer_task_name, system=sys_p, user=user_p))
             answer = out.text.strip()
         except Exception as exc:

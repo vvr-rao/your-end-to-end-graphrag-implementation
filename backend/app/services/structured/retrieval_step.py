@@ -423,9 +423,12 @@ async def combination_hints(checks: list[dict]) -> list[dict]:
     return out
 
 
-def _listing_text(head: str, res: SqlResult, char_cap: int) -> str:
+def _listing_text(head: str, res: SqlResult, char_cap: int, summary: str = "") -> str:
     """Compact layout for a LISTING result: the header once, then one line of
-    values per row (about half the size of name=value pairs)."""
+    values per row (about half the size of name=value pairs). ``summary`` (the
+    exact change statistics) goes first, so the row cap never cuts it."""
+    if summary:
+        head += summary + " "
     def cell(v) -> str:
         return "" if v is None else str(v).replace("|", "/")
     lines = [" | ".join(res.columns)]
@@ -452,7 +455,11 @@ def _evidence_text(rec: dict, res: SqlResult, meta: dict, char_cap: int) -> str:
     if rec.get("params"):
         head += "Parameters: " + ", ".join(f"{k}={v}" for k, v in rec["params"].items()) + ". "
     if rec.get("listing"):
-        return _listing_text(head, res, char_cap)
+        from backend.app.services.structured.listing_stats import change_stats, roles_for, stats_text
+
+        period_col, value_col = roles_for(meta or {}, rec.get("query_id"), res.columns)
+        st = change_stats(res.columns, res.rows, period_col, value_col) if period_col else None
+        return _listing_text(head, res, char_cap, stats_text(st) if st else "")
     cols = res.columns
     body = []
     used = len(head)

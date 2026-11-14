@@ -665,7 +665,7 @@ qa:
   # written answer.
   structured_listing_max_rows: 2000
   structured_listing_char_cap: 60000
-  structured_listing_answer_max_tokens: 4096
+  structured_listing_answer_max_tokens: 8192
   # For comparison/enumeration queries over multiple entities ("compare A vs its
   # competitors"), retrieval fans out ONE vector probe per matched entity so each
   # gets even representation (instead of only the 1-2 a generic decompose named).

@@ -2840,6 +2840,73 @@ def answer_simple_qa(
     return system, user
 
 
+_LISTING_ANALYSIS_RULE = (
+    "TABLE LISTINGS: a viao:SqlResult_ item marked LISTING holds every row a query "
+    "returned for many items; when it carries a CHANGE SUMMARY, that summary was "
+    "computed exactly from the rows -- take every first/last value, change, "
+    "percentage, count, median and mover from it verbatim and never recompute or "
+    "estimate them yourself. Cover EVERY item the listing holds, not a few chosen "
+    "examples. Keep each value with its unit/basis/qualifier, and never compare or "
+    "rank items whose units differ by their level -- compare their % changes. Say "
+    "which periods the numbers span; an item whose first or last period differs from "
+    "the others is noted as such. Document passages may add context or causes, but "
+    "keep their figures apart from the table's: they may use other periods (e.g. "
+    "fiscal vs calendar years), other definitions of the quantity, or other units."
+)
+
+
+def answer_listing_analysis(
+    question: str,
+    evidence: list[dict],
+    evidence_char_cap: int = 600,
+    aliases: dict[str, list[str]] | None = None,
+    time_terms: list[str] | None = None,
+) -> tuple[str, str]:
+    """simple_qa when the evidence holds a LISTING result: an analysis-style
+    answer over every item instead of the 1-3 sentence reply (which can only
+    name a few examples). Domain-neutral; shaped by what the question asks."""
+    system = (
+        "You answer the user's question using ONLY the evidence below. The evidence "
+        "includes a LISTING -- a data-table result covering many items -- so the "
+        "answer is an analysis of the whole listing, shaped by the question:\n"
+        "  - A question that asks to LIST or SHOW values: give the full list as a "
+        "table, with one short line on what it holds (how many items and periods).\n"
+        "  - A question about CHANGE, TREND, COMPARISON or RANKING:\n"
+        "      1. ANSWER: 2-4 sentences with the overall picture -- how many items "
+        "rose and fell, the median change, the period span.\n"
+        "      2. NOTABLE MOVES: the largest rises and falls with their numbers, and "
+        "any groups of related items that moved together (group by what the item "
+        "names show; do not invent categories the data does not support).\n"
+        "      3. ALL ITEMS: a table of every item -- item, first value, last value, "
+        "change % -- from the CHANGE SUMMARY.\n"
+        "      4. NOTES: units/bases, items with missing or shorter periods, and "
+        "anything the data cannot tell (e.g. causes, unless the evidence states them).\n"
+        "  - Any other question: answer it directly first, then support it from the "
+        "listing.\n\n"
+        + _LISTING_ANALYSIS_RULE
+        + "\n\n"
+        + _FACTS_FIRST_RULE
+        + "\n\n"
+        + _ATTRIBUTION_RULE
+        + "\n\nUse simple markdown tables (| col | col |). Cite the listing's id once "
+        "per section rather than on every row. If the evidence does not answer the "
+        "question, say so. Return ONLY the answer text."
+    )
+    user = (
+        f"QUESTION: {question}"
+        + _format_alias_block(aliases)
+        + _format_time_scope_block(time_terms)
+        + "\n\nEVIDENCE:\n"
+        + _format_evidence_block(evidence, evidence_char_cap)
+        + "\n\nAnswer now."
+    )
+    return system, user
+
+
+def has_listing(evidence: list[dict]) -> bool:
+    return any(ev.get("kind") == "sql_result" and ev.get("listing") for ev in evidence)
+
+
 _DEEP_RESEARCH_SECTIONS = (
     "OUTPUT STRUCTURE -- seven labelled sections, always in this order. "
     "Every section MUST render, even if empty. Use the labels verbatim "
@@ -2926,6 +2993,13 @@ def answer_deep_research(
         + _ATTRIBUTION_RULE
         + "\n\n"
         + _DEEP_RESEARCH_SECTIONS
+        + (
+            "\n\n" + _LISTING_ANALYSIS_RULE + " In SPECIFICS give one line per item of "
+            "the listing (item: first -> last, change %); ANALYSIS and KEY INSIGHTS use the "
+            "summary's counts, median and movers. The per-item lines do not count toward "
+            "LENGTH."
+            if has_listing(evidence) else ""
+        )
         + "\n\nLENGTH: 650-1,300 words across all seven sections. "
         "Return plain text only -- no markdown."
     )
@@ -4417,6 +4491,7 @@ PROMPTS = {
     "retrieval_rounds_plan": retrieval_rounds_plan,
     "chunk_relevance_filter": chunk_relevance_filter,
     "answer_simple_qa": answer_simple_qa,
+    "answer_listing_analysis": answer_listing_analysis,
     "answer_deep_research": answer_deep_research,
     # Milestone G
     "follow_up_resolution": follow_up_resolution,

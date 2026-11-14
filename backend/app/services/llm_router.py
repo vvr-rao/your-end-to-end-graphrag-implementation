@@ -830,6 +830,9 @@ class LLMRouter:
         model = model or spec["model"]
         max_tokens = int(max_tokens or spec.get("max_tokens", 4096))
         timeout = int(spec.get("timeout", 120))
+        # a per-call larger output budget brings its own time budget (the
+        # same tokens/20 floor the task configs follow)
+        timeout = max(timeout, max_tokens // 20)
         retryer = self._make_retryer(task, provider_name, model)
 
         self._preflight_size(
