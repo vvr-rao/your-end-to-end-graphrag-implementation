@@ -451,6 +451,7 @@ async def retrieve_and_answer(
     answer_question: bool = True,
     use_structured_data: bool | None = None,
     _round_depth: int = 0,
+    _carry_sql_evidence: list[dict[str, Any]] | None = None,
 ) -> RetrievalResult:
     """Driver. `resolved_query` skips the follow-up resolution step
     (the caller -- typically Milestone G -- already resolved it).
@@ -542,6 +543,10 @@ async def retrieve_and_answer(
                 conversation_turn_id=conversation_turn_id,
                 verbose=verbose, multi_round=False, persist=persist,
                 use_structured_data=use_structured_data, _round_depth=1,
+                # The prior-research block cites round 1's SQL results; table
+                # rows are not re-retrieved by text search, so hand them over
+                # or the final synthesis cannot cite them.
+                _carry_sql_evidence=[ev for ev in r1.evidence if ev.get("kind") == "sql_result"],
             )
             # Merge: r2 is the final answer; fold in round-1 evidence + all cost.
             # artifact_only only ever surfaces artifact evidence, so skip folding
@@ -1781,6 +1786,9 @@ async def retrieve_and_answer(
         # Ahead of the text evidence: exact figures first.
         evidence[:0] = _sd_ev
         parsed["structured_data"] = _sd_plan
+    if _carry_sql_evidence:
+        _have = {ev.get("iri") for ev in evidence}
+        evidence[:0] = [ev for ev in _carry_sql_evidence if ev.get("iri") not in _have]
 
     _walk_ids = {cid for cid, _ in ent_chunks}
     async with session_scope() as session:

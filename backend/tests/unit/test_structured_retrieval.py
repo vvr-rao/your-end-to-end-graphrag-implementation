@@ -6,6 +6,7 @@ path is covered in test_structured_db.py.
 
 from __future__ import annotations
 
+import re
 import uuid
 
 import pytest
@@ -78,7 +79,7 @@ async def test_catalog_query_is_used_and_becomes_cited_evidence(patched):
     assert len(ev) == 1 and ev[0]["kind"] == "sql_result" and ev[0]["node_id"] == NODE
     assert ev[0]["query_id"] == "avg_price" and ev[0]["sql_source"] == "catalog"
     assert "avg_value=8500" in ev[0]["text"] and "Parameters: c=Copper" in ev[0]["text"]
-    assert ev[0]["iri"].endswith("#SqlResult_prices_avg_price_1")
+    assert re.search(r"#SqlResult_prices_avg_price_[0-9a-f]{8}$", ev[0]["iri"])
     assert plan["needed"] and not plan["retried"] and plan["calls"][0]["source"] == "catalog"
 
 
@@ -298,3 +299,13 @@ async def test_empty_result_retry_gets_existing_combinations(patched, monkeypatc
     _, plan = await _go(router)
     assert plan["retried"] and "($/dmtu)" in router.calls[1][1]
     assert plan["calls"][0]["value_combinations"][0]["where"] == {"commodity": "Iron ore, cfr spot"}
+
+
+def test_carried_sql_evidence_reaches_the_final_round():
+    import inspect
+
+    from backend.app.services import retrieval
+
+    src = inspect.getsource(retrieval.retrieve_and_answer)
+    assert '_carry_sql_evidence=[ev for ev in r1.evidence if ev.get("kind") == "sql_result"]' in src
+    assert "if _carry_sql_evidence:" in src

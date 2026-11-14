@@ -20,6 +20,7 @@ Runs after the graph walk, before answer synthesis:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -486,7 +487,11 @@ async def structured_evidence(
     for i, (rec, res) in enumerate(results, start=1):
         meta = (by_table.get(rec["table"]) or {}).get("meta") or {}
         node = (by_table.get(rec["table"]) or {}).get("id")
-        frag = f"SqlResult_{rec['table']}_{rec.get('query_id') or 'q'}_{i}"
+        # Same statement + params -> same id (deep_research rounds can then
+        # share it); a different run of the same query gets a different id.
+        digest = hashlib.sha256(json.dumps([res.sql, res.params], sort_keys=True,
+                                           default=str).encode()).hexdigest()[:8]
+        frag = f"SqlResult_{rec['table']}_{rec.get('query_id') or 'q'}_{digest}"
         evidence.append({
             "kind": "sql_result",
             "node_id": node,
