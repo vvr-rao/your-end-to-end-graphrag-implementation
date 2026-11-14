@@ -1446,6 +1446,33 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Skip entity extraction; only load/link --structured-data.")
     p_ext.set_defaults(func=_cmd_extract_entities)
 
+    # ---------- structured data: review loop ----------
+    p_tme = sub.add_parser(
+        "table-metadata-export",
+        help="Write the loaded tables' metadata (descriptions, metrics, filters, "
+             "SQL, lookups) as one editable Markdown file per table.",
+    )
+    p_tme.add_argument("--table", action="append", default=None, metavar="NAME",
+                       help="Table to export (repeatable). Default: every loaded table.")
+    p_tme.add_argument("-o", "--output-dir", required=True, type=Path,
+                       help="Folder for the <table>.md files (created if missing).")
+    p_tme.set_defaults(func=_cmd_table_metadata_export)
+
+    p_tmi = sub.add_parser(
+        "table-metadata-import",
+        help="Read edited table-metadata Markdown back: validate every SQL "
+             "statement (guard + EXPLAIN), show the diff, update the metadata "
+             "node + embedding, rebuild its graph edges, and keep the edit in "
+             "the metadata cache (edited: true).",
+    )
+    p_tmi.add_argument("paths", nargs="+", type=Path,
+                       help="Markdown file(s) or folder(s) of <table>.md files.")
+    p_tmi.add_argument("--dry-run", action="store_true",
+                       help="Validate and show the diff; change nothing.")
+    p_tmi.add_argument("--no-entity-links", action="store_true",
+                       help="Rebuild only the class edges (skip matching key values to entities).")
+    p_tmi.set_defaults(func=_cmd_table_metadata_import)
+
     # ---------- Phase 2: Milestone E (artifacts) ----------
     p_art = sub.add_parser(
         "generate-artifacts",
@@ -2835,6 +2862,60 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
         return 2
     asyncio.run(_all())
     return 0
+
+
+def _cmd_table_metadata_export(args: argparse.Namespace) -> int:
+    from backend.app.services.structured.review import export_tables
+
+    written, missing = asyncio.run(export_tables(args.output_dir, args.table))
+    for p in written:
+        print(f"[table-metadata-export] wrote {p}")
+    for n in missing:
+        print(f"[table-metadata-export] not loaded: {n}")
+    if not written and not missing:
+        print("[table-metadata-export] no structured tables are loaded "
+              "(extract-entities --structured-data DIR)")
+    return 1 if missing else 0
+
+
+def _cmd_table_metadata_import(args: argparse.Namespace) -> int:
+    from backend.app.services.structured.cache import MetadataCache
+    from backend.app.services.structured.review import import_markdown
+
+    async def go():
+        embed = None
+        if not args.dry_run:
+            from backend.app.db.embedding_guard import ensure_embedding_model
+            from backend.app.services.embeddings import Embedder
+
+            embedder = Embedder()
+            await ensure_embedding_model(embedder)
+            embed = embedder.embed
+        return await import_markdown(args.paths, dry_run=args.dry_run, embed=embed,
+                                     cache=MetadataCache(), link_entities=not args.no_entity_links)
+
+    reports = asyncio.run(go())
+    bad = 0
+    for r in reports:
+        name = r.table or r.path.name
+        if r.diff:
+            print(r.diff, end="" if r.diff.endswith("\n") else "\n")
+        if r.errors:
+            bad += 1
+            print(f"[table-metadata-import] {name}: NOT applied -- {len(r.errors)} error(s):")
+            for e in r.errors:
+                print(f"    {e}")
+        elif not r.changed:
+            print(f"[table-metadata-import] {name}: no changes")
+        elif r.applied:
+            print(f"[table-metadata-import] {name}: applied; edges rebuilt "
+                  f"({r.class_edges} class, {r.entity_edges} entity); cache marked edited")
+        else:
+            print(f"[table-metadata-import] {name}: valid (dry run, nothing changed)")
+    if not reports:
+        print("[table-metadata-import] no .md files found")
+        return 2
+    return 1 if bad else 0
 
 
 def get_settings_app_config() -> dict:

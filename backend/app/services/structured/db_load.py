@@ -222,7 +222,7 @@ async def upsert_node(session: AsyncSession, meta: dict, embedding: list[float] 
         await session.execute(sql_text(f"""
             UPDATE {SCHEMA}.intelligence_artifacts
                SET text = :text, title = :title, extra_metadata = CAST(:meta AS jsonb),
-                   embedding = CAST(:vec AS vector), model_name = :model,
+                   embedding = COALESCE(CAST(:vec AS vector), embedding), model_name = :model,
                    prompt_version = :pv, graph_version = :gv, status = 'ACTIVE'
              WHERE id = :id
         """), {"text": text, "title": meta["table_name"], "meta": json.dumps(payload),

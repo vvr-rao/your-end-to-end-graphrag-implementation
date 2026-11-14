@@ -8,7 +8,7 @@ os.environ.setdefault("DATABASE_URL", "postgresql://x:y@localhost:5432/db")
 os.environ.setdefault("BEARER_TOKEN", "test-bearer-token")
 
 
-import pytest  # noqa: E402
+import pytest
 
 
 @pytest.fixture(autouse=True)
