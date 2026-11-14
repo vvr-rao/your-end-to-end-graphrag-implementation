@@ -1078,6 +1078,75 @@ Credentials (`SEC_USER_AGENT`, `FRED_API_KEY`, optional `OPENFDA_API_KEY`,
 live-tested vs fixture-tested status of each source are in
 [`source_documents/structured/README.md`](source_documents/structured/README.md).
 
+#### Supplementary sources
+
+`source_documents/supplementary_download.py` covers six more public sources in
+the same snapshot layout (so `hf_dataset.py` uploads them too). None needs a key.
+
+| Source | What it gives |
+|---|---|
+| `worldbank-pinksheet` | World Bank commodity prices (monthly since 1960 + annual), incl. potash, phosphate, copper, iron ore |
+| `owid-iea-ev` | IEA Global EV Outlook car series via Our World in Data (iea.org blocks scripted downloads) |
+| `usgs-mcs` | USGS Mineral Commodity Summaries: US + world production / reserves by country |
+| `cms-partd` | Medicare Part D spending by drug (national tables + a cut for `--drugs`) |
+| `rxnorm` | NLM RxNorm ingredient -> branded / clinical products |
+| `faers` | openFDA FAERS top reactions + report totals per drug (not evidence of causation) |
+
+```bash
+uv run --extra structured python source_documents/supplementary_download.py worldbank-pinksheet
+uv run python source_documents/supplementary_download.py faers --drugs semaglutide,tirzepatide --dry-run
+```
+
+Release URLs are discovered at run time; `--url` pins them. `worldbank-pinksheet`
+needs openpyxl (`uv sync --extra structured`).
+
+#### Entity crosswalks
+
+`source_documents/build_crosswalk.py` builds a small table linking a corpus to its
+structured bundle: one row per company or drug with hand-curated identifiers (SEC
+CIK, LEI, ChEMBL id, ...) from a JSON spec, how often the documents mention it, and
+coverage counts looked up in the bundle's snapshots (SEC facts, LEI status, trials,
+Part D rows, FAERS reports, ...). Specs for the two test datasets are in
+`source_documents/crosswalks/`.
+
+```bash
+uv run python source_documents/build_crosswalk.py source_documents/crosswalks/pharma30.json --dry-run
+```
+
+### Saving datasets to Hugging Face (optional)
+
+`source_documents/hf_dataset.py` uploads the corpora, structured downloads and
+evaluation sets you choose to a **private** Hugging Face dataset repo, and
+downloads a dataset back into a checkout. The app never needs it.
+
+```bash
+uv sync --extra hf                       # installs huggingface_hub
+# add HF_TOKEN=... to .env ("write" token to push, "read" to pull)
+uv run python source_documents/hf_dataset.py whoami
+uv run python source_documents/hf_dataset.py push --repo yegi-pharma \
+  --corpus source_documents/pharma-12-audit \
+  --structured source_documents/structured_orangebook \
+  --eval eval_questions/testsets/pharma12.json --dry-run
+uv run python source_documents/hf_dataset.py list --repo <user>/yegi-pharma
+uv run python source_documents/hf_dataset.py pull --repo <user>/yegi-pharma [--kind eval] [--dry-run]
+```
+
+- `push` creates the repo **private** and refuses to write to one that is not
+  private. Re-pushing uploads only changed files (`--delete-missing` removes remote
+  files you deleted locally; otherwise they are kept).
+- A `yegi_manifest.json` in the repo lists every file with its SHA-256 and the path
+  it came from. `pull` restores each item to that same path (so a test set's
+  `"corpus": "source_documents/..."` still resolves), verifies every SHA-256, and
+  never overwrites a local file that differs unless you pass `--overwrite`.
+- Never uploaded: `.env*`, key/credential-looking files, `.part`/`.bak`/`.tmp`
+  leftovers, `__pycache__`, `.git`. Symlinked files (subset corpora) are uploaded
+  only when the link points inside the repo; `pull` restores them as plain files.
+- A repo without `yegi_manifest.json` (not written by this tool) is downloaded whole
+  to `source_documents/hf_<owner>__<name>/`.
+- The repo card lists each item, and the attribution and terms of any structured
+  source. Third-party data keeps its original licence, so keep these repos private
+  unless every source allows redistribution.
+
 You can also download standard ontologies into `source_ontologies/`:
 
 ```bash

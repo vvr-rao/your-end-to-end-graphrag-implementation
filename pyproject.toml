@@ -58,10 +58,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# source_documents/structured_download.py: Parquet -> CSV for Open Targets bulk
+# source_documents/structured_download.py: Parquet -> CSV for Open Targets bulk;
+# source_documents/supplementary_download.py: World Bank Pink Sheet xlsx
 # (`uv sync --extra structured`). Kept optional so the deployed image stays small.
 structured = [
     "pyarrow>=15",
+    "openpyxl>=3.1",
+]
+# source_documents/hf_dataset.py: push/pull datasets to a private Hugging Face
+# dataset repo (`uv sync --extra hf`). Optional; not needed by the app itself.
+hf = [
+    "huggingface_hub>=0.30",
 ]
 dev = [
     "pytest>=8.3",

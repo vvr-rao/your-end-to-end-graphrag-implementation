@@ -1,0 +1,409 @@
+{
+  "corpus": "source_documents/fin-longdoc-test",
+  "structured": "source_documents/fin-longdoc-structured",
+  "output": "companies/company-crosswalk",
+  "dataset": "company-crosswalk",
+  "description": "Companies mentioned in source_documents/fin-longdoc-test, linked to SEC CIK and GLEIF LEI in the sibling sec/ and gleif/ downloads.",
+  "warnings": [
+    "CIK from SEC company_tickers.json; LEI by exact legal name + country on api.gleif.org (curated by hand)",
+    "Not found by exact LEI match and left out: Sociedad Quimica y Minera de Chile (SQM), Yunnan Yuntianhua (ICL JV partner)",
+    "Geely Automobile and BYD trade in the US only as unsponsored ADRs: no SEC XBRL facts"
+  ],
+  "tables": [
+    {
+      "name": "companies",
+      "case_sensitive": true,
+      "columns": [
+        "company",
+        "role",
+        "industry",
+        "sec_cik",
+        "sec_ticker",
+        "lei"
+      ],
+      "enrich": [
+        "sec_xbrl_facts",
+        "lei_status"
+      ],
+      "rows": [
+        {
+          "company": "BHP Group Limited",
+          "role": "subject",
+          "industry": "Mining (copper, iron ore, coal, potash, nickel)",
+          "sec_cik": "811809",
+          "sec_ticker": "BHP",
+          "lei": "WZE1WSENV6JSZFK0JC28",
+          "pattern": "\\bBHP\\b"
+        },
+        {
+          "company": "ICL Group Ltd",
+          "role": "subject",
+          "industry": "Fertilizers & specialty chemicals (potash, bromine, phosphate)",
+          "sec_cik": "941221",
+          "sec_ticker": "ICL",
+          "lei": "529900FQVQD88SHIGM04",
+          "pattern": "\\bICL\\b|Israel Chemicals"
+        },
+        {
+          "company": "Geely Automobile Holdings Limited",
+          "role": "subject",
+          "industry": "Automobiles / EVs",
+          "sec_cik": "",
+          "sec_ticker": "GELYF (unsponsored ADR; no XBRL)",
+          "lei": "549300YS3T1KVQ2SNI84",
+          "pattern": "\\bGeely Automobile\\b|\\bGeely Auto\\b"
+        },
+        {
+          "company": "Israel Corporation Ltd",
+          "role": "mentioned",
+          "industry": "Holding company (ICL controlling shareholder)",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "213800VASRTF37M7LO42",
+          "pattern": "\\bIsrael Corp(?:oration)?\\b"
+        },
+        {
+          "company": "Zhejiang Geely Holding Group",
+          "role": "mentioned",
+          "industry": "Automobiles (Geely parent group)",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "300300981TJLHHGCY944",
+          "pattern": "Zhejiang Geely Holding|Geely Holding Group|Geely Holding\\b"
+        },
+        {
+          "company": "Volvo Car AB",
+          "role": "mentioned",
+          "industry": "Automobiles",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "5299000EAMGGBEYP7J33",
+          "pattern": "\\bVolvo Car(?:s)?\\b"
+        },
+        {
+          "company": "ZEEKR Intelligent Technology Holding",
+          "role": "mentioned",
+          "industry": "Automobiles / EVs",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "529900YUS7B7GL43ZF95",
+          "pattern": "\\bZEEKR\\b|\\bZeekr\\b"
+        },
+        {
+          "company": "Lotus Technology Inc",
+          "role": "mentioned",
+          "industry": "Automobiles / EVs",
+          "sec_cik": "1962746",
+          "sec_ticker": "LOT",
+          "lei": "984500BB84E413EA3D69",
+          "pattern": "\\bLotus\\b"
+        },
+        {
+          "company": "Polestar Automotive Holding UK PLC",
+          "role": "mentioned",
+          "industry": "Automobiles / EVs",
+          "sec_cik": "1884082",
+          "sec_ticker": "PSNY",
+          "lei": "894500HDA1DJKHYN4D83",
+          "pattern": "\\bPolestar\\b"
+        },
+        {
+          "company": "Renault SA",
+          "role": "mentioned",
+          "industry": "Automobiles",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "969500F7JLTX36OUI695",
+          "pattern": "\\bRenault\\b"
+        },
+        {
+          "company": "Vale S.A.",
+          "role": "mentioned",
+          "industry": "Mining (iron ore, nickel); Samarco JV partner",
+          "sec_cik": "917851",
+          "sec_ticker": "VALE",
+          "lei": "254900SMTWBX7RU2SR20",
+          "pattern": "\\bVale\\b"
+        },
+        {
+          "company": "Samarco Mineração S.A.",
+          "role": "mentioned",
+          "industry": "Mining (iron ore pellets; BHP-Vale JV)",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "529900U8HKV15GJC4O60",
+          "pattern": "\\bSamarco\\b"
+        },
+        {
+          "company": "Minera Escondida Limitada",
+          "role": "mentioned",
+          "industry": "Mining (copper; BHP-operated)",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "549300RUPF4SKMJPUR70",
+          "pattern": "\\bEscondida\\b"
+        },
+        {
+          "company": "Rio Tinto plc",
+          "role": "mentioned",
+          "industry": "Mining",
+          "sec_cik": "863064",
+          "sec_ticker": "RIO",
+          "lei": "213800YOEO5OQ72G2R82",
+          "pattern": "\\bRio Tinto\\b"
+        },
+        {
+          "company": "Rio Tinto Limited",
+          "role": "mentioned",
+          "industry": "Mining (Rio Tinto dual listing; mentions counted under Rio Tinto plc)",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "529900X2VMAQT2PE0V24"
+        },
+        {
+          "company": "Woodside Energy Group Ltd",
+          "role": "mentioned",
+          "industry": "Oil & gas (merged BHP Petroleum)",
+          "sec_cik": "844551",
+          "sec_ticker": "WDS",
+          "lei": "2549005ZC5RXAOO7FH41",
+          "pattern": "\\bWoodside\\b"
+        },
+        {
+          "company": "South32 Limited",
+          "role": "mentioned",
+          "industry": "Mining (BHP demerger)",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "213800LAZNPXSBKVHR17",
+          "pattern": "\\bSouth32\\b"
+        },
+        {
+          "company": "Antofagasta plc",
+          "role": "mentioned",
+          "industry": "Mining (copper)",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "213800MY6QVH4FVLD628",
+          "pattern": "\\bAntofagasta\\b"
+        },
+        {
+          "company": "Mitsubishi Corporation",
+          "role": "mentioned",
+          "industry": "Trading house (BHP Mitsubishi Alliance coal JV)",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "KVIPTY4PULAPGC1VVD26",
+          "pattern": "\\bMitsubishi\\b"
+        },
+        {
+          "company": "Mitsui & Co., Ltd.",
+          "role": "mentioned",
+          "industry": "Trading house (iron ore JVs)",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "2NRSB4GOU9DD6CNW5R48",
+          "pattern": "\\bMitsui\\b"
+        },
+        {
+          "company": "Lundin Mining Corporation",
+          "role": "mentioned",
+          "industry": "Mining (copper; Filo/Vicuña JV)",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "549300FQDIM6C8HTN269",
+          "pattern": "\\bLundin\\b"
+        },
+        {
+          "company": "Filo Corp.",
+          "role": "mentioned",
+          "industry": "Mining (copper; acquired by BHP/Lundin)",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "54930049JO3VWJU1B514",
+          "pattern": "\\bFilo\\b"
+        },
+        {
+          "company": "Anglo American plc",
+          "role": "mentioned",
+          "industry": "Mining",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "549300S9XF92D1X8ME43",
+          "pattern": "\\bAnglo American\\b"
+        },
+        {
+          "company": "Nutrien Ltd.",
+          "role": "mentioned",
+          "industry": "Fertilizers (potash)",
+          "sec_cik": "1725964",
+          "sec_ticker": "NTR",
+          "lei": "5493002QQ7GD21OWF963",
+          "pattern": "\\bNutrien\\b"
+        },
+        {
+          "company": "The Mosaic Company",
+          "role": "mentioned",
+          "industry": "Fertilizers (potash, phosphate)",
+          "sec_cik": "1285785",
+          "sec_ticker": "MOS",
+          "lei": "2YD5STGSJNMUB7H76907",
+          "pattern": "\\bMosaic\\b"
+        },
+        {
+          "company": "Albemarle Corporation",
+          "role": "mentioned",
+          "industry": "Specialty chemicals (bromine, lithium)",
+          "sec_cik": "915913",
+          "sec_ticker": "ALB",
+          "lei": "HDBLS2Q6GV1LSKQPBS54",
+          "pattern": "\\bAlbemarle\\b"
+        },
+        {
+          "company": "LANXESS AG",
+          "role": "mentioned",
+          "industry": "Specialty chemicals (bromine)",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "529900PTLRE72EMYIJ77",
+          "pattern": "\\bLanxess\\b|\\bLANXESS\\b"
+        },
+        {
+          "company": "K+S AG",
+          "role": "mentioned",
+          "industry": "Fertilizers (potash)",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "529900YURAYD4IJX2J91",
+          "pattern": "\\bK\\+S\\b"
+        },
+        {
+          "company": "BYD Company Limited",
+          "role": "mentioned",
+          "industry": "Automobiles / EVs / batteries",
+          "sec_cik": "",
+          "sec_ticker": "BYDDF (unsponsored ADR; no XBRL)",
+          "lei": "5299005557VL7ULJ7A69",
+          "pattern": "\\bBYD\\b"
+        },
+        {
+          "company": "Contemporary Amperex Technology Co., Limited (CATL)",
+          "role": "mentioned",
+          "industry": "EV batteries",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "300300KINDY1K0E9I032",
+          "pattern": "\\bCATL\\b|Contemporary Amperex"
+        },
+        {
+          "company": "LG Energy Solution",
+          "role": "mentioned",
+          "industry": "EV batteries",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "988400QX6P286XA6ZS85",
+          "pattern": "LG Energy Solution"
+        },
+        {
+          "company": "Tesla, Inc.",
+          "role": "mentioned",
+          "industry": "Automobiles / EVs",
+          "sec_cik": "1318605",
+          "sec_ticker": "TSLA",
+          "lei": "54930043XZGB27CTOV49",
+          "pattern": "\\bTesla\\b"
+        },
+        {
+          "company": "Volkswagen AG",
+          "role": "mentioned",
+          "industry": "Automobiles",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "529900NNUPAGGOMPXZ31",
+          "pattern": "\\bVolkswagen\\b"
+        },
+        {
+          "company": "Stellantis N.V.",
+          "role": "mentioned",
+          "industry": "Automobiles",
+          "sec_cik": "1605484",
+          "sec_ticker": "STLA",
+          "lei": "549300LKT9PW7ZIBDF31",
+          "pattern": "\\bStellantis\\b"
+        },
+        {
+          "company": "Hyundai Motor Company",
+          "role": "mentioned",
+          "industry": "Automobiles",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "9884004RQX8PRBXQ8S60",
+          "pattern": "\\bHyundai\\b"
+        },
+        {
+          "company": "Ford Motor Company",
+          "role": "mentioned",
+          "industry": "Automobiles",
+          "sec_cik": "37996",
+          "sec_ticker": "F",
+          "lei": "20S05OYHG0MQM4VUIC57",
+          "pattern": "\\bFord\\b"
+        },
+        {
+          "company": "SAIC Motor Corporation",
+          "role": "mentioned",
+          "industry": "Automobiles",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "30030001QBC7EXJJGT71",
+          "pattern": "\\bSAIC\\b"
+        },
+        {
+          "company": "Toyota Motor Corporation",
+          "role": "mentioned",
+          "industry": "Automobiles",
+          "sec_cik": "1094517",
+          "sec_ticker": "TM",
+          "lei": "5493006W3QUS5LMH6R84",
+          "pattern": "\\bToyota\\b"
+        },
+        {
+          "company": "NIO Inc.",
+          "role": "mentioned",
+          "industry": "Automobiles / EVs",
+          "sec_cik": "1736541",
+          "sec_ticker": "NIO",
+          "lei": "549300JBU4TV5OCKJV96",
+          "pattern": "\\bNIO\\b"
+        },
+        {
+          "company": "Honda Motor Co., Ltd.",
+          "role": "mentioned",
+          "industry": "Automobiles",
+          "sec_cik": "715153",
+          "sec_ticker": "HMC",
+          "lei": "549300P7ZYCQJ36CCS16",
+          "pattern": "\\bHonda\\b"
+        },
+        {
+          "company": "General Motors Company",
+          "role": "mentioned",
+          "industry": "Automobiles",
+          "sec_cik": "1467858",
+          "sec_ticker": "GM",
+          "lei": "54930070NSV60J38I987",
+          "pattern": "General Motors|\\bGM\\b"
+        },
+        {
+          "company": "Rivian Automotive, Inc.",
+          "role": "mentioned",
+          "industry": "Automobiles / EVs",
+          "sec_cik": "1874178",
+          "sec_ticker": "RIVN",
+          "lei": "25490004LNKJ84MFYY24",
+          "pattern": "\\bRivian\\b"
+        }
+      ]
+    }
+  ]
+}

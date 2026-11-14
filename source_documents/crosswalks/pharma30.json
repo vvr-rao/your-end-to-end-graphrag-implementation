@@ -1,0 +1,436 @@
+{
+  "corpus": "source_documents/pharma-30-identity-test",
+  "structured": "source_documents/pharma30-structured",
+  "output": "derived/crosswalk",
+  "dataset": "crosswalk",
+  "description": "Drugs and companies in source_documents/pharma-30-identity-test linked to the identifiers used by the sibling structured downloads.",
+  "warnings": [
+    "chembl_id / primary_targets curated from ChEMBL + Open Targets mechanisms; metformin's mechanism lists ~60 mitochondrial complex-I subunits, summarised here",
+    "CIKs verified against SEC submissions names; LEIs verified by exact legal name + country on api.gleif.org",
+    "No LEI found for Prasco, Structure Therapeutics, Novel Laboratories, Watson Laboratories, Patheon or Lilly USA LLC; parents' LEIs are listed where known",
+    "Novo Nordisk, AstraZeneca, Sanofi, Novartis, Takeda, Teva file 20-F with IFRS XBRL; units/concepts differ from US-GAAP filers"
+  ],
+  "tables": [
+    {
+      "name": "drugs",
+      "case_sensitive": false,
+      "columns": [
+        "drug",
+        "brands",
+        "drug_class",
+        "role",
+        "chembl_id",
+        "primary_targets"
+      ],
+      "enrich": [
+        "rxnorm_rxcui",
+        "opentargets_indications",
+        "ctgov_trials",
+        "cms_partd_rows",
+        "faers_reports"
+      ],
+      "rows": [
+        {
+          "drug": "semaglutide",
+          "brands": "Ozempic; Wegovy; Rybelsus",
+          "drug_class": "GLP-1 receptor agonist",
+          "role": "label in corpus",
+          "chembl_id": "CHEMBL2108724",
+          "primary_targets": "GLP1R",
+          "aliases": [
+            "semaglutide",
+            "Ozempic",
+            "Wegovy",
+            "Rybelsus"
+          ]
+        },
+        {
+          "drug": "tirzepatide",
+          "brands": "Mounjaro; Zepbound",
+          "drug_class": "GIP/GLP-1 receptor agonist",
+          "role": "label in corpus",
+          "chembl_id": "CHEMBL4297839",
+          "primary_targets": "GIPR; GLP1R",
+          "aliases": [
+            "tirzepatide",
+            "Mounjaro",
+            "Zepbound"
+          ]
+        },
+        {
+          "drug": "dulaglutide",
+          "brands": "Trulicity",
+          "drug_class": "GLP-1 receptor agonist",
+          "role": "label in corpus",
+          "chembl_id": "CHEMBL2108027",
+          "primary_targets": "GLP1R",
+          "aliases": [
+            "dulaglutide",
+            "Trulicity"
+          ]
+        },
+        {
+          "drug": "liraglutide",
+          "brands": "Victoza; Saxenda",
+          "drug_class": "GLP-1 receptor agonist",
+          "role": "mentioned",
+          "chembl_id": "CHEMBL4084119",
+          "primary_targets": "GLP1R",
+          "aliases": [
+            "liraglutide",
+            "Victoza",
+            "Saxenda"
+          ]
+        },
+        {
+          "drug": "exenatide",
+          "brands": "Byetta; Bydureon",
+          "drug_class": "GLP-1 receptor agonist",
+          "role": "mentioned",
+          "chembl_id": "CHEMBL414357",
+          "primary_targets": "GLP1R",
+          "aliases": [
+            "exenatide",
+            "Byetta",
+            "Bydureon"
+          ]
+        },
+        {
+          "drug": "lixisenatide",
+          "brands": "Adlyxin",
+          "drug_class": "GLP-1 receptor agonist",
+          "role": "mentioned",
+          "chembl_id": "CHEMBL2108336",
+          "primary_targets": "GLP1R",
+          "aliases": [
+            "lixisenatide",
+            "Adlyxin"
+          ]
+        },
+        {
+          "drug": "orforglipron",
+          "brands": "(investigational)",
+          "drug_class": "oral GLP-1 receptor agonist",
+          "role": "mentioned",
+          "chembl_id": "CHEMBL4446782",
+          "primary_targets": "GLP1R",
+          "aliases": [
+            "orforglipron"
+          ]
+        },
+        {
+          "drug": "retatrutide",
+          "brands": "(investigational)",
+          "drug_class": "GIP/GLP-1/glucagon receptor agonist",
+          "role": "mentioned",
+          "chembl_id": "CHEMBL5095485",
+          "primary_targets": "GIPR; GLP1R; GCGR",
+          "aliases": [
+            "retatrutide"
+          ]
+        },
+        {
+          "drug": "amlodipine",
+          "brands": "Norvasc",
+          "drug_class": "calcium channel blocker",
+          "role": "label in corpus",
+          "chembl_id": "CHEMBL1491",
+          "primary_targets": "CACNA1C; CACNA1D; CACNA1F; CACNA1S",
+          "aliases": [
+            "amlodipine",
+            "Norvasc"
+          ]
+        },
+        {
+          "drug": "atorvastatin",
+          "brands": "Lipitor",
+          "drug_class": "statin (HMG-CoA reductase inhibitor)",
+          "role": "label in corpus",
+          "chembl_id": "CHEMBL1487",
+          "primary_targets": "HMGCR",
+          "aliases": [
+            "atorvastatin",
+            "Lipitor"
+          ]
+        },
+        {
+          "drug": "valsartan",
+          "brands": "Diovan",
+          "drug_class": "angiotensin II receptor blocker",
+          "role": "label in corpus",
+          "chembl_id": "CHEMBL1069",
+          "primary_targets": "AGTR1",
+          "aliases": [
+            "valsartan",
+            "Diovan"
+          ]
+        },
+        {
+          "drug": "enalapril",
+          "brands": "Vasotec",
+          "drug_class": "ACE inhibitor",
+          "role": "label in corpus",
+          "chembl_id": "CHEMBL578",
+          "primary_targets": "ACE",
+          "aliases": [
+            "enalapril",
+            "Vasotec"
+          ]
+        },
+        {
+          "drug": "hydrochlorothiazide",
+          "brands": "(generic)",
+          "drug_class": "thiazide diuretic",
+          "role": "label in corpus",
+          "chembl_id": "CHEMBL435",
+          "primary_targets": "SLC12A3",
+          "aliases": [
+            "hydrochlorothiazide"
+          ]
+        },
+        {
+          "drug": "lisinopril",
+          "brands": "Zestril; Prinivil",
+          "drug_class": "ACE inhibitor",
+          "role": "label in corpus",
+          "chembl_id": "CHEMBL419213",
+          "primary_targets": "ACE",
+          "aliases": [
+            "lisinopril",
+            "Zestril",
+            "Prinivil"
+          ]
+        },
+        {
+          "drug": "losartan",
+          "brands": "Cozaar",
+          "drug_class": "angiotensin II receptor blocker",
+          "role": "label in corpus",
+          "chembl_id": "CHEMBL191",
+          "primary_targets": "AGTR1",
+          "aliases": [
+            "losartan",
+            "Cozaar"
+          ]
+        },
+        {
+          "drug": "metformin",
+          "brands": "Glucophage",
+          "drug_class": "biguanide",
+          "role": "mentioned",
+          "chembl_id": "CHEMBL1431",
+          "primary_targets": "mitochondrial complex I (many subunits); GPD2",
+          "aliases": [
+            "metformin",
+            "Glucophage"
+          ]
+        },
+        {
+          "drug": "sitagliptin",
+          "brands": "Januvia",
+          "drug_class": "DPP-4 inhibitor",
+          "role": "mentioned",
+          "chembl_id": "CHEMBL1422",
+          "primary_targets": "DPP4",
+          "aliases": [
+            "sitagliptin",
+            "Januvia"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "companies",
+      "case_sensitive": false,
+      "columns": [
+        "company",
+        "role",
+        "sec_cik",
+        "sec_ticker",
+        "lei"
+      ],
+      "enrich": [
+        "sec_xbrl_facts",
+        "lei_status"
+      ],
+      "rows": [
+        {
+          "company": "Eli Lilly and Company",
+          "role": "label sponsor (Mounjaro, Zepbound, Trulicity)",
+          "sec_cik": "59478",
+          "sec_ticker": "LLY",
+          "lei": "FRDRIPF3EKNDJ2CQJL29",
+          "pattern": "\\bLilly\\b"
+        },
+        {
+          "company": "Novo Nordisk A/S",
+          "role": "label sponsor (Ozempic, Wegovy)",
+          "sec_cik": "353278",
+          "sec_ticker": "NVO",
+          "lei": "549300DAQ1CVT6CXN342",
+          "pattern": "Novo Nordisk"
+        },
+        {
+          "company": "Organon & Co.",
+          "role": "label sponsor (Cozaar)",
+          "sec_cik": "1821825",
+          "sec_ticker": "OGN",
+          "lei": "549300AMCKY57OK2CO56",
+          "pattern": "\\bOrganon\\b"
+        },
+        {
+          "company": "Merck & Co., Inc.",
+          "role": "former Cozaar/Prinivil sponsor (Organon spun off 2021); not named in text",
+          "sec_cik": "310158",
+          "sec_ticker": "MRK",
+          "lei": "4YV9Y5M8S0BRK1RP0397",
+          "pattern": "\\bMerck\\b"
+        },
+        {
+          "company": "Pfizer Inc.",
+          "role": "mentioned",
+          "sec_cik": "78003",
+          "sec_ticker": "PFE",
+          "lei": "765LHXWGK1KXCLTFYQ30",
+          "pattern": "\\bPfizer\\b"
+        },
+        {
+          "company": "Teva Pharmaceutical Industries Ltd",
+          "role": "parent of Watson Laboratories (enalapril label)",
+          "sec_cik": "818686",
+          "sec_ticker": "TEVA",
+          "lei": "549300BAFGM4RC74ZJ94",
+          "pattern": "\\bTeva\\b|\\bWatson\\b"
+        },
+        {
+          "company": "Thermo Fisher Scientific Inc.",
+          "role": "parent of Patheon (enalapril label manufacturer)",
+          "sec_cik": "97745",
+          "sec_ticker": "TMO",
+          "lei": "HCHV7422L5HDJZCRFL38",
+          "pattern": "Patheon|Thermo Fisher"
+        },
+        {
+          "company": "Taro Pharmaceutical Industries Ltd",
+          "role": "generic label (enalapril/HCTZ)",
+          "sec_cik": "906338",
+          "sec_ticker": "(delisted 2024)",
+          "lei": "5493002WIJCSC2L2VL79",
+          "pattern": "\\bTaro\\b"
+        },
+        {
+          "company": "Sun Pharmaceutical Industries Limited",
+          "role": "parent of Taro; not named in text",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "335800KJ7GE29LB4SS73",
+          "pattern": "Sun Pharma"
+        },
+        {
+          "company": "Cipla Limited",
+          "role": "generic label (lisinopril/HCTZ, via InvaGen / Cipla USA)",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "335800KMJJYEDDK82Q34",
+          "pattern": "\\bCipla\\b"
+        },
+        {
+          "company": "InvaGen Pharmaceuticals Inc.",
+          "role": "generic label manufacturer (Cipla subsidiary)",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "549300PSQTOK7P8ZE722",
+          "pattern": "InvaGen"
+        },
+        {
+          "company": "Alembic Pharmaceuticals Limited",
+          "role": "generic label (amlodipine/atorvastatin)",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "335800PM173KNG818V30",
+          "pattern": "\\bAlembic\\b"
+        },
+        {
+          "company": "Lupin Limited",
+          "role": "parent of Novel Laboratories (amlodipine/valsartan label)",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "335800HHXTESDEE2FC65",
+          "pattern": "Novel Laboratories|\\bLupin\\b"
+        },
+        {
+          "company": "Prasco Laboratories",
+          "role": "generic label distributor (amlodipine/atorvastatin)",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "",
+          "pattern": "\\bPrasco\\b"
+        },
+        {
+          "company": "AstraZeneca PLC",
+          "role": "mentioned",
+          "sec_cik": "901832",
+          "sec_ticker": "AZN",
+          "lei": "PY6ZZQWO2IZFZC3IOL08",
+          "pattern": "AstraZeneca"
+        },
+        {
+          "company": "Sanofi",
+          "role": "mentioned",
+          "sec_cik": "1121404",
+          "sec_ticker": "SNY",
+          "lei": "549300E9PC51EN656011",
+          "pattern": "\\bSanofi\\b"
+        },
+        {
+          "company": "Novartis AG",
+          "role": "mentioned",
+          "sec_cik": "1114448",
+          "sec_ticker": "NVS",
+          "lei": "5493007HIVTX6SY6XD66",
+          "pattern": "\\bNovartis\\b"
+        },
+        {
+          "company": "Takeda Pharmaceutical Company Limited",
+          "role": "mentioned",
+          "sec_cik": "1395064",
+          "sec_ticker": "TAK",
+          "lei": "549300ZLMVP4X0OGR454",
+          "pattern": "\\bTakeda\\b"
+        },
+        {
+          "company": "Bristol-Myers Squibb Company",
+          "role": "mentioned",
+          "sec_cik": "14272",
+          "sec_ticker": "BMY",
+          "lei": "HLYYNH7UQUORYSJQCN42",
+          "pattern": "Bristol|\\bBMS\\b"
+        },
+        {
+          "company": "Structure Therapeutics Inc.",
+          "role": "mentioned (oral GLP-1 pipeline)",
+          "sec_cik": "1888886",
+          "sec_ticker": "GPCR",
+          "lei": "",
+          "pattern": "Structure Therapeutics"
+        },
+        {
+          "company": "Viking Therapeutics, Inc.",
+          "role": "GLP-1 pipeline competitor; not named in text",
+          "sec_cik": "1607678",
+          "sec_ticker": "VKTX",
+          "lei": "529900IVC72YPFA25M37",
+          "pattern": "\\bViking\\b"
+        },
+        {
+          "company": "Zealand Pharma A/S",
+          "role": "mentioned (GLP-1 pipeline)",
+          "sec_cik": "",
+          "sec_ticker": "",
+          "lei": "549300ITBB1ULBL4CZ12",
+          "pattern": "\\bZealand\\b"
+        }
+      ]
+    }
+  ]
+}
