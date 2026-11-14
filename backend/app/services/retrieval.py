@@ -1767,16 +1767,15 @@ async def retrieve_and_answer(
     # every other run is unchanged.
     _use_sd = (use_structured_data if use_structured_data is not None
                else _qa_flag("use_structured_data", False))
-    # Round 2 of deep_research already holds round 1's results for the same
-    # (user's) question: selecting again would only repeat them.
-    if _use_sd and _carry_sql_evidence and _table_question:
-        parsed["structured_data"] = {"reused_from_round1": len(_carry_sql_evidence)}
+    _tq = table_selection_question(resolved_query, _table_question, _carry_sql_evidence)
+    if _use_sd and _tq is None:
+        parsed["structured_data"] = {"reused_from_round1": len(_carry_sql_evidence or [])}
     elif _use_sd and mode in ("simple_qa", "deep_research"):
         from backend.app.services.structured.retrieval_step import structured_evidence
 
         try:
             _sd_ev, _sd_plan = await structured_evidence(
-                _table_question or resolved_query, router=router,
+                _tq, router=router,
                 entity_ids=list(expanded_entity_ids),
                 class_ids=[c["id"] for c in matched_classes if c.get("id")],
                 qvec=qvec,
@@ -1854,13 +1853,16 @@ async def retrieve_and_answer(
     # A listing answer's per-item table is appended exactly from the computed
     # statistics (the model writes the analysis; copying dozens of rows is
     # where it abbreviates or slips).
-    if answer and _listing and answer_prompt_fn is PROMPTS.get("answer_listing_analysis"):
+    # Not on a deep_research BRIDGE round (simple_qa at depth 1): its answer
+    # becomes part of the final round's question and probes.
+    if answer and _listing and not (_round_depth and mode == "simple_qa"):
         from backend.app.services.structured.listing_stats import stats_table
 
         for _ev in evidence:
             if _ev.get("listing") and _ev.get("change_stats"):
                 _frag = str(_ev.get("iri") or "").rsplit("#", 1)[-1]
-                answer += "\n\n" + stats_table(_ev["change_stats"], f"[viao:{_frag}]" if _frag else "")
+                answer += "\n\n" + stats_table(_ev["change_stats"], f"[viao:{_frag}]" if _frag else "",
+                                                 plain=mode != "simple_qa")
 
     # Every cited id must resolve to something we actually retrieved.
     answer, invalid_citations = _validate_citations(answer, evidence)
@@ -2992,6 +2994,18 @@ async def _entity_probes(
         return []
     probes = parsed.get("probes") or []
     return [p for p in probes if isinstance(p, str) and p.strip()]
+
+
+def table_selection_question(resolved_query: str, table_question: str | None,
+                             carried_sql: list[dict[str, Any]] | None) -> str | None:
+    """The question the structured-data step selects tables for, or None to
+    reuse what an earlier round already returned. Tables answer the USER's
+    question: deep_research's bridge/final rewrites steer document retrieval
+    and can narrow it ("the major commodities"). A final round that carries
+    round 1's results for that same question would only select them again."""
+    if table_question and carried_sql:
+        return None
+    return table_question or resolved_query
 
 
 async def _plan_rounds(router: LLMRouter, q: str) -> dict[str, Any]:

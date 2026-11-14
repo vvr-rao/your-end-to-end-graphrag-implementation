@@ -56,3 +56,14 @@ def test_appended_table_is_exact_and_prompt_defers_to_it():
     assert "Do NOT write a per-item table" in PROMPTS["answer_listing_analysis"]("q", ev)[0]
     ev[0]["change_stats"] = None
     assert "ALL ITEMS" in PROMPTS["answer_listing_analysis"]("q", ev)[0]
+
+
+def test_plain_table_for_deep_research_and_its_prompt():
+    from backend.app.services.structured.listing_stats import stats_table
+
+    st = change_stats(COLS, ROWS, "period", "value")
+    lines = stats_table(st, "[viao:S]", plain=True).splitlines()
+    assert lines[0] == "ALL ITEMS (4, value by period) [viao:S]"
+    assert lines[1] == "  A / u1: 2023 100.0 -> 2025 120.0 (+20.0%)" and "|" not in "".join(lines)
+    ev = [{"kind": "sql_result", "listing": True, "iri": "x", "text": "t", "change_stats": st}]
+    assert "appended after KEY INSIGHTS" in PROMPTS["answer_deep_research"]("q", ev)[0]

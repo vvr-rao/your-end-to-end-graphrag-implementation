@@ -3010,10 +3010,15 @@ def answer_deep_research(
         + "\n\n"
         + _DEEP_RESEARCH_SECTIONS
         + (
-            "\n\n" + _LISTING_ANALYSIS_RULE + " In SPECIFICS give one line per item of "
-            "the listing (item: first -> last, change %); ANALYSIS and KEY INSIGHTS use the "
-            "summary's counts, median and movers. The per-item lines do not count toward "
-            "LENGTH."
+            "\n\n" + _LISTING_ANALYSIS_RULE + (
+                " Do NOT list every item in SPECIFICS: an exact ALL ITEMS section with one "
+                "line per item is appended after KEY INSIGHTS automatically. SPECIFICS gives "
+                "the summary's counts, median and the notable movers; ANALYSIS and KEY "
+                "INSIGHTS build on them."
+                if any(ev.get("change_stats") for ev in evidence if ev.get("listing")) else
+                " In SPECIFICS give one line per item of the listing; these lines do not "
+                "count toward LENGTH."
+            )
             if has_listing(evidence) else ""
         )
         + "\n\nLENGTH: 650-1,300 words across all seven sections. "

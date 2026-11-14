@@ -139,13 +139,23 @@ def stats_text(st: dict) -> str:
     return head + " Per item: " + " ;; ".join(lines)
 
 
-def stats_table(st: dict, cite: str = "") -> str:
-    """The per-item table appended to a listing answer (markdown), exact."""
+def stats_table(st: dict, cite: str = "", *, plain: bool = False) -> str:
+    """The per-item table appended to a listing answer, exact. Markdown, or
+    ``plain`` lines (item: first -> last, change %) for plain-text answers."""
+    ordered = sorted(st["items"], key=lambda it: (it["pct"] is None, -(it["pct"] or 0)))
+    if plain:
+        out = [f"ALL ITEMS ({len(st['items'])}, {st['value_column']} by {st['period_column']})"
+               + (f" {cite}" if cite else "")]
+        for it in ordered:
+            pct = "n/a" if it["pct"] is None else f"{it['pct']:+.1f}%"
+            out.append(f"  {it['item']}: {it['first_period']} {_fmt(it['first'])} -> "
+                       f"{it['last_period']} {_fmt(it['last'])} ({pct})")
+        return "\n".join(out)
     head = (f"| {' / '.join(st['group_columns']) or 'item'} | {st['periods'][0]}..{st['periods'][1]}: first "
             f"| last | change % |")
     lines = [f"All items ({len(st['items'])}, {st['value_column']} by {st['period_column']})"
              + (f" {cite}" if cite else "") + ":", "", head, "|---|---|---|---|"]
-    for it in sorted(st["items"], key=lambda it: (it["pct"] is None, -(it["pct"] or 0))):
+    for it in ordered:
         pct = "n/a" if it["pct"] is None else f"{it['pct']:+.1f}%"
         lines.append(f"| {it['item']} | {it['first_period']}: {_fmt(it['first'])} "
                      f"| {it['last_period']}: {_fmt(it['last'])} | {pct} |")

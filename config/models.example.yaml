@@ -457,7 +457,7 @@ tasks:
   # simple_qa: tight 1-3 sentence direct answer.
   answer_simple_qa:
     provider: openai
-    model: gpt-4o-mini
+    model: gpt-4.1          # instruction following on listing analyses; 4o-mini drifted
     timeout: 90
     temperature: 0.0
     max_tokens: 1024
