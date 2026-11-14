@@ -100,3 +100,26 @@ def test_merge_params_keeps_descriptions_but_not_types_from_the_model():
                            {"name": "unused", "description": "x"}])
     assert got == [{"name": "fy", "type": "integer", "column": "fy", "description": "fiscal year",
                     "example": "2025"}]
+
+
+def test_aggregate_order_by_maps_to_the_selected_fn_column():
+    b = _b({"select": ["unit", {"column": "end", "fn": "year"}, {"agg": "count", "as": "n"}],
+            "order_by": [{"column": "end", "dir": "asc"}]})
+    assert b.sql.endswith('GROUP BY "unit", CAST(EXTRACT(YEAR FROM "end") AS integer) '
+                          'ORDER BY "year_end" ASC')
+    with pytest.raises(QuerySpecError, match="aggregate query"):
+        build_sql({"select": ["unit", {"agg": "count"}], "order_by": ["filed"]}, "facts", COLS)
+
+
+def test_reserved_word_param_names_are_refused_with_a_hint():
+    with pytest.raises(QuerySpecError, match=r"key word; use e\.g\. from_end"):
+        build_sql({"select": ["val"], "where": [{"column": "end", "op": "between", "param": ["from", "to"]}]},
+                  "facts", COLS)
+
+
+def test_list_param_written_as_text_is_parsed():
+    from backend.app.services.structured.sql_exec import coerce_params
+
+    got = coerce_params({"fys": "['2022', '2023']", "tags": "Revenue, ProfitLoss"},
+                        [{"name": "fys", "type": "integer[]"}, {"name": "tags", "type": "text[]"}])
+    assert got == {"fys": [2022, 2023], "tags": ["Revenue", "ProfitLoss"]}

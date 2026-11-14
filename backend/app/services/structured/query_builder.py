@@ -39,6 +39,7 @@ from datetime import date
 from typing import Any
 
 from backend.app.services.structured.profiling import PG_TYPES
+from backend.app.services.structured.sql_guard import PG_RESERVED
 
 AGGS = {"sum": "SUM", "avg": "AVG", "min": "MIN", "max": "MAX", "count": "COUNT",
         "count_distinct": "COUNT"}
@@ -92,6 +93,7 @@ class _Ctx:
             self.other = other
         self.params: dict[str, dict] = {}
         self.aliases: set[str] = set()
+        self.fn_alias: dict[str, str] = {}     # raw column sql -> alias of fn(column) in select
 
     @property
     def tables(self) -> list[str]:
@@ -139,6 +141,9 @@ class _Ctx:
         name = str(name or "").lstrip(":")
         if not _NAME.match(name):
             raise QuerySpecError(f"bad parameter name {name!r} (use snake_case)")
+        if name.lower() in PG_RESERVED:
+            raise QuerySpecError(f"parameter name {name!r} is an SQL key word; "
+                                 f"use e.g. {name}_{column or 'value'}")
         prev = self.params.get(name)
         if prev and prev["type"] != ptype:
             raise QuerySpecError(f"parameter '{name}' is used as {prev['type']} and as {ptype}")
@@ -169,6 +174,9 @@ def _select_item(ctx: _Ctx, raw) -> tuple[str, str, bool, str | None]:
             raise QuerySpecError(f"bad alias {alias!r} (use snake_case)")
         return f"{expr} AS {_q(alias)}", alias, True, None
     sql, _ct, _t, out = ctx.ref(raw)
+    if isinstance(raw, dict) and raw.get("fn"):
+        base = ctx.ref({k: v for k, v in raw.items() if k not in {"fn", "as"}})[0]
+        ctx.fn_alias.setdefault(base, str(raw.get("as") or "").strip() or out)
     alias = str(raw.get("as") or "").strip() if isinstance(raw, dict) else ""
     if alias and not _NAME.match(alias):
         raise QuerySpecError(f"bad alias {alias!r} (use snake_case)")
@@ -267,6 +275,7 @@ def build_sql(spec: dict, table: str, columns: dict[str, dict[str, str]]) -> Bui
     if where:
         sql += " WHERE " + " AND ".join(where)
 
+    groups: list[str] = []
     if has_agg:
         groups = [ctx.ref(r)[0] for r in spec.get("group_by") or []]
         for g in plain_groups:
@@ -284,7 +293,16 @@ def build_sql(spec: dict, table: str, columns: dict[str, dict[str, str]]) -> Bui
         if d not in {"asc", "desc"}:
             raise QuerySpecError(f"dir must be asc or desc (got {d!r})")
         col = o.get("column")
-        expr = _q(col) if isinstance(col, str) and col in ctx.aliases and "." not in col else ctx.ref(col)[0]
+        if isinstance(col, str) and col in ctx.aliases and "." not in col:
+            expr = _q(col)
+        else:
+            expr = ctx.ref(col)[0]
+            if has_agg and expr not in groups:
+                if expr in ctx.fn_alias:          # year(date) selected: order by that
+                    expr = _q(ctx.fn_alias[expr])
+                else:
+                    raise QuerySpecError(f"order_by {col!r}: in an aggregate query order by a "
+                                         "selected/grouped column or an aggregate alias")
         order.append(f"{expr} {d.upper()}" + (" NULLS LAST" if d == "desc" else ""))
     if distinct_on:
         # Postgres: DISTINCT ON expressions must lead the ORDER BY.

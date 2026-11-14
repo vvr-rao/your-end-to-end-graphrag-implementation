@@ -173,7 +173,8 @@ def _norm_params(raw) -> list[dict]:
             continue
         out.append({"name": str(p["name"]).lstrip(":"), "type": str(p.get("type") or "text"),
                     "column": p.get("column") or None, "description": str(p.get("description") or ""),
-                    "example": None if p.get("example") in (None, "") else str(p.get("example"))})
+                    "example": None if p.get("example") in (None, "") else
+                    (p["example"] if isinstance(p["example"], list) else str(p["example"]))})
     return out
 
 

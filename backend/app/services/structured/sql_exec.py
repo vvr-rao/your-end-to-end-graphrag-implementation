@@ -11,6 +11,7 @@ says how many rows there were. The transaction is always rolled back.
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from dataclasses import dataclass, field
@@ -78,6 +79,11 @@ def _coerce_one(kind: str, v):
     k = (kind or "text").lower()
     try:
         if k.endswith("[]"):
+            if isinstance(v, str) and v.strip().startswith("["):
+                try:   # a JSON-ish list written as text: ["a", "b"] or ['a', 'b']
+                    v = json.loads(v.replace("'", '"'))
+                except ValueError:
+                    pass
             items = v if isinstance(v, list) else [x.strip() for x in str(v).split(",") if x.strip()]
             return [_coerce_one(k[:-2], x) for x in items]
         if k in {"integer", "int", "bigint", "smallint"}:
