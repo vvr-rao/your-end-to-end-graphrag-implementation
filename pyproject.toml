@@ -56,6 +56,7 @@ dependencies = [
     "jsonschema>=4",          # Phase 2a: validate StructuredTable JSON-LD
     "langsmith>=0.3,<1",
     "sqlglot>=25",
+    "pycountry>=24.6.1",
 ]
 
 [project.optional-dependencies]

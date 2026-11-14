@@ -48,6 +48,7 @@ from backend.app.services.structured.metadata import (
     finalize_item,
     items,
     metadata_text,
+    tag_items,
     validate_all,
 )
 from backend.app.services.structured.query_builder import QuerySpecError, example_value
@@ -209,10 +210,11 @@ async def import_markdown(
             from backend.app.services.structured.value_domains import attach_value_domains
 
             await attach_value_domains(s, new)
+            tag_items(new)
             gv = await current_version(s)
             node_id: uuid.UUID = await upsert_node(s, new, vec, gv, cur["id"])
             rep.class_edges, rep.entity_edges = await rebuild_edges(
-                s, node_id, new, gv, link_entities=link_entities)
+                s, node_id, new, gv, link_entities=link_entities, embed=embed)
         if cache is not None:
             # Keep the profile (sample rows, stats) of the cached entry; the
             # node in the database never stores it.

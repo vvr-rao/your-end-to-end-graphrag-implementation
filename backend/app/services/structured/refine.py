@@ -46,6 +46,7 @@ from backend.app.services.structured.metadata import (
     finalize_item,
     item_spec,
     items,
+    tag_items,
     time_columns,
 )
 from backend.app.services.structured.query_builder import QuerySpecError, build_sql, compact
@@ -453,6 +454,8 @@ async def refine_table(meta: dict, router, *, all_types: dict[str, dict[str, str
                                                    "error": f"failed its data test: {r['error']}"})
     async with session_scope() as s:
         await attach_value_domains(s, meta)
+        await _measure_classes(s, meta)
+    tag_items(meta)
 
     # typical questions: keep the ones whose query runs and returns rows
     meta["common_questions"] = await _test_questions(meta, reply.get("common_questions") or [], all_types)
@@ -469,6 +472,25 @@ async def refine_table(meta: dict, router, *, all_types: dict[str, dict[str, str
         f"{len(dropped)} dropped after testing, {len(meta['common_questions'])} typical question(s), "
         f"{calls} LLM call(s), {report['seconds']}s")
     return report
+
+
+async def _measure_classes(session, meta: dict) -> None:
+    """A measure is tagged with the ontology class its label names (exact
+    label, case- and space-insensitive), when the ontology has one."""
+    for it in meta.get("measures") or []:
+        if it.get("class_iri"):
+            continue
+        keys = {re.sub(r"[^a-z0-9]", "", str(it.get(k) or "").lower())
+                for k in ("label",)} | {re.sub(r"[^a-z0-9]", "", it["measure"]["id"])}
+        keys.discard("")
+        if not keys:
+            continue
+        row = (await session.execute(sql_text(
+            "SELECT iri, label FROM graphrag.ontology_classes "
+            "WHERE regexp_replace(lower(label), '[^a-z0-9]', '', 'g') = ANY(CAST(:k AS text[])) LIMIT 1"),
+            {"k": sorted(keys)})).first()
+        if row:
+            it["class_iri"], it["class_label"] = row[0], row[1]
 
 
 def _model(router) -> str:
@@ -520,6 +542,7 @@ async def _test_questions(meta: dict, raw: list, all_types) -> list[dict]:
 
 
 async def refine_registered(router, *, tables: list[str] | None = None, refresh: bool = False,
+                            relink: bool = False,
                             cache=None, embed: EmbedFn | None = None, link_entities: bool = True,
                             log: Callable[[str], None] = print) -> list[dict]:
     """Refine loaded tables (all, or ``tables``) whose metadata is not yet
@@ -537,10 +560,18 @@ async def refine_registered(router, *, tables: list[str] | None = None, refresh:
     for name in names:
         meta = reg[name]["meta"]
         if not refresh and (meta.get("refined") or {}).get("version") == REFINE_VERSION:
-            log(f"[structured] {name}: already refined ({REFINE_VERSION}), no LLM call")
-            continue
+            if not relink:
+                log(f"[structured] {name}: already refined ({REFINE_VERSION}), no LLM call")
+                continue
+            # no LLM: re-derive tags and graph links (classes, entities, periods, places)
+            async with session_scope() as s:
+                await _measure_classes(s, meta)
+            tag_items(meta)
+            rep = {"relinked": True, "llm_calls": 0}
+        else:
+            rep = None
         try:
-            rep = await refine_table(meta, router, all_types=all_types, log=log)
+            rep = rep or await refine_table(meta, router, all_types=all_types, log=log)
         except Exception as exc:  # one table must not stop the rest
             log(f"[structured] FAILED refining {name}: {type(exc).__name__}: {exc}")
             reports.append({"table": name, "error": str(exc)})
@@ -549,7 +580,7 @@ async def refine_registered(router, *, tables: list[str] | None = None, refresh:
         async with session_scope() as s:
             gv = await current_version(s)
             node_id = await upsert_node(s, meta, vec, gv, reg[name]["id"])
-            await rebuild_edges(s, node_id, meta, gv, link_entities=link_entities)
+            await rebuild_edges(s, node_id, meta, gv, link_entities=link_entities, embed=embed, log=log)
         if cache is not None and meta.get("cache_key"):
             base = cache.get(meta["cache_key"], name) or {}
             entry = {**base, **meta}

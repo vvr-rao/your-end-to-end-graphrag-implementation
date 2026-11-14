@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from typing import Any
 
 from backend.app.services.structured.query_builder import (
     Built,
@@ -229,7 +230,8 @@ def metadata_text(meta: dict) -> str:
     return "\n".join(lines)
 
 
-def catalog_for_prompt(meta: dict, max_items: int = 40) -> dict:
+def catalog_for_prompt(meta: dict, max_items: int = 40,
+                       ranking: dict[str, tuple[float, list[str]]] | None = None) -> dict:
     """Compact view the retrieval model chooses queries from.
 
     Columns carry their VALID VALUES (every distinct value when there are few,
@@ -255,7 +257,12 @@ def catalog_for_prompt(meta: dict, max_items: int = 40) -> dict:
            "columns": [_col(c) for c in meta.get("columns") or []],
            "queries": []}
     combos: list[dict] = []
-    for sec, it in items(meta):
+    ordered = list(items(meta))
+    if ranking:
+        # most relevant first (graph tags matched by the question), so the
+        # cap keeps them; ties keep the stored order (measures first)
+        ordered.sort(key=lambda si: -(ranking.get(si[1]["id"]) or (0.0, []))[0])
+    for sec, it in ordered:
         if len(cat["queries"]) >= max_items:
             break
         combo_ref = {}
@@ -267,6 +274,9 @@ def catalog_for_prompt(meta: dict, max_items: int = 40) -> dict:
             if key not in combos:
                 combos.append(key)
             combo_ref = {"valid_combinations": {"params": ac["params"], "see": combos.index(key)}}
+        why = (ranking or {}).get(it["id"])
+        if why and why[0] > 0:
+            combo_ref = {**combo_ref, "matched": why[1]}
         cat["queries"].append({**combo_ref,
             "id": it["id"], "kind": sec[:-1] if sec != "queries" else "query",
             "label": it.get("label"), "description": it.get("description"),
@@ -291,6 +301,69 @@ def catalog_for_prompt(meta: dict, max_items: int = 40) -> dict:
     return cat
 
 
+def spec_columns(spec: Any, table: str) -> set[str]:
+    """Column names a query spec references (base-table names unqualified,
+    other tables' as ``table.column``)."""
+    out: set[str] = set()
+
+    def col(c):
+        if isinstance(c, dict):
+            c = c.get("column")
+        if isinstance(c, str) and c:
+            out.add(c[len(table) + 1:] if c.startswith(table + ".") else c)
+
+    if not isinstance(spec, dict):
+        return out
+    for key in ("select", "group_by", "distinct_on"):
+        for c in spec.get(key) or []:
+            if isinstance(c, dict) and "columns" in c:
+                for x in c["columns"] or []:
+                    col(x)
+            col(c)
+    for w in spec.get("where") or []:
+        col(w.get("column") if isinstance(w, dict) else None)
+    for o in spec.get("order_by") or []:
+        col(o)
+    return out
+
+
+def item_tags(meta: dict, section: str, item: dict) -> dict:
+    """What a stored query is ABOUT, so retrieval can pick it from the graph:
+    the ontology classes of the columns it uses (and its own class), the
+    entity / place columns its parameters take, the period columns it reads."""
+    from backend.app.services.structured.graph_links import period_columns, place_level
+
+    table = meta["table_name"]
+    cols = {c["name"]: c for c in meta.get("columns") or []}
+    used = spec_columns(item_spec(section, item), table)
+    classes: list[dict] = []
+
+    def add(iri, label):
+        if (iri or label) and not any(c["iri"] == iri and c["label"] == label for c in classes):
+            classes.append({"iri": iri, "label": label})
+
+    add(item.get("class_iri"), item.get("class_label"))
+    for name in sorted(used):
+        c = cols.get(name)
+        if c is not None:
+            add(c.get("class_iri"), c.get("class_label"))
+    param_cols = {p.get("column") for p in item.get("params") or [] if p.get("column") in cols}
+    ent = set(entity_key_columns(meta))
+    places = {n for n, c in cols.items() if place_level(c) is not None}
+    periods = set(period_columns(meta)) or set(time_columns(meta))
+    return {"classes": classes,
+            "entity_columns": sorted((param_cols | used) & ent - places),
+            "place_columns": sorted((param_cols | used) & places),
+            "time_columns": sorted(used & periods)}
+
+
+def tag_items(meta: dict) -> dict:
+    """Set ``tags`` on every stored item (in place); returns meta."""
+    for sec, it in items(meta):
+        it["tags"] = item_tags(meta, sec, it)
+    return meta
+
+
 def class_refs(meta: dict) -> list[dict]:
     """Every (kind, name, class_iri, class_label) the node should link to."""
     out = []
@@ -298,7 +371,7 @@ def class_refs(meta: dict) -> list[dict]:
         if c.get("class_iri") or c.get("class_label"):
             out.append({"kind": "tableColumn", "name": c["name"],
                         "class_iri": c.get("class_iri"), "class_label": c.get("class_label")})
-    for sec, kind in (("metrics", "tableMetric"), ("filters", "tableFilter")):
+    for sec, kind in (("measures", "tableMetric"), ("metrics", "tableMetric"), ("filters", "tableFilter")):
         for it in meta.get(sec) or []:
             if it.get("class_iri") or it.get("class_label"):
                 out.append({"kind": kind, "name": it["id"],

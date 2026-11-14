@@ -1777,6 +1777,7 @@ async def retrieve_and_answer(
                 max_calls=int(_qa_cfg("structured_max_calls", 4)),
                 char_cap=int(_qa_cfg("structured_char_cap", 5000)),
                 verbose=verbose,
+                time_ids=list(expanded_time_ids) if seed_time_ids else [],
             )
         except Exception as exc:  # never lose the text answer to a table problem
             log.warning("structured-data step failed: %s", exc)

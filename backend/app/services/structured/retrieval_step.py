@@ -41,7 +41,7 @@ from backend.app.services.structured.sql_exec import SqlResult, run_sql
 from backend.app.services.structured.sql_guard import SqlGuardError
 from backend.app.services.structured.value_domains import check_params, spec_declared
 
-_TABLE_EDGE_KINDS = ("tableEntity", "tableColumn", "tableMetric", "tableFilter")
+_TABLE_EDGE_KINDS = ("tableEntity", "tablePlace", "tableColumn", "tableMetric", "tableFilter", "tableTime")
 
 
 def _vec(v: list[float]) -> str:
@@ -55,29 +55,50 @@ async def candidate_tables(
     *,
     max_tables: int = 3,
     vector_max_distance: float | None = None,
+    time_ids: list[uuid.UUID] | None = None,
 ) -> list[dict[str, Any]]:
-    """[{id, table, meta, score, via}] best first."""
+    """[{id, table, meta, score, via, hits}] best first. ``hits`` records what
+    the question reached the table through (entity/place columns, class
+    labels, periods) so the table's tagged queries can be ranked."""
     from backend.app.db.session import session_scope
 
     scored: dict[uuid.UUID, dict[str, Any]] = {}
     async with session_scope() as s:
-        if entity_ids or class_ids:
+        if entity_ids or class_ids or time_ids:
             rows = (await s.execute(sql_text("""
-                SELECT a.id, gr.target_node_type, count(*)
+                SELECT a.id, gr.target_node_type, gr.relationship_type, gr.extra_metadata, oc.iri, oc.label
                   FROM graphrag.intelligence_artifacts a
                   JOIN graphrag.graph_relationships gr
                     ON gr.source_node_type = 'intelligence_artifact' AND gr.source_node_id = a.id
                    AND gr.relationship_type = ANY(CAST(:kinds AS text[]))
+                  LEFT JOIN graphrag.ontology_classes oc
+                    ON gr.target_node_type = 'ontology_class' AND oc.id = gr.target_node_id
                  WHERE a.artifact_type = 'TableMetadata' AND a.status = 'ACTIVE'
                    AND ((gr.target_node_type = 'entity' AND gr.target_node_id = ANY(CAST(:ents AS uuid[])))
-                     OR (gr.target_node_type = 'ontology_class' AND gr.target_node_id = ANY(CAST(:cls AS uuid[]))))
-                 GROUP BY a.id, gr.target_node_type
+                     OR (gr.target_node_type = 'ontology_class' AND gr.target_node_id = ANY(CAST(:cls AS uuid[])))
+                     OR (gr.target_node_type = 'time_instance' AND gr.target_node_id = ANY(CAST(:tms AS uuid[]))))
             """), {"kinds": list(_TABLE_EDGE_KINDS), "ents": [str(e) for e in entity_ids],
-                   "cls": [str(c) for c in class_ids]})).all()
-            for aid, ttype, n in rows:
-                d = scored.setdefault(aid, {"score": 0.0, "via": []})
-                d["score"] += (2.0 if ttype == "entity" else 1.0) * float(n)
-                d["via"].append(f"{ttype}:{n}")
+                   "cls": [str(c) for c in class_ids],
+                   "tms": [str(t) for t in time_ids or []]})).all()
+            counts: dict[tuple[uuid.UUID, str], int] = {}
+            for aid, ttype, kind, extra, ciri, clabel in rows:
+                d = scored.setdefault(aid, {"score": 0.0, "via": [], "hits": {
+                    "columns": set(), "classes": set(), "time": False}})
+                extra = extra or {}
+                if ttype == "time_instance":
+                    if not d["hits"]["time"]:
+                        d["score"] += 1.0          # once: a long series covers many periods
+                    d["hits"]["time"] = True
+                else:
+                    d["score"] += 2.0 if ttype == "entity" else 1.0
+                if ttype == "entity":
+                    d["hits"]["columns"].update(extra.get("columns") or [])
+                if ttype == "ontology_class":
+                    d["hits"]["classes"].update(x for x in (ciri, clabel) if x)
+                key = "place" if kind == "tablePlace" else ttype
+                counts[(aid, key)] = counts.get((aid, key), 0) + 1
+            for (aid, key), n in counts.items():
+                scored[aid]["via"].append(f"{key}:{n}")
         if qvec is not None and len(scored) < max_tables:
             rows = (await s.execute(sql_text("""
                 SELECT id, (embedding <-> CAST(:q AS vector)) AS dist
@@ -89,7 +110,8 @@ async def candidate_tables(
                 if vector_max_distance is not None and float(dist) > vector_max_distance:
                     continue
                 if aid not in scored:
-                    scored[aid] = {"score": 0.5 / (1.0 + float(dist)), "via": [f"vector:{float(dist):.3f}"]}
+                    scored[aid] = {"score": 0.5 / (1.0 + float(dist)), "via": [f"vector:{float(dist):.3f}"],
+                                   "hits": {"columns": set(), "classes": set(), "time": False}}
         if not scored:
             return []
         best = sorted(scored.items(), key=lambda kv: -kv[1]["score"])[:max_tables]
@@ -102,6 +124,38 @@ async def candidate_tables(
         meta = metas.get(aid) or {}
         if meta.get("table_name"):
             out.append({"id": aid, "table": meta["table_name"], "meta": meta, **d})
+    return out
+
+
+def rank_items(meta: dict, hits: dict | None) -> dict[str, tuple[float, list[str]]]:
+    """Score each stored query by the graph tags the question matched: its
+    classes among the classes the question reached, its entity/place columns
+    among the columns whose values the question named, its period columns
+    when the question names a period. Measures get a small edge (tested,
+    one value per period)."""
+    from backend.app.services.structured.metadata import item_tags, items
+
+    hits = hits or {}
+    out: dict[str, tuple[float, list[str]]] = {}
+    for sec, it in items(meta):
+        tags = it.get("tags") or item_tags(meta, sec, it)
+        score, why = 0.0, []
+        cls = [c.get("label") or c.get("iri") for c in tags.get("classes") or []
+               if (c.get("iri") in hits.get("classes", set()) or c.get("label") in hits.get("classes", set()))]
+        if cls:
+            score += 2.0 * len(set(cls))
+            why.append("class " + ", ".join(sorted(set(cls))))
+        cols = sorted(set(tags.get("entity_columns") or []) | set(tags.get("place_columns") or []))
+        cols = [c for c in cols if c in hits.get("columns", set())]
+        if cols:
+            score += 1.5 * len(cols)
+            why.append("entity in " + ", ".join(cols))
+        if hits.get("time") and tags.get("time_columns"):
+            score += 1.0
+            why.append("period in " + ", ".join(tags["time_columns"]))
+        if score and sec == "measures":
+            score += 0.5
+        out[it["id"]] = (score, why)
     return out
 
 
@@ -406,6 +460,7 @@ async def structured_evidence(
     char_cap: int = 5000,
     vector_max_distance: float | None = None,
     verbose: bool = False,
+    time_ids: list[uuid.UUID] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Evidence items (``kind='sql_result'``) + a plan record for persistence."""
     from backend.app.services.prompts import PROMPTS
@@ -413,9 +468,12 @@ async def structured_evidence(
     t0 = time.monotonic()
     plan: dict[str, Any] = {"candidates": [], "needed": False, "calls": [], "retried": False}
     cands = await candidate_tables(entity_ids, class_ids, qvec, max_tables=max_tables,
-                                   vector_max_distance=vector_max_distance)
+                                   vector_max_distance=vector_max_distance, time_ids=time_ids)
     plan["candidates"] = [{"table": c["table"], "score": round(c["score"], 3), "via": c["via"]}
                           for c in cands]
+    rankings = {c["table"]: rank_items(c["meta"], c.get("hits")) for c in cands}
+    plan["ranked_queries"] = {t: [i for i, (sc, _w) in sorted(r.items(), key=lambda kv: -kv[1][0]) if sc > 0][:5]
+                              for t, r in rankings.items()}
     if not cands:
         plan["reason"] = "no table reachable from the graph walk"
         return [], plan
@@ -429,7 +487,7 @@ async def structured_evidence(
     all_tables = set(by_table) | set(partners)   # a partner that is not loaded cannot be read
     types = {c["table"]: column_types(c["meta"]) for c in cands}
     types.update({n: column_types(m) for n, m in partners.items()})
-    catalogs = [catalog_for_prompt(c["meta"]) for c in cands]
+    catalogs = [catalog_for_prompt(c["meta"], ranking=rankings.get(c["table"])) for c in cands]
     col_types = {c["table"]: {col["name"].lower(): (col.get("type") or "text")
                               for col in c["meta"].get("columns") or []} for c in cands}
     id_cols = {c["table"]: {col["name"].lower() for col in c["meta"].get("columns") or []

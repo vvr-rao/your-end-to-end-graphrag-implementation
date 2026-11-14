@@ -39,14 +39,16 @@ from backend.app.services.structured.discovery import fit_identifier, sanitize_i
 from backend.app.services.structured.metadata import (
     class_refs,
     entity_key_columns,
+    items,
     metadata_text,
     rename_table,
+    tag_items,
 )
 from backend.app.services.structured.profiling import PG_TYPES, convert_value, iter_records
 
 SCHEMA = "graphrag"
 COMMENT_PREFIX = "yegi-structured-data:"
-TABLE_EDGE_KINDS = ("tableColumn", "tableMetric", "tableFilter", "tableEntity")
+TABLE_EDGE_KINDS = ("tableColumn", "tableMetric", "tableFilter", "tableEntity", "tableTime", "tablePlace")
 COPY_BATCH = 5_000
 MAX_VALUES_PER_COLUMN = 5_000
 MAX_FUZZY_VALUES = 2_000
@@ -308,8 +310,11 @@ def _edge(src_id, tgt_type: str, tgt_id, kind: str, gv: int, extra: dict) -> dic
 
 async def rebuild_edges(session: AsyncSession, node_id: uuid.UUID, meta: dict, gv: int,
                         entity_lookup: dict[str, uuid.UUID] | None = None,
-                        *, link_entities: bool = True) -> tuple[int, int]:
-    """Delete the node's table edges and re-derive them from ``meta``."""
+                        *, link_entities: bool = True, embed=None,
+                        log: Callable[[str], None] | None = None) -> tuple[int, int]:
+    """Delete the node's table edges and re-derive them from ``meta``:
+    classes, entities, and (``graph_links``) the periods and places the
+    table's values cover."""
     await session.execute(sql_text(f"""
         DELETE FROM {SCHEMA}.graph_relationships
          WHERE source_node_type = 'intelligence_artifact' AND source_node_id = :id
@@ -320,13 +325,21 @@ async def rebuild_edges(session: AsyncSession, node_id: uuid.UUID, meta: dict, g
     refs = class_refs(meta)
     resolved = await _class_lookup(session, refs) if refs else {}
     per_class: dict[tuple[uuid.UUID, str], list[str]] = {}
+    tagged: dict[uuid.UUID, list[str]] = {}       # class -> stored queries tagged with it
     for i, r in enumerate(refs):
         cid = resolved.get(i)
         if cid:
             per_class.setdefault((cid, r["kind"]), []).append(r["name"])
+            for _sec, it in items(meta):
+                if any((t.get("iri") and t["iri"] == r.get("class_iri"))
+                       or (t.get("label") and t["label"] == r.get("class_label"))
+                       for t in (it.get("tags") or {}).get("classes") or []):
+                    if it["id"] not in tagged.setdefault(cid, []):
+                        tagged[cid].append(it["id"])
     for (cid, kind), names in per_class.items():
         edges.append(_edge(node_id, "ontology_class", cid, kind, gv,
-                           {"table": meta["table_name"], "names": names}))
+                           {"table": meta["table_name"], "names": names,
+                            "queries": tagged.get(cid, [])}))
     n_class = len(edges)
 
     n_ent = 0
@@ -382,6 +395,16 @@ async def rebuild_edges(session: AsyncSession, node_id: uuid.UUID, meta: dict, g
                                {"table": meta["table_name"], "columns": sorted(h["columns"]),
                                 "values": h["values"], "match": h["match"]}))
         n_ent = len(edges) - n_class
+
+        from backend.app.services.structured.graph_links import time_and_place_edges
+
+        tp_edges, tp = await time_and_place_edges(session, node_id, meta, gv, embed=embed)
+        edges += tp_edges
+        n_ent += tp["places"]
+        if log is not None and (tp["periods"] or tp["places"]):
+            log(f"[structured] {meta['table_name']}: {tp['periods']} period(s) at {tp['time_level']} "
+                f"level from {tp['time_columns']}, {tp['places']} place(s) "
+                f"({tp['places_minted']} new), {tp['containment']} containment edge(s)")
 
     for i in range(0, len(edges), 500):
         batch = edges[i:i + 500]
@@ -464,11 +487,13 @@ async def load_and_link(run, *, root_name: str, cache=None, embed: EmbedFn | Non
                 from backend.app.services.structured.value_domains import attach_value_domains
 
                 await attach_value_domains(s, meta)
+                tag_items(meta)
                 vec = None
                 if embed is not None:
                     vec = (await embed([metadata_text(meta)]))[0]
                 node_id = await upsert_node(s, meta, vec, gv, existing_id)
-                nc, ne = await rebuild_edges(s, node_id, meta, gv, lookup, link_entities=link_entities)
+                nc, ne = await rebuild_edges(s, node_id, meta, gv, lookup, link_entities=link_entities,
+                                               embed=embed, log=log)
                 summary.class_edges += nc
                 summary.entity_edges += ne
                 summary.nodes[name] = str(node_id)

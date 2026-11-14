@@ -1486,6 +1486,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Table to refine (repeatable). Default: every loaded table.")
     p_tmr.add_argument("--refresh", action="store_true",
                        help="Refine again even when the metadata is already refined.")
+    p_tmr.add_argument("--relink", action="store_true",
+                       help="For already-refined tables: no LLM call; re-derive query tags and the "
+                            "graph links (classes, entities, periods, places).")
     p_tmr.add_argument("--no-entity-links", action="store_true",
                        help="Rebuild only the class edges (skip matching key values to entities).")
     p_tmr.add_argument("--json", action="store_true", help="Print the per-table reports as JSON.")
@@ -2971,6 +2974,7 @@ def _cmd_table_metadata_refine(args: argparse.Namespace) -> int:
         await ensure_embedding_model(embedder)
         router = LLMRouter()
         reports = await refine_registered(router, tables=args.table, refresh=args.refresh,
+                                          relink=args.relink,
                                           cache=MetadataCache(), embed=embedder.embed,
                                           link_entities=not args.no_entity_links)
         return reports, router
@@ -2981,6 +2985,9 @@ def _cmd_table_metadata_refine(args: argparse.Namespace) -> int:
     for r in reports:
         if "error" in r:
             print(f"[table-metadata-refine] {r['table']}: FAILED -- {r['error']}")
+            continue
+        if r.get("relinked"):
+            print(f"[table-metadata-refine] {r['table']}: relinked (no LLM call)")
             continue
         print(f"[table-metadata-refine] {r['table']}: measures {', '.join(r['measures']) or 'none'}; "
               f"repaired {len(r['repaired'])}, dropped {len(r['dropped'])}, "
