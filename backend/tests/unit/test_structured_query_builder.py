@@ -145,3 +145,35 @@ def test_year_of_a_text_period_uses_its_first_four_characters():
     assert 'CAST(substr(CAST("period" AS text), 1, 4) AS integer) = CAST(:year AS bigint)' in b.sql
     with pytest.raises(QuerySpecError, match="needs a date column"):
         build_sql({"select": [{"column": "period", "fn": "month"}]}, "prices", cols)
+
+
+def test_measure_with_many_item_values_takes_the_item_as_a_parameter():
+    from backend.app.services.structured.refine import measure_item, normalize_measure
+
+    meta = {"table_name": "prices", "columns": [
+        {"name": "commodity", "type": "text"}, {"name": "period", "type": "text"},
+        {"name": "unit", "type": "text"}, {"name": "value", "type": "numeric"}],
+        "value_domains": {"unit": {"values": ["a", "b"]}}}
+    raw = {"id": "price", "value_column": "value", "entity_columns": ["commodity"],
+           "item": {"column": "commodity", "values": [f"c{i}" for i in range(20)]},
+           "period_columns": ["period"], "qualifier_columns": ["unit"]}
+    m, err = normalize_measure(raw, meta)
+    assert err is None and m["item"] is None and m["entity_columns"] == ["commodity"]
+    spec = measure_item(m, meta)["query"]
+    assert [w.get("param") for w in spec["where"] if "param" in w] == \
+        ["commodity", "unit", ["period_from", "period_to"]]
+    m2, err = normalize_measure({**raw, "item": {"column": "period", "values": ["2004"]}}, meta)
+    assert err is None and m2["item"] is None          # a period is never a fixed item
+
+
+def test_period_granularity_column_becomes_a_qualifier():
+    from backend.app.services.structured.refine import normalize_measure
+
+    meta = {"table_name": "prices", "columns": [
+        {"name": "commodity", "type": "text"}, {"name": "period", "type": "text"},
+        {"name": "frequency", "type": "text"}, {"name": "value", "type": "numeric"}],
+        "value_domains": {"frequency": {"values": ["annual", "monthly"]}}}
+    m, err = normalize_measure({"id": "p", "value_column": "value", "entity_columns": ["commodity"],
+                                "period_columns": ["period"], "qualifier_columns": []},
+                               meta, {"dependencies": {"period": ["frequency"]}})
+    assert err is None and m["qualifier_columns"] == ["frequency"]

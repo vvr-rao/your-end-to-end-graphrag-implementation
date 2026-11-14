@@ -54,6 +54,7 @@ from backend.app.services.structured.sql_guard import SqlGuardError
 
 REFINE_VERSION = "tr-1"
 MAX_MEASURES = 15
+MAX_ITEM_VALUES = 8     # variants of ONE quantity, not a list of quantities
 SAMPLE_ROWS = 8
 EmbedFn = Callable[[list[str]], Awaitable[list[list[float]]]]
 
@@ -74,8 +75,10 @@ def _parse(text: str) -> dict:
 # ------------------------------------------------------------------ measures
 
 
-def normalize_measure(raw: Any, meta: dict) -> tuple[dict | None, str | None]:
-    """Validate one measure definition against the table. (measure, error)."""
+def normalize_measure(raw: Any, meta: dict, analysis: dict | None = None) -> tuple[dict | None, str | None]:
+    """Validate one measure definition against the table. (measure, error).
+    Columns the analysis found to identify only the REPORT are removed from
+    the entity/period/qualifier lists (they would keep every restatement)."""
     if not isinstance(raw, dict):
         return None, "not an object"
     cols = {c["name"]: c for c in meta.get("columns") or []}
@@ -93,22 +96,48 @@ def normalize_measure(raw: Any, meta: dict) -> tuple[dict | None, str | None]:
         vals = [str(v) for v in vals if v not in (None, "")]
         if not vals:
             return None, "item has no values"
-        item = {"column": item["column"], "values": list(dict.fromkeys(vals))}
+        # more values than naming variants of one quantity: the column is a
+        # dimension of the measure -> it becomes a parameter, not a constant
+        item = ({"column": item["column"], "values": list(dict.fromkeys(vals))}
+                if len(set(vals)) <= MAX_ITEM_VALUES else {"column": item["column"], "as_param": True})
 
     def _list(key: str) -> list[str]:
         return [c for c in dict.fromkeys(raw.get(key) or []) if isinstance(c, str)]
 
-    ents, periods, quals = _list("entity_columns"), _list("period_columns"), _list("qualifier_columns")
+    report = set(report_columns(analysis or {}, vcol))
+    ents = [c for c in _list("entity_columns") if c not in report]
+    periods = [c for c in _list("period_columns") if c not in report and c not in ents]
+    quals = [c for c in _list("qualifier_columns") if c not in report]
     bad = [c for c in ents + periods + quals if c not in cols]
+    if item and (cols[item["column"]].get("role") == "time" or item["column"] in periods + quals):
+        item = None        # a period/qualifier is not an item: keep the measure, drop the constant
+    dims: list[str] = []          # extra entity-level parameters
+    if item and (item.get("as_param") or item["column"] in ents):
+        if item["column"] not in ents:
+            ents.insert(1 if ents else 0, item["column"])
+        if item["column"] != ents[0]:
+            dims.append(item["column"])
+        item = None
     if bad:
         return None, f"unknown column(s): {', '.join(bad)}"
     if not ents:
         return None, "needs at least one entity column"
+    # a few-valued column the period determines is the period's GRANULARITY
+    # (annual/monthly, quarter/year-to-date...): mixing them in one range
+    # mixes different quantities, so it is a qualifier whatever the model said
+    domains = meta.get("value_domains") or {}
+    deps = (analysis or {}).get("dependencies") or {}
+    for p in periods:
+        for d in deps.get(p, []):
+            if (d not in ents + periods + quals and d not in report
+                    and len((domains.get(d) or {}).get("values") or []) > 1):
+                quals.append(d)
     latest = raw.get("latest_by") if raw.get("latest_by") in cols else None
     return {"id": mid, "label": str(raw.get("label") or mid), "description": str(raw.get("description") or ""),
             "value_column": vcol, "item": item, "entity_columns": ents, "period_columns": periods,
             "qualifier_columns": [q for q in quals if q not in ents + periods],
-            "latest_by": latest, "additive_over_time": bool(raw.get("additive_over_time"))}, None
+            "latest_by": latest, "additive_over_time": bool(raw.get("additive_over_time")),
+            "param_columns": dims}, None
 
 
 def measure_item(m: dict, meta: dict) -> dict:
@@ -130,14 +159,18 @@ def measure_item(m: dict, meta: dict) -> dict:
                       "value": vals if len(vals) > 1 else vals[0]})
     where.append({"column": m["value_column"], "op": "not_null"})
     where.append({"column": key, "op": "=", "param": key})
+    for d in m.get("param_columns") or []:
+        where.append({"column": d, "op": "=", "param": d})
     for q in m["qualifier_columns"]:
         if len((domains.get(q) or {}).get("values") or []) > 1:
             where.append({"column": q, "op": "=", "param": q})
     if m["period_columns"]:
         p = m["period_columns"][-1]
         where.append({"column": p, "op": "between", "param": [f"{p}_from", f"{p}_to"]})
+    sel = list(dict.fromkeys(sel))
     spec: dict = {"select": sel, "where": where}
-    one_per = [key] + m["period_columns"] + m["qualifier_columns"]
+    one_per = list(dict.fromkeys([key, *(m.get("param_columns") or []), *m["period_columns"],
+                                  *m["qualifier_columns"]]))
     spec["distinct_on"] = one_per
     order = [{"column": c, "dir": "asc"} for c in one_per]
     if m["latest_by"]:
@@ -363,7 +396,7 @@ async def refine_table(meta: dict, router, *, all_types: dict[str, dict[str, str
     meta["measures"] = []
     seen = set()
     for raw in (reply.get("measures") or [])[:MAX_MEASURES]:
-        m, err = normalize_measure(raw, meta)
+        m, err = normalize_measure(raw, meta, analysis)
         if err or m["id"] in seen:
             rejected.append({"measure": raw.get("id") if isinstance(raw, dict) else raw,
                              "error": err or "duplicate id"})

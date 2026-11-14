@@ -34,10 +34,11 @@ log = logging.getLogger(__name__)
 
 MAX_KEY_COLUMNS = 8
 MAX_CANDIDATES = 16
-REPEAT_MIN_SHARE = 0.9        # of multi-row groups where the measure is constant
+REPEAT_MIN_SHARE = 0.75       # of multi-row groups where the measure is constant
 REPEAT_MIN_GROUPS = 0.02      # multi-row groups / all groups, to count at all
 TOP_VALUES = 60
 TIMEOUT_MS = 30000
+SPARSE_NULL_SHARE = 0.3       # columns this often null are annotations, not identity
 
 
 def _q(ident: str) -> str:
@@ -90,10 +91,13 @@ async def analyze_table(session, meta: dict) -> dict[str, Any]:
 
     cands = candidate_columns(meta)
     distinct = {}
+    nulls = {}
     for c in cands:
         n = await _distinct(session, ref, [c["name"]])
         if n is not None:
             distinct[c["name"]] = n
+            nulls[c["name"]] = await _scalar(
+                session, f"SELECT COUNT(*) FROM {ref} WHERE {_q(c['name'])} IS NULL") or 0
     # A column unique on (nearly) every row is a row id, not part of a grain.
     usable = [c["name"] for c in cands if c["name"] in distinct and 1 < distinct[c["name"]] < 0.95 * rows]
     usable = sorted(usable, key=lambda n: -distinct[n])[:MAX_CANDIDATES]
@@ -128,29 +132,56 @@ async def analyze_table(session, meta: dict) -> dict[str, Any]:
                 deps.setdefault(a, []).append(b)
     out["dependencies"] = deps
 
-    # ---- repeated measure values across report/version columns
+    # ---- repeated measure values across report/version columns.
+    # A mostly-null column can be an annotation set in only ONE of the reports
+    # that restate a value; it splits the restated rows apart. So the test is
+    # also run with each such column left out (one at a time: another sparse
+    # column may be a real part of the identity, e.g. a start date that only
+    # some rows have), and the column that reveals the repeat is reported with
+    # the report columns.
+    sparse = [c for c in usable if nulls.get(c, 0) >= SPARSE_NULL_SHARE * rows]
+    out["sparse"] = sparse
+
+    async def _repeat(m: str, group: list[str]):
+        if not group:
+            return None
+        stats = await _scalar(session, f"""
+            SELECT json_build_object(
+                'multi', COUNT(*) FILTER (WHERE n > 1),
+                'groups', COUNT(*),
+                'same', COUNT(*) FILTER (WHERE n > 1 AND nd = 1))
+              FROM (SELECT COUNT(*) AS n, COUNT(DISTINCT {_q(m)}) AS nd
+                      FROM {ref} WHERE {_q(m)} IS NOT NULL GROUP BY {_cols(group)}) g""")
+        if not stats or not stats.get("groups"):
+            return None
+        multi, groups, same = stats["multi"], stats["groups"], stats["same"]
+        if multi and multi / groups >= REPEAT_MIN_GROUPS and same / multi >= REPEAT_MIN_SHARE:
+            return round(multi / groups, 3), round(same / multi, 3)
+        return None
+
+    roles = {c["name"]: c.get("role") for c in cands}
     measures = measure_columns(meta)
     for m in measures:
         found = []
         for c in usable:
-            moved = [c, *deps.get(c, [])]
-            group = [x for x in usable if x not in moved]
-            if not group:
+            if c in sparse:
                 continue
-            stats = await _scalar(session, f"""
-                SELECT json_build_object(
-                    'multi', COUNT(*) FILTER (WHERE n > 1),
-                    'groups', COUNT(*),
-                    'same', COUNT(*) FILTER (WHERE n > 1 AND nd = 1))
-                  FROM (SELECT COUNT(*) AS n, COUNT(DISTINCT {_q(m)}) AS nd
-                          FROM {ref} WHERE {_q(m)} IS NOT NULL GROUP BY {_cols(group)}) g""")
-            if not stats or not stats.get("groups"):
-                continue
-            multi, groups, same = stats["multi"], stats["groups"], stats["same"]
-            if multi and multi / groups >= REPEAT_MIN_GROUPS and same / multi >= REPEAT_MIN_SHARE:
-                found.append({"column": c, "with": deps.get(c, []),
-                              "share_of_groups_repeated": round(multi / groups, 3),
-                              "share_identical": round(same / multi, 3)})
+            # columns a report column determines move with it (its date, its
+            # type...), except the identifiers of what the value is ABOUT (a
+            # report belongs to one entity; that entity stays in the group)
+            keep = {b for b in deps.get(c, []) if roles.get(b) == "identifier"}
+            keep |= {x for k in keep for x in deps.get(k, [])}
+            moved = [c, *[b for b in deps.get(c, []) if b not in keep]]
+            base = [x for x in usable if x not in moved]
+            hit, extra = await _repeat(m, base), []
+            for sp in [x for x in sparse if x in base] if hit is None else []:
+                hit = await _repeat(m, [x for x in base if x != sp])
+                if hit is not None:
+                    extra = [sp]
+                    break
+            if hit is not None:
+                found.append({"column": c, "with": moved[1:] + extra,
+                              "share_of_groups_repeated": hit[0], "share_identical": hit[1]})
         if found:
             out["repeats"][m] = found
 
