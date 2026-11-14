@@ -169,3 +169,30 @@ async def test_extract_entities_hook_reads_cache_only(db, data, tmp_path, monkey
         n = (await s.execute(text("SELECT count(*) FROM graphrag.intelligence_artifacts "
                                   "WHERE artifact_type = 'TableMetadata' AND embedding IS NOT NULL"))).scalar()
     assert n == 2
+
+
+async def test_retrieval_finds_table_via_entity_and_runs_stored_sql(db, data, tmp_path):
+    from sqlalchemy import text
+
+    from backend.app.services.structured.db_load import load_and_link
+    from backend.app.services.structured.retrieval_step import candidate_tables, structured_evidence
+
+    await load_and_link(await _profile(data, tmp_path), root_name="data", log=lambda *_: None)
+    async with db() as s:
+        copper = (await s.execute(text(
+            "SELECT id FROM graphrag.entities WHERE normalized_name = 'copper'"))).scalar()
+    cands = await candidate_tables([copper], [], None)
+    assert {c["table"] for c in cands} >= {"prices"}
+    assert all(c["via"][0].startswith("entity:") for c in cands)
+    assert await candidate_tables([], [], None) == []     # nothing reached, no vector -> none
+
+    router = FakeRouter({"table_query_select": [{"needed": True, "calls": [
+        {"table": "prices", "query_id": "by_first", "params": {"v": "Copper"}},
+        {"table": "prices", "new_sql": "DELETE FROM prices", "params": {}}]},
+        {"needed": False}]})
+    ev, plan = await structured_evidence("copper price?", router=router, entity_ids=[copper],
+                                         class_ids=[], qvec=None)
+    assert len(ev) == 1 and ev[0]["rows"] == [["Copper", "2024-01-01", "8500"]]
+    assert plan["retried"] and "rejected" in plan["calls"][1]["error"]
+    async with db() as s:                                 # the guard blocked the write
+        assert (await s.execute(text('SELECT count(*) FROM graphrag."prices"'))).scalar() == 3

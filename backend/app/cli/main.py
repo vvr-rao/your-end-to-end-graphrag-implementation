@@ -1782,6 +1782,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_q.add_argument(
+        "--use-structured-data", action=argparse.BooleanOptionalAction, default=None,
+        help=(
+            "Let simple_qa / deep_research read the loaded data tables "
+            "(extract-entities --structured-data): tables reached through the "
+            "graph walk are offered to one selection call that picks stored "
+            "SQL; results are row-capped (qa.structured_max_rows) and cited. "
+            "Unset => qa.use_structured_data (off)."
+        ),
+    )
+    p_q.add_argument(
         "--json", action="store_true",
         help="Print the full response envelope as JSON.",
     )
@@ -1899,6 +1909,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_conv_turn.add_argument(
         "--no-concepts", action="store_true",
         help="Turn off the concept layer for this turn (see `query --no-concepts`).",
+    )
+    p_conv_turn.add_argument(
+        "--use-structured-data", action=argparse.BooleanOptionalAction, default=None,
+        help=(
+            "Let simple_qa / deep_research read the loaded data tables "
+            "(extract-entities --structured-data): tables reached through the "
+            "graph walk are offered to one selection call that picks stored "
+            "SQL; results are row-capped (qa.structured_max_rows) and cited. "
+            "Unset => qa.use_structured_data (off)."
+        ),
     )
     p_conv_turn.add_argument(
         "--history-window", type=int, default=3,
@@ -3160,6 +3180,7 @@ def _cmd_query(args: argparse.Namespace) -> int:
             verbose=args.verbose,
             multi_round=getattr(args, "multi_round", True),
             persist=getattr(args, "persist", True),
+            use_structured_data=getattr(args, "use_structured_data", None),
         )
     )
 
@@ -3209,6 +3230,11 @@ def _cmd_query(args: argparse.Namespace) -> int:
         elif kind == "artifact":
             snip = (ev["text"] or "").replace("\n", " ")[:140]
             line += f"\n        ({ev['artifact_type']}) {snip}"
+        elif kind == "sql_result":
+            line += (f"\n        table: {ev.get('table')}  query: {ev.get('query_id') or '(new SQL)'}"
+                     f"  rows: {ev.get('row_count')}"
+                     + (f" of {ev.get('total_rows') or 'more'} (capped)" if ev.get("truncated") else ""))
+            line += "\n        sql: " + " ".join((ev.get("sql") or "").split())[:200]
         print(line)
     return 0
 
@@ -3273,6 +3299,7 @@ def _cmd_conversation_turn(args: argparse.Namespace) -> int:
             max_probes=args.max_probes,
             rerank=True if getattr(args, "rerank", False) else None,
             concepts=False if getattr(args, "no_concepts", False) else None,
+            use_structured_data=getattr(args, "use_structured_data", None),
             history_window=args.history_window,
             verbose=args.verbose,
         )

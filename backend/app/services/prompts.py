@@ -2577,6 +2577,15 @@ def chunk_relevance_filter(
     return system, user
 
 
+_SQL_RESULT_NOTE = (
+    "  (Items whose id starts with viao:SqlResult_ are rows returned by SQL "
+    "queries run on loaded data tables. Their numbers are exact values from "
+    "the source data -- prefer them over approximate figures in prose, cite "
+    "them like any other item, and do not assume rows that are not shown: a "
+    "result marked as capped is partial.)"
+)
+
+
 def _format_evidence_block(evidence_items: list[dict], char_cap: int = 600) -> str:
     """Compact textual rendering of evidence items for stuffing into
     answer-synthesis prompts. Each item: {iri, kind, text}, optionally
@@ -2593,11 +2602,18 @@ def _format_evidence_block(evidence_items: list[dict], char_cap: int = 600) -> s
     `_ATTRIBUTION_RULE` below be enforceable.
     """
     lines = []
+    if any(it.get("kind") == "sql_result" for it in evidence_items):
+        # Only when `--use-structured-data` produced results, so every other
+        # prompt is byte-identical to before.
+        lines.append(_SQL_RESULT_NOTE)
     for it in evidence_items:
         kind = it.get("kind", "evidence")
         text = (it.get("text") or "").strip().replace("\n", " ")
-        if len(text) > char_cap:
-            text = text[:char_cap] + "..."
+        # SQL results carry their own (larger) cap: they are already bounded
+        # by the row cap, and clipping a result mid-row loses values.
+        cap = int(it.get("char_cap") or char_cap)
+        if len(text) > cap:
+            text = text[:cap] + "..."
         tags = []
         title = (it.get("document_title") or "").strip()
         if title:

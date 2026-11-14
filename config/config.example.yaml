@@ -643,6 +643,21 @@ qa:
   # deep_research, against ~11k before -- roughly $0.09 vs $0.03 per query on
   # gpt-4.1. Raise `chunking.chunk_size` and this together, never separately.
   evidence_char_cap: 5000
+  # Structured data (`query --use-structured-data`; tables loaded by
+  # `extract-entities --structured-data`). Off by default -- answers are then
+  # exactly as before. When on, tables reached through the graph walk (up to
+  # structured_max_tables) go to ONE `table_query_select` call that picks
+  # stored SQL; each statement runs read-only under structured_timeout_ms and
+  # at most structured_max_rows rows reach the prompt (aggregates still run
+  # over the whole table -- the cap bounds only what is shown). A failed or
+  # empty result gets one retry call. structured_char_cap bounds each result's
+  # text in the prompt.
+  use_structured_data: false
+  structured_max_tables: 3
+  structured_max_rows: 50
+  structured_timeout_ms: 5000
+  structured_max_calls: 4
+  structured_char_cap: 5000
   # For comparison/enumeration queries over multiple entities ("compare A vs its
   # competitors"), retrieval fans out ONE vector probe per matched entity so each
   # gets even representation (instead of only the 1-2 a generic decompose named).

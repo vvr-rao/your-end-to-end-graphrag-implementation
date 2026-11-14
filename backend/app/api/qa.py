@@ -46,6 +46,15 @@ class QARequest(BaseModel):
     max_cost_usd: float = Field(1.0, gt=0.0, le=10.0)
     decompose: bool = Field(True, description="Run step-9a query decomposition.")
     max_probes: int = Field(5, ge=1, le=8)
+    use_structured_data: bool | None = Field(
+        None,
+        description=(
+            "Let the answer read the loaded data tables (via guarded, "
+            "row-capped SQL picked from each table's stored queries). "
+            "simple_qa / deep_research only. Null = qa.use_structured_data "
+            "in config (off when unset)."
+        ),
+    )
 
 
 class QAEvidenceItem(BaseModel):
@@ -78,6 +87,20 @@ class QAEvidenceItem(BaseModel):
     # Rendered period span, e.g. "2011 ... 2024 (8 periods)". Empty when
     # the chunk carries no `time:hasTime` edge.
     times: str = ""
+    # kind='sql_result' only (`--use-structured-data`): the data table, the
+    # stored query id (None when the model had to write new SQL), the SQL
+    # actually run with its bound parameters, and the capped rows.
+    table: str | None = None
+    query_id: str | None = None
+    sql: str | None = None
+    params: dict[str, Any] | None = None
+    columns: list[str] | None = None
+    rows: list[list[str | None]] | None = None
+    row_count: int | None = None
+    truncated: bool | None = None
+    total_rows: int | None = None
+    source_file: str | None = None
+    sql_source: str | None = None
 
 
 class QAResponse(BaseModel):
@@ -124,6 +147,7 @@ async def qa_ask(req: QARequest) -> QAResponse:
         max_cost_usd=req.max_cost_usd,
         decompose=req.decompose,
         max_probes=req.max_probes,
+        use_structured_data=req.use_structured_data,
     )
     return QAResponse(
         answer=result.answer,

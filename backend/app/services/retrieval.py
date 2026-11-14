@@ -449,6 +449,7 @@ async def retrieve_and_answer(
     multi_round: bool = True,
     persist: bool = True,
     answer_question: bool = True,
+    use_structured_data: bool | None = None,
     _round_depth: int = 0,
 ) -> RetrievalResult:
     """Driver. `resolved_query` skips the follow-up resolution step
@@ -465,6 +466,12 @@ async def retrieve_and_answer(
     writes, leaving `retrieval_run_id` None. Lets the CLI be pointed at a
     deployed database for testing without leaving rows in it; the API
     path always persists.
+
+    `use_structured_data=True` (simple_qa / deep_research only) lets the
+    answer read the loaded data tables: tables reached through the graph
+    walk are offered to a selection call that picks stored SQL, and the
+    capped results join the evidence as `sql_result` items. None falls back
+    to `qa.use_structured_data` (off when unset).
 
     `answer_question=False` stops before the answer call: retrieval and the
     evidence packet are complete, `answer` is empty. Used by the question
@@ -511,7 +518,8 @@ async def retrieve_and_answer(
                 plan["round1_question"], mode="simple_qa",
                 hops=hops, max_cost_usd=max_cost_usd, decompose=decompose,
                 max_probes=max_probes, rerank=rerank, concepts=concepts, verbose=verbose,
-                multi_round=False, persist=persist, _round_depth=1,
+                multi_round=False, persist=persist,
+                use_structured_data=use_structured_data, _round_depth=1,
             )
             # Round 2 (final): enrich the question with round-1 findings so the
             # pipeline seeds on the discovered entities AND the synthesis uses them.
@@ -533,7 +541,7 @@ async def retrieve_and_answer(
                 max_probes=max_probes, rerank=rerank, concepts=concepts,
                 conversation_turn_id=conversation_turn_id,
                 verbose=verbose, multi_round=False, persist=persist,
-                _round_depth=1,
+                use_structured_data=use_structured_data, _round_depth=1,
             )
             # Merge: r2 is the final answer; fold in round-1 evidence + all cost.
             # artifact_only only ever surfaces artifact evidence, so skip folding
@@ -1742,6 +1750,37 @@ async def retrieve_and_answer(
             "text": info["text"],
             "confidence": info["confidence"],
         })
+
+    # -------- step 11b: structured data (opt-in) --------
+    # Tables are reached through the graph walk (entities + matched classes),
+    # read ONLY through guarded, row-capped SQL. Off unless asked for, so
+    # every other run is unchanged.
+    _use_sd = (use_structured_data if use_structured_data is not None
+               else _qa_flag("use_structured_data", False))
+    if _use_sd and mode in ("simple_qa", "deep_research"):
+        from backend.app.services.structured.retrieval_step import structured_evidence
+
+        try:
+            _sd_ev, _sd_plan = await structured_evidence(
+                resolved_query, router=router,
+                entity_ids=list(expanded_entity_ids),
+                class_ids=[c["id"] for c in matched_classes if c.get("id")],
+                qvec=qvec,
+                max_tables=int(_qa_cfg("structured_max_tables", 3)),
+                max_rows=int(_qa_cfg("structured_max_rows", 50)),
+                timeout_ms=int(_qa_cfg("structured_timeout_ms", 5000)),
+                max_calls=int(_qa_cfg("structured_max_calls", 4)),
+                char_cap=int(_qa_cfg("structured_char_cap", 5000)),
+                verbose=verbose,
+            )
+        except Exception as exc:  # never lose the text answer to a table problem
+            log.warning("structured-data step failed: %s", exc)
+            _sd_ev, _sd_plan = [], {"error": str(exc)[:500]}
+        for _ev in _sd_ev:
+            _ev["char_cap"] = int(_qa_cfg("structured_char_cap", 5000))
+        # Ahead of the text evidence: exact figures first.
+        evidence[:0] = _sd_ev
+        parsed["structured_data"] = _sd_plan
 
     _walk_ids = {cid for cid, _ in ent_chunks}
     async with session_scope() as session:
@@ -3009,6 +3048,8 @@ async def _persist_run(
                     "relations": [_relation_text(r) for r in result.parsed.get("relations") or []],
                     "graph_walk": result.parsed.get("graph_walk"),
                     "eval_trace": result.parsed.get("eval_trace"),
+                    **({"structured_data": result.parsed["structured_data"]}
+                       if result.parsed.get("structured_data") else {}),
                     # Persisted so citation quality is trendable across runs
                     # rather than only visible in a log line.
                     "invalid_citations": result.invalid_citations,
@@ -3038,7 +3079,10 @@ async def _persist_run(
             ev_rows.append({
                 "id": uuid.uuid4(),
                 "retrieval_run_id": run_id,
-                "evidence_kind": ev["kind"],
+                # A SQL result is persisted against its table's metadata
+                # node (an intelligence artifact); the SQL itself is in
+                # retrieval_plan.structured_data.
+                "evidence_kind": "artifact" if ev["kind"] == "sql_result" else ev["kind"],
                 "evidence_uuid": node_id,
                 "evidence_iri": ev["iri"],
                 "rank": ev["rank"],
