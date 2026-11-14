@@ -4054,12 +4054,26 @@ def document_subject(document_opening: str, file_name: str) -> tuple[str, str]:
 # Structured data (backend/app/services/structured/): per-table metadata + SQL.
 # ---------------------------------------------------------------------------
 
+_QUALIFIER_RULE = (
+    "- QUALIFIERS: before aggregating a measure (SUM/AVG/MIN/MAX), find the columns that "
+    "qualify it -- unit, currency, price basis (nominal vs real), frequency, scale, period "
+    "start/end, period type, scenario, filing/version/form. Rows that differ in any qualifier "
+    "are DIFFERENT quantities: filter each qualifier to one value or GROUP BY it, and return "
+    "the qualifier columns in the SELECT. Never add or average across them. A table that "
+    "repeats the same value in several reports (restatements, comparative periods) must be "
+    "filtered to one row per period, not summed. For 'the value for year X' select the "
+    "row(s) whose period is X (e.g. the period end date falls in X) instead of aggregating "
+    "every row tagged X.\n"
+)
+
+
 _TABLE_SQL_RULES = (
     "SQL RULES (every statement is checked by a parser before it is stored):\n"
     "- Postgres dialect. Exactly ONE read-only SELECT (WITH ... SELECT allowed). "
     "No INSERT/UPDATE/DELETE/DDL, no SELECT INTO, no FOR UPDATE, no semicolons.\n"
     "- Read ONLY the table(s) named in the task, unqualified (prices, not graphrag.prices). "
-    "Use only the column names listed; never the original headers.\n"
+    "Use only the column names listed; never the original headers. Double-quote a column "
+    "whose name is an SQL key word (\"end\", \"user\", \"order\", \"group\").\n"
     "- Parameters are named placeholders like :company or :start_year. Declare every "
     "placeholder in \"params\" and use every declared param. Every param is REQUIRED "
     "(no optional `:x IS NULL OR ...` patterns). Cast when the type is not obvious from "
@@ -4068,6 +4082,7 @@ _TABLE_SQL_RULES = (
     "col ILIKE :pattern and say in the param description that it takes % wildcards.\n"
     "- Text columns hold the values exactly as shown in the profile (keep leading zeros). "
     "A numeric value stored in a text column must be cast before arithmetic.\n"
+    + _QUALIFIER_RULE +
     "- Aggregates must GROUP BY every non-aggregated column. Order results sensibly "
     "(time ascending, largest values first for rankings). Do NOT add LIMIT unless the "
     "query is a top-N ranking (then use a :n param cast to integer).\n"
@@ -4190,7 +4205,10 @@ def table_query_select(question: str, catalogs: list[dict[str, Any]],
         "with values taken from the question, matching the column's stored values (see "
         "examples). PREFER catalog statements; pick several when the question has several "
         "parts. Fewer, aggregated results are better than raw rows.\n"
-        "3. ONLY when no catalog statement can answer a part, write new_sql for it. "
+        "3. ONLY when no catalog statement can answer a part, write new_sql for it, and say "
+        "in why_not_catalog which catalog ids you considered and why each cannot answer it "
+        "(a catalog statement with the right filters/params DOES answer it -- fill its params "
+        "instead). "
         + _TABLE_SQL_RULES.replace("Read ONLY the table(s) named in the task",
                                    "Read ONLY the candidate tables") +
         "Results are capped at a few dozen rows, so aggregate or filter instead of "
@@ -4205,7 +4223,8 @@ def table_query_select(question: str, catalogs: list[dict[str, Any]],
             + json.dumps(catalogs, ensure_ascii=False, indent=1) + fail_block + "\n\n"
             'Return JSON: {"needed": true|false, "reason": "...", "calls": [{"table": "...", '
             '"query_id": "<catalog id>", "params": {"name": value}} | {"table": "...", '
-            '"new_sql": "SELECT ...", "params": {"name": value}, "purpose": "..."}]}')
+            '"new_sql": "SELECT ...", "params": {"name": value}, "purpose": "...", '
+            '"why_not_catalog": "..."}]}')
     return system, user
 
 PROMPTS = {

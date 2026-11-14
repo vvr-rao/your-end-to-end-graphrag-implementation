@@ -331,7 +331,7 @@ async def rebuild_edges(session: AsyncSession, node_id: uuid.UUID, meta: dict, g
 
     n_ent = 0
     if link_entities:
-        from backend.app.services.db_entity_extract import _normalize_name
+        from backend.app.services.db_entity_extract import _normalize_name, _short_form_variants
 
         lookup = entity_lookup if entity_lookup is not None else await _entity_lookup(session)
         hits: dict[uuid.UUID, dict] = {}
@@ -345,8 +345,18 @@ async def rebuild_edges(session: AsyncSession, node_id: uuid.UUID, meta: dict, g
                 if not norm or len(norm) < 2:
                     continue
                 eid = lookup.get(norm)
+                match = "exact"
+                if eid is None:
+                    # Tables carry full legal names ("BHP GROUP LIMITED"), the
+                    # text carries the short one ("BHP Group"): strip the
+                    # corporate suffixes on the TABLE side too, longest first.
+                    for short in _short_form_variants(norm)[1:]:
+                        eid = lookup.get(short)
+                        if eid is not None:
+                            match = "short_form"
+                            break
                 if eid is not None:
-                    h = hits.setdefault(eid, {"columns": set(), "values": [], "match": "exact"})
+                    h = hits.setdefault(eid, {"columns": set(), "values": [], "match": match})
                     h["columns"].add(col)
                     if len(h["values"]) < 5 and str(v) not in h["values"]:
                         h["values"].append(str(v))

@@ -43,6 +43,7 @@ def patched(monkeypatch):
         r = results.pop(0) if results else SqlResult(sql=sql, params=dict(params or {}),
                                                       columns=["avg_value"], rows=[["8500"]], row_count=1)
         r.sql = sql
+        r.params = r.params or dict(params or {})
         return r
 
     monkeypatch.setattr(rs, "candidate_tables", fake_cands)
@@ -193,3 +194,60 @@ def test_flag_threads_through_every_entry_point():
     item = QAEvidenceItem(kind="sql_result", iri="https://x#SqlResult_a_1", rank=1, score=1.0,
                           sql="SELECT 1", rows=[["1"]], query_id="q", truncated=False)
     assert item.rows == [["1"]] and item.sql == "SELECT 1"
+
+
+def test_compared_values_finds_literals_params_and_in_lists():
+    cols = {"facts": {"tag": "text", "fy": "integer", "cik": "text"},
+            "prices": {"commodity": "text", "value": "numeric"}}
+    sql = ("SELECT f.tag FROM facts f WHERE f.cik = :cik AND tag IN ('Revenues', :t2) "
+           "AND fy = 2025 AND unit_x = 'USD'")
+    got = rs.compared_values(sql, {"cik": "0000811809", "t2": "ProfitLoss"}, cols, {"facts": {"cik"}})
+    ctx_tag = [("cik", "0000811809")]
+    assert got == [
+        {"table": "facts", "column": "cik", "value": "0000811809", "context": []},
+        {"table": "facts", "column": "tag", "value": "Revenues", "context": ctx_tag},
+        {"table": "facts", "column": "tag", "value": "ProfitLoss", "context": ctx_tag},
+    ]                                                         # fy is integer; unit_x unknown
+    assert rs.compared_values("SELECT * FROM prices WHERE commodity = :c", {"c": "Iron ore"}, cols) \
+        == [{"table": "prices", "column": "commodity", "value": "Iron ore", "context": []}]
+
+
+async def test_missing_value_triggers_retry_with_hints_and_keeps_partial_result(patched, monkeypatch):
+    _calls, _ = patched
+    seen = []
+
+    async def fake_missing(checks):
+        seen.append(checks)
+        return [{"table": "prices", "column": "commodity", "value": "Iron ore",
+                 "existing_similar": ["Iron ore, cfr spot"]}] if len(seen) == 1 else []
+
+    monkeypatch.setattr(rs, "missing_values", fake_missing)
+    router = FakeRouter({"table_query_select": [
+        {"needed": True, "calls": [{"table": "prices", "query_id": "avg_price", "params": {"c": "Iron ore"}}]},
+        {"needed": True, "calls": [{"table": "prices", "query_id": "avg_price",
+                                    "params": {"c": "Iron ore, cfr spot"}}]},
+    ]})
+    ev, plan = await _go(router)
+    assert seen[0] == [{"table": "prices", "column": "commodity", "value": "Iron ore", "context": []}]
+    assert "Iron ore, cfr spot" in router.calls[1][1]         # hint reached the retry prompt
+    assert plan["retried"] and plan["calls"][0]["missing_values"][0]["value"] == "Iron ore"
+    assert len(ev) == 2                                        # partial + corrected result
+
+
+async def test_identical_retry_result_is_deduplicated(patched):
+    _, results = patched
+    # 1st: Copper succeeds (default), Zinc comes back empty -> retry, which
+    # repeats Copper (identical SQL + params) and fixes Zinc.
+    results.extend([SqlResult(sql="", columns=["avg_value"], rows=[["8500"]], row_count=1),
+                    SqlResult(sql="", columns=["avg_value"])])
+    router = FakeRouter({"table_query_select": [
+        {"needed": True, "calls": [
+            {"table": "prices", "query_id": "avg_price", "params": {"c": "Copper"}},
+            {"table": "prices", "query_id": "avg_price", "params": {"c": "Zinc"}}]},
+        {"needed": True, "calls": [
+            {"table": "prices", "query_id": "avg_price", "params": {"c": "Copper"}},
+            {"table": "prices", "query_id": "avg_price", "params": {"c": "zinc"}}]},
+    ]})
+    ev, _ = await _go(router)
+    assert [e["params"] for e in ev] == [{"c": "Copper"}, {"c": "zinc"}]
+    assert [e["rank"] for e in ev] == [1, 2]

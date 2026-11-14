@@ -70,3 +70,16 @@ def test_rename_only_touches_table_references():
 def test_wrappers():
     assert wrap_limit("SELECT 1;", 51).endswith("LIMIT 51")
     assert count_sql("SELECT value FROM prices").startswith("SELECT count(*) FROM (")
+
+
+def test_reserved_word_columns_are_quoted_without_touching_params():
+    from backend.app.services.structured.sql_guard import check_sql, quote_reserved
+
+    sql = ("SELECT cik, end, f.end AS last FROM facts f "
+           "WHERE end >= CAST(:end AS date) AND tag = :tag ORDER BY \"end\" DESC")
+    res = check_sql(sql, {"facts"})
+    assert res.sql == ('SELECT cik, "end", f."end" AS last FROM facts f '
+                       'WHERE "end" >= CAST(:end AS date) AND tag = :tag ORDER BY "end" DESC')
+    assert sorted(res.params) == ["end", "tag"]
+    assert quote_reserved("SELECT a FROM t WHERE a = :x") == "SELECT a FROM t WHERE a = :x"
+    assert quote_reserved(res.sql) == res.sql                 # idempotent

@@ -143,7 +143,47 @@ def check_sql(
     for p in root.find_all(exp.Placeholder):
         if p.name and p.name not in params:
             params.append(p.name)
-    return GuardResult(sql=(sql or "").strip().rstrip(";").strip(), tables=tables, params=params)
+    return GuardResult(sql=quote_reserved((sql or "").strip().rstrip(";").strip(), root),
+                       tables=tables, params=params)
+
+
+# Postgres reserved key words (SQL key words appendix, "reserved" and
+# "reserved (can be function or type)"). A data column can legitimately be
+# called `end` or `user` (SEC company facts has `start`/`end`); sqlglot parses
+# such SQL happily, Postgres rejects it unless the name is double-quoted.
+PG_RESERVED = frozenset("""
+all analyse analyze and any array as asc asymmetric authorization binary both case cast
+check collate collation column concurrently constraint create cross current_catalog
+current_date current_role current_schema current_time current_timestamp current_user
+default deferrable desc distinct do else end except false fetch for foreign freeze from
+full grant group having ilike in initially inner intersect into is isnull join lateral
+leading left like limit localtime localtimestamp natural not notnull null offset on only
+or order outer overlaps placing primary references returning right select session_user
+similar some symmetric system_user table tablesample then to trailing true union unique
+user using variadic verbose when where window with
+""".split())
+
+
+def quote_reserved(sql: str, root: exp.Expression | None = None) -> str:
+    """Double-quote unquoted identifiers that are Postgres reserved words.
+
+    Spliced at the positions the parser reports (like :func:`rename_tables`),
+    so placeholders and formatting are untouched. Stored statements written
+    before this existed are repaired at run time without re-profiling."""
+    text = (sql or "").strip().rstrip(";").strip()
+    root = root if root is not None else parse_one_select(text)
+    spans = []
+    for ident in root.find_all(exp.Identifier):
+        name = ident.name or ""
+        meta = ident.meta or {}
+        if ident.quoted or name.lower() not in PG_RESERVED or "start" not in meta:
+            continue
+        start, end = meta["start"], meta["end"] + 1
+        if text[start:end].lower() == name.lower():
+            spans.append((start, end, f'"{name.lower()}"'))
+    for start, end, new in sorted(set(spans), reverse=True):
+        text = text[:start] + new + text[end:]
+    return text
 
 
 def rename_tables(sql: str, mapping: dict[str, str]) -> str:

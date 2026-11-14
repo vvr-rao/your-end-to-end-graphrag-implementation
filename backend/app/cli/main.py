@@ -2837,7 +2837,8 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
         # Fail before the paid extraction when the folder is wrong.
         from backend.app.services.structured.prune_expand_hook import check_folder
 
-        check_folder(Path(_sd), getattr(args, "structured_limit", None))
+        check_folder(Path(_sd), getattr(args, "structured_limit", None),
+                     when="and load after entity extraction")
 
     async def _structured() -> None:
         from backend.app.services.structured.graph_hook import run_structured_load

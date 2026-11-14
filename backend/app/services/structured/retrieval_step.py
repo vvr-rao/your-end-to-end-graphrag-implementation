@@ -134,7 +134,7 @@ async def _execute(call: dict, by_table: dict[str, dict], *, max_rows: int, time
     elif call.get("new_sql"):
         res = await run_sql(str(call["new_sql"]), params, all_tables, max_rows=max_rows, timeout_ms=timeout_ms)
         rec = {"table": table, "query_id": None, "label": call.get("purpose") or "generated query",
-               "source": "generated"}
+               "source": "generated", "why_not_catalog": call.get("why_not_catalog")}
     else:
         err = "call has neither query_id nor new_sql"
         return {"table": table, "error": err}, None, err
@@ -146,6 +146,120 @@ async def _execute(call: dict, by_table: dict[str, dict], *, max_rows: int, time
     if res.row_count == 0:
         return rec, res, "returned no rows"
     return rec, res, None
+
+
+MAX_VALUE_CHECKS = 8
+MAX_SUGGESTIONS = 8
+
+
+def compared_values(sql: str, params: dict, columns: dict[str, dict[str, str]],
+                    id_columns: dict[str, set[str]] | None = None) -> list[dict]:
+    """``text_column = 'value'`` / ``IN (...)`` comparisons, from literals and
+    bound :params: [{table, column, value, context}], where ``context`` holds
+    the statement's OTHER single-value equality filters on the same table
+    (``cik = '0000811809'``) -- a tag can exist in the table and still not
+    exist for that company. ``columns``: table -> {column: type}; only text
+    columns of known tables count."""
+    from sqlglot import exp
+
+    from backend.app.services.structured.sql_guard import SqlGuardError, parse_one_select
+
+    try:
+        root = parse_one_select(sql)
+    except SqlGuardError:
+        return []
+    alias = {}
+    for t in root.find_all(exp.Table):
+        if t.name and t.name.lower() in columns:
+            alias[t.alias_or_name.lower()] = t.name.lower()
+    tables = sorted(set(alias.values()))
+
+    def _table_of(col) -> str | None:
+        qual = (col.table or "").lower()
+        if qual:
+            return alias.get(qual)
+        owners = [t for t in tables if col.name.lower() in columns[t]]
+        return owners[0] if len(owners) == 1 else None
+
+    def _vals(node) -> list[str]:
+        if isinstance(node, exp.Literal) and node.is_string:
+            return [node.this]
+        if isinstance(node, exp.Placeholder) and node.name:
+            v = (params or {}).get(node.name)
+            if isinstance(v, str):
+                return [v]
+            if isinstance(v, list):
+                return [x for x in v if isinstance(x, str)]
+        return []
+
+    found: list[tuple[str, str, list[str], bool]] = []   # table, column, values, single-EQ
+    for node in root.find_all(exp.EQ, exp.In):
+        col, rhs = node.this, (node.expressions if isinstance(node, exp.In) else [node.expression])
+        if not isinstance(col, exp.Column):
+            continue
+        t = _table_of(col)
+        if t is None or (columns[t].get(col.name.lower()) or "text") != "text":
+            continue
+        vals = [v for r in rhs for v in _vals(r)]
+        if vals:
+            found.append((t, col.name.lower(), vals, isinstance(node, exp.EQ) and len(vals) == 1))
+
+    out: list[dict] = []
+    for t, c, vals, _single in found:
+        # Only identifier filters (cik, lei, id...) scope the check: another
+        # compared value may itself be the wrong one, and using it as context
+        # would flag every value next to it.
+        ids = (id_columns or {}).get(t, set())
+        ctx = [(c2, v2[0]) for t2, c2, v2, single in found
+               if t2 == t and c2 != c and single and c2 in ids]
+        for v in vals:
+            item = {"table": t, "column": c, "value": v, "context": ctx}
+            if item not in out:
+                out.append(item)
+    return out[:MAX_VALUE_CHECKS]
+
+
+async def missing_values(checks: list[dict]) -> list[dict]:
+    """Which compared values do not occur in their column (under the
+    statement's other equality filters), with the closest values that do. The
+    model only ever sees a handful of example values, so it guesses 'Iron ore'
+    for 'Iron ore, cfr spot' and US-GAAP tag names for an IFRS filer.
+    Read-only, no LLM."""
+    if not checks:
+        return []
+    from backend.app.db.engine import get_sessionmaker
+    from backend.app.services.structured.db_load import q
+
+    out = []
+    async with get_sessionmaker()() as s:
+        try:
+            await s.execute(sql_text("SET TRANSACTION READ ONLY"))
+            await s.execute(sql_text("SET LOCAL statement_timeout = 3000"))
+            for chk in checks:
+                table, col, val, ctx = chk["table"], chk["column"], chk["value"], chk.get("context") or []
+                ref = f"graphrag.{q(table)}"
+                binds = {"v": val, **{f"c{i}": v for i, (_c, v) in enumerate(ctx)}}
+                where_ctx = "".join(f" AND {q(c)} = :c{i}" for i, (c, _v) in enumerate(ctx))
+                hit = (await s.execute(sql_text(
+                    f"SELECT 1 FROM {ref} WHERE {q(col)} = :v{where_ctx} LIMIT 1"), binds)).first()
+                if hit:
+                    continue
+                words = re.findall(r"[A-Za-z0-9]{3,}", val)[:4]
+                like = " OR ".join(f"{q(col)} ILIKE :w{i}" for i in range(len(words)))
+                binds.update({f"w{i}": f"%{w[:max(3, len(w) - 1)]}%" for i, w in enumerate(words)})
+                cond = f"({like}) OR similarity({q(col)}, :v) > 0.3" if like else f"similarity({q(col)}, :v) > 0.3"
+                rows = (await s.execute(sql_text(
+                    f"SELECT v FROM (SELECT DISTINCT {q(col)} AS v FROM {ref} WHERE TRUE{where_ctx}) d "
+                    f"WHERE {cond.replace(q(col), 'v')} "
+                    f"ORDER BY similarity(v, :v) DESC, length(v) LIMIT {MAX_SUGGESTIONS}"), binds)).scalars().all()
+                out.append({"table": table, "column": col, "value": val,
+                            **({"where": {c: v for c, v in ctx}} if ctx else {}),
+                            "existing_similar": [str(r) for r in rows]})
+        except Exception as exc:  # hints are best effort
+            out.append({"error": f"value check failed: {str(exc).splitlines()[0][:200]}"})
+        finally:
+            await s.rollback()
+    return out
 
 
 def _evidence_text(rec: dict, res: SqlResult, meta: dict, char_cap: int) -> str:
@@ -205,6 +319,16 @@ async def structured_evidence(
             if it.get("other_table"):
                 all_tables.add(it["other_table"])
     catalogs = [catalog_for_prompt(c["meta"]) for c in cands]
+    col_types = {c["table"]: {col["name"].lower(): (col.get("type") or "text")
+                              for col in c["meta"].get("columns") or []} for c in cands}
+    id_cols = {c["table"]: {col["name"].lower() for col in c["meta"].get("columns") or []
+                            if col.get("role") == "identifier"} for c in cands}
+
+    async def _value_failures(rec: dict, res: SqlResult | None) -> list[dict]:
+        if res is None or res.error:
+            return []
+        return [m for m in await missing_values(compared_values(res.sql, res.params, col_types, id_cols))
+                if "value" in m]
 
     system, user = PROMPTS["table_query_select"](question, catalogs)
     out = await router.chat("table_query_select", system=system, user=user)
@@ -220,10 +344,17 @@ async def structured_evidence(
     for call in calls:
         rec, res, err = await _execute(call, by_table, max_rows=max_rows, timeout_ms=timeout_ms,
                                        all_tables=all_tables)
+        missing = await _value_failures(rec, res)
+        if missing:
+            rec["missing_values"] = missing
         plan["calls"].append(rec)
-        if err:
-            failures.append({"call": call, "sql": rec.get("sql"), "error": err})
-        elif res is not None:
+        if err or missing:
+            failures.append({"call": call, "sql": rec.get("sql"),
+                             "error": err or "value(s) not found in their column (see missing_values)",
+                             **({"missing_values": missing} if missing else {})})
+        if not err and res is not None:
+            # A partial hit (one IN value matched, another did not) is still
+            # evidence; the retry may add the missing part.
             results.append((rec, res))
 
     if failures:
@@ -235,9 +366,22 @@ async def structured_evidence(
             rec, res, err = await _execute(call, by_table, max_rows=max_rows, timeout_ms=timeout_ms,
                                            all_tables=all_tables)
             rec["retry"] = True
+            missing = await _value_failures(rec, res)
+            if missing:
+                rec["missing_values"] = missing
             plan["calls"].append(rec)
             if not err and res is not None:
                 results.append((rec, res))
+
+    # The retry may repeat a statement that already succeeded; keep one copy.
+    seen_runs: set[str] = set()
+    unique = []
+    for rec, res in results:
+        k = json.dumps([" ".join(res.sql.split()), res.params], sort_keys=True, default=str)
+        if k not in seen_runs:
+            seen_runs.add(k)
+            unique.append((rec, res))
+    results = unique
 
     evidence = []
     for i, (rec, res) in enumerate(results, start=1):

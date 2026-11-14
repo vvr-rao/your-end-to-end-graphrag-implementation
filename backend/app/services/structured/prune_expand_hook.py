@@ -16,7 +16,7 @@ from backend.app.services.structured.discovery import discover_tables
 from backend.app.services.structured.profiler import add_classes_to_ontology, profile_folder
 
 
-def check_folder(folder: Path, limit: int | None) -> int:
+def check_folder(folder: Path, limit: int | None, when: str = "after Stage 4") -> int:
     """Fail fast (before any paid stage) on a missing or empty folder."""
     disc = discover_tables(Path(folder))
     n = len(disc.tables[:limit] if limit else disc.tables)
@@ -24,7 +24,7 @@ def check_folder(folder: Path, limit: int | None) -> int:
         raise SystemExit(f"--structured-data {folder}: no CSV/TSV/JSON/Parquet tables found")
     for rel, why in disc.skipped:
         print(f"[structured] skipping {rel}: {why}")
-    print(f"[structured] {n} table(s) will be profiled after Stage 4 (cache first)")
+    print(f"[structured] {n} table(s) found; metadata {when} (cache first)")
     return n
 
 
