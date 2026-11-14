@@ -2582,7 +2582,12 @@ _SQL_RESULT_NOTE = (
     "queries run on loaded data tables. Their numbers are exact values from "
     "the source data -- prefer them over approximate figures in prose, cite "
     "them like any other item, and do not assume rows that are not shown: a "
-    "result marked as capped is partial.)"
+    "result marked as capped is partial. A column rows_aggregated > 1 means the "
+    "number on that row combines that many rows; first_*/last_* columns give the "
+    "span they cover. If that span covers several periods, the number is NOT the "
+    "value of a single period -- say what it combines, or use a row that holds "
+    "the single period's value. Never add up values yourself across rows that "
+    "differ only in a report/version column.)"
 )
 
 
@@ -4057,15 +4062,15 @@ def document_subject(document_opening: str, file_name: str) -> tuple[str, str]:
 _QUALIFIER_RULE = (
     "- QUALIFIERS: before aggregating a measure (sum/avg/min/max), find the columns that "
     "qualify it -- unit, currency, price basis (nominal vs real), frequency, scale, period "
-    "start/end, period type, scenario, filing/version/form. Rows that differ in any qualifier "
+    "start/end, period type, scenario, report/version. Rows that differ in any qualifier "
     "are DIFFERENT quantities: filter each qualifier to one value (a where entry) or select "
     "it as a plain column (it is then grouped by), so it appears in the result. Never add "
     "or average across them. A table that repeats the same value in several reports "
     "(restatements, comparative periods) must be reduced to one row per period with "
-    "distinct_on (e.g. distinct_on the period end, ordered by filing date desc), not "
-    "summed. For 'the value for year X' select the row(s) whose period is X (e.g. "
-    "{\"column\": {\"column\": \"end\", \"fn\": \"year\"}, \"op\": \"=\", \"param\": "
-    "\"year\"}) instead of aggregating every row tagged X.\n"
+    "distinct_on the period columns, ordered by the report/version column desc, not "
+    "summed. For 'the value for year X' filter the column that holds the period the "
+    "VALUE covers (e.g. {\"column\": {\"column\": \"<period column>\", \"fn\": \"year\"}, "
+    "\"op\": \"=\", \"param\": \"year\"}), not a column that only dates the report.\n"
 )
 
 
@@ -4088,7 +4093,7 @@ _QUERY_SPEC_RULES = (
     "automatically. order_by may name a select alias.\n"
     "- Parameter types and casts come from the column they are compared with -- do not "
     "write casts. Every param is REQUIRED (no optional filters); use a constant \"value\" "
-    "for a fixed filter (e.g. form = '10-K').\n"
+    "for a fixed filter (e.g. a category column = one of its values).\n"
     "- \"params\" lists each parameter once: {\"name\", \"description\", \"example\"}. The "
     "example must be a real value from the profile (keep leading zeros).\n"
     + _QUALIFIER_RULE +
@@ -4115,20 +4120,20 @@ def table_profile(profile_md: str, candidate_classes: list[dict[str, str]]) -> t
         "DESCRIBE\n"
         "- description: 2-4 sentences: what the table holds, its source if evident, "
         "time coverage, and what questions it can answer.\n"
-        "- grain: what one row is (e.g. 'one reported value per company, XBRL tag and period').\n"
+        "- grain: what one row is (e.g. 'one value per entity, item and period').\n"
         "- columns: one entry per listed column, same names, same order. description says "
-        "what the column means; when the name is cryptic (codes, abbreviations, 'val', "
-        "'fp'), infer the meaning from its values and say so. role is one of identifier "
+        "what the column means; when the name is cryptic (codes, abbreviations, short "
+        "names), infer the meaning from its values and say so. role is one of identifier "
         "(keys/codes), dimension (categories you group or filter by), measure (numbers you "
         "aggregate), time (dates/periods/years), attribute (other descriptive values), text "
         "(free text). unit when evident (USD, $/bbl, %, count). entity_kind when values "
-        "name real-world things (company, drug, country, commodity, clinical_trial, "
+        "name real-world things (the kind of thing, e.g. organization, product, place, "
         "person, ...), else null.\n\n"
         "METRICS: aggregates worth asking for: totals, averages, MIN/MAX ranges, counts "
         "per category, latest value, values for two periods to compare. One query each, "
-        "usually parameterised by the main dimension(s) (e.g. company, commodity).\n"
-        "FILTERS: the columns users would filter on (company, country, date range, "
-        "category, status). One query each that returns the matching rows' key "
+        "usually parameterised by the main dimension(s) (the entity or item a row is about).\n"
+        "FILTERS: the columns users would filter on (the entity, a place, a date "
+        "range, a category, a status). One query each that returns the matching rows' key "
         "columns with that filter applied as a parameter.\n"
         "QUERIES: other useful retrievals: lookup of one record by key, latest rows for "
         "an entity, time series for an entity, top-N rankings, distinct values of a "
@@ -4137,8 +4142,8 @@ def table_profile(profile_md: str, candidate_classes: list[dict[str, str]]) -> t
         "ids are short snake_case, unique across all three lists.\n\n"
         "ONTOLOGY CONCEPTS: for each column (except pure keys, free text and row ids) and "
         "each metric/filter give \"concept\": the general KIND of thing it measures or "
-        "classifies (Revenue, CommodityPrice, Country, ClinicalTrialPhase, AdverseEvent, "
-        "PatentExpiryDate), never a specific value or a sentence. If one of the "
+        "classifies (a kind of quantity, category, place, period or event), never a "
+        "specific value or a sentence. If one of the "
         "CANDIDATE CLASSES fits, set iri to its IRI and label to its label. Otherwise "
         "iri null, label a new UpperCamelCase class name, and parent_label the most "
         "specific candidate label it is a kind of, or one of Metric, Measure, Dimension, "
@@ -4146,9 +4151,9 @@ def table_profile(profile_md: str, candidate_classes: list[dict[str, str]]) -> t
         "periods -> TimePeriod). Use concept null when nothing general applies.\n"
         "Never invent a NEW class for an identifier or code column (ids, registration or "
         "reference numbers, codes, tickers, LEIs, internal flags/status codes): use the "
-        "candidate class of the thing it identifies (e.g. LegalEntity) or concept null. "
-        "A metric's concept is the quantity it measures (CommodityPrice, Revenue), never "
-        "the aggregation (no TotalPrice, AveragePrice, RowCount, NumberOfFacts).\n\n"
+        "candidate class of the thing it identifies, or concept null. A metric's concept "
+        "is the quantity it measures, never the aggregation (no 'Total...', "
+        "'Average...', 'Count...' or 'Number of...' classes).\n\n"
         + _QUERY_SPEC_RULES +
         "\nReturn JSON only, no markdown fences."
     )
@@ -4186,8 +4191,8 @@ def table_lookups(tables: list[dict[str, Any]]) -> tuple[str, str]:
     """Find join keys shared by tables and write a LOOKUP query spec for each pair."""
     system = (
         "You connect database tables. Find pairs of tables that share a key: the same "
-        "identifier or name in both (SEC CIK, LEI, NCT id, FDA application number, ticker, "
-        "drug or company name, country, series id, commodity). Compare column meanings AND "
+        "identifier, code or name in both (a registry id, a code, an entity name, a place, "
+        "a series id). Compare column meanings AND "
         "example values; equal names are not enough and different names can still match. "
         "Only propose joins whose values would actually match (same format, e.g. both "
         "zero-padded). For each pair define ONE lookup query that joins the two tables on "
@@ -4208,6 +4213,75 @@ def table_lookups(tables: list[dict[str, Any]]) -> tuple[str, str]:
     return system, user
 
 
+def table_refine(table: dict[str, Any]) -> tuple[str, str]:
+    """Second, data-driven metadata pass over ONE loaded table.
+
+    The model gets what was MEASURED on the data (grain, columns that only
+    identify the report/version a value came from, functional dependencies,
+    item columns and their most shared values) plus the valid values, a few
+    sample rows and the current query catalog, and defines the table's
+    MEASURES, usage rules and typical questions. Domain-neutral: nothing in
+    this prompt names a dataset, a field or a value."""
+    system = (
+        "You design how a question-answering system must query ONE database table. "
+        "You get its columns with their valid values, STRUCTURE measured on the data, "
+        "sample rows and the current catalog of stored queries. Use the structure; do "
+        "not guess what it contradicts.\n\n"
+        "STRUCTURE you get:\n"
+        "- grain: columns that together identify one row.\n"
+        "- values_repeated_across {measure: [columns]}: the measure keeps the SAME value "
+        "when only these columns change. They identify the report, version, release or "
+        "snapshot a value was published in -- not what the value is about and not the "
+        "period it covers. The same figure appears once per report, so summing or "
+        "averaging across these columns counts it several times, and a period-like "
+        "column among them (e.g. the year of the report) is NOT the period of the value.\n"
+        "- determines {a: [b, ...]}: each value of a has exactly one value of b.\n"
+        "- item_columns {column: top_values}: a grain column whose values name DIFFERENT "
+        "quantities (one row per item); top_values are those shared by most entities.\n\n"
+        "DEFINE\n"
+        "1. columns: ONLY columns whose role or description must change in the light of "
+        "the structure (a column that identifies the report/version, a period column, a "
+        "label determined by a key). role is one of identifier, dimension, measure, "
+        "time, attribute, text. Omit unchanged columns.\n"
+        "2. measures: the quantities people ask for first (up to 15). Each:\n"
+        "   - id (snake_case), label, description;\n"
+        "   - value_column: the numeric column holding the value;\n"
+        "   - item: for a table with an item column, {\"column\": ..., \"values\": [...]} "
+        "with EVERY valid value that names this same quantity (variants of the same "
+        "quantity under different naming conventions); null for a wide table;\n"
+        "   - entity_columns: what the value is about, the lookup key first (labels it "
+        "determines may follow);\n"
+        "   - period_columns: the columns that identify the period the VALUE covers "
+        "(never a report/version column);\n"
+        "   - qualifier_columns: columns whose values make it a different quantity "
+        "(unit, currency, scale, price basis, frequency, period length...);\n"
+        "   - latest_by: when the measure's values are repeated across report columns, "
+        "the report column whose highest value is the latest report (to keep one value "
+        "per period); else null;\n"
+        "   - additive_over_time: true only when values of consecutive periods add up "
+        "to the longer period without overlap.\n"
+        "3. usage_notes: 2-6 short rules for querying this table correctly, derived from "
+        "the structure (which columns identify the period, which only the report, what "
+        "must never be summed, which qualifiers must be fixed).\n"
+        "4. common_questions: 5-12 typical questions an analyst asks of this table, in "
+        "general form, each answered by ONE catalog id or measure id with params filled "
+        "from valid values or sample rows. A measure takes params <first entity column>, "
+        "one param per qualifier column with more than one valid value, and "
+        "<last period column>_from / <last period column>_to.\n\n"
+        "Use only column names and values that appear in the input. Return JSON only."
+    )
+    user = ("TABLE:\n" + json.dumps(table, ensure_ascii=False, indent=1, default=str) + "\n\n"
+            'Return JSON: {"columns": [{"name": "...", "role": "...", "description": "..."}], '
+            '"measures": [{"id": "...", "label": "...", "description": "...", '
+            '"value_column": "...", "item": {"column": "...", "values": ["..."]} | null, '
+            '"entity_columns": ["..."], "period_columns": ["..."], "qualifier_columns": ["..."], '
+            '"latest_by": "..." | null, "additive_over_time": false}], '
+            '"usage_notes": ["..."], '
+            '"common_questions": [{"question": "...", "query_id": "<catalog id or measure id>", '
+            '"params": {"name": value}}]}')
+    return system, user
+
+
 def table_query_select(question: str, catalogs: list[dict[str, Any]],
                        failures: list[dict[str, Any]] | None = None) -> tuple[str, str]:
     """Decide whether a question needs table data and which stored query to run."""
@@ -4223,12 +4297,19 @@ def table_query_select(question: str, catalogs: list[dict[str, Any]],
         "2. If needed, pick the catalog queries that answer it and fill EVERY one of their "
         "params. VALID VALUES: a column that lists \"values\" holds exactly those values "
         "-- a param on that column MUST be one of them, copied exactly (pick the value that "
-        "means what the question asks, e.g. the right unit, basis, taxonomy, form or "
-        "period type for that company/item). A query with \"valid_combinations\" "
+        "means what the question asks, e.g. the right unit, basis, version or period "
+        "type for that entity/item). A query with \"valid_combinations\" "
         "{params, see: i} may only use a row of value_combinations[i] (the values that "
         "occur together). A column with \"range\" holds values between min and max. "
         "Pick several queries when the question has several parts. Fewer, aggregated "
         "results are better than raw rows.\n"
+        "   MEASURES (kind \"measure\") were built and tested on the data: they return ONE "
+        "value per entity, period and qualifier, with repeated reports already reduced to "
+        "one. Prefer a measure whenever the question asks for that quantity; set its "
+        "period range to just the period(s) asked about. Follow the table's usage_notes "
+        "and its structure (values_repeated_across lists columns that identify only the "
+        "report a value came from: never aggregate across them or treat them as the "
+        "period). examples show how typical questions map to queries.\n"
         "3. ONLY when no catalog query can answer a part, give a new \"query\" spec for it "
         "(same JSON shape as the catalog's, rules below), and say in why_not_catalog which "
         "catalog ids you considered and why each cannot answer it (a catalog query with "
@@ -4252,6 +4333,7 @@ def table_query_select(question: str, catalogs: list[dict[str, Any]],
 
 PROMPTS = {
     "table_profile": table_profile,
+    "table_refine": table_refine,
     "table_sql_repair": table_sql_repair,
     "table_lookups": table_lookups,
     "table_query_select": table_query_select,

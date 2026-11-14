@@ -166,7 +166,12 @@ def _select_item(ctx: _Ctx, raw) -> tuple[str, str, bool, str | None]:
         if agg not in AGGS:
             raise QuerySpecError(f"agg must be one of {', '.join(AGGS)} (got {agg!r})")
         alias = str(raw.get("as") or "").strip()
-        if raw.get("column") in (None, "", "*"):
+        if agg == "count_distinct" and isinstance(raw.get("columns"), list) and raw["columns"]:
+            refs = [ctx.ref(c) for c in raw["columns"]]
+            inner = ", ".join(r[0] for r in refs)
+            expr = f"COUNT(DISTINCT ({inner}))" if len(refs) > 1 else f"COUNT(DISTINCT {inner})"
+            alias = alias or "count_distinct_" + "_".join(r[3] for r in refs)
+        elif raw.get("column") in (None, "", "*"):
             if agg != "count":
                 raise QuerySpecError(f"{agg} needs a column")
             expr, alias = "COUNT(*)", alias or "row_count"
@@ -226,9 +231,15 @@ def _where(ctx: _Ctx, cond: dict) -> str:
     return f"{sql} {COMPARE[op]} {rhs}"
 
 
-def build_sql(spec: dict, table: str, columns: dict[str, dict[str, str]]) -> Built:
+def build_sql(spec: dict, table: str, columns: dict[str, dict[str, str]], *,
+              time_columns: dict[str, list[str]] | None = None) -> Built:
     """Compile ``spec`` (reading ``table``) to SQL. ``columns``: table ->
-    {column: type} for every table the spec may read."""
+    {column: type} for every table the spec may read.
+
+    Every aggregate query also returns how much it combined, so a total is
+    never mistaken for one value: ``rows_aggregated`` (COUNT(*)) and, for each
+    of the table's ``time_columns`` that is not grouped by, ``first_<col>`` /
+    ``last_<col>`` (the span of periods the aggregate covers)."""
     if not isinstance(spec, dict):
         raise QuerySpecError("query spec must be a JSON object")
     unknown = set(spec) - _SPEC_KEYS
@@ -253,6 +264,20 @@ def build_sql(spec: dict, table: str, columns: dict[str, dict[str, str]]) -> Bui
         has_agg |= is_agg
         if grp:
             plain_groups.append(grp)
+    if has_agg:
+        grouped = {ctx.ref(r)[0] for r in spec.get("group_by") or []} | set(plain_groups)
+        extra = []
+        if "COUNT(*)" not in " ".join(p.split(" AS ")[0] for p in parts):
+            extra.append(("COUNT(*)", "rows_aggregated"))
+        base_cols = columns.get(table, {})
+        for tcol in [c for c in (time_columns or {}).get(table, []) if c in base_cols][:2]:
+            expr = f"{_q(table)}.{_q(tcol)}" if ctx.other else _q(tcol)
+            if expr not in grouped:
+                extra += [(f"MIN({expr})", f"first_{tcol}"), (f"MAX({expr})", f"last_{tcol}")]
+        for expr, alias in extra:
+            if alias not in names:
+                parts.append(f"{expr} AS {_q(alias)}")
+                names.append(alias)
     ctx.aliases = set(names)
 
     distinct_on = [ctx.ref(r)[0] for r in spec.get("distinct_on") or []]

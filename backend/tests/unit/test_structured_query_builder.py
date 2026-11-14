@@ -47,6 +47,18 @@ def test_aggregates_group_by_plain_columns_automatically():
                      'WHERE "cik" = CAST(:cik AS text) GROUP BY "unit" ORDER BY "total" DESC NULLS LAST')
 
 
+def test_aggregates_report_rows_combined_and_the_time_span():
+    b = build_sql({"select": ["unit", {"agg": "sum", "column": "val", "as": "total"}],
+                   "where": [{"column": "cik", "op": "=", "param": "cik"}]},
+                  "facts", COLS, time_columns={"facts": ["end", "filed"]})
+    assert b.sql == ('SELECT "unit", SUM("val") AS "total", COUNT(*) AS "rows_aggregated", '
+                     'MIN("end") AS "first_end", MAX("end") AS "last_end", '
+                     'MIN("filed") AS "first_filed", MAX("filed") AS "last_filed" FROM "facts" '
+                     'WHERE "cik" = CAST(:cik AS text) GROUP BY "unit"')
+    plain = build_sql({"select": ["end", "val"]}, "facts", COLS, time_columns={"facts": ["end"]})
+    assert "rows_aggregated" not in plain.sql
+
+
 def test_distinct_on_leads_order_by_and_year_fn():
     b = _b({"select": ["end", "val", "filed"], "distinct_on": ["end"],
             "where": [{"column": {"column": "end", "fn": "year"}, "op": "=", "param": "year"}],

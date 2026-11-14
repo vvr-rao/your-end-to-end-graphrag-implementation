@@ -162,7 +162,7 @@ async def test_extract_entities_hook_reads_cache_only(db, data, tmp_path, monkey
     async def fake_embed(texts):
         return [[0.01] * 1024 for _ in texts]
 
-    profile, summary = await run_structured_load(data, router=silent, embed=fake_embed)
+    profile, summary = await run_structured_load(data, router=silent, embed=fake_embed, refine=False)
     assert silent.calls == [] and profile["from_cache"] == 2 and profile["llm_calls"] == 0
     assert sorted(summary.loaded) == ["companies", "prices"]
     async with db() as s:

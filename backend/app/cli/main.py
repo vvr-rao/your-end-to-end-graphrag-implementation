@@ -1473,6 +1473,24 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Rebuild only the class edges (skip matching key values to entities).")
     p_tmi.set_defaults(func=_cmd_table_metadata_import)
 
+    p_tmr = sub.add_parser(
+        "table-metadata-refine",
+        help="Second metadata pass on LOADED tables: measure each table's "
+             "structure with SQL (grain, columns that only identify the report "
+             "a value came from), define its MEASURES with one LLM call, then "
+             "test every stored query on the data (repair once, drop what "
+             "still fails). Runs automatically after extract-entities "
+             "--structured-data; already-refined tables make no LLM call.",
+    )
+    p_tmr.add_argument("--table", action="append", default=None, metavar="NAME",
+                       help="Table to refine (repeatable). Default: every loaded table.")
+    p_tmr.add_argument("--refresh", action="store_true",
+                       help="Refine again even when the metadata is already refined.")
+    p_tmr.add_argument("--no-entity-links", action="store_true",
+                       help="Rebuild only the class edges (skip matching key values to entities).")
+    p_tmr.add_argument("--json", action="store_true", help="Print the per-table reports as JSON.")
+    p_tmr.set_defaults(func=_cmd_table_metadata_refine)
+
     p_tq = sub.add_parser(
         "table-query",
         help="Build and run one table query with no LLM: a stored metric/filter/"
@@ -2281,7 +2299,7 @@ def _cmd_import_ontology(args: argparse.Namespace) -> int:
     print(f"  instances seen    : {summary.instances_total}")
     print(f"  embed cost        : ${summary.cost_usd:.4f}")
     if summary.dry_run:
-        print(f"  (DRY RUN -- no DB writes happened)")
+        print("  (DRY RUN -- no DB writes happened)")
     return 0
 
 
@@ -2315,7 +2333,11 @@ def _cmd_graph_stats(args: argparse.Namespace) -> int:
     from backend.app.core.config import get_settings
     from backend.app.db.session import session_scope
     from backend.app.services.run_stats import (
-        diff_against_snapshot, format_graph_stats, format_ontology_stats, graph_stats, ontology_stats,
+        diff_against_snapshot,
+        format_graph_stats,
+        format_ontology_stats,
+        graph_stats,
+        ontology_stats,
     )
 
     roots = _concept_roots_from_config()
@@ -2536,7 +2558,7 @@ def _cmd_db_migrate(args: argparse.Namespace) -> int:
     cfg = AlembicConfig("alembic.ini")
     print(f"[db-migrate] upgrading to revision: {args.revision}")
     command.upgrade(cfg, args.revision)
-    print(f"[db-migrate] DONE")
+    print("[db-migrate] DONE")
     return 0
 
 
@@ -2548,7 +2570,7 @@ def _cmd_db_downgrade(args: argparse.Namespace) -> int:
     cfg = AlembicConfig("alembic.ini")
     print(f"[db-downgrade] target revision: {args.revision}")
     command.downgrade(cfg, args.revision)
-    print(f"[db-downgrade] DONE")
+    print("[db-downgrade] DONE")
     return 0
 
 
@@ -2620,7 +2642,7 @@ def _cmd_db_init(args: argparse.Namespace) -> int:
         print("=" * 64)
         print(f"DB-INIT: step 3/4 -- import from {args.input}")
         print("=" * 64)
-        summary = asyncio.run(import_ontology_folder(
+        asyncio.run(import_ontology_folder(
             input_folder=args.input,
             limit=args.limit,
             dry_run=False,
@@ -2936,6 +2958,44 @@ def _cmd_table_metadata_import(args: argparse.Namespace) -> int:
     return 1 if bad else 0
 
 
+def _cmd_table_metadata_refine(args: argparse.Namespace) -> int:
+    from backend.app.services.llm_router import LLMRouter
+    from backend.app.services.structured.cache import MetadataCache
+    from backend.app.services.structured.refine import refine_registered
+
+    async def go():
+        from backend.app.db.embedding_guard import ensure_embedding_model
+        from backend.app.services.embeddings import Embedder
+
+        embedder = Embedder()
+        await ensure_embedding_model(embedder)
+        router = LLMRouter()
+        reports = await refine_registered(router, tables=args.table, refresh=args.refresh,
+                                          cache=MetadataCache(), embed=embedder.embed,
+                                          link_entities=not args.no_entity_links)
+        return reports, router
+
+    reports, router = asyncio.run(go())
+    if args.json:
+        print(json.dumps(reports, indent=2, default=str))
+    for r in reports:
+        if "error" in r:
+            print(f"[table-metadata-refine] {r['table']}: FAILED -- {r['error']}")
+            continue
+        print(f"[table-metadata-refine] {r['table']}: measures {', '.join(r['measures']) or 'none'}; "
+              f"repaired {len(r['repaired'])}, dropped {len(r['dropped'])}, "
+              f"typical questions {r['questions']}")
+        for d in r["dropped"]:
+            print(f"    dropped {d['section']}/{d['id']}: {d['error']}")
+        for m in r["rejected_measures"]:
+            print(f"    measure rejected {m['measure']}: {m['error']}")
+    try:
+        print(f"[table-metadata-refine] LLM cost ${router.total_cost_usd:.4f}")
+    except Exception:
+        pass
+    return 1 if any("error" in r for r in reports) else 0
+
+
 def _cmd_table_query(args: argparse.Namespace) -> int:
     from backend.app.services.structured import query_runner as qrun
     from backend.app.services.structured.query_builder import QuerySpecError
@@ -2999,12 +3059,11 @@ def _cmd_classify_concepts(args: argparse.Namespace) -> int:
 
 
 def _cmd_enrich_geo(args: argparse.Namespace) -> int:
+    from backend.app.core.config import get_settings
     from backend.app.services.db_geo_enrich import (
         DEFAULT_GEO_CLASS_LABELS,
         enrich_geography,
     )
-
-    from backend.app.core.config import get_settings
 
     labels = tuple(
         args.class_labels
@@ -3300,6 +3359,7 @@ def _cmd_mine_aliases(args: argparse.Namespace) -> int:
 
 def _cmd_query(args: argparse.Namespace) -> int:
     import json as _json
+
     from backend.app.services.retrieval import retrieve_and_answer
 
     # Accept the hyphenated spelling (artifact-only) as an alias for the
@@ -3407,6 +3467,7 @@ def _cmd_evaluate_queries(args: argparse.Namespace) -> int:
 
 def _cmd_conversation_start(args: argparse.Namespace) -> int:
     import json as _json
+
     from backend.app.services.db_conversation import start_conversation
 
     result = asyncio.run(start_conversation(title=args.title))
@@ -3421,6 +3482,7 @@ def _cmd_conversation_start(args: argparse.Namespace) -> int:
 
 def _cmd_conversation_turn(args: argparse.Namespace) -> int:
     import json as _json
+
     from backend.app.services.db_conversation import add_turn
 
     # Accept the hyphenated spelling (artifact-only) as an alias for the
@@ -3464,6 +3526,7 @@ def _cmd_conversation_turn(args: argparse.Namespace) -> int:
 
 def _cmd_conversation_show(args: argparse.Namespace) -> int:
     import json as _json
+
     from backend.app.services.db_conversation import replay_conversation
 
     result = asyncio.run(replay_conversation(conversation_iri=args.conv))
@@ -3639,8 +3702,10 @@ def _cmd_render_init(args: argparse.Namespace) -> int:
     .env, no dashboard click-through. Idempotent: skips services that
     already exist by name. Cross-links FRONTEND_ORIGIN <-> VITE_API_BASE_URL
     after both services have URLs."""
-    import yaml
     from pathlib import Path
+
+    import yaml
+
     from backend.app.services.render_client import RenderClient
 
     repo_root = Path(__file__).resolve().parents[3]

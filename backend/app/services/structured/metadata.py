@@ -48,8 +48,8 @@ from backend.app.services.structured.query_builder import (
 )
 from backend.app.services.structured.sql_guard import SqlGuardError, check_sql, rename_tables
 
-SECTIONS = ("metrics", "filters", "queries", "lookups")
-SECTION_TITLES = {"metrics": "Metrics", "filters": "Filters", "queries": "Queries", "lookups": "Lookups"}
+SECTIONS = ("measures", "metrics", "filters", "queries", "lookups")
+SECTION_TITLES = {"measures": "Measures", "metrics": "Metrics", "filters": "Filters", "queries": "Queries", "lookups": "Lookups"}
 COLUMN_ROLES = ("identifier", "dimension", "measure", "time", "attribute", "text")
 
 
@@ -72,6 +72,14 @@ def item_tables(meta: dict, section: str, item: dict) -> set[str]:
     if section == "lookups" and item.get("other_table"):
         tables.add(item["other_table"])
     return tables
+
+
+def time_columns(meta: dict) -> list[str]:
+    """Columns that place a row in time (role time first, then date types)."""
+    cols = meta.get("columns") or []
+    first = [c["name"] for c in cols if c.get("role") == "time"]
+    return first + [c["name"] for c in cols
+                    if c.get("type") in {"date", "timestamp"} and c["name"] not in first]
 
 
 def column_types(meta: dict) -> dict[str, str]:
@@ -102,7 +110,8 @@ def compile_item(meta: dict, section: str, item: dict,
                                           for p in res.params], tables=res.tables)
     types = {t: types_by_table[t] for t in tables if t in types_by_table}
     types.setdefault(meta["table_name"], column_types(meta))
-    built = build_sql(spec, meta["table_name"], types)
+    built = build_sql(spec, meta["table_name"], types,
+                      time_columns={meta["table_name"]: time_columns(meta)})
     check_sql(built.sql, tables)      # defence in depth: the guard still applies
     return built
 
@@ -268,6 +277,17 @@ def catalog_for_prompt(meta: dict, max_items: int = 40) -> dict:
         })
     if combos:
         cat["value_combinations"] = combos
+    if meta.get("usage_notes"):
+        cat["usage_notes"] = meta["usage_notes"]
+    if meta.get("analysis"):
+        from backend.app.services.structured.analysis import summary_for_prompt
+
+        st = summary_for_prompt(meta["analysis"])
+        st.pop("item_columns", None)     # the measures already name their items
+        cat["structure"] = st
+    if meta.get("common_questions"):
+        cat["examples"] = [{k: q.get(k) for k in ("question", "query_id", "params")}
+                           for q in meta["common_questions"][:8]]
     return cat
 
 

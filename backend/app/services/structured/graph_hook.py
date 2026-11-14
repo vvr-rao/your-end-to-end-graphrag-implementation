@@ -5,6 +5,9 @@
    and its concepts map to EXISTING classes only (Phase 2 adds no classes).
 2. Load each table into ``graphrag."<table>"`` and connect its TableMetadata
    node to ontology classes and to existing entities (``db_load``).
+3. Refine (``refine``): measure each loaded table's structure, define its
+   measures, test every stored query on the data (one LLM call per table;
+   none when the cached metadata is already refined).
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ async def run_structured_load(
     limit: int | None = None,
     concurrency: int = 4,
     refresh: bool = False,
+    refine: bool = True,
     link_entities: bool = True,
     router=None,
     embed=None,
@@ -56,7 +60,14 @@ async def run_structured_load(
         embed = embedder.embed
     summary = await load_and_link(run, root_name=folder.resolve().name, cache=cache, embed=embed,
                                   link_entities=link_entities)
-    profile = {"tables": len(run.tables), "from_cache": len(run.cached), "profiled": len(run.profiled),
+    refined = []
+    if refine:
+        from backend.app.services.structured.refine import refine_registered
+
+        names = [n for n in summary.loaded + summary.unchanged]
+        refined = await refine_registered(router, tables=names, refresh=refresh, cache=cache,
+                                          embed=embed, link_entities=link_entities)
+    profile = {"tables": len(run.tables), "refined": [r.get("table") for r in refined if "error" not in r], "from_cache": len(run.cached), "profiled": len(run.profiled),
                "llm_calls": run.llm_calls, "failed": run.failed}
     print(f"[structured] metadata: {profile['from_cache']} from cache, {profile['profiled']} profiled now "
           f"({run.llm_calls} LLM call(s)); tables: {len(summary.loaded)} loaded "

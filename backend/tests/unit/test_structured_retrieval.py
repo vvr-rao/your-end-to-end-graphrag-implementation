@@ -31,7 +31,8 @@ META = {
                  "join": [{"column": "commodity", "other_column": "commodity"}],
                  "query": {"select": ["companies.company", "value"]}}],
 }
-AVG_SQL = ('SELECT AVG("value") AS "avg_value" FROM "prices" '
+AVG_SQL = ('SELECT AVG("value") AS "avg_value", COUNT(*) AS "rows_aggregated", '
+           'MIN("period") AS "first_period", MAX("period") AS "last_period" FROM "prices" '
            'WHERE "commodity" = CAST(:c AS text)')
 COMPANIES = {"table_name": "companies", "columns": [{"name": "company", "type": "text"},
                                                     {"name": "commodity", "type": "text"}]}
@@ -104,7 +105,9 @@ async def test_failed_catalog_query_gets_one_retry_with_a_query_spec(patched):
     assert 'column \\"x\\" does not exist' in router.calls[1][1]
     assert plan["retried"] and len(ev) == 1 and ev[0]["sql_source"] == "spec"
     assert ev[0]["query_id"] is None
-    assert calls[1][0] == 'SELECT MAX("value") AS "m" FROM "prices"' and calls[1][2] == {"prices"}
+    assert calls[1][0] == ('SELECT MAX("value") AS "m", COUNT(*) AS "rows_aggregated", '
+                           'MIN("period") AS "first_period", MAX("period") AS "last_period" FROM "prices"')
+    assert calls[1][2] == {"prices"}
 
 
 async def test_model_written_sql_is_never_run(patched):

@@ -121,8 +121,8 @@ async def test_profile_builds_metadata_and_lookups(folder, tmp_path):
     m = run.by_name()["prices"]
     assert m["row_count"] == 3 and [c["type"] for c in m["columns"]] == ["text", "date", "numeric"]
     assert m["metrics"][0]["id"] == "count_by_first"
-    assert m["metrics"][0]["sql"] == ('SELECT "commodity", COUNT(*) AS "n" FROM "prices" '
-                                      'GROUP BY "commodity"')
+    assert m["metrics"][0]["sql"] == ('SELECT "commodity", COUNT(*) AS "n", MIN("period") AS "first_period", '
+                                      'MAX("period") AS "last_period" FROM "prices" GROUP BY "commodity"')
     f = m["filters"][0]                     # params: names/types from the spec, text from the model
     assert f["params"] == [{"name": "v", "type": "text", "column": "commodity",
                             "description": "the value", "example": "x"}]
@@ -163,7 +163,8 @@ async def test_bad_query_spec_is_repaired_once(folder, tmp_path):
     router = _make(bad_sql=True)
     run = await profile_folder(folder, router, cache=tc.MetadataCache(user_dir=tmp_path / "c"), log=lambda *_: None)
     q = run.by_name()["prices"]["queries"]
-    assert q[0]["sql"] == 'SELECT COUNT(*) AS "row_count" FROM "prices"' and q[0]["repaired"]
+    assert q[0]["sql"] == ('SELECT COUNT(*) AS "row_count", MIN("period") AS "first_period", '
+                           'MAX("period") AS "last_period" FROM "prices"') and q[0]["repaired"]
     assert sum("REJECTED STATEMENTS" in u for _t, u in router.calls) == 1
 
 

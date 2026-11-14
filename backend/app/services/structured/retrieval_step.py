@@ -177,7 +177,11 @@ async def _execute(call: dict, by_table: dict[str, dict], *, max_rows: int, time
             err = f"table {table!r} is not a candidate table"
             return {**rec, "error": err}, None, err
         try:
-            built = build_sql(call["query"], table, {t: c for t, c in types.items() if t in all_tables})
+            from backend.app.services.structured.metadata import time_columns
+
+            tmeta = (by_table.get(table) or {}).get("meta") or {}
+            built = build_sql(call["query"], table, {t: c for t, c in types.items() if t in all_tables},
+                              time_columns={table: time_columns(tmeta)})
         except QuerySpecError as exc:
             err = f"query spec does not compile: {exc}"
             return {**rec, "error": err}, None, err

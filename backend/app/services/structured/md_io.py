@@ -90,7 +90,15 @@ def to_markdown(meta: dict) -> str:
             _cell(c.get("entity_kind")), _cell(c.get("description")),
             _cell(_class(c.get("class_label"), c.get("class_iri"))),
         ]) + " |")
+    if meta.get("usage_notes"):
+        w("")
+        w("## Usage notes")
+        w("")
+        for note in meta["usage_notes"]:
+            w(f"- {_one_line(note)}")
     for sec in SECTIONS:
+        if sec == "measures" and not meta.get(sec):
+            continue
         w("")
         w(f"## {SECTION_TITLES[sec]}")
         for it in meta.get(sec) or []:
@@ -106,6 +114,8 @@ def to_markdown(meta: dict) -> str:
                 w(f"- **Join:** {joins}")
             w(f"- **Columns:** {', '.join(_code(c) for c in it.get('columns') or [])}")
             w(f"- **Class:** {_class(it.get('class_label'), it.get('class_iri'))}")
+            if isinstance(it.get("measure"), dict):
+                w(f"- **Measure:** {_code(json.dumps(it['measure'], ensure_ascii=False))}")
             params = it.get("params") or []
             if not params:
                 w("- **Parameters:** none")
@@ -193,6 +203,7 @@ class _Doc:
     description: str = ""
     columns: list[dict] = field(default_factory=list)
     sections: dict[str, list[dict]] = field(default_factory=dict)
+    usage_notes: list[str] | None = None
 
 
 def parse_markdown(text: str) -> _Doc:
@@ -284,6 +295,18 @@ def parse_markdown(text: str) -> _Doc:
                                         "entity_kind": _none(row[4]), "description": row[5],
                                         "class_label": label, "class_iri": iri})
                 continue
+            if title == "Usage notes":
+                section = "usage_notes"
+                doc.usage_notes = []
+                i += 1
+                while i < n and not lines[i].startswith("## "):
+                    t = lines[i].strip()
+                    if t.startswith("- "):
+                        doc.usage_notes.append(t[2:].strip())
+                    elif t:
+                        err(i + 1, "usage notes must be '- ' bullet lines")
+                    i += 1
+                continue
             if title in _TITLE_TO_SECTION:
                 section = _TITLE_TO_SECTION[title]
                 if section in seen_sections:
@@ -299,7 +322,7 @@ def parse_markdown(text: str) -> _Doc:
             mm = ITEM_RE.match(s)
             if not mm or section not in SECTIONS:
                 err(i + 1, "item heading must look like ### `id` — label, inside "
-                           "Metrics/Filters/Queries/Lookups")
+                           "Measures/Metrics/Filters/Queries/Lookups")
                 i += 1
                 continue
             item = {"id": mm.group(1), "label": (mm.group(2) or "").strip() or None,
@@ -326,6 +349,16 @@ def parse_markdown(text: str) -> _Doc:
                 item["columns"] = [_uncode(c) for c in val.split(",") if c.strip()]
             elif key == "Class":
                 item["class_label"], item["class_iri"] = _parse_class(val)
+            elif key == "Measure" and section == "measures":
+                try:
+                    m = json.loads(_uncode(val))
+                except json.JSONDecodeError as exc:
+                    err(i, f"measure definition is not valid JSON: {exc.msg}")
+                    m = None
+                if m is not None and not isinstance(m, dict):
+                    err(i, "measure definition must be a JSON object")
+                    m = None
+                item["measure"] = m
             elif key == "Other table" and section == "lookups":
                 item["other_table"] = _uncode(val) or None
             elif key == "Join" and section == "lookups":
@@ -439,5 +472,8 @@ def apply_markdown(meta: dict, text: str) -> dict:
             col[k] = new.get(k) or None
         col["description"] = new.get("description") or ""
     for sec in SECTIONS:
-        out[sec] = doc.sections.get(sec, [])
+        if sec in doc.sections or sec in out:
+            out[sec] = doc.sections.get(sec, [])
+    if doc.usage_notes is not None:
+        out["usage_notes"] = doc.usage_notes
     return out

@@ -64,7 +64,9 @@ async def prepare(table: str, *, query_id: str | None = None, spec: dict | None 
         built = compile_item(meta, section, item, types)
         declared = item.get("params") if isinstance(item.get("query"), dict) else built.params
         return QueryRun(table=table, query_id=query_id, built=built, declared=declared or [])
-    built = build_sql(spec, table, types)
+    from backend.app.services.structured.metadata import time_columns
+
+    built = build_sql(spec, table, types, time_columns={table: time_columns(meta)})
     return QueryRun(table=table, query_id=None, built=built, declared=built.params)
 
 
