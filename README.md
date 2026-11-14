@@ -1117,7 +1117,8 @@ uv run python -m backend.app.cli table-query prices --query-id latest_price_for_
 
 Models: `table_profile` / `table_lookups` use gpt-4.1 (claude-sonnet-4-6 in
 Anthropic mode, the dedicated Qwen 27B in DeepInfra mode); `table_query_select`
-uses each mode's retrieval model. Code: `backend/app/services/structured/`.
+uses gpt-4.1 in the OpenAI presets (claude-haiku-4-5 in Anthropic mode,
+DeepSeek-V4.1-Flash in DeepInfra mode). Code: `backend/app/services/structured/`.
 
 #### Supplementary sources
 
