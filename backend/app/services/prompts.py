@@ -2616,7 +2616,6 @@ def _format_evidence_block(evidence_items: list[dict], char_cap: int = 600) -> s
         # prompt is byte-identical to before.
         lines.append(_SQL_RESULT_NOTE)
     for it in evidence_items:
-        kind = it.get("kind", "evidence")
         text = (it.get("text") or "").strip().replace("\n", " ")
         # SQL results carry their own (larger) cap: they are already bounded
         # by the row cap, and clipping a result mid-row loses values.
@@ -4296,6 +4295,9 @@ def table_query_select(question: str, catalogs: list[dict[str, Any]],
                        failures: list[dict[str, Any]] | None = None, *,
                        max_calls: int = 4) -> tuple[str, str]:
     """Decide whether a question needs table data and which stored query to run."""
+    from datetime import date
+
+    today = date.today().isoformat()
     system = (
         "You answer questions from database tables, but you may ONLY read them through "
         "stored queries. You get the question and, for each candidate table, its "
@@ -4331,6 +4333,14 @@ def table_query_select(question: str, catalogs: list[dict[str, Any]],
         "item and period -- marked \"listing\": true; never one call per item. Select only "
         "the columns the answer needs and fix each qualifier to one value, so the rows "
         "stay short. A listing returns up to a few thousand rows.\n"
+        "   CATEGORY QUESTIONS: a question about a kind of thing in general (a measure "
+        "across all the entities or items of a table) that names no specific "
+        "items covers EVERY item the table holds -- answer it with one listing query over "
+        "all items, never with a sample of items you choose.\n"
+        "   RELATIVE PERIODS ('past N years', 'recent', 'latest', 'this year') count back "
+        "from the LATEST period the table holds (see the period column's range), not from "
+        "your own knowledge of the date; complete periods first (a partial current year "
+        f"only when the question asks for it). Today is {today}.\n"
         "3. ONLY when no catalog query can answer a part, give a new \"query\" spec for it "
         "(same JSON shape as the catalog's, rules below), and say in why_not_catalog which "
         "catalog ids you considered and why each cannot answer it (a catalog query with "
