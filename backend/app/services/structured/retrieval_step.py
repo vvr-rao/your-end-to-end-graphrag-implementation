@@ -448,18 +448,25 @@ def _listing_text(head: str, res: SqlResult, char_cap: int, summary: str = "") -
     return head + f"LISTING, {note}. Rows: " + " ;; ".join(lines)
 
 
-def _evidence_text(rec: dict, res: SqlResult, meta: dict, char_cap: int) -> str:
+def _listing_stats(rec: dict, res: SqlResult, meta: dict) -> dict | None:
+    if not rec.get("listing"):
+        return None
+    from backend.app.services.structured.listing_stats import change_stats, roles_for
+
+    period_col, value_col = roles_for(meta or {}, rec.get("query_id"), res.columns)
+    return change_stats(res.columns, res.rows, period_col, value_col) if period_col else None
+
+
+def _evidence_text(rec: dict, res: SqlResult, meta: dict, char_cap: int, stats: dict | None = None) -> str:
     head = (f"SQL result from table {rec['table']}"
             + (f" ({rec['label']})" if rec.get("label") else "")
             + (f" [{(meta.get('source') or {}).get('rel_path')}]" if meta else "") + ". ")
     if rec.get("params"):
         head += "Parameters: " + ", ".join(f"{k}={v}" for k, v in rec["params"].items()) + ". "
     if rec.get("listing"):
-        from backend.app.services.structured.listing_stats import change_stats, roles_for, stats_text
+        from backend.app.services.structured.listing_stats import stats_text
 
-        period_col, value_col = roles_for(meta or {}, rec.get("query_id"), res.columns)
-        st = change_stats(res.columns, res.rows, period_col, value_col) if period_col else None
-        return _listing_text(head, res, char_cap, stats_text(st) if st else "")
+        return _listing_text(head, res, char_cap, stats_text(stats) if stats else "")
     cols = res.columns
     body = []
     used = len(head)
@@ -620,12 +627,14 @@ async def structured_evidence(
         digest = hashlib.sha256(json.dumps([res.sql, res.params], sort_keys=True,
                                            default=str).encode()).hexdigest()[:8]
         frag = f"SqlResult_{rec['table']}_{rec.get('query_id') or 'q'}_{digest}"
+        stats = _listing_stats(rec, res, meta)
         evidence.append({
             "kind": "sql_result",
             "node_id": node,
             "iri": f"{VIAO_NS}#{re.sub(r'[^A-Za-z0-9_]', '_', frag)}",
             "rank": i, "score": 1.0,
-            "text": _evidence_text(rec, res, meta, listing_char_cap if rec.get("listing") else char_cap),
+            "text": _evidence_text(rec, res, meta, listing_char_cap if rec.get("listing") else char_cap, stats),
+            "change_stats": stats,
             "char_cap": listing_char_cap if rec.get("listing") else char_cap,
             "listing": bool(rec.get("listing")),
             "document_title": f"table {rec['table']}",

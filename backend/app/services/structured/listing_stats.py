@@ -139,4 +139,17 @@ def stats_text(st: dict) -> str:
     return head + " Per item: " + " ;; ".join(lines)
 
 
-__all__ = ["change_stats", "roles_for", "stats_text"]
+def stats_table(st: dict, cite: str = "") -> str:
+    """The per-item table appended to a listing answer (markdown), exact."""
+    head = (f"| {' / '.join(st['group_columns']) or 'item'} | {st['periods'][0]}..{st['periods'][1]}: first "
+            f"| last | change % |")
+    lines = [f"All items ({len(st['items'])}, {st['value_column']} by {st['period_column']})"
+             + (f" {cite}" if cite else "") + ":", "", head, "|---|---|---|---|"]
+    for it in sorted(st["items"], key=lambda it: (it["pct"] is None, -(it["pct"] or 0))):
+        pct = "n/a" if it["pct"] is None else f"{it['pct']:+.1f}%"
+        lines.append(f"| {it['item']} | {it['first_period']}: {_fmt(it['first'])} "
+                     f"| {it['last_period']}: {_fmt(it['last'])} | {pct} |")
+    return "\n".join(lines)
+
+
+__all__ = ["change_stats", "roles_for", "stats_table", "stats_text"]

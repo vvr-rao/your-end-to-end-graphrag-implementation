@@ -41,3 +41,18 @@ def test_listing_evidence_switches_answer_prompts():
     assert "ALL ITEMS" in system and "CHANGE SUMMARY" in system
     assert "TABLE LISTINGS" in PROMPTS["answer_deep_research"]("q", ev)[0]
     assert "TABLE LISTINGS" not in PROMPTS["answer_deep_research"]("q", [])[0]   # unchanged otherwise
+
+
+def test_appended_table_is_exact_and_prompt_defers_to_it():
+    from backend.app.services.structured.listing_stats import stats_table
+
+    st = change_stats(COLS, ROWS, "period", "value")
+    t = stats_table(st, "[viao:SqlResult_x]")
+    lines = t.splitlines()
+    assert lines[0].startswith("All items (4,") and "[viao:SqlResult_x]" in lines[0]
+    assert lines[4] == "| A / u1 | 2023: 100.0 | 2025: 120.0 | +20.0% |"      # largest rise first
+    assert lines[-1].startswith("| D / u1 |") and lines[-1].endswith("n/a |")
+    ev = [{"kind": "sql_result", "listing": True, "iri": "x", "text": "t", "change_stats": st}]
+    assert "Do NOT write a per-item table" in PROMPTS["answer_listing_analysis"]("q", ev)[0]
+    ev[0]["change_stats"] = None
+    assert "ALL ITEMS" in PROMPTS["answer_listing_analysis"]("q", ev)[0]

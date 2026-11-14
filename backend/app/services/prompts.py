@@ -2864,21 +2864,37 @@ def answer_listing_analysis(
 ) -> tuple[str, str]:
     """simple_qa when the evidence holds a LISTING result: an analysis-style
     answer over every item instead of the 1-3 sentence reply (which can only
-    name a few examples). Domain-neutral; shaped by what the question asks."""
+    name a few examples). Domain-neutral; shaped by what the question asks.
+    When a listing carries change statistics, the caller appends their exact
+    per-item table to the answer, so the model writes only the analysis."""
+    appended = any(ev.get("change_stats") for ev in evidence if ev.get("listing"))
     system = (
         "You answer the user's question using ONLY the evidence below. The evidence "
         "includes a LISTING -- a data-table result covering many items -- so the "
         "answer is an analysis of the whole listing, shaped by the question:\n"
-        "  - A question that asks to LIST or SHOW values: give the full list as a "
-        "table, with one short line on what it holds (how many items and periods).\n"
+        + (
+            "  - A question that asks to LIST or SHOW values: one short line on what the "
+            "listing holds (how many items and periods); the table below gives every "
+            "item's first and last value -- add a table of your own only for values it "
+            "does not show (periods in between).\n"
+            if appended else
+            "  - A question that asks to LIST or SHOW values: give the full list as a "
+            "table, with one short line on what it holds (how many items and periods).\n"
+        ) +
         "  - A question about CHANGE, TREND, COMPARISON or RANKING:\n"
         "      1. ANSWER: 2-4 sentences with the overall picture -- how many items "
         "rose and fell, the median change, the period span.\n"
         "      2. NOTABLE MOVES: the largest rises and falls with their numbers, and "
         "any groups of related items that moved together (group by what the item "
         "names show; do not invent categories the data does not support).\n"
-        "      3. ALL ITEMS: a table of every item -- item, first value, last value, "
-        "change % -- from the CHANGE SUMMARY.\n"
+        + (
+            "      3. Do NOT write a per-item table: the complete table of every item from "
+            "the CHANGE SUMMARY is appended to your answer automatically (refer to it as "
+            "'the table below').\n"
+            if appended else
+            "      3. ALL ITEMS: a table of every item -- item, first value, last value, "
+            "change.\n"
+        ) +
         "      4. NOTES: units/bases, items with missing or shorter periods, and "
         "anything the data cannot tell (e.g. causes, unless the evidence states them).\n"
         "  - Any other question: answer it directly first, then support it from the "

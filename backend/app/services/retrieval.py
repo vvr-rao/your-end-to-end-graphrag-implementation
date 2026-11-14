@@ -452,6 +452,7 @@ async def retrieve_and_answer(
     use_structured_data: bool | None = None,
     _round_depth: int = 0,
     _carry_sql_evidence: list[dict[str, Any]] | None = None,
+    _table_question: str | None = None,
 ) -> RetrievalResult:
     """Driver. `resolved_query` skips the follow-up resolution step
     (the caller -- typically Milestone G -- already resolved it).
@@ -521,6 +522,9 @@ async def retrieve_and_answer(
                 max_probes=max_probes, rerank=rerank, concepts=concepts, verbose=verbose,
                 multi_round=False, persist=persist,
                 use_structured_data=use_structured_data, _round_depth=1,
+                # tables answer the USER's question: the bridge/final rewrites
+                # steer document retrieval and can narrow it ("the major ...")
+                _table_question=resolved_query,
             )
             # Round 2 (final): enrich the question with round-1 findings so the
             # pipeline seeds on the discovered entities AND the synthesis uses them.
@@ -547,6 +551,7 @@ async def retrieve_and_answer(
                 # rows are not re-retrieved by text search, so hand them over
                 # or the final synthesis cannot cite them.
                 _carry_sql_evidence=[ev for ev in r1.evidence if ev.get("kind") == "sql_result"],
+                _table_question=resolved_query,
             )
             # Merge: r2 is the final answer; fold in round-1 evidence + all cost.
             # artifact_only only ever surfaces artifact evidence, so skip folding
@@ -1762,12 +1767,16 @@ async def retrieve_and_answer(
     # every other run is unchanged.
     _use_sd = (use_structured_data if use_structured_data is not None
                else _qa_flag("use_structured_data", False))
-    if _use_sd and mode in ("simple_qa", "deep_research"):
+    # Round 2 of deep_research already holds round 1's results for the same
+    # (user's) question: selecting again would only repeat them.
+    if _use_sd and _carry_sql_evidence and _table_question:
+        parsed["structured_data"] = {"reused_from_round1": len(_carry_sql_evidence)}
+    elif _use_sd and mode in ("simple_qa", "deep_research"):
         from backend.app.services.structured.retrieval_step import structured_evidence
 
         try:
             _sd_ev, _sd_plan = await structured_evidence(
-                resolved_query, router=router,
+                _table_question or resolved_query, router=router,
                 entity_ids=list(expanded_entity_ids),
                 class_ids=[c["id"] for c in matched_classes if c.get("id")],
                 qvec=qvec,
@@ -1841,6 +1850,17 @@ async def retrieve_and_answer(
             answer = out.text.strip()
         except Exception as exc:
             answer = f"(answer generation failed: {exc})"
+
+    # A listing answer's per-item table is appended exactly from the computed
+    # statistics (the model writes the analysis; copying dozens of rows is
+    # where it abbreviates or slips).
+    if answer and _listing and answer_prompt_fn is PROMPTS.get("answer_listing_analysis"):
+        from backend.app.services.structured.listing_stats import stats_table
+
+        for _ev in evidence:
+            if _ev.get("listing") and _ev.get("change_stats"):
+                _frag = str(_ev.get("iri") or "").rsplit("#", 1)[-1]
+                answer += "\n\n" + stats_table(_ev["change_stats"], f"[viao:{_frag}]" if _frag else "")
 
     # Every cited id must resolve to something we actually retrieved.
     answer, invalid_citations = _validate_citations(answer, evidence)
