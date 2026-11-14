@@ -87,6 +87,12 @@ source_documents/*
 !source_documents/financial_report_download.py
 !source_documents/salvage_mangled_pdfs.py
 !source_documents/structured_download.py
+!source_documents/hf_dataset.py
+!source_documents/supplementary_download.py
+!source_documents/build_crosswalk.py
+!source_documents/crosswalks/
+source_documents/crosswalks/*
+!source_documents/crosswalks/*.json
 # structured/ package: only code + README are tracked. Anything else written
 # inside it (e.g. downloads via -o source_documents/structured/...) stays ignored.
 !source_documents/structured/
@@ -132,3 +138,6 @@ docs/
 
 # Benchmark runs (scripts/bench/): per-arm logs, caches, cost dumps, reports
 benchmarks/
+
+# hf_dataset.py pull: temporary download folder (removed after each pull)
+.hf_staging/

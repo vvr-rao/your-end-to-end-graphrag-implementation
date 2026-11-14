@@ -45,5 +45,30 @@ uv run python source_documents/structured_download.py clinicaltrials api \
   --condition obesity --limit 3 --format csv
 ```
 
+`supplementary_download.py` adds World Bank commodity prices, IEA EV data (via
+Our World in Data), USGS mineral statistics, Medicare Part D spending, RxNorm and
+FAERS reaction counts in the same snapshot layout:
+
+```bash
+uv run --extra structured python source_documents/supplementary_download.py worldbank-pinksheet -o source_documents/my-bundle/worldbank
+uv run python source_documents/supplementary_download.py cms-partd --drugs semaglutide --dry-run
+```
+
+`build_crosswalk.py <spec.json>` links a corpus's companies / drugs to their
+identifiers and to the structured snapshots (specs in `crosswalks/`).
+
+## Save to / load from Hugging Face (optional)
+
+`hf_dataset.py` pushes chosen corpora, structured downloads and evaluation sets to a
+**private** Hugging Face dataset repo (`HF_TOKEN` in `.env`, `uv sync --extra hf`),
+and pulls them back to the same paths. See the README section "Saving datasets to
+Hugging Face".
+
+```bash
+uv run python source_documents/hf_dataset.py push --repo yegi-pharma \
+  --corpus source_documents/pharma-12-audit --eval eval_questions/testsets --dry-run
+uv run python source_documents/hf_dataset.py pull --repo <user>/yegi-pharma
+```
+
 Other useful sources of information
 - HKEX for Hong Kong listed securities. No API Available that I know of but you can go to their site and do a keyword search (e.g. "Annual Report") - https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&lang=EN&market=SEHK&stockId=130186
