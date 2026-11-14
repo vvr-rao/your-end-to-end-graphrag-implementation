@@ -262,6 +262,50 @@ async def missing_values(checks: list[dict]) -> list[dict]:
     return out
 
 
+async def combination_hints(checks: list[dict]) -> list[dict]:
+    """For an EMPTY result whose values all exist on their own: which
+    combinations of the other compared columns actually occur with each value
+    ('Iron ore, cfr spot' exists, '($/mt)' exists, but not together). Read-only."""
+    by_table: dict[str, list[dict]] = {}
+    for c in checks:
+        by_table.setdefault(c["table"], []).append(c)
+    if not any(len({c["column"] for c in cs}) > 1 for cs in by_table.values()):
+        return []
+    from backend.app.db.engine import get_sessionmaker
+    from backend.app.services.structured.db_load import q
+
+    out = []
+    async with get_sessionmaker()() as s:
+        try:
+            await s.execute(sql_text("SET TRANSACTION READ ONLY"))
+            await s.execute(sql_text("SET LOCAL statement_timeout = 3000"))
+            for table, cs in by_table.items():
+                cols = list(dict.fromkeys(c["column"] for c in cs))
+                if len(cols) < 2:
+                    continue
+                # Anchor on the most selective value (fewest combinations):
+                # 'Iron ore, cfr spot' says something, 'nominal_usd' does not.
+                best = None
+                for anchor in cs[:4]:
+                    others = [c for c in cols if c != anchor["column"]]
+                    rows = (await s.execute(sql_text(
+                        f"SELECT DISTINCT {', '.join(q(c) for c in others)} FROM graphrag.{q(table)} "
+                        f"WHERE {q(anchor['column'])} = :v LIMIT {MAX_SUGGESTIONS + 1}"),
+                        {"v": anchor["value"]})).all()
+                    if rows and (best is None or len(rows) < len(best[2])):
+                        best = (anchor, others, rows)
+                if best is not None:
+                    anchor, others, rows = best
+                    out.append({"table": table, "where": {anchor["column"]: anchor["value"]},
+                                "existing_combinations": [dict(zip(others, map(str, r), strict=True))
+                                                          for r in rows[:MAX_SUGGESTIONS]]})
+        except Exception as exc:  # hints are best effort
+            out.append({"error": f"combination check failed: {str(exc).splitlines()[0][:200]}"})
+        finally:
+            await s.rollback()
+    return out
+
+
 def _evidence_text(rec: dict, res: SqlResult, meta: dict, char_cap: int) -> str:
     head = (f"SQL result from table {rec['table']}"
             + (f" ({rec['label']})" if rec.get("label") else "")
@@ -327,8 +371,13 @@ async def structured_evidence(
     async def _value_failures(rec: dict, res: SqlResult | None) -> list[dict]:
         if res is None or res.error:
             return []
-        return [m for m in await missing_values(compared_values(res.sql, res.params, col_types, id_cols))
-                if "value" in m]
+        checks = compared_values(res.sql, res.params, col_types, id_cols)
+        missing = [m for m in await missing_values(checks) if "value" in m]
+        if not missing and res.row_count == 0:
+            combos = [h for h in await combination_hints(checks) if "where" in h]
+            if combos:
+                rec["value_combinations"] = combos
+        return missing
 
     system, user = PROMPTS["table_query_select"](question, catalogs)
     out = await router.chat("table_query_select", system=system, user=user)
@@ -351,7 +400,9 @@ async def structured_evidence(
         if err or missing:
             failures.append({"call": call, "sql": rec.get("sql"),
                              "error": err or "value(s) not found in their column (see missing_values)",
-                             **({"missing_values": missing} if missing else {})})
+                             **({"missing_values": missing} if missing else {}),
+                             **({"value_combinations": rec["value_combinations"]}
+                                if rec.get("value_combinations") else {})})
         if not err and res is not None:
             # A partial hit (one IN value matched, another did not) is still
             # evidence; the retry may add the missing part.

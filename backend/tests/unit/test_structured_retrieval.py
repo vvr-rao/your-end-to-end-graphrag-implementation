@@ -251,3 +251,25 @@ async def test_identical_retry_result_is_deduplicated(patched):
     ev, _ = await _go(router)
     assert [e["params"] for e in ev] == [{"c": "Copper"}, {"c": "zinc"}]
     assert [e["rank"] for e in ev] == [1, 2]
+
+
+async def test_empty_result_retry_gets_existing_combinations(patched, monkeypatch):
+    _, results = patched
+    results.append(SqlResult(sql="", columns=["avg_value"]))       # empty, values all exist
+
+    async def no_missing(checks):
+        return []
+
+    async def combos(checks):
+        return [{"table": "prices", "where": {"commodity": "Iron ore, cfr spot"},
+                 "existing_combinations": [{"unit": "($/dmtu)"}]}]
+
+    monkeypatch.setattr(rs, "missing_values", no_missing)
+    monkeypatch.setattr(rs, "combination_hints", combos)
+    router = FakeRouter({"table_query_select": [
+        {"needed": True, "calls": [{"table": "prices", "query_id": "avg_price", "params": {"c": "x"}}]},
+        {"needed": False},
+    ]})
+    _, plan = await _go(router)
+    assert plan["retried"] and "($/dmtu)" in router.calls[1][1]
+    assert plan["calls"][0]["value_combinations"][0]["where"] == {"commodity": "Iron ore, cfr spot"}

@@ -4083,6 +4083,9 @@ _TABLE_SQL_RULES = (
     "- Text columns hold the values exactly as shown in the profile (keep leading zeros). "
     "A numeric value stored in a text column must be cast before arithmetic.\n"
     + _QUALIFIER_RULE +
+    "- Results are capped at a few dozen rows. A time series or 'latest rows' query must "
+    "take a period range as params (:start_period, :end_period) or ORDER BY the time "
+    "column DESC (newest first) -- never oldest first over the whole history.\n"
     "- Aggregates must GROUP BY every non-aggregated column. Order results sensibly "
     "(time ascending, largest values first for rankings). Do NOT add LIMIT unless the "
     "query is a top-N ranking (then use a :n param cast to integer).\n"
@@ -4132,7 +4135,12 @@ def table_profile(profile_md: str, candidate_classes: list[dict[str, str]]) -> t
         "iri null, label a new UpperCamelCase class name, and parent_label the most "
         "specific candidate label it is a kind of, or one of Metric, Measure, Dimension, "
         "TimePeriod (numbers you aggregate -> Metric; categories -> Dimension; dates/"
-        "periods -> TimePeriod). Use concept null when nothing general applies.\n\n"
+        "periods -> TimePeriod). Use concept null when nothing general applies.\n"
+        "Never invent a NEW class for an identifier or code column (ids, registration or "
+        "reference numbers, codes, tickers, LEIs, internal flags/status codes): use the "
+        "candidate class of the thing it identifies (e.g. LegalEntity) or concept null. "
+        "A metric's concept is the quantity it measures (CommodityPrice, Revenue), never "
+        "the aggregation (no TotalPrice, AveragePrice, RowCount, NumberOfFacts).\n\n"
         + _TABLE_SQL_RULES +
         "\nReturn JSON only, no markdown fences."
     )

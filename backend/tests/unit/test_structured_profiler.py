@@ -182,7 +182,8 @@ async def test_classes_added_and_iris_written_back(folder, tmp_path):
     onto = {"classes_dict": {}, "object_properties_dict": {}, "data_properties_dict": {}, "instances_dict": {}}
     created = add_classes_to_ontology(run, onto, base_iri="https://ex.org/o#", default_parent_iri=None)
     labels = {e["labels"][0] for e in onto["classes_dict"].values()}
-    assert {"CommodityThing", "RowCount", "ValueThing"} <= labels and len(created) == len(labels)
+    assert {"CommodityThing", "ValueThing"} <= labels and len(created) == len(labels)
+    assert "RowCount" not in labels                    # aggregation, not a concept
     col = next(c for c in run.by_name()["prices"]["columns"] if c["name"] == "commodity")
     assert col["class_iri"] and col["class_iri"] in onto["classes_dict"]
 
@@ -214,3 +215,13 @@ def test_check_folder_rejects_empty(tmp_path):
 
     with pytest.raises(SystemExit, match="no CSV"):
         check_folder(tmp_path, None)
+
+
+def test_no_new_class_for_identifier_columns_or_aggregation_labels():
+    from backend.app.services.structured.profiler import new_class_blocked
+
+    assert new_class_blocked({"role": "identifier"}, "RegistrationNumber")
+    for bad in ("TotalPrice", "AveragePrice", "FactCount", "RowCount", "NumberOfFacts", "MaxValue"):
+        assert new_class_blocked({"role": "measure"}, bad), bad
+    for ok in ("CommodityPrice", "Country", "CountryCode", "Revenue", "Jurisdiction", "TotalityIndex"):
+        assert not new_class_blocked({"role": "dimension"}, ok), ok

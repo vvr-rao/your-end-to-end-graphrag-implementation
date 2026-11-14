@@ -298,7 +298,7 @@ def _apply_concepts(meta: dict, index: ClassIndex) -> None:
         if iri:
             owner["class_iri"], owner["class_label"] = iri, index.by_iri[iri]
             found.append({"IRI": iri, "TEXT_SNIPPET": f"{meta['table_name']}: {desc}"[:300]})
-        elif label and not _looks_bad_label(label):
+        elif label and not _looks_bad_label(label) and not new_class_blocked(owner, label):
             owner["class_iri"], owner["class_label"] = None, label
             not_found.append({"LABEL": label, "DESCRIPTION": desc[:500],
                               "PARENT_LABEL": c.get("parent_label") or "Metric"})
@@ -311,6 +311,21 @@ def _apply_concepts(meta: dict, index: ClassIndex) -> None:
     for it in meta["queries"]:
         it.pop("_concept", None)
     meta["ontology"] = {"MATCHES FOUND": found, "MATCH NOT FOUND": not_found}
+
+
+_AGGREGATION_LABEL = re.compile(
+    r"^(Total|Average|Avg|Mean|Median|Sum|Count|NumberOf|Num|Max|Maximum|Min|Minimum)(?=[A-Z])"
+    r"|(Count|Total|Sum|Average)$")
+
+
+def new_class_blocked(owner: dict, label: str) -> bool:
+    """No NEW ontology class for an identifier/code column (a registration
+    number or an LEI is a key, not a concept -- it may still MATCH an existing
+    class such as LegalEntity), nor one named after an aggregation
+    (TotalPrice, FactCount): the concept is the quantity, not the SUM of it."""
+    if owner.get("role") == "identifier":
+        return True
+    return bool(_AGGREGATION_LABEL.search(re.sub(r"[^A-Za-z0-9]", "", label)))
 
 
 def _looks_bad_label(label: str) -> bool:
