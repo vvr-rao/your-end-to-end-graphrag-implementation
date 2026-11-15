@@ -432,6 +432,51 @@ def _validate_citations(
     return cleaned, invalid
 
 
+def task_usage(router) -> dict[str, dict[str, float]]:
+    """Per-task LLM usage of one question: {task: {cost_usd, seconds, calls,
+    in_tokens, out_tokens}} (measurement only)."""
+    out = {}
+    try:
+        for t, n in router.calls_by_task.items():
+            out[t] = {"cost_usd": round(router.cost_by_task.get(t, 0.0), 6),
+                      "seconds": round(router._seconds_by_task.get(t, 0.0), 2),
+                      "calls": n,
+                      "in_tokens": router._in_tokens_by_task.get(t, 0),
+                      "out_tokens": sum(router._out_tokens_by_task.get(t, []))}
+    except AttributeError:   # a router without usage counters (tests)
+        return {}
+    return out
+
+
+def merge_task_usage(*usages: dict[str, dict[str, float]] | None) -> dict[str, dict[str, float]]:
+    out: dict[str, dict[str, float]] = {}
+    for u in usages:
+        for t, row in (u or {}).items():
+            acc = out.setdefault(t, {k: 0 for k in row})
+            for k, v in row.items():
+                acc[k] = round(acc.get(k, 0) + v, 6)
+    return out
+
+
+def structured_doc_context(evidence: list[dict[str, Any]], *, items: int = 6,
+                           chars: int = 4000) -> list[dict[str, Any]]:
+    """The best-ranked text evidence (chunks and graph relationships), as the
+    table-selection step sees it: facts there may fill a query parameter (the
+    city a company is based in, the drug a trial tested). ``items`` 0 = off."""
+    if items <= 0:
+        return []
+    out = []
+    for ev in sorted((e for e in evidence if e.get("kind") in {"chunk", "relationship"}),
+                     key=lambda e: e.get("rank") or 0):
+        text = " ".join(str(ev.get("text") or "").split())
+        if not text:
+            continue
+        out.append({"id": ev.get("iri"), "text": text[:chars]})
+        if len(out) >= items:
+            break
+    return out
+
+
 async def retrieve_and_answer(
     question: str,
     *,
@@ -566,6 +611,10 @@ async def retrieve_and_answer(
                     r2.evidence.append(ev)
             planning_cost = router.total_cost_usd - cost_before
             r2.cost_usd += r1.cost_usd + planning_cost
+            r2.parsed["usage_by_task"] = merge_task_usage(
+                r1.parsed.get("usage_by_task"), r2.parsed.get("usage_by_task"), task_usage(router))
+            r2.parsed["structured_seconds"] = round(
+                (r1.parsed.get("structured_seconds") or 0) + (r2.parsed.get("structured_seconds") or 0), 2)
             r2.resolved_query = resolved_query  # report the user's original query
             r2.parsed["rounds"] = {
                 "round1_question": plan["round1_question"],
@@ -1774,6 +1823,7 @@ async def retrieve_and_answer(
     elif _use_sd and mode in ("simple_qa", "deep_research"):
         from backend.app.services.structured.retrieval_step import structured_evidence
 
+        _sd_t0 = time.time()
         try:
             _sd_ev, _sd_plan = await structured_evidence(
                 _tq, router=router,
@@ -1789,6 +1839,9 @@ async def retrieve_and_answer(
                 time_ids=list(expanded_time_ids) if seed_time_ids else [],
                 listing_max_rows=int(_qa_cfg("structured_listing_max_rows", 2000)),
                 listing_char_cap=int(_qa_cfg("structured_listing_char_cap", 60000)),
+                doc_context=structured_doc_context(
+                    evidence, items=int(_qa_cfg("structured_doc_context_items", 6)),
+                    chars=int(_qa_cfg("structured_doc_context_chars", 4000))),
             )
         except Exception as exc:  # never lose the text answer to a table problem
             log.warning("structured-data step failed: %s", exc)
@@ -1798,6 +1851,7 @@ async def retrieve_and_answer(
         # Ahead of the text evidence: exact figures first.
         evidence[:0] = _sd_ev
         parsed["structured_data"] = _sd_plan
+        parsed["structured_seconds"] = round(time.time() - _sd_t0, 2)
     if _carry_sql_evidence:
         _have = {ev.get("iri") for ev in evidence}
         evidence[:0] = [ev for ev in _carry_sql_evidence if ev.get("iri") not in _have]
@@ -1884,6 +1938,7 @@ async def retrieve_and_answer(
         )
 
     cost = router.total_cost_usd - cost_before
+    parsed["usage_by_task"] = task_usage(router)
     result = RetrievalResult(
         answer=answer,
         mode=mode,

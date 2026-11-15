@@ -278,7 +278,8 @@ async def test_load_stores_valid_values_and_retrieval_checks_them(db, data, tmp_
         {"needed": False}]})
     ev, plan = await structured_evidence("copper?", router=router, entity_ids=await ids(),
                                          class_ids=[], qvec=None)
-    assert len(ev) == 1 and ev[0]["params"] == {"v": "Copper"}
+    assert len(ev) == 2 and ev[0]["params"] == {"v": "Copper"}
+    assert ev[1]["query_id"] == "value_check" and "'Gold' is not one of the values" in ev[1]["text"]
     assert plan["calls"][0]["substituted"] == [{"param": "v", "from": "COPPER", "to": "Copper"}]
     bad = plan["calls"][1]
     assert bad["invalid_values"][0]["allowed_values"] == ["Copper", "Crude oil"] and "sql" not in bad

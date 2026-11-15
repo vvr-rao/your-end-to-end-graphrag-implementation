@@ -80,9 +80,20 @@ def trace_from_result(question: str, result: Any) -> dict[str, Any]:
             "run_id": str(result.retrieval_run_id) if result.retrieval_run_id else None,
             "evidence_chunk_ids": [str(ev["node_id"]) for ev in chunks],
             **({"structured_calls": [
-                {k: c.get(k) for k in ("table", "query_id", "params", "listing", "row_count", "error")}
+                {k: c.get(k) for k in ("table", "query_id", "params", "listing", "row_count", "error",
+                                       "retry", "unranked_rows", "unsupported_identifiers", "from_calls")
+                 if k in ("table", "query_id", "params", "listing", "row_count", "error") or c.get(k)}
                 for c in (result.parsed.get("structured_data") or {}).get("calls") or []]}
                if (result.parsed.get("structured_data") or {}).get("calls") else {}),
+            # measurement: what this question cost and how long it took
+            "seconds": round(float(getattr(result, "wall_seconds", 0.0) or 0.0), 2),
+            "cost_usd": round(float(getattr(result, "cost_usd", 0.0) or 0.0), 6),
+            **({"structured_seconds": result.parsed["structured_seconds"]}
+               if result.parsed.get("structured_seconds") is not None else {}),
+            **({"structured_needed": bool((result.parsed.get("structured_data") or {}).get("needed"))}
+               if result.parsed.get("structured_data") is not None else {}),
+            **({"usage_by_task": result.parsed["usage_by_task"]}
+               if result.parsed.get("usage_by_task") else {}),
             **(result.parsed.get("eval_trace") or {})}
 
 
@@ -274,6 +285,8 @@ def _row(t: dict[str, Any], tq: Any, kinds: dict, levels: dict, names: dict,
         "ranked_documents": ranked[:max(k, 20)],
         "evidence_chunk_ids": t.get("evidence_chunk_ids") or [],
         **({"structured_calls": t["structured_calls"]} if t.get("structured_calls") else {}),
+        **{k: t[k] for k in ("seconds", "cost_usd", "structured_seconds", "structured_needed",
+                             "usage_by_task") if k in t},
         "gold_documents": gold,
         "retrieval": retrieval_metrics(ranked, gold, k) if gold else None,
         "answers": (answer_metrics(

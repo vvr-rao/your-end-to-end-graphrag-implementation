@@ -100,9 +100,14 @@ def item_spec(section: str, item: dict) -> dict | None:
 
 
 def compile_item(meta: dict, section: str, item: dict,
-                 types_by_table: dict[str, dict[str, str]]) -> Built:
+                 types_by_table: dict[str, dict[str, str]], *,
+                 totals: dict[str, dict[str, str]] | None = None) -> Built:
     """Deterministic SQL for one item (raises QuerySpecError/SqlGuardError).
-    ``types_by_table``: table -> {column: type} for the item's table(s)."""
+    ``types_by_table``: table -> {column: type} for the item's table(s).
+    ``totals``: table -> {column: total value}; defaults to this table's own
+    (from its analysis)."""
+    from backend.app.services.structured.analysis import total_markers
+
     spec = item_spec(section, item)
     tables = item_tables(meta, section, item)
     if spec is None:  # legacy item: stored SQL
@@ -111,8 +116,10 @@ def compile_item(meta: dict, section: str, item: dict,
                                           for p in res.params], tables=res.tables)
     types = {t: types_by_table[t] for t in tables if t in types_by_table}
     types.setdefault(meta["table_name"], column_types(meta))
+    if totals is None:
+        totals = {meta["table_name"]: total_markers(meta)}
     built = build_sql(spec, meta["table_name"], types,
-                      time_columns={meta["table_name"]: time_columns(meta)})
+                      time_columns={meta["table_name"]: time_columns(meta)}, totals=totals)
     check_sql(built.sql, tables)      # defence in depth: the guard still applies
     return built
 
@@ -231,7 +238,8 @@ def metadata_text(meta: dict) -> str:
 
 
 def catalog_for_prompt(meta: dict, max_items: int = 40,
-                       ranking: dict[str, tuple[float, list[str]]] | None = None) -> dict:
+                       ranking: dict[str, tuple[float, list[str]]] | None = None,
+                       *, stable: bool = False) -> dict:
     """Compact view the retrieval model chooses queries from.
 
     Columns carry their VALID VALUES (every distinct value when there are few,
@@ -265,6 +273,13 @@ def catalog_for_prompt(meta: dict, max_items: int = 40,
         # most relevant first (graph tags matched by the question), so the
         # cap keeps them; ties keep the stored order (measures first)
         ordered.sort(key=lambda si: -(ranking.get(si[1]["id"]) or (0.0, []))[0])
+    if stable:
+        # Same text for every question (prompt-cache friendly): the ranking only
+        # decides which items survive the cap; order and content are the stored
+        # ones, and the per-question matches go in a separate block.
+        keep = {it["id"] for _s, it in ordered[:max_items]}
+        ordered = [si for si in items(meta) if si[1]["id"] in keep]
+        ranking = None
     for sec, it in ordered:
         if len(cat["queries"]) >= max_items:
             break

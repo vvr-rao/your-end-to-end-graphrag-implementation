@@ -665,6 +665,10 @@ qa:
   # written answer.
   structured_listing_max_rows: 2000
   structured_listing_char_cap: 60000
+  # Text evidence (best-ranked chunks/relationships) shown to the table-selection
+  # step so a value stated in a document can fill a query parameter. 0 = off.
+  structured_doc_context_items: 6
+  structured_doc_context_chars: 4000
   structured_listing_answer_max_tokens: 8192
   # For comparison/enumeration queries over multiple entities ("compare A vs its
   # competitors"), retrieval fans out ONE vector probe per matched entity so each

@@ -188,8 +188,38 @@ async def _create_and_fill(session: AsyncSession, src, meta: dict) -> int:
         idx = fit_identifier(f"{name}_{col}_idx")
         await session.execute(sql_text(
             f"CREATE INDEX IF NOT EXISTS {q(idx)} ON {SCHEMA}.{q(name)} ({q(col)})"))
+    await ensure_value_indexes(session, name, meta)
     await session.execute(sql_text(f"ANALYZE {SCHEMA}.{q(name)}"))
     return total
+
+
+MAX_VALUE_INDEXES = 12
+VALUE_INDEX_MAX_AVG_CHARS = 120
+
+
+async def ensure_value_indexes(session, name: str, meta: dict) -> list[str]:
+    """Trigram (pg_trgm GIN) index on each short text column, so a value the
+    question-time model supplies can be checked BEFORE its query runs: exact
+    match and closest existing values both use the index (~1-30 ms instead of
+    a scan of the whole table). Long prose columns (average > 120 chars) are
+    skipped. Idempotent; returns the columns indexed."""
+    done: list[str] = []
+    for c in meta.get("columns") or []:
+        if (c.get("type") or "text") != "text" or c.get("role") == "measure":
+            continue
+        col = c["name"]
+        avg = (await session.execute(sql_text(
+            f"SELECT AVG(octet_length({q(col)})) FROM {SCHEMA}.{q(name)}"))).scalar()
+        if avg is None or float(avg) > VALUE_INDEX_MAX_AVG_CHARS:
+            continue
+        idx = fit_identifier(f"{name}_{col}_trgm")
+        await session.execute(sql_text(
+            f"CREATE INDEX IF NOT EXISTS {q(idx)} ON {SCHEMA}.{q(name)} "
+            f"USING gin ({q(col)} gin_trgm_ops)"))
+        done.append(col)
+        if len(done) >= MAX_VALUE_INDEXES:
+            break
+    return done
 
 
 def _index_columns(meta: dict) -> list[str]:

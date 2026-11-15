@@ -2591,7 +2591,10 @@ _SQL_RESULT_NOTE = (
     "row the query returned (header first, rows separated by ';;'): when the "
     "question asks for a list, give the whole list faithfully, as a table when "
     "it is long, and state how many rows it has; if it says capped or 'more in "
-    "the returned data', say the list is partial.)"
+    "the returned data', say the list is partial. An item whose text starts with "
+    "'Value check' lists values the table does NOT hold (an exact lookup found no "
+    "row): say the data has no figures for them -- never that the table includes "
+    "them or that the figure exists but was not retrieved -- and cite that item.)"
 )
 
 
@@ -2600,7 +2603,11 @@ _TABLE_METADATA_NOTE = (
     "holds, its source, what one row means, and each column's meaning with counts, "
     "ranges and value lists MEASURED on the table -- exact, cite them like any other "
     "item. Use them for questions about the data itself (which tables exist, what they "
-    "contain, the columns, the periods covered, how many items).)"
+    "contain, the columns, the periods covered, how many items). A column's range is the "
+    "smallest and largest value over ALL rows of the table -- it is never the value of "
+    "one item, period or row. A value for a specific item (one product, company, country, "
+    "period...) may be stated only from a viao:SqlResult_ item that holds it; if no "
+    "result holds it, say the retrieved data does not show it.)"
 )
 
 
@@ -4400,7 +4407,9 @@ def table_refine(table: dict[str, Any]) -> tuple[str, str]:
 def table_query_select(question: str, catalogs: list[dict[str, Any]],
                        failures: list[dict[str, Any]] | None = None, *,
                        max_calls: int = 4,
-                       inventory: list[dict[str, Any]] | None = None) -> tuple[str, str]:
+                       inventory: list[dict[str, Any]] | None = None,
+                       doc_context: list[dict[str, Any]] | None = None,
+                       relevance: list[dict[str, Any]] | None = None) -> tuple[str, str]:
     """Decide whether a question needs table data and which stored query to run,
     or which tables' metadata describes them (questions about the tables)."""
     from datetime import date
@@ -4439,11 +4448,36 @@ def table_query_select(question: str, catalogs: list[dict[str, Any]],
         "period range to just the period(s) asked about. Follow the table's usage_notes "
         "and its structure (values_repeated_across lists columns that identify only the "
         "report a value came from: never aggregate across them or treat them as the "
-        "period). examples show how typical questions map to queries. Queries are "
-        "listed most relevant first: \"matched\" says which of the question's "
-        "concepts, entities/places or periods (reached through the knowledge graph) a "
-        "query is tagged with -- prefer those queries when they fit.\n"
+        "period). examples show how typical questions map to queries. RELEVANCE (after "
+        "the tables) lists the candidate tables most relevant first and, per table, the "
+        "queries whose tags match the question's concepts, entities/places or periods "
+        "(reached through the knowledge graph) -- prefer those queries when they fit.\n"
         f"   Use at most {max_calls} calls in total.\n"
+        "   IDENTIFIERS: never fill an identifier (an id, code or accession number) from "
+        "memory or by guessing which value belongs to an item. Use an identifier value only "
+        "when the question states it, an earlier call returns it, or the DOCUMENT EVIDENCE "
+        "states it. Otherwise filter by the item's name or description column (a name the "
+        "question uses), or chain calls.\n"
+        "   PARAMETER VALUES: a value must be the right KIND for its column (a place for a "
+        "place column, a company for a company column) -- never put a value of one kind into "
+        "a column of another. When the question refers to something indirectly (\"the city "
+        "where X is based\", \"the company that makes Y\"), take the value from the question, "
+        "an earlier call's result, or the DOCUMENT EVIDENCE, never from memory; if none of "
+        "them states it, leave that part out and say so in reason. Every value is checked "
+        "against its column before the query runs; a value that is not there is refused "
+        "with the closest values that are.\n"
+        "   CHAINED CALLS: when one part needs a value another call must find first (look an "
+        "item up by its name, then use its id or code in another query or table), give the "
+        "later call's param as {\"from_call\": <number of the earlier call in your calls "
+        "list, counting from 1>, \"column\": \"<column of that call's result>\"}. The program "
+        "fills it from that result: one run per returned value (at most 5); add "
+        "\"as_list\": true to pass all the values to one list (in) param.\n"
+        "   TOTAL ROWS: a table's structure may list total_rows (a column value whose rows "
+        "already hold the total of the other rows of their group). The program keeps them "
+        "from being counted twice: a query that does not use that column reads only the "
+        "total rows; a query that selects, groups, counts or orders by it reads only the "
+        "other rows (the parts). Leave an optional param on that column out to get the total; "
+        "fill it to get one part.\n"
         "   LISTS: a question that asks to list, show or compare MANY items (every item of "
         "a kind, all entities, a full table for some periods) is ONE call -- a query that "
         "filters only by what the items share (period, qualifiers) and returns one row per "
@@ -4467,21 +4501,37 @@ def table_query_select(question: str, catalogs: list[dict[str, Any]],
         + _QUERY_SPEC_RULES +
         "Return JSON only."
     )
+    # Layout for prompt caching: everything that is the same across questions
+    # (system, candidate tables, inventory, reply format) comes FIRST, the
+    # question-specific parts LAST. JSON is compact (no indentation).
+    def _j(x) -> str:
+        return json.dumps(x, ensure_ascii=False, separators=(",", ":"))
+
     fail_block = ""
     if failures:
         fail_block = ("\n\nPREVIOUS ATTEMPT FAILED (fix it: other param values -- take them "
-                      "from allowed_values / valid_combinations below --, another catalog "
-                      "query, or a new query spec):\n"
-                      + json.dumps(failures, ensure_ascii=False, indent=1))
+                      "from allowed_values / valid_combinations above --, another catalog "
+                      "query, a new query spec, or chained calls; an identifier listed in "
+                      "unsupported_identifiers must not be used again):\n" + _j(failures))
     inv_block = ("\n\nALL TABLES (every loaded table; describe any of them):\n"
-                 + json.dumps(inventory, ensure_ascii=False)) if inventory else ""
-    user = (f"QUESTION: {question}\n\nCANDIDATE TABLES:\n"
-            + json.dumps(catalogs, ensure_ascii=False, indent=1) + inv_block + fail_block + "\n\n"
+                 + _j(inventory)) if inventory else ""
+    doc_block = ""
+    if doc_context:
+        doc_block = ("\n\nDOCUMENT EVIDENCE (retrieved from the documents for this question; a "
+                     "value stated here may fill a parameter -- the table answers the question, "
+                     "these only supply values):\n"
+                     + "\n".join(f"[{d.get('id') or i + 1}] {d.get('text') or ''}"
+                                 for i, d in enumerate(doc_context)))
+    rel_block = ("\n\nRELEVANCE (candidate tables, most relevant first):\n" + _j(relevance)
+                 if relevance else "")
+    user = ("CANDIDATE TABLES:\n" + _j(catalogs) + inv_block + "\n\n"
             'Return JSON: {"needed": true|false, "reason": "...", "describe": ["<table>"], '
             '"calls": [{"table": "...", '
-            '"query_id": "<catalog id>", "params": {"name": value}, "listing": false} | '
+            '"query_id": "<catalog id>", "params": {"name": value | {"from_call": 1, "column": "..."}}, '
+            '"listing": false} | '
             '{"table": "...", "query": {QUERY SPEC}, "params": {"name": value}, "listing": false, '
-            '"purpose": "...", "why_not_catalog": "..."}]}')
+            '"purpose": "...", "why_not_catalog": "..."}]}'
+            + rel_block + doc_block + fail_block + f"\n\nQUESTION: {question}")
     return system, user
 
 PROMPTS = {

@@ -611,6 +611,10 @@ async def refine_registered(router, *, tables: list[str] | None = None, refresh:
             log(f"[structured] FAILED refining {name}: {type(exc).__name__}: {exc}")
             reports.append({"table": name, "error": str(exc)})
             continue
+        from backend.app.services.structured.db_load import ensure_value_indexes
+
+        async with session_scope() as s:                          # SQL only
+            rep["value_indexes"] = len(await ensure_value_indexes(s, name, meta))
         vec = (await embed([metadata_text(meta)]))[0] if embed is not None else None
         async with session_scope() as s:
             gv = await current_version(s)

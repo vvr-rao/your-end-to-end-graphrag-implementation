@@ -53,6 +53,9 @@ async def prepare(table: str, *, query_id: str | None = None, spec: dict | None 
         raise QueryRunError(f"table {table!r} is not loaded (loaded: {', '.join(sorted(reg)) or 'none'})")
     meta = reg[table]["meta"]
     types = {n: column_types(r["meta"]) for n, r in reg.items()}
+    from backend.app.services.structured.analysis import total_markers
+
+    totals = {n: total_markers(r["meta"]) for n, r in reg.items()}
     if (query_id is None) == (spec is None):
         raise QueryRunError("give exactly one of a stored query id or a query spec")
     if query_id is not None:
@@ -61,12 +64,12 @@ async def prepare(table: str, *, query_id: str | None = None, spec: dict | None 
             ids = ", ".join(it["id"] for _s, it in items(meta))
             raise QueryRunError(f"no stored query {query_id!r} in {table} (ids: {ids})")
         section, item = hit
-        built = compile_item(meta, section, item, types)
+        built = compile_item(meta, section, item, types, totals=totals)
         declared = item.get("params") if isinstance(item.get("query"), dict) else built.params
         return QueryRun(table=table, query_id=query_id, built=built, declared=declared or [])
     from backend.app.services.structured.metadata import time_columns
 
-    built = build_sql(spec, table, types, time_columns={table: time_columns(meta)})
+    built = build_sql(spec, table, types, time_columns={table: time_columns(meta)}, totals=totals)
     return QueryRun(table=table, query_id=None, built=built, declared=built.params)
 
 

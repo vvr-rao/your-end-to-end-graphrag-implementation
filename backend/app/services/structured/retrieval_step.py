@@ -16,6 +16,18 @@ Runs after the graph walk, before answer synthesis:
    returns nothing gets one retry call, which is told the error.
 4. Each result becomes an evidence item ``kind="sql_result"`` with its own
    citation id. Table data reaches the prompt ONLY through these results.
+
+Two checks keep a call honest:
+
+* **Identifiers are never guessed.** A value compared with an identifier
+  column that names individual items (ids, codes, accession numbers) must
+  come from the question, from an earlier call's result, or name a row whose
+  descriptive values match the question; otherwise the call is refused before
+  it runs and the retry is told what that id actually is.
+* **Chained calls.** A param may be ``{"from_call": k, "column": c}``: its
+  value(s) come from call ``k``'s result (one run per value, up to
+  ``MAX_FANOUT``; ``"as_list": true`` passes them all to one list param), so
+  "look the item up by name, then use its id in another table" needs no guess.
 """
 
 from __future__ import annotations
@@ -25,23 +37,53 @@ import json
 import re
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import date
 from typing import Any
 
 from sqlalchemy import text as sql_text
 
 from backend.app.services.predicates import VIAO_NS
+from backend.app.services.structured.analysis import total_markers
 from backend.app.services.structured.metadata import (
     catalog_for_prompt,
     column_types,
     compile_item,
     find_item,
     item_spec,
+    time_columns,
 )
 from backend.app.services.structured.query_builder import QuerySpecError, build_sql
 from backend.app.services.structured.sql_exec import SqlResult, run_sql
 from backend.app.services.structured.sql_guard import SqlGuardError
 from backend.app.services.structured.value_domains import check_params, spec_declared
+
+MAX_FANOUT = 5                  # runs of one chained call (one per referenced value)
+ENTITY_ID_MIN_DISTINCT = 10     # an identifier column this varied names individual items
+DISTINCTIVE_SHARE = 0.2         # a word in at most this share of a column's values identifies a row
+MISSING_VALUE_ERROR = ("value(s) not found in their column (see missing_values, which lists the closest "
+                       "values that DO exist): checked before the query ran; do not use them again")
+UNRANKED_NOTE = ("This query kept only the latest row(s) by {column}, but {rows} other matching "
+                 "row(s) have an empty {column} and were never shown; they may hold values the "
+                 "returned row(s) lack. Do not take a missing value as absent from the table.")
+UNSUPPORTED_ID_ERROR = (
+    "identifier value(s) not taken from the question or from an earlier call's result (see "
+    "unsupported_identifiers; row_values shows what each id actually is in the table). Never "
+    "fill an identifier from memory: filter by the item's name/description column instead, or "
+    "find the id with one call and pass it to the next with {\"from_call\": k, \"column\": ...}.")
+# Legal-form suffixes plus ordinary English function words: a question's
+# "did", "have" or "which" must never vouch for an identifier's row.
+_ID_STOPWORDS = {"the", "and", "for", "with", "inc", "ltd", "llc", "plc", "corp", "corporation",
+                 "company", "group", "holdings", "limited", "co", "of", "in", "on", "a", "an",
+                 "about", "after", "all", "also", "any", "are", "around", "been", "before", "being",
+                 "between", "both", "but", "by", "can", "could", "did", "does", "doing", "done",
+                 "during", "each", "from", "had", "has", "have", "having", "her", "his", "how",
+                 "into", "its", "many", "more", "most", "much", "not", "only", "other", "over",
+                 "per", "than", "that", "their", "them", "then", "there", "these", "they", "this",
+                 "those", "through", "under", "was", "were", "what", "when", "where", "which",
+                 "while", "who", "whom", "whose", "why", "will", "within", "without", "would",
+                 "you", "your", "our", "out", "same", "such", "very", "list", "show", "tell",
+                 "give", "find", "total", "number", "whether"}
 
 _TABLE_EDGE_KINDS = ("tableEntity", "tablePlace", "tableColumn", "tableMetric", "tableFilter", "tableTime")
 
@@ -298,6 +340,162 @@ def describe_evidence(names: list[str], inv: dict[str, dict], start_rank: int) -
     return out
 
 
+def _norm_value(v: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(v).lower())
+
+
+def _sig_words(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9][a-z0-9\-]{2,}", str(text).lower())
+            if w not in _ID_STOPWORDS}
+
+
+def _word_regex(word: str) -> str:
+    """Postgres ARE matching ``word`` as a whole word (not inside another word)."""
+    return r"\m" + re.sub(r"([^a-z0-9])", r"\\\1", word) + r"\M"
+
+
+def entity_id_columns(meta: dict) -> set[str]:
+    """Identifier columns that name individual items (not a handful of
+    categories such as a source file): role identifier and >= 10 distinct values."""
+    stats = meta.get("column_stats") or {}
+    out = set()
+    for c in meta.get("columns") or []:
+        if c.get("role") != "identifier" or (c.get("type") or "text") != "text":
+            continue
+        d = (stats.get(c["name"]) or {}).get("distinct")
+        if d is None or d >= ENTITY_ID_MIN_DISTINCT:
+            out.add(c["name"].lower())
+    return out
+
+
+def name_columns(meta: dict, id_column: str) -> list[str]:
+    """Descriptive text columns of a row (what an id stands for): the columns
+    the id determines, else every varied text column but the id itself."""
+    stats = meta.get("column_stats") or {}
+    text_cols = {c["name"] for c in meta.get("columns") or []
+                 if (c.get("type") or "text") == "text" and c.get("role") not in {"measure", "time"}}
+    deps = ((meta.get("analysis") or {}).get("dependencies") or {}).get(id_column) or []
+    cands = [c for c in deps if c in text_cols] or sorted(text_cols - {id_column})
+    return [c for c in cands
+            if ((stats.get(c) or {}).get("distinct") or ENTITY_ID_MIN_DISTINCT) >= ENTITY_ID_MIN_DISTINCT][:8]
+
+
+def expand_refs(call: dict, done: dict[int, list[SqlResult]]) -> tuple[list[dict], str | None]:
+    """Fill ``{"from_call": k, "column": c}`` params from call k's result rows.
+    Returns ([concrete calls], error). Scalar params fan out (one call per
+    value, at most MAX_FANOUT runs); ``"as_list": true`` passes all values."""
+    params = call.get("params") if isinstance(call.get("params"), dict) else {}
+    refs = {n: v for n, v in params.items() if isinstance(v, dict) and "from_call" in v}
+    if not refs:
+        return [call], None
+    lists: dict[str, list] = {}
+    scalars: list[tuple[str, list]] = []
+    for name, ref in refs.items():
+        try:
+            k = int(ref.get("from_call"))
+        except (TypeError, ValueError):
+            return [], f"param {name}: from_call must be the number of an earlier call"
+        results = done.get(k)
+        if not results:
+            return [], (f"param {name}: call {k} has no result to take values from (it failed, "
+                        "returned no rows, or is not an earlier call)")
+        col = str(ref.get("column") or name)
+        vals: list = []
+        for res in results:
+            idx = next((i for i, c in enumerate(res.columns) if c.lower() == col.lower()), None)
+            if idx is None:
+                return [], f"param {name}: call {k}'s result has no column {col!r} (columns: {', '.join(res.columns)})"
+            for row in res.rows:
+                v = row[idx]
+                if v is not None and v not in vals:
+                    vals.append(v)
+        if not vals:
+            return [], f"param {name}: column {col!r} of call {k}'s result holds no values"
+        if ref.get("as_list"):
+            lists[name] = vals
+        else:
+            scalars.append((name, vals))
+    combos: list[dict] = [{}]
+    total = 1
+    for name, vals in scalars:
+        total *= len(vals)
+        combos = [{**c, name: v} for c in combos for v in vals[:MAX_FANOUT]]
+    combos = combos[:MAX_FANOUT]
+    note = {n: refs[n] for n in refs}
+    out = []
+    for c in combos:
+        out.append({**call, "params": {**params, **lists, **c}, "_from_calls": note,
+                    **({"_fanout_cut": f"first {MAX_FANOUT} of {total} value combinations"}
+                       if total > MAX_FANOUT else {})})
+    return out, None
+
+
+async def identifier_guard(sql: str, params: dict, *, question: str, seen_values: set[str],
+                           types: dict[str, dict[str, str]], metas: dict[str, dict],
+                           context_norm: str = "") -> list[dict]:
+    """Values compared with an item-identifier column that the question does
+    not state, no earlier result returned, and whose row's descriptive values
+    share no word with the question. Read-only."""
+    id_cols = {t: entity_id_columns(m) for t, m in metas.items()}
+    if not any(id_cols.values()):
+        return []
+    lowered = {t: {c.lower(): ty for c, ty in cols.items()} for t, cols in types.items()}
+    checks = [c for c in compared_values(sql, params, lowered, id_cols)
+              if c["column"] in id_cols.get(c["table"], set())]
+    if not checks:
+        return []
+    q_norm, q_words = _norm_value(question), _sig_words(question)
+    out = []
+    from backend.app.db.engine import get_sessionmaker
+    from backend.app.services.structured.db_load import q
+
+    pending = []
+    for c in checks:
+        v = _norm_value(c["value"])
+        if v and (v in q_norm or v in seen_values or (len(v) >= 4 and v in context_norm)):
+            continue
+        pending.append(c)
+    if not pending:
+        return []
+    async with get_sessionmaker()() as s:
+        try:
+            await s.execute(sql_text("SET TRANSACTION READ ONLY"))
+            await s.execute(sql_text("SET LOCAL statement_timeout = 3000"))
+            for c in pending:
+                meta = metas.get(c["table"]) or {}
+                names = name_columns(meta, c["column"])
+                vals: list[str] = []
+                matched = False
+                if names:
+                    rows = (await s.execute(sql_text(
+                        f"SELECT {', '.join(q(n) for n in names)} FROM graphrag.{q(c['table'])} "
+                        f"WHERE {q(c['column'])} = :v LIMIT 3"), {"v": c["value"]})).all()
+                    vals = list(dict.fromkeys(str(x) for r in rows for x in r if x not in (None, "")))
+                    # the id's own row names what the question asks about -- by a
+                    # word that is distinctive in its column (not one every row shares)
+                    for n in names:
+                        own = {w for r in rows for w in _sig_words(r[names.index(n)] or "")}
+                        for w in sorted(own & q_words)[:6]:
+                            share = (await s.execute(sql_text(
+                                f"SELECT COUNT(DISTINCT {q(n)}) FILTER (WHERE {q(n)} ~* :w)::float "
+                                f"/ GREATEST(COUNT(DISTINCT {q(n)}), 1) FROM graphrag.{q(c['table'])}"),
+                                {"w": _word_regex(w)})).scalar() or 0.0
+                            if share <= DISTINCTIVE_SHARE:
+                                matched = True
+                                break
+                        if matched:
+                            break
+                if matched:
+                    continue
+                out.append({"table": c["table"], "column": c["column"], "value": c["value"],
+                            "row_values": vals[:6] or "no row has this value"})
+        except Exception:  # best effort: a failed check never blocks the call
+            return []
+        finally:
+            await s.rollback()
+    return out
+
+
 async def table_metas(names: set[str]) -> dict[str, dict]:
     """ACTIVE metadata of the named tables (lookup partners outside the
     candidate set need their column types to compile)."""
@@ -316,8 +514,14 @@ async def table_metas(names: set[str]) -> dict[str, dict]:
 
 async def _execute(call: dict, by_table: dict[str, dict], *, max_rows: int, timeout_ms: int,
                    all_tables: set[str], types: dict[str, dict[str, str]],
+                   totals: dict[str, dict[str, str]] | None = None,
+                   guard: Callable[[str, dict], Awaitable[list[dict]]] | None = None,
+                   prevalidate: Callable[[str, dict], Awaitable[tuple[dict, list[dict], list[dict]]]]
+                   | None = None,
                    ) -> tuple[dict, SqlResult | None, str | None]:
-    """Build (deterministically) and run one selected call. Returns (record, result, error)."""
+    """Build (deterministically) and run one selected call. Returns (record, result, error).
+    ``guard(sql, params)`` returns identifier values the call may not use
+    (checked before the SQL runs)."""
     table = call.get("table")
     params = call.get("params") if isinstance(call.get("params"), dict) else {}
     if call.get("query_id"):
@@ -337,7 +541,7 @@ async def _execute(call: dict, by_table: dict[str, dict], *, max_rows: int, time
         rec = {"table": meta["table_name"], "query_id": item["id"], "label": item.get("label"),
                "source": "catalog", "section": section}
         try:
-            built = compile_item(meta, section, item, types)
+            built = compile_item(meta, section, item, types, totals=totals)
         except (QuerySpecError, SqlGuardError) as exc:
             err = f"stored query does not compile: {exc}"
             return {**rec, "error": err}, None, err
@@ -348,6 +552,18 @@ async def _execute(call: dict, by_table: dict[str, dict], *, max_rows: int, time
         if bad:
             err = "parameter value(s) not in the column's valid values (see invalid_values)"
             return {**rec, "params": params, "invalid_values": bad, "error": err}, None, err
+        unsupported = await guard(built.sql, params) if guard else []
+        if unsupported:
+            return {**rec, "params": params, "unsupported_identifiers": unsupported,
+                    "error": UNSUPPORTED_ID_ERROR}, None, UNSUPPORTED_ID_ERROR
+        if prevalidate:
+            params, missing, vsubs = await prevalidate(built.sql, params)
+            if vsubs:
+                rec["substituted"] = [*(rec.get("substituted") or []), *vsubs]
+            if missing:
+                rec["missing_values"] = missing
+                if not all(m.get("dropped_from") for m in missing):
+                    return {**rec, "params": params, "error": MISSING_VALUE_ERROR}, None, MISSING_VALUE_ERROR
         res = await run_sql(built.sql, params, built.tables & (all_tables | {meta["table_name"]}),
                             max_rows=max_rows, timeout_ms=timeout_ms, declared_params=declared)
     elif isinstance(call.get("query"), dict):
@@ -361,7 +577,7 @@ async def _execute(call: dict, by_table: dict[str, dict], *, max_rows: int, time
 
             tmeta = (by_table.get(table) or {}).get("meta") or {}
             built = build_sql(call["query"], table, {t: c for t, c in types.items() if t in all_tables},
-                              time_columns={table: time_columns(tmeta)})
+                              time_columns={table: time_columns(tmeta)}, totals=totals)
         except QuerySpecError as exc:
             err = f"query spec does not compile: {exc}"
             return {**rec, "error": err}, None, err
@@ -373,6 +589,18 @@ async def _execute(call: dict, by_table: dict[str, dict], *, max_rows: int, time
         if bad:
             err = "parameter value(s) not in the column's valid values (see invalid_values)"
             return {**rec, "params": params, "invalid_values": bad, "error": err}, None, err
+        unsupported = await guard(built.sql, params) if guard else []
+        if unsupported:
+            return {**rec, "params": params, "unsupported_identifiers": unsupported,
+                    "error": UNSUPPORTED_ID_ERROR}, None, UNSUPPORTED_ID_ERROR
+        if prevalidate:
+            params, missing, vsubs = await prevalidate(built.sql, params)
+            if vsubs:
+                rec["substituted"] = [*(rec.get("substituted") or []), *vsubs]
+            if missing:
+                rec["missing_values"] = missing
+                if not all(m.get("dropped_from") for m in missing):
+                    return {**rec, "params": params, "error": MISSING_VALUE_ERROR}, None, MISSING_VALUE_ERROR
         res = await run_sql(built.sql, params, built.tables, max_rows=max_rows, timeout_ms=timeout_ms,
                             declared_params=declared)
     else:
@@ -390,6 +618,62 @@ async def _execute(call: dict, by_table: dict[str, dict], *, max_rows: int, time
 
 MAX_VALUE_CHECKS = 8
 MAX_SUGGESTIONS = 8
+
+
+def unranked_count_sql(sql: str, period_columns: set[str]) -> tuple[str, str] | None:
+    """For a row query that keeps only the latest row(s) -- no aggregate,
+    ORDER BY a period column DESC, cut by LIMIT or DISTINCT ON -- return
+    (count SQL, column): the same query counting the matching rows whose
+    period is EMPTY. Those rows sort last, so the cut never shows them, yet
+    they can hold values the returned row lacks. None for any other query."""
+    import sqlglot
+    from sqlglot import exp
+
+    # sqlglot rewrites ``:name`` placeholders: park them as identifiers
+    marked = re.sub(r"(?<![:\w]):([A-Za-z_]\w*)", r"__yegi_p_\1__", sql)
+    try:
+        tree = sqlglot.parse_one(marked, read="postgres")
+    except Exception:
+        return None
+    if not isinstance(tree, exp.Select) or tree.args.get("group") or tree.find(exp.AggFunc):
+        return None
+    if not (tree.args.get("limit") or isinstance(tree.args.get("distinct"), exp.Distinct)):
+        return None
+    order = tree.args.get("order")
+    col = None
+    for o in (order.expressions if order else []):
+        c = o.this
+        if o.args.get("desc") and isinstance(c, exp.Column) and c.name.lower() in period_columns:
+            col = c
+            break
+    if col is None:
+        return None
+    count = tree.copy()
+    for key in ("order", "limit", "distinct", "offset"):
+        count.set(key, None)
+    count = count.select(exp.Count(this=exp.Star()), append=False).where(
+        exp.Is(this=col.copy(), expression=exp.Null()), append=True)
+    out = re.sub(r'"?__yegi_p_([A-Za-z_]\w*?)__"?', r":\1", count.sql(dialect="postgres"))
+    return out, col.name
+
+
+async def _unranked_rows(rec: dict, res: SqlResult | None, meta: dict | None) -> dict | None:
+    """``{"column", "rows"}`` when a latest-row query passed over matching rows
+    whose period column is empty (see ``unranked_count_sql``)."""
+    if res is None or res.error or not res.rows or not rec.get("sql") or not meta:
+        return None
+    periods = {c.lower() for c in time_columns(meta)} | {
+        str(c.get("name")).lower() for c in meta.get("columns") or [] if c.get("role") == "time"}
+    built = unranked_count_sql(rec["sql"], periods)
+    if not built:
+        return None
+    count_sql, col = built
+    try:
+        out = await run_sql(count_sql, rec.get("params") or {}, {rec["table"]}, max_rows=1, timeout_ms=3000)
+        n = int(out.rows[0][0]) if not out.error and out.rows else 0
+    except Exception:  # best effort: a failed check never hides the result
+        return None
+    return {"column": col, "rows": n} if n > 0 else None
 
 
 def compared_values(sql: str, params: dict, columns: dict[str, dict[str, str]],
@@ -490,11 +774,13 @@ async def missing_values(checks: list[dict]) -> list[dict]:
                 words = re.findall(r"[A-Za-z0-9]{3,}", val)[:4]
                 like = " OR ".join(f"{q(col)} ILIKE :w{i}" for i in range(len(words)))
                 binds.update({f"w{i}": f"%{w[:max(3, len(w) - 1)]}%" for i, w in enumerate(words)})
-                cond = f"({like}) OR similarity({q(col)}, :v) > 0.3" if like else f"similarity({q(col)}, :v) > 0.3"
+                # `%` (trigram similarity >= 0.3) and ILIKE both use the column's
+                # trigram index when the loader made one (ensure_value_indexes)
+                cond = f"({like}) OR {q(col)} % :v" if like else f"{q(col)} % :v"
                 rows = (await s.execute(sql_text(
-                    f"SELECT v FROM (SELECT DISTINCT {q(col)} AS v FROM {ref} WHERE TRUE{where_ctx}) d "
-                    f"WHERE {cond.replace(q(col), 'v')} "
-                    f"ORDER BY similarity(v, :v) DESC, length(v) LIMIT {MAX_SUGGESTIONS}"), binds)).scalars().all()
+                    f"SELECT {q(col)} AS v FROM {ref} WHERE ({cond}){where_ctx} GROUP BY 1 "
+                    f"ORDER BY similarity({q(col)}, :v) DESC, length({q(col)}) LIMIT {MAX_SUGGESTIONS}"),
+                    binds)).scalars().all()
                 out.append({"table": table, "column": col, "value": val,
                             **({"where": {c: v for c, v in ctx}} if ctx else {}),
                             "existing_similar": [str(r) for r in rows]})
@@ -503,6 +789,52 @@ async def missing_values(checks: list[dict]) -> list[dict]:
         finally:
             await s.rollback()
     return out
+
+
+def _replace_value(params: dict, old: str, new: str) -> str | None:
+    """Swap ``old`` for ``new`` in the bound params; returns the param name."""
+    for name, v in params.items():
+        if v == old:
+            params[name] = new
+            return name
+        if isinstance(v, list) and old in v:
+            params[name] = [new if x == old else x for x in v]
+            return name
+    return None
+
+
+async def prevalidate_values(sql: str, params: dict, *, col_types: dict[str, dict[str, str]],
+                             id_cols: dict[str, set[str]] | None = None,
+                             ) -> tuple[dict, list[dict], list[dict]]:
+    """Check every text value a statement compares against the column it is
+    compared with, BEFORE the statement runs (an indexed lookup each, ~1 ms).
+    Returns (params, missing, substituted): a value that differs from an
+    existing one only in case/spacing/punctuation is replaced (and recorded);
+    any other absent value is returned in ``missing`` with the closest values
+    that do exist, so the call is refused instead of running empty."""
+    checks = compared_values(sql, params, col_types, id_cols)
+    if not checks:
+        return params, [], []
+    missing = [m for m in await missing_values(checks) if "value" in m]
+    if not missing:
+        return params, [], []
+    fixed, subs, left = dict(params), [], []
+    for m in missing:
+        want = _norm_value(m["value"])
+        near = next((v for v in m.get("existing_similar") or [] if _norm_value(v) == want), None)
+        name = _replace_value(fixed, m["value"], near) if near and want else None
+        if name:
+            subs.append({"param": name, "from": m["value"], "to": near})
+            continue
+        # one absent value of a LIST keeps the call alive for the others (it is
+        # still reported, so the retry can fix it); a single value refuses it
+        lst = next((n for n, v in fixed.items() if isinstance(v, list) and m["value"] in v
+                    and len(v) > 1), None)
+        if lst:
+            fixed[lst] = [x for x in fixed[lst] if x != m["value"]]
+            m = {**m, "dropped_from": lst}
+        left.append(m)
+    return fixed, left, subs
 
 
 async def combination_hints(checks: list[dict]) -> list[dict]:
@@ -583,6 +915,94 @@ def _listing_stats(rec: dict, res: SqlResult, meta: dict) -> dict | None:
     return change_stats(res.columns, res.rows, period_col, value_col) if period_col else None
 
 
+MAX_CHECK_VALUES = 6
+
+
+def value_check_evidence(calls: list[dict], by_table: dict[str, dict], start_rank: int, *,
+                         char_cap: int = 5000) -> list[dict]:
+    """Values a call asked for that the TABLE DOES NOT HOLD (found by an exact
+    lookup, or not among the column's listed values), as evidence for the
+    answer model -- one item per table. Without it the answer model only sees
+    the table's description ('a spending column per drug') and may assume an
+    absent item is in the table. A value some call used successfully -- or one
+    whose suggested replacement a retry used -- is left out."""
+    used = {_norm_value(v) for c in calls if not c.get("error") and c.get("row_count")
+            for v in _flat(c.get("params") or {})}
+    by_tab: dict[str, dict[tuple, dict]] = {}
+    for c in calls:
+        table = c.get("table")
+        for m in c.get("missing_values") or []:
+            if "value" not in m or _norm_value(m["value"]) in used:
+                continue
+            if any(_norm_value(x) in used for x in m.get("existing_similar") or []):
+                continue                         # a retry used the corrected value
+            key = (m.get("column"), _norm_value(m["value"]), json.dumps(m.get("where") or {}, sort_keys=True))
+            by_tab.setdefault(m.get("table") or table, {}).setdefault(key, {
+                "column": m.get("column"), "value": m["value"], "where": m.get("where") or {},
+                "near": m.get("existing_similar") or []})
+        for m in c.get("invalid_values") or []:
+            if "value" not in m or not m.get("column") or _norm_value(m["value"]) in used:
+                continue
+            key = (m["column"], _norm_value(m["value"]), "{}")
+            by_tab.setdefault(table, {}).setdefault(key, {
+                "column": m["column"], "value": m["value"], "where": {},
+                "listed": m.get("allowed_values") or [], "more": m.get("more_values") or 0})
+    out = []
+    for table, checks in by_tab.items():
+        if not table:
+            continue
+        lines = []
+        for chk in list(checks.values())[:MAX_CHECK_VALUES]:
+            ctx = (" together with " + ", ".join(f"{k} = '{v}'" for k, v in chk["where"].items())
+                   if chk["where"] else "")
+            if "listed" in chk:
+                shown = " | ".join(map(str, chk["listed"][:20]))
+                more = f" (+{chk['more']} more)" if chk["more"] else ""
+                lines.append(f"'{chk['value']}' is not one of the values of column {chk['column']}"
+                             f" (its values: {shown}{more}).")
+            else:
+                near = "; values that do occur and look similar: " + " | ".join(chk["near"][:8]) \
+                    if chk["near"] else "; no similar value occurs"
+                lines.append(f"'{chk['value']}' does not occur in column {chk['column']}{ctx}{near}.")
+        meta = (by_table.get(table) or {}).get("meta") or {}
+        text = (f"Value check on table {table}"
+                + (f" [{(meta.get('source') or {}).get('rel_path')}]" if meta else "")
+                + " (exact lookup in the loaded table, run before any query): "
+                + " ".join(lines) + " The table holds no rows for these values; do not assume "
+                "it covers them.")[:char_cap]
+        digest = hashlib.sha256(text.encode()).hexdigest()[:8]
+        frag = f"SqlResult_{table}_value_check_{digest}"
+        out.append({
+            "kind": "sql_result", "node_id": (by_table.get(table) or {}).get("id"),
+            "iri": f"{VIAO_NS}#{re.sub(r'[^A-Za-z0-9_]', '_', frag)}",
+            "rank": start_rank + len(out), "score": 1.0, "text": text, "char_cap": char_cap,
+            "listing": False, "document_title": f"table {table}", "table": table,
+            "query_id": "value_check", "sql": None, "params": {}, "columns": [], "rows": [],
+            "row_count": 0, "truncated": False, "total_rows": None,
+            "source_file": (meta.get("source") or {}).get("rel_path"), "sql_source": "value_check",
+        })
+    return out
+
+
+def relevance_hints(cands: list[dict], rankings: dict[str, dict], top: int = 8) -> list[dict]:
+    """Per candidate table (most relevant first): its graph score and the
+    stored items whose tags the question matched, with why."""
+    out = []
+    for c in sorted(cands, key=lambda c: -(c.get("score") or 0)):
+        r = rankings.get(c["table"]) or {}
+        matched = [{"id": i, "matched": w} for i, (sc, w) in sorted(r.items(), key=lambda kv: -kv[1][0])
+                   if sc > 0][:top]
+        out.append({"table": c["table"], "reached_via": c.get("via") or [], "matched_items": matched})
+    return out
+
+
+def _flat(params: dict) -> list:
+    out = []
+    for v in params.values():
+        out.extend(v if isinstance(v, list) else [v])
+    return [v for v in out if isinstance(v, str)]
+
+
 def _evidence_text(rec: dict, res: SqlResult, meta: dict, char_cap: int, stats: dict | None = None) -> str:
     head = (f"SQL result from table {rec['table']}"
             + (f" ({rec['label']})" if rec.get("label") else "")
@@ -604,6 +1024,8 @@ def _evidence_text(rec: dict, res: SqlResult, meta: dict, char_cap: int, stats: 
         body.append("(" + row + ")")
         used += len(row) + 4
     tail = ""
+    if rec.get("unranked_rows"):
+        tail += " " + UNRANKED_NOTE.format(**rec["unranked_rows"])
     if res.truncated:
         tail = (f" Result capped at {res.row_count} of "
                 f"{res.total_rows if res.total_rows is not None else 'more'} rows.")
@@ -627,6 +1049,7 @@ async def structured_evidence(
     time_ids: list[uuid.UUID] | None = None,
     listing_max_rows: int = 2000,
     listing_char_cap: int = 60000,
+    doc_context: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Evidence items (``kind='sql_result'``) + a plan record for persistence."""
     from backend.app.services.prompts import PROMPTS
@@ -653,7 +1076,12 @@ async def structured_evidence(
     all_tables = set(by_table) | set(partners)   # a partner that is not loaded cannot be read
     types = {c["table"]: column_types(c["meta"]) for c in cands}
     types.update({n: column_types(m) for n, m in partners.items()})
-    catalogs = [catalog_for_prompt(c["meta"], ranking=rankings.get(c["table"])) for c in cands]
+    # Catalogs are the same text whatever the question (sorted by table, stored
+    # order) so repeated calls share a cacheable prompt prefix; what the
+    # question matched goes in a short separate block.
+    catalogs = [catalog_for_prompt(c["meta"], ranking=rankings.get(c["table"]), stable=True)
+                for c in sorted(cands, key=lambda c: c["table"])]
+    relevance = relevance_hints(cands, rankings)
     inv = await table_inventory()
     inventory = inventory_for_prompt(inv)
     col_types = {c["table"]: {col["name"].lower(): (col.get("type") or "text")
@@ -672,7 +1100,7 @@ async def structured_evidence(
                 rec["value_combinations"] = combos
         return missing
 
-    system, user = PROMPTS["table_query_select"](question, catalogs, max_calls=max_calls,
+    system, user = PROMPTS["table_query_select"](question, catalogs, max_calls=max_calls, doc_context=doc_context, relevance=relevance,
                                                   inventory=inventory)
     out = await router.chat("table_query_select", system=system, user=user)
     choice = _parse(out.text)
@@ -685,7 +1113,7 @@ async def structured_evidence(
             "error": "your previous reply was cut off or was not valid JSON. Reply again with FEWER "
                      "calls: one call per part of the question; a question that lists many items is "
                      "ONE listing query, never one call per item."}], max_calls=max_calls,
-            inventory=inventory)
+            inventory=inventory, doc_context=doc_context, relevance=relevance)
         out = await router.chat("table_query_select", system=system, user=user)
         choice = _parse(out.text)
         if "needed" not in choice:
@@ -705,51 +1133,86 @@ async def structured_evidence(
         if adj:
             plan.setdefault("period_adjustments", []).append({"table": call.get("table"), **adj})
     results: list[tuple[dict, SqlResult]] = []
-    failures = []
+    failures: list[dict] = []
+    metas_all = {**{c["table"]: c["meta"] for c in cands}, **partners}
+    totals = {t: total_markers(m) for t, m in metas_all.items()}
+    seen_values: set[str] = set()       # every value an earlier call returned
+
+    doc_norm = _norm_value(" ".join(str(d.get("text") or "") for d in doc_context or []))
+
+    async def _guard(sql: str, params: dict) -> list[dict]:
+        return await identifier_guard(sql, params, question=question, seen_values=seen_values,
+                                      types=types, metas=metas_all, context_norm=doc_norm)
+
+    async def _prevalidate(sql: str, params: dict) -> tuple[dict, list[dict], list[dict]]:
+        return await prevalidate_values(sql, params, col_types=col_types, id_cols=id_cols)
+
     def _rows_for(call: dict) -> int:
         return listing_max_rows if call.get("listing") else max_rows
 
-    for call in calls:
-        rec, res, err = await _execute(call, by_table, max_rows=_rows_for(call), timeout_ms=timeout_ms,
-                                       all_tables=all_tables, types=types)
-        rec["listing"] = bool(call.get("listing"))
-        missing = await _value_failures(rec, res)
-        if missing:
-            rec["missing_values"] = missing
-        plan["calls"].append(rec)
-        if err or missing:
-            failures.append({"call": call, "sql": rec.get("sql"),
-                             "error": err or "value(s) not found in their column (see missing_values)",
-                             **({"invalid_values": rec["invalid_values"]} if rec.get("invalid_values") else {}),
-                             **({"missing_values": missing} if missing else {}),
-                             **({"value_combinations": rec["value_combinations"]}
-                                if rec.get("value_combinations") else {})})
-        if not err and res is not None:
-            # A partial hit (one IN value matched, another did not) is still
-            # evidence; the retry may add the missing part.
-            results.append((rec, res))
+    async def _run_calls(batch: list[dict], *, retry: bool) -> None:
+        done: dict[int, list[SqlResult]] = {}       # call number -> its results (chaining)
+        for n, call in enumerate(batch, start=1):
+            concrete, ref_err = expand_refs(call, done)
+            if ref_err:
+                rec = {"table": call.get("table"), "query_id": call.get("query_id"), "error": ref_err,
+                       **({"retry": True} if retry else {})}
+                plan["calls"].append(rec)
+                failures.append({"call": call, "error": ref_err})
+                continue
+            for sub in concrete:
+                sub_call = {k: v for k, v in sub.items() if not k.startswith("_")}
+                rec, res, err = await _execute(sub_call, by_table, max_rows=_rows_for(sub),
+                                               timeout_ms=timeout_ms, all_tables=all_tables,
+                                               types=types, totals=totals, guard=_guard,
+                                               prevalidate=_prevalidate)
+                if retry:
+                    rec["retry"] = True
+                if sub.get("_from_calls"):
+                    rec["from_calls"] = sub["_from_calls"]
+                    if sub.get("_fanout_cut"):
+                        rec["fanout_cut"] = sub["_fanout_cut"]
+                rec["listing"] = bool(sub.get("listing"))
+                missing = await _value_failures(rec, res) or rec.get("missing_values") or []
+                if missing:
+                    rec["missing_values"] = missing
+                unranked = None if err else await _unranked_rows(
+                    rec, res, (by_table.get(rec.get("table")) or {}).get("meta"))
+                if unranked:
+                    rec["unranked_rows"] = unranked
+                plan["calls"].append(rec)
+                if (err or missing or unranked) and not retry:
+                    failures.append({"call": call, "sql": rec.get("sql"),
+                                     "error": err or ("value(s) not found in their column (see missing_values)"
+                                                      if missing else UNRANKED_NOTE.format(**unranked)),
+                                     **{k: rec[k] for k in ("invalid_values", "unsupported_identifiers",
+                                                            "value_combinations", "missing_values")
+                                        if rec.get(k)},
+                                     **({"missing_values": missing} if missing else {})})
+                if not err and res is not None:
+                    # A partial hit (one IN value matched, another did not) is
+                    # still evidence; the retry may add the missing part.
+                    results.append((rec, res))
+                    if res.rows:
+                        done.setdefault(n, []).append(res)
+                        seen_values.update(_norm_value(v) for r in res.rows for v in r if v is not None)
+
+    await _run_calls(calls, retry=False)
 
     if failures:
         plan["retried"] = True
         system, user = PROMPTS["table_query_select"](question, catalogs, failures, max_calls=max_calls,
+                                                     doc_context=doc_context, relevance=relevance,
                                                      inventory=inventory)
         out = await router.chat("table_query_select", system=system, user=user)
         retry = _parse(out.text)
-        for call in [c for c in (retry.get("calls") or []) if isinstance(c, dict)][:max_calls]:
+        retry_calls = [c for c in (retry.get("calls") or []) if isinstance(c, dict)][:max_calls]
+        for call in retry_calls:
             meta_c = (by_table.get(call.get("table")) or {}).get("meta")
             adj = anchor_relative_periods(question, call, meta_c, today_year=today_year) if meta_c else None
             if adj:
                 plan.setdefault("period_adjustments", []).append({"table": call.get("table"), **adj})
-            rec, res, err = await _execute(call, by_table, max_rows=_rows_for(call), timeout_ms=timeout_ms,
-                                           all_tables=all_tables, types=types)
-            rec["retry"] = True
-            rec["listing"] = bool(call.get("listing"))
-            missing = await _value_failures(rec, res)
-            if missing:
-                rec["missing_values"] = missing
-            plan["calls"].append(rec)
-            if not err and res is not None:
-                results.append((rec, res))
+        await _run_calls(retry_calls, retry=True)
 
     # The retry may repeat a statement that already succeeded; keep one copy.
     seen_runs: set[str] = set()
@@ -787,6 +1250,7 @@ async def structured_evidence(
             "source_file": (meta.get("source") or {}).get("rel_path"),
             "sql_source": rec.get("source"),
         })
+    evidence += value_check_evidence(plan["calls"], by_table, len(evidence) + 1, char_cap=char_cap)
     evidence += describe_evidence(describe, inv, len(evidence) + 1)
     plan["seconds"] = round(time.monotonic() - t0, 3)
     if verbose:

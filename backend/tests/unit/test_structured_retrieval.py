@@ -6,6 +6,7 @@ path is covered in test_structured_db.py.
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 
@@ -246,8 +247,8 @@ def test_compared_values_finds_literals_params_and_in_lists():
         == [{"table": "prices", "column": "commodity", "value": "Iron ore", "context": []}]
 
 
-async def test_missing_value_triggers_retry_with_hints_and_keeps_partial_result(patched, monkeypatch):
-    _calls, _ = patched
+async def test_missing_value_is_refused_before_the_query_runs_and_retried(patched, monkeypatch):
+    calls, _ = patched
     seen = []
 
     async def fake_missing(checks):
@@ -265,7 +266,20 @@ async def test_missing_value_triggers_retry_with_hints_and_keeps_partial_result(
     assert seen[0] == [{"table": "prices", "column": "commodity", "value": "Iron ore", "context": []}]
     assert "Iron ore, cfr spot" in router.calls[1][1]         # hint reached the retry prompt
     assert plan["retried"] and plan["calls"][0]["missing_values"][0]["value"] == "Iron ore"
-    assert len(ev) == 2                                        # partial + corrected result
+    assert plan["calls"][0]["error"] == rs.MISSING_VALUE_ERROR and "row_count" not in plan["calls"][0]
+    assert [c[1] for c in calls] == [{"c": "Iron ore, cfr spot"}]      # only the corrected call ran
+    assert len(ev) == 1
+
+
+async def test_one_absent_value_of_a_list_keeps_the_rest(monkeypatch):
+    async def fake_missing(checks):
+        return [{"table": "prices", "column": "commodity", "value": "Zink", "existing_similar": ["Zinc"]}]
+
+    monkeypatch.setattr(rs, "missing_values", fake_missing)
+    sql = "SELECT * FROM prices WHERE commodity = ANY(CAST(:cs AS text[]))"
+    cols = {"prices": {"commodity": "text"}}
+    params, missing, subs = await rs.prevalidate_values(sql, {"cs": ["Copper", "Zink"]}, col_types=cols)
+    assert params == {"cs": ["Copper"]} and subs == [] and missing[0]["dropped_from"] == "cs"
 
 
 async def test_identical_retry_result_is_deduplicated(patched):
@@ -367,4 +381,87 @@ async def test_questions_about_the_tables_get_their_metadata_not_sql(patched):
     assert "Table prices" in ev[0]["text"] and "worldbank/pink-sheet" in ev[0]["text"]
     assert plan["needed"] and plan["describe"] == ["prices", "companies"]   # unknown table dropped
     user = router.calls[0][1]
-    assert "ALL TABLES" in user and '"table": "companies"' in user       # every table is offered
+    assert "ALL TABLES" in user and '"table":"companies"' in user        # every table is offered
+
+
+async def test_chained_call_takes_its_param_from_an_earlier_result(patched):
+    calls, results = patched
+    results.append(SqlResult(sql="", columns=["commodity", "n"], rows=[["Copper", "3"], ["Zinc", "2"]],
+                             row_count=2))
+    router = FakeRouter({"table_query_select": [{"needed": True, "calls": [
+        {"table": "prices", "purpose": "which commodities",
+         "query": {"select": ["commodity", {"agg": "count", "as": "n"}]}, "params": {}},
+        {"table": "prices", "query_id": "avg_price",
+         "params": {"c": {"from_call": 1, "column": "commodity"}}}]}]})
+    ev, plan = await _go(router)
+    assert [c[1] for c in calls[1:]] == [{"c": "Copper"}, {"c": "Zinc"}]     # one run per value
+    assert len(ev) == 3 and not plan["retried"]
+    assert plan["calls"][1]["from_calls"] == {"c": {"from_call": 1, "column": "commodity"}}
+
+
+async def test_chained_call_without_a_usable_result_fails_into_the_retry(patched):
+    calls, _ = patched
+    router = FakeRouter({"table_query_select": [
+        {"needed": True, "calls": [{"table": "prices", "query_id": "avg_price",
+                                    "params": {"c": {"from_call": 2, "column": "commodity"}}}]},
+        {"needed": False}]})
+    ev, plan = await _go(router)
+    assert calls == [] and ev == [] and plan["retried"]
+    assert "no result to take values from" in plan["calls"][0]["error"]
+    assert "no result to take values from" in router.calls[1][1]
+
+
+async def test_value_the_table_does_not_hold_reaches_the_answer_as_evidence(patched, monkeypatch):
+    calls, _ = patched
+
+    async def fake_missing(checks):
+        return [{"table": "prices", "column": "commodity", "value": "Unobtainium",
+                 "existing_similar": ["Uranium"]}]
+
+    monkeypatch.setattr(rs, "missing_values", fake_missing)
+    router = FakeRouter({"table_query_select": [
+        {"needed": True, "calls": [{"table": "prices", "query_id": "avg_price", "params": {"c": "Unobtainium"}}]},
+        {"needed": False}]})
+    ev, _plan = await _go(router)
+    assert calls == []                                               # refused before any SQL ran
+    assert len(ev) == 1 and ev[0]["kind"] == "sql_result" and ev[0]["query_id"] == "value_check"
+    assert ev[0]["text"].startswith("Value check on table prices")
+    assert "'Unobtainium' does not occur in column commodity" in ev[0]["text"]
+    assert "Uranium" in ev[0]["text"] and re.search(r"#SqlResult_prices_value_check_[0-9a-f]{8}$", ev[0]["iri"])
+
+
+def test_value_check_skips_values_a_call_used_successfully_and_lists_refused_listed_values():
+    calls = [
+        {"table": "prices", "error": "x", "missing_values": [
+            {"table": "prices", "column": "commodity", "value": "Iron ore", "existing_similar": ["Iron ore, cfr spot"]},
+            {"table": "prices", "column": "commodity", "value": "Zink", "existing_similar": []}]},
+        {"table": "prices", "error": "x", "invalid_values": [
+            {"param": "u", "value": "($/t)", "column": "unit", "allowed_values": ["($/mt)", "($/kg)"],
+             "more_values": 3}]},
+        {"table": "prices", "error": "x", "missing_values": [
+            {"table": "prices", "column": "commodity", "value": "Copr", "existing_similar": ["Copper"]}]},
+        {"table": "prices", "error": None, "row_count": 1, "params": {"c": "Iron ore"}},
+        {"table": "prices", "error": None, "row_count": 1, "params": {"c": ["Copper"]}},
+    ]
+    ev = rs.value_check_evidence(calls, {"prices": {"meta": META, "id": NODE}}, 3)
+    assert len(ev) == 1 and ev[0]["rank"] == 3
+    text = ev[0]["text"]
+    assert "Iron ore'" not in text and "Copr" not in text            # used / corrected later
+    assert "'Zink' does not occur in column commodity; no similar value occurs." in text
+    assert "'($/t)' is not one of the values of column unit (its values: ($/mt) | ($/kg) (+3 more))." in text
+    assert rs.value_check_evidence([{"table": "prices", "error": None, "row_count": 2}], {}, 1) == []
+
+
+def test_selection_prompt_puts_the_question_last_and_keeps_catalogs_question_independent():
+    from backend.app.services.prompts import PROMPTS
+    cat = [rs.catalog_for_prompt(META, ranking={"avg_price": (2.0, ["class:Price"])}, stable=True)]
+    assert cat == [rs.catalog_for_prompt(META, stable=True)]          # ranking does not change the text
+    assert "matched" not in json.dumps(cat)
+    _s, u1 = PROMPTS["table_query_select"]("first question?", cat, relevance=[{"table": "prices"}])
+    _s, u2 = PROMPTS["table_query_select"]("another one?", cat,
+                                           doc_context=[{"id": "c", "text": "doc"}])
+    assert u1.rstrip().endswith("QUESTION: first question?")
+    head = u1.index("RELEVANCE")
+    assert u1[:head] == u2[:head]                                     # shared prefix (cacheable)
+    tables = u1[:u1.index("Return JSON")]
+    assert '": ' not in tables and "\n " not in tables                # compact JSON

@@ -30,6 +30,14 @@ Spec shape::
 Parameter types are taken from the column the parameter is compared with,
 and every parameter is bound (``:name``) and cast, never pasted into the SQL.
 All identifiers are double-quoted, so a column called ``end`` just works.
+
+TOTAL ROWS (``totals``: table -> {column: value}, from the table analysis):
+rows whose column holds the total value repeat the sum of the other rows.
+A query that does not use the column reads ONLY the total rows (one row per
+group, nothing counted twice); a query that selects, groups, counts or
+orders by it reads only the other rows (its parts). A where filter on the
+column is left alone, except that an optional parameter on it, when left
+out, means the total rather than every value.
 """
 
 from __future__ import annotations
@@ -80,11 +88,13 @@ def _lit(v: Any) -> str:
 
 
 class _Ctx:
-    def __init__(self, table: str, columns: dict[str, dict[str, str]], join: dict | None):
+    def __init__(self, table: str, columns: dict[str, dict[str, str]], join: dict | None,
+                 totals: dict[str, dict[str, Any]] | None = None):
         if table not in columns:
             raise QuerySpecError(f"unknown table '{table}'")
         self.base = table
         self.columns = columns
+        self.totals = totals or {}
         self.other: str | None = None
         if join:
             other = str(join.get("table") or "")
@@ -210,7 +220,10 @@ def _where(ctx: _Ctx, cond: dict) -> str:
     op = str(cond.get("op") or "=").lower()
     if op not in OPS:
         raise QuerySpecError(f"op must be one of {', '.join(sorted(OPS))} (got {op!r})")
-    sql, ctype, _t, out = ctx.ref(cond.get("column"))
+    sql, ctype, tbl, out = ctx.ref(cond.get("column"))
+    total = None
+    if not (isinstance(cond.get("column"), dict) and cond["column"].get("fn")):
+        total = (ctx.totals.get(tbl) or {}).get(out)
     if op in {"is_null", "not_null"}:
         return f"{sql} IS {'NOT ' if op == 'not_null' else ''}NULL"
     has_param, has_value = cond.get("param") not in (None, ""), "value" in cond
@@ -231,6 +244,8 @@ def _where(ctx: _Ctx, cond: dict) -> str:
     if op == "in":
         if has_param and cond.get("optional"):
             rhs = ctx.param(cond["param"], ctype + "[]", out, optional=True)
+            if total is not None:       # left out: the total row, not every part
+                return f"{sql} = ANY(COALESCE({rhs}, ARRAY[{_lit(total)}]))"
             return f"({rhs} IS NULL OR {sql} = ANY({rhs}))"
         if has_param:
             return f"{sql} = ANY({ctx.param(cond['param'], ctype + '[]', out)})"
@@ -243,20 +258,85 @@ def _where(ctx: _Ctx, cond: dict) -> str:
             raise QuerySpecError(f"optional on '{out}': only a single '=' or 'in' param can be optional")
     if op == "=" and has_param and cond.get("optional"):
         rhs = ctx.param(cond["param"], ctype, out, optional=True)
+        if total is not None:           # left out: the total row, not every part
+            return f"{sql} = COALESCE({rhs}, {_lit(total)})"
         return f"({rhs} IS NULL OR {sql} = {rhs})"
     rhs = ctx.param(cond["param"], ctype, out) if has_param else _lit(cond["value"])
     return f"{sql} {COMPARE[op]} {rhs}"
 
 
+def _used_columns(ctx: _Ctx, spec: dict) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+    """((table, column) read outside where, (table, column) filtered in where)."""
+    used: set[tuple[str, str]] = set()
+
+    def add(raw) -> None:
+        if raw in (None, "", "*"):
+            return
+        if isinstance(raw, str) and raw in ctx.aliases and "." not in raw and not any(
+                raw in ctx.columns[t] for t in ctx.tables):
+            return
+        try:
+            _s, _ct, tbl, _o = ctx.ref(raw)
+        except QuerySpecError:
+            return
+        name = raw.get("column") if isinstance(raw, dict) else str(raw).split(".")[-1]
+        used.add((tbl, str(name)))
+
+    for s in spec.get("select") or []:
+        if isinstance(s, dict) and s.get("agg"):
+            add(s.get("column"))
+            for c in s.get("columns") or []:
+                add(c)
+        else:
+            add(s)
+    for key in ("group_by", "distinct_on"):
+        for c in spec.get(key) or []:
+            add(c)
+    for o in spec.get("order_by") or []:
+        add(o.get("column") if isinstance(o, dict) else o)
+    filtered: set[tuple[str, str]] = set()
+    for w in spec.get("where") or []:
+        if not isinstance(w, dict):
+            continue
+        raw = w.get("column")
+        try:
+            _s, _ct, tbl, _o = ctx.ref(raw)
+        except QuerySpecError:
+            continue
+        name = raw.get("column") if isinstance(raw, dict) else str(raw).split(".")[-1]
+        filtered.add((tbl, str(name)))
+    return used, filtered
+
+
+def _total_conditions(ctx: _Ctx, spec: dict) -> list[str]:
+    """Where conditions that keep totals and their parts from being mixed."""
+    if not ctx.totals:
+        return []
+    used, filtered = _used_columns(ctx, spec)
+    out = []
+    for tbl in ctx.tables:
+        for col, value in (ctx.totals.get(tbl) or {}).items():
+            if col not in ctx.columns[tbl] or (tbl, col) in filtered:
+                continue
+            sql = ctx.ref({"column": col, "table": tbl})[0]
+            if (tbl, col) in used:
+                out.append(f"{sql} IS DISTINCT FROM {_lit(value)}")
+            else:
+                out.append(f"{sql} = {_lit(value)}")
+    return out
+
+
 def build_sql(spec: dict, table: str, columns: dict[str, dict[str, str]], *,
-              time_columns: dict[str, list[str]] | None = None) -> Built:
+              time_columns: dict[str, list[str]] | None = None,
+              totals: dict[str, dict[str, Any]] | None = None) -> Built:
     """Compile ``spec`` (reading ``table``) to SQL. ``columns``: table ->
     {column: type} for every table the spec may read.
 
     Every aggregate query also returns how much it combined, so a total is
     never mistaken for one value: ``rows_aggregated`` (COUNT(*)) and, for each
     of the table's ``time_columns`` that is not grouped by, ``first_<col>`` /
-    ``last_<col>`` (the span of periods the aggregate covers)."""
+    ``last_<col>`` (the span of periods the aggregate covers). ``totals``:
+    table -> {column: total value} (see TOTAL ROWS above)."""
     if not isinstance(spec, dict):
         raise QuerySpecError("query spec must be a JSON object")
     unknown = set(spec) - _SPEC_KEYS
@@ -266,7 +346,7 @@ def build_sql(spec: dict, table: str, columns: dict[str, dict[str, str]], *,
     # keeps the base it was written for).
     table = str(spec.get("from") or table)
     join = spec.get("join") or None
-    ctx = _Ctx(table, columns, join)
+    ctx = _Ctx(table, columns, join, totals)
 
     sel = spec.get("select") or []
     if not isinstance(sel, list) or not sel:
@@ -319,7 +399,7 @@ def build_sql(spec: dict, table: str, columns: dict[str, dict[str, str]], *,
             conds.append(f"{_q(table)}.{_q(a)} = {_q(ctx.other)}.{_q(b)}")
         sql += f" JOIN {_q(ctx.other)} ON " + " AND ".join(conds)
 
-    where = [_where(ctx, c) for c in spec.get("where") or []]
+    where = [_where(ctx, c) for c in spec.get("where") or []] + _total_conditions(ctx, spec)
     if where:
         sql += " WHERE " + " AND ".join(where)
 

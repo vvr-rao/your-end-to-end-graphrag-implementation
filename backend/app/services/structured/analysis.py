@@ -17,6 +17,11 @@ table:
 * **item columns** -- a text column in the grain whose values name different
   quantities (a long-format table); its most widely shared values are listed
   so the measures can be defined on them.
+* **total rows** -- a value of a grain column ('Overall', 'All', 'Total',
+  'World'...) whose rows hold the SUM of the other rows of their group (the
+  rest of the grain). Published tables often ship totals next to their parts;
+  adding both counts everything twice. The query builder keeps only the total
+  rows when a query does not use that column and drops them when it does.
 
 The result is stored in ``meta["analysis"]`` and drives both the LLM step
 that defines measures (``refine``) and the deterministic tests of every
@@ -41,6 +46,12 @@ TIMEOUT_MS = 30000
 NEAR_DEP_MIN_VALUES = 50     # near-dependency only over columns this varied
 NEAR_DEP_SHARE = 0.02         # ... and at most this share of exceptions
 SPARSE_NULL_SHARE = 0.3       # columns this often null are annotations, not identity
+TOTAL_CANDIDATE_VALUES = 5    # per grain column, the values present in the most groups
+TOTAL_MIN_COVERAGE = 0.5      # a total value appears in at least this share of groups
+TOTAL_MIN_GROUPS = 5          # groups where total and parts can be compared
+TOTAL_MIN_SHARE = 0.9         # ... and where the total equals the sum of the parts
+TOTAL_TOLERANCE = 0.005       # relative difference still counted as equal (rounding)
+TOTAL_MAX_MEASURES = 6
 
 
 def _q(ident: str) -> str:
@@ -213,6 +224,80 @@ async def analyze_table(session, meta: dict) -> dict[str, Any]:
             vals = []
         if vals:
             out["item_columns"][c] = {"distinct": distinct.get(c), "top_values": [str(v) for v in vals]}
+
+    out["total_rows"] = await detect_total_rows(session, meta, key, types, measures)
+    return out
+
+
+async def detect_total_rows(session, meta: dict, key: list[str], types: dict[str, str],
+                            measures: list[str]) -> list[dict]:
+    """Values of a grain column whose rows are the totals of the other rows of
+    their group: [{"column", "value", "groups_by", "groups_compared",
+    "share_equal", "measure"}]. A value qualifies when it is present in most
+    groups (the rest of the grain) and, for at least one measure, its row
+    equals the sum of the group's other rows in nearly every group where both
+    exist. SQL only."""
+    table = meta["table_name"]
+    ref = f"graphrag.{_q(table)}"
+    found: list[dict] = []
+    if not measures:
+        return found
+    for c in key:
+        if types.get(c) != "text":
+            continue
+        group = [g for g in key if g != c]
+        if not group:
+            continue
+        grp = _cols(group)
+        n_groups = await _distinct(session, ref, group)
+        if not n_groups:
+            continue
+        try:
+            async with session.begin_nested():
+                await session.execute(sql_text(f"SET LOCAL statement_timeout = {TIMEOUT_MS}"))
+                cands = (await session.execute(sql_text(
+                    f"SELECT {_q(c)}, COUNT(DISTINCT ROW({grp})) AS n FROM {ref} "
+                    f"WHERE {_q(c)} IS NOT NULL GROUP BY 1 ORDER BY 2 DESC, 1 "
+                    f"LIMIT {TOTAL_CANDIDATE_VALUES}"))).all()
+        except Exception as exc:
+            log.info("total-row candidates skipped: %s", str(exc).splitlines()[0][:200])
+            continue
+        for value, n in cands:
+            if n < TOTAL_MIN_COVERAGE * n_groups:
+                break                                    # ordered by coverage
+            best = None
+            for m in measures[:TOTAL_MAX_MEASURES]:
+                mq = _q(m)
+                st = await _scalar(session, f"""
+                    SELECT json_build_object(
+                        'compared', COUNT(*) FILTER (WHERE ok),
+                        'equal', COUNT(*) FILTER (WHERE ok AND abs(tot - rest)
+                                 <= {TOTAL_TOLERANCE} * greatest(abs(tot), abs(rest), 1e-9)))
+                      FROM (SELECT SUM({mq}) FILTER (WHERE {_q(c)} = :v) AS tot,
+                                   SUM({mq}) FILTER (WHERE {_q(c)} IS DISTINCT FROM :v) AS rest,
+                                   COUNT({mq}) FILTER (WHERE {_q(c)} = :v) = 1
+                                   AND COUNT({mq}) FILTER (WHERE {_q(c)} IS DISTINCT FROM :v) >= 1 AS ok
+                              FROM {ref} GROUP BY {grp}) g""", {"v": value})
+                if not st or not st.get("compared"):
+                    continue
+                share = st["equal"] / st["compared"]
+                if st["compared"] >= TOTAL_MIN_GROUPS and share >= TOTAL_MIN_SHARE and (
+                        best is None or share > best[1]):
+                    best = (m, share, st["compared"])
+            if best is not None:
+                found.append({"column": c, "value": str(value), "groups_by": group,
+                              "groups_compared": best[2], "share_equal": round(best[1], 3),
+                              "measure": best[0]})
+                break                                    # one total value per column
+    return found
+
+
+def total_markers(meta: dict | None) -> dict[str, str]:
+    """{column: total value} from a table's analysis (empty when none)."""
+    out: dict[str, str] = {}
+    for t in ((meta or {}).get("analysis") or {}).get("total_rows") or []:
+        if isinstance(t, dict) and t.get("column") and t.get("value") is not None:
+            out.setdefault(str(t["column"]), str(t["value"]))
     return out
 
 
@@ -244,4 +329,10 @@ def summary_for_prompt(analysis: dict) -> dict:
         out["mostly_determines"] = analysis["near_dependencies"]
     if analysis.get("item_columns"):
         out["item_columns"] = analysis["item_columns"]
+    if analysis.get("total_rows"):
+        out["total_rows"] = [
+            {"column": t["column"], "value": t["value"],
+             "meaning": (f"rows with {t['column']} = {t['value']!r} hold the total of the other rows "
+                         f"with the same {', '.join(t.get('groups_by') or [])}")}
+            for t in analysis["total_rows"]]
     return out

@@ -143,7 +143,8 @@ def metadata_card(meta: dict, *, max_values: int = 40) -> str:
     grain = meta.get("grain")
     if grain:
         lines.append(f"One row = {grain if isinstance(grain, str) else ', '.join(map(str, grain))}.")
-    lines.append("Columns (exact counts and ranges measured on the loaded table):")
+    lines.append("Columns (exact counts and ranges measured on the loaded table; a range is "
+                 "the whole column, not the value of any one item):")
     for c in meta.get("columns") or []:
         name = c.get("name")
         s = stats.get(name) or {}
@@ -154,7 +155,7 @@ def metadata_card(meta: dict, *, max_values: int = 40) -> str:
         if s.get("periods"):
             cov.append("periods " + "; ".join(f"{g} {lo}..{hi}" for g, (lo, hi) in s["periods"].items()))
         elif "min" in s and s.get("min") is not None:
-            cov.append(f"range {s['min']}..{s['max']}")
+            cov.append(f"smallest..largest over all rows {s['min']}..{s['max']}")
         vals = (domains.get(name) or {}).get("values")
         if vals:
             shown = " | ".join(map(str, vals[:max_values]))
