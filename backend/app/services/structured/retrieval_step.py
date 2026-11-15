@@ -63,6 +63,8 @@ ENTITY_ID_MIN_DISTINCT = 10     # an identifier column this varied names individ
 DISTINCTIVE_SHARE = 0.2         # a word in at most this share of a column's values identifies a row
 MISSING_VALUE_ERROR = ("value(s) not found in their column (see missing_values, which lists the closest "
                        "values that DO exist): checked before the query ran; do not use them again")
+EMPTY_EXCLUDED_NOTE = ("Rows with an empty {columns} are not listed or counted as a value "
+                       "here (an empty value is not a category).")
 UNRANKED_NOTE = ("This query kept only the latest row(s) by {column}, but {rows} other matching "
                  "row(s) have an empty {column} and were never shown; they may hold values the "
                  "returned row(s) lack. Do not take a missing value as absent from the table.")
@@ -606,6 +608,8 @@ async def _execute(call: dict, by_table: dict[str, dict], *, max_rows: int, time
     else:
         err = "call has neither query_id nor query"
         return {"table": table, "error": err}, None, err
+    if built.empty_excluded:
+        rec["empty_excluded"] = list(built.empty_excluded)
     rec.update({"sql": res.sql, "params": res.params, "row_count": res.row_count,
                 "truncated": res.truncated, "total_rows": res.total_rows, "seconds": res.seconds,
                 "error": res.error})
@@ -1012,6 +1016,8 @@ def _evidence_text(rec: dict, res: SqlResult, meta: dict, char_cap: int, stats: 
     if rec.get("listing"):
         from backend.app.services.structured.listing_stats import stats_text
 
+        if rec.get("empty_excluded"):
+            head += EMPTY_EXCLUDED_NOTE.format(columns=", ".join(rec["empty_excluded"])) + " "
         return _listing_text(head, res, char_cap, stats_text(stats) if stats else "")
     cols = res.columns
     body = []
@@ -1026,8 +1032,10 @@ def _evidence_text(rec: dict, res: SqlResult, meta: dict, char_cap: int, stats: 
     tail = ""
     if rec.get("unranked_rows"):
         tail += " " + UNRANKED_NOTE.format(**rec["unranked_rows"])
+    if rec.get("empty_excluded"):
+        tail += " " + EMPTY_EXCLUDED_NOTE.format(columns=", ".join(rec["empty_excluded"]))
     if res.truncated:
-        tail = (f" Result capped at {res.row_count} of "
+        tail += (f" Result capped at {res.row_count} of "
                 f"{res.total_rows if res.total_rows is not None else 'more'} rows.")
     return head + f"{res.row_count} row(s): " + " ".join(body) + tail
 

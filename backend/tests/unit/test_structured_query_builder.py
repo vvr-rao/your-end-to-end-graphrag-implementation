@@ -44,7 +44,7 @@ def test_aggregates_group_by_plain_columns_automatically():
             "where": [{"column": "cik", "op": "=", "param": "cik"}],
             "order_by": [{"column": "total", "dir": "desc"}]})
     assert b.sql == ('SELECT "unit", SUM("val") AS "total", COUNT(*) AS "row_count" FROM "facts" '
-                     'WHERE "cik" = CAST(:cik AS text) GROUP BY "unit" ORDER BY "total" DESC NULLS LAST')
+                     'WHERE "cik" = CAST(:cik AS text) AND NULLIF("unit", \'\') IS NOT NULL GROUP BY "unit" ORDER BY "total" DESC NULLS LAST')
 
 
 def test_aggregates_report_rows_combined_and_the_time_span():
@@ -54,7 +54,7 @@ def test_aggregates_report_rows_combined_and_the_time_span():
     assert b.sql == ('SELECT "unit", SUM("val") AS "total", COUNT(*) AS "rows_aggregated", '
                      'MIN("end") AS "first_end", MAX("end") AS "last_end", '
                      'MIN("filed") AS "first_filed", MAX("filed") AS "last_filed" FROM "facts" '
-                     'WHERE "cik" = CAST(:cik AS text) GROUP BY "unit"')
+                     'WHERE "cik" = CAST(:cik AS text) AND NULLIF("unit", \'\') IS NOT NULL GROUP BY "unit"')
     plain = build_sql({"select": ["end", "val"]}, "facts", COLS, time_columns={"facts": ["end"]})
     assert "rows_aggregated" not in plain.sql
 
@@ -208,3 +208,41 @@ def test_measure_params_for_items_and_their_own_qualifiers_are_optional():
     where = {w["column"]: w for w in measure_item(m, meta)["query"]["where"] if "param" in w}
     assert where["item"].get("optional") and where["unit"].get("optional")
     assert not where["basis"].get("optional") and not where["period"].get("optional")
+
+
+# -- empty values are not a category ------------------------------------------
+
+def test_distinct_listing_leaves_out_empty_values():
+    b = _b({"select": ["company"], "distinct": True, "order_by": ["company"]}, "companies")
+    assert b.sql == ('SELECT DISTINCT "company" FROM "companies" '
+                     "WHERE NULLIF(\"company\", '') IS NOT NULL ORDER BY \"company\" ASC")
+    assert b.empty_excluded == ["company"]
+
+
+def test_group_by_on_a_non_text_column_drops_only_null():
+    b = _b({"select": ["fy", {"agg": "count", "as": "n"}], "group_by": ["fy"]})
+    assert 'WHERE "fy" IS NOT NULL GROUP BY "fy"' in b.sql and b.empty_excluded == ["fy"]
+
+
+def test_several_keys_drop_a_row_only_when_every_key_is_empty():
+    b = _b({"select": ["unit", "fy", {"agg": "sum", "column": "val", "as": "total"}]})
+    assert "WHERE COALESCE(NULLIF(\"unit\", ''), CAST(\"fy\" AS text)) IS NOT NULL" in b.sql
+    assert b.empty_excluded == ["unit", "fy"]
+
+
+def test_distinct_on_keys_are_checked_too():
+    b = _b({"select": ["cik", "val"], "distinct_on": ["cik"],
+            "order_by": [{"column": "end", "dir": "desc"}]})
+    assert "WHERE NULLIF(\"cik\", '') IS NOT NULL" in b.sql and b.empty_excluded == ["cik"]
+
+
+def test_explicit_filter_on_a_key_keeps_its_empty_values():
+    b = _b({"select": ["unit", {"agg": "count", "as": "n"}],
+            "where": [{"column": "unit", "op": "is_null"}]})
+    assert "NULLIF" not in b.sql and b.empty_excluded == []
+
+
+def test_plain_rows_and_whole_table_aggregates_are_unchanged():
+    assert "WHERE" not in _b({"select": ["cik", "val"]}).sql
+    b = _b({"select": [{"agg": "sum", "column": "val", "as": "total"}]})
+    assert "WHERE" not in b.sql and b.empty_excluded == []

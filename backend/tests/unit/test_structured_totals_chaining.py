@@ -372,3 +372,49 @@ async def test_guard_accepts_an_identifier_stated_in_the_document_evidence():
     sql = "SELECT n FROM items WHERE item_id = CAST(:id AS text)"
     kw = {"types": ITYPES, "metas": {"items": META}, "seen_values": set(), "question": "n for the trial?"}
     assert await identifier_guard(sql, {"id": "AB-1234"}, context_norm="theyranab1234in2020", **kw) == []
+
+
+# ---------------------------------------------------------------- empty values are not a category
+
+@db_only
+async def test_distinct_listing_and_group_by_do_not_count_empty_values(pg):
+    from sqlalchemy import text
+
+    from backend.app.services.structured.sql_exec import run_sql
+    async with pg() as s:
+        await s.execute(text("CREATE TABLE IF NOT EXISTS graphrag.t_places (site text, country text)"))
+        await s.execute(text("DELETE FROM graphrag.t_places"))
+        await s.execute(text("INSERT INTO graphrag.t_places VALUES ('a','France'),('b','Peru'),"
+                             "('c',NULL),('d',''),('e','Peru')"))
+    try:
+        types = {"t_places": {"site": "text", "country": "text"}}
+        listing = build_sql({"select": ["country"], "distinct": True}, "t_places", types)
+        res = await run_sql(listing.sql, {}, {"t_places"}, max_rows=50, timeout_ms=5000)
+        assert sorted(r[0] for r in res.rows) == ["France", "Peru"]
+        counted = build_sql({"select": [{"agg": "count_distinct", "column": "country", "as": "n"}]},
+                            "t_places", types)
+        res = await run_sql(counted.sql, {}, {"t_places"}, max_rows=50, timeout_ms=5000)
+        assert int(res.rows[0][0]) == 2
+        per = build_sql({"select": ["country", {"agg": "count", "as": "sites"}]}, "t_places", types)
+        res = await run_sql(per.sql, {}, {"t_places"}, max_rows=50, timeout_ms=5000)
+        assert {r[0]: int(r[1]) for r in res.rows} == {"France": 1, "Peru": 2}
+        assert counted.empty_excluded == [] and per.empty_excluded == ["country"]
+    finally:
+        async with pg() as s:
+            await s.execute(text("DROP TABLE IF EXISTS graphrag.t_places"))
+
+
+def test_evidence_says_empty_values_were_left_out_and_keeps_the_other_notes():
+    from backend.app.services.structured.retrieval_step import (
+        EMPTY_EXCLUDED_NOTE,
+        UNRANKED_NOTE,
+        _evidence_text,
+    )
+    res = SqlResult(sql="SELECT 1", params={}, columns=["country"], rows=[["France"], ["Peru"]],
+                    row_count=2, truncated=True, total_rows=9)
+    rec = {"table": "t_places", "empty_excluded": ["country"],
+           "unranked_rows": {"column": "period", "rows": 1}}
+    out = _evidence_text(rec, res, {}, 4000)
+    assert EMPTY_EXCLUDED_NOTE.format(columns="country") in out
+    assert UNRANKED_NOTE.format(column="period", rows=1) in out      # a capped result kept it
+    assert "Result capped at 2 of 9 rows." in out

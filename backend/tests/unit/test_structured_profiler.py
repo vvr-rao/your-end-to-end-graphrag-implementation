@@ -122,7 +122,7 @@ async def test_profile_builds_metadata_and_lookups(folder, tmp_path):
     assert m["row_count"] == 3 and [c["type"] for c in m["columns"]] == ["text", "date", "numeric"]
     assert m["metrics"][0]["id"] == "count_by_first"
     assert m["metrics"][0]["sql"] == ('SELECT "commodity", COUNT(*) AS "n", MIN("period") AS "first_period", '
-                                      'MAX("period") AS "last_period" FROM "prices" GROUP BY "commodity"')
+                                      'MAX("period") AS "last_period" FROM "prices" WHERE NULLIF("commodity", \'\') IS NOT NULL GROUP BY "commodity"')
     f = m["filters"][0]                     # params: names/types from the spec, text from the model
     assert f["params"] == [{"name": "v", "type": "text", "column": "commodity",
                             "description": "the value", "example": "x"}]

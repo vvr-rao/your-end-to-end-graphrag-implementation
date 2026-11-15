@@ -70,6 +70,9 @@ class Built:
     sql: str
     params: list[dict] = field(default_factory=list)   # [{name, type, column}] in order of use
     tables: set[str] = field(default_factory=set)
+    # Output columns of a listing (DISTINCT / DISTINCT ON / GROUP BY keys)
+    # whose rows are left out when every key is empty (NULL or '').
+    empty_excluded: list[str] = field(default_factory=list)
 
 
 def _q(ident: str) -> str:
@@ -197,7 +200,11 @@ def _select_item(ctx: _Ctx, raw) -> tuple[str, str, bool, str | None]:
             sql, ctype, _t, out = ctx.ref(raw["column"])
             if agg in {"sum", "avg"} and ctype not in {"integer", "numeric"}:
                 sql = f"CAST({sql} AS numeric)"
-            inner = f"DISTINCT {sql}" if agg == "count_distinct" else sql
+            if agg == "count_distinct":
+                # NULL is never counted; '' is no value either.
+                inner = f"DISTINCT NULLIF({sql}, '')" if ctype == "text" else f"DISTINCT {sql}"
+            else:
+                inner = sql
             expr, alias = f"{AGGS[agg]}({inner})", alias or f"{agg}_{out}"
         if not _NAME.match(alias):
             raise QuerySpecError(f"bad alias {alias!r} (use snake_case)")
@@ -326,6 +333,36 @@ def _total_conditions(ctx: _Ctx, spec: dict) -> list[str]:
     return out
 
 
+def _empty_key_condition(ctx: _Ctx, spec: dict, keys: list) -> tuple[str | None, list[str]]:
+    """A listing's keys (the columns a DISTINCT / DISTINCT ON / GROUP BY
+    lists values of): a row whose every key is empty (NULL or '') is no value
+    of that column, so it is left out (it would otherwise be listed or counted
+    as one more category). A key the query filters explicitly (e.g. op
+    is_null) is left alone. -> (where condition or None, output names)."""
+    _used, filtered = _used_columns(ctx, spec)
+    refs, names = [], []
+    for raw in keys:
+        if raw in (None, "", "*"):
+            continue
+        try:
+            sql, ctype, tbl, out = ctx.ref(raw)
+        except QuerySpecError:
+            continue
+        name = raw.get("column") if isinstance(raw, dict) else str(raw).split(".")[-1]
+        if (tbl, str(name)) in filtered:
+            return None, []          # the question asked about these values itself
+        if all(sql != r[0] for r in refs):
+            refs.append((sql, ctype))
+            names.append(out)
+    if not refs:
+        return None, []
+    if len(refs) == 1:
+        sql, ctype = refs[0]
+        return (f"NULLIF({sql}, '') IS NOT NULL" if ctype == "text" else f"{sql} IS NOT NULL"), names
+    parts = [f"NULLIF({sql}, '')" if ctype == "text" else f"CAST({sql} AS text)" for sql, ctype in refs]
+    return f"COALESCE({', '.join(parts)}) IS NOT NULL", names
+
+
 def build_sql(spec: dict, table: str, columns: dict[str, dict[str, str]], *,
               time_columns: dict[str, list[str]] | None = None,
               totals: dict[str, dict[str, Any]] | None = None) -> Built:
@@ -400,6 +437,18 @@ def build_sql(spec: dict, table: str, columns: dict[str, dict[str, str]], *,
         sql += f" JOIN {_q(ctx.other)} ON " + " AND ".join(conds)
 
     where = [_where(ctx, c) for c in spec.get("where") or []] + _total_conditions(ctx, spec)
+    if distinct_on:
+        keys = list(spec.get("distinct_on") or [])
+    elif has_agg:
+        keys = list(spec.get("group_by") or []) + [
+            r for r in sel if not (isinstance(r, dict) and r.get("agg"))]
+    elif spec.get("distinct"):
+        keys = list(sel)
+    else:
+        keys = []
+    empty_cond, empty_excluded = _empty_key_condition(ctx, spec, keys)
+    if empty_cond:
+        where.append(empty_cond)
     if where:
         sql += " WHERE " + " AND ".join(where)
 
@@ -452,7 +501,8 @@ def build_sql(spec: dict, table: str, columns: dict[str, dict[str, str]], *,
             sql += f" LIMIT {lim}"
         else:
             raise QuerySpecError(f"limit must be 1..{MAX_LIMIT} or {{\"param\": \"n\"}}")
-    return Built(sql=sql, params=list(ctx.params.values()), tables=set(ctx.tables))
+    return Built(sql=sql, params=list(ctx.params.values()), tables=set(ctx.tables),
+                 empty_excluded=empty_excluded)
 
 
 def merge_params(built: Built, declared: list[dict] | None) -> list[dict]:
