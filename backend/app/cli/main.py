@@ -445,7 +445,8 @@ def _add_structured_profile_flags(p: argparse.ArgumentParser) -> None:
             "metrics, filters, Postgres SQL, cross-table lookups) and their "
             "concepts become ontology classes. Metadata is cached and reused by "
             "extract-entities --structured-data. One table_profile call per "
-            "table (~$0.05-0.08 on gpt-4.1). Default: OFF."
+            "table (wide tables: several, in column batches) plus one "
+            "table_lookups call. Default: OFF."
         ),
     )
     p.add_argument(
@@ -1934,10 +1935,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_ev.add_argument("--runs-per-question", type=int, default=3)
     p_ev.add_argument(
+        "--use-structured-data", action=argparse.BooleanOptionalAction, default=None,
+        help="Answer with the loaded data tables too (see `query --use-structured-data`). "
+             "Unset => qa.use_structured_data (off).",
+    )
+    p_ev.add_argument(
         "--judge-model",
-        choices=("gpt-4.1", "gpt-4o-mini"),
-        default="gpt-4.1",
-        help="Override the judge model. gpt-4o-mini is ~10x cheaper but less reliable.",
+        default=None,
+        metavar="[PROVIDER:]MODEL",
+        help="Run the four judge_* tasks on this model instead of the ones in "
+             "config/models.yaml (default). Any model: the provider is inferred "
+             "from the name (claude-* -> anthropic, gpt-*/o* -> openai, org/model "
+             "-> deepinfra) or given as provider:model (e.g. groq:llama-3.3-70b-"
+             "versatile). Its API key must be set.",
     )
     p_ev.add_argument("--output", type=Path, default=None,
                       help="Detailed JSON log.")
@@ -3602,6 +3612,7 @@ def _cmd_evaluate_queries(args: argparse.Namespace) -> int:
             mode=args.mode,
             runs_per_question=args.runs_per_question,
             judge_model=args.judge_model,
+            use_structured_data=args.use_structured_data,
             output_json=args.output,
             output_md=args.output_md,
             max_cost_usd=args.max_cost_usd,
