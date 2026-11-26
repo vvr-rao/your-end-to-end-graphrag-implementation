@@ -964,18 +964,18 @@ The UI's `LoadingSpinner` switches copy to warn about cold start after 5s.
 
 ## LLM provider routing
 
-Task → provider/model map lives in `config/models.yaml`. Defaults:
+Task → provider/model map lives in `config/models.yaml`. Defaults (Groq + OpenAI and OpenAI-only presets, GPT-6 since 2026-11-25):
 
 | Task | Provider | Model |
 |---|---|---|
-| `chunk_classification` (ontology expansion Stage 1) | Groq | `llama-3.3-70b-versatile` |
-| `class_proposal`, `match_dedup` (ontology expansion Stages 2–3) | OpenAI | `gpt-4.1` |
-| `class_summarization`, `document_summarize`, `compact_description` | OpenAI | `gpt-4o-mini` |
-| `entity_extract`, `question_parse`, `concept_expansion`, `query_decompose`, `follow_up_resolution` | OpenAI | `gpt-4o-mini` |
-| `artifact_chunk_extract_with_entities` (Claim / Finding / Observation / Event extraction) | OpenAI | `gpt-4o-mini` |
-| `answer_simple_qa`, `answer_conversation_turn` | OpenAI | `gpt-4o-mini` |
-| `answer_deep_research`, `insight_gen`, `recommendation_gen` | OpenAI | `gpt-4.1` |
+| `chunk_classification` (ontology expansion Stage 1) | Groq (OpenAI-only: `gpt-6-luna`) | `llama-3.3-70b-versatile` |
+| `class_proposal`, `match_dedup`, `concept_grouping`, `document_summarize`, `alias_judge`, `relationship_orphan_check`, `artifact_merge*`, `insight_gen`, `recommendation_gen`, `answer_simple_qa`, `answer_deep_research`, `qa_synthesis`, `table_lookups`, `table_verify`, `table_concept_map`, `table_query_select`, `judge_*` | OpenAI | `gpt-6.1-terra`, `reasoning_effort: none` |
+| `table_profile`, `table_refine` | OpenAI | `gpt-6.2-sol` (model default effort) |
+| every other chat task (summaries, extraction, entity/relationship checks, question parsing, conversation turns, small judges, table vision) | OpenAI | `gpt-6-luna` |
+| `summary_merge`, `summary_merge_evaluate`, `summary_merge_revise` | OpenAI | `gpt-5.4` |
 | `embeddings` | OpenAI | `text-embedding-3-small` @ 1024 dim |
+
+Why this split: on a 17-document + 3-table end-to-end run, Terra (no reasoning) built the graph in 32 min / $6.40 against 82 min / $14.59 with Sol on the same tasks, with the same answer accuracy (23/24); only for table profiling/refining did Sol write clearly fuller stored-query catalogs (about 40% more queries). Any OpenAI reasoning-model task accepts an optional `reasoning_effort: none|minimal|low|medium|high|xhigh`; leave it out for the model's default. The earlier gpt-4.1 / gpt-4.1-mini / gpt-4o-mini settings are in the git history of the preset files; model choices quoted elsewhere in this README describe the benchmarks they were measured in.
 
 `OPENAI_API_KEY` is required in every mode except DeepInfra (which needs only `DEEPINFRA_API_KEY` and uses DeepInfra models for every task); `GROQ_API_KEY` is only needed if you use the Groq-backed Stage 1 in ontology expansion.
 
@@ -1095,15 +1095,72 @@ uv run python -m backend.app.cli prune-expand --input output_ontologies/v<TS>-me
   --structured-data <DATA_DIR> --structured-limit 2      # smoke test first
 
 # 2. Load the tables into the graphrag schema (one table per file) and link each
-#    table's TableMetadata node to classes and to existing entities in key
-#    columns. Reads the cache -- no profiling calls when step 1 ran.
+#    table's TableMetadata node to classes and to EXISTING entities in key and
+#    place columns (structured data never creates an entity; unknown places are
+#    reported). Reads the cache -- no profiling calls when step 1 ran; class
+#    proposals that match no existing class are reported (run step 1 to add
+#    them). Every stored query is compiled and TESTED on the loaded data.
 uv run python -m backend.app.cli extract-entities --structured-only --structured-data <DATA_DIR>
 
-# 3. Answer from the tables via SQL only: the model picks stored queries and fills
-#    their parameters (or returns a new JSON spec when none fits); the SQL is
-#    compiled from the spec, run read-only, timed out, at most
-#    qa.structured_max_rows rows shown.
+# 2b. Runs automatically after step 2 (or on its own): measure each loaded table
+#    (grain, dependencies, repeat statistics as EVIDENCE of version columns),
+#    define its measures (identity vs display columns; a version rule only with
+#    a reason), test the EXACT stored SQL of every query on the data (a measure
+#    must return every observation once; a join must hold its cardinality and
+#    not multiply sums) -> passed / failed / not_exercised. Failed specs are
+#    repaired once, failed measure definitions get one bounded repair (original,
+#    failure and proposal are kept; unresolved ones stay in failed_measures),
+#    then VERIFY independently (task
+#    table_verify): a fresh call checks the column metadata against what was
+#    measured (incl. which periods/reports a column is filled for), then each
+#    stored query's compiled SQL -- with a program-written SHAPE line and a sample
+#    result -- against its label and description: ok / re-describe / fix the query
+#    (re-tested) / drop; a measure only ok / re-describe / drop. Items left
+#    without a verdict stay pending and a later run verifies only those.
+#    --no-verify skips it, --reverify repeats it; --relink re-compiles and
+#    re-tests everything with no LLM (also migrates catalogs written before the
+#    verified-catalog version).
+uv run python -m backend.app.cli table-metadata-refine [--table NAME] [--reverify] [--relink]
+
+# 3. Answer from the tables via SQL only: the model picks STORED queries
+#    ({table, query_id, params}) or says no_match -- inline SQL or specs are
+#    refused. Only queries whose exact SQL passed its test are offered; that
+#    SQL runs with the parameters validated (names, types, allowed values) and
+#    bound by the driver, read-only, timed out, at most qa.structured_max_rows
+#    rows shown. Zero rows is an answer; a retry may only fix a value shown to
+#    be invalid, never broaden the question.
 uv run python -m backend.app.cli query --mode simple_qa --use-structured-data "..."
+
+# What the catalog guarantees (all generic -- no dataset-specific rule):
+#  - Wide tables: above `continuation.batch` columns (default 40) profiling runs
+#    in column batches (every batch sees the whole schema plus measured
+#    evidence: single-column keys, year-suffixed column families, indicator /
+#    value pairs, unit-like columns), then a synthesis call (description,
+#    grain, relationships, candidates) and capability calls batched by
+#    candidate id. Each call is checkpointed (<cache>/table_metadata/partial/),
+#    so a re-run resumes only unfinished work. table_refine continues by
+#    candidate id the same way (no fixed number of rounds). Cut-off replies
+#    keep their complete records; budgets (max_calls, max_output_tokens) and a
+#    no-progress stop bound the work; anything unfinished is recorded as
+#    incomplete_due_to_budget / incomplete_due_to_truncation / invalid_reply.
+#  - Measures: version_order (column, direction, nulls, basis precedence |
+#    tie_break) -- a tie at the winning precedence with different values keeps
+#    the measure unavailable unless a tie_policy is given; population
+#    (include / exclude predicates) is applied to the SQL, the parameter
+#    domains and the test witness; subject / uniqueness / dimension columns
+#    (identity columns no observation needs are measured and moved to
+#    dimensions; a column with published total rows stays in the key).
+#  - Tests: the witness reads REQUIRED parameters only (with every condition
+#    of the compiled SQL); optional filters are tested one by one; identical
+#    SQL under two names is aliased (same population) or failed (different);
+#    unsafe parameter names (SQL key words, collisions) are renamed; dropped
+#    templates are re-tested on --relink.
+#  - Coverage ledger (meta.coverage_ledger): one row per capability with a
+#    stable id and category dedicated_measure / generic_query / partial /
+#    unexercised / verifier_drop / unsupported / unfinished / gap.
+#  - Entity links: shortened or fuzzy matches must fit the column's type, a
+#    place is never linked from a non-place column, close fuzzy runners-up are
+#    ambiguous; rejected matches stay unresolved (meta.entity_matches).
 
 # 4. Review / edit the metadata as Markdown.
 uv run python -m backend.app.cli table-metadata-export -o review/
@@ -1119,6 +1176,14 @@ Models: `table_profile` / `table_lookups` use gpt-4.1 (claude-sonnet-4-6 in
 Anthropic mode, the dedicated Qwen 27B in DeepInfra mode); `table_query_select`
 uses gpt-4.1 in the OpenAI presets (claude-haiku-4-5 in Anthropic mode,
 DeepSeek-V4.1-Flash in DeepInfra mode). Code: `backend/app/services/structured/`.
+
+Output caps: `max_tokens` per task, `max_tokens_by_model` per model (e.g.
+table_profile 65,536 on models that allow it); the router clamps the request
+to the model's output limit and remaining context window, logs requested vs
+effective caps, and the cost report lists per task the caps, finish reasons,
+retries and reasoning tokens (a subset of output tokens, never added twice).
+`continuation: {batch, max_calls, max_output_tokens, no_progress_calls}` on
+`table_profile` / `table_refine` sets the batch size and per-table budgets.
 
 #### Supplementary sources
 
