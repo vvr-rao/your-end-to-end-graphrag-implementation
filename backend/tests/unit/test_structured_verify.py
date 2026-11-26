@@ -279,3 +279,55 @@ async def test_a_split_whose_new_query_fails_keeps_the_original(db, tmp_path):  
     async with db() as s:
         meta = (await registered_tables(s))["reports"]["meta"]
     assert find_item(meta, "by_entity")[1]["label"] == "Listing" and find_item(meta, "x") is None
+
+
+async def test_a_fixed_lookup_is_tested_with_the_partner_tables_metadata(monkeypatch):
+    """Regression: the verifier's set of partner table NAMES shadowed the
+    ``partners`` argument ({table: metadata}); re-testing a lookup after a
+    fix_query verdict then failed with "'set' object is not subscriptable".
+    No database: the SQL-touching helpers are stubbed."""
+    import contextlib
+
+    from backend.app.db import session as session_mod
+    from backend.app.services.structured import db_load, refine, verify
+
+    @contextlib.asynccontextmanager
+    async def no_session():
+        yield None
+
+    async def no_filled(_s, _meta):
+        return {}
+
+    async def no_rows(*_a, **_k):
+        return []
+
+    async def sample(*_a, **_k):
+        return {"sql": "SELECT 1", "columns": ["k"], "rows": []}
+
+    async def registered(_s):
+        return {"b": {"meta": {"columns": [{"name": "k", "type": "text"}]}}}
+
+    seen = []
+
+    async def fake_test_item(meta, sec, item, analysis, types, *, partners=None):
+        seen.append(partners)
+        return {"status": "passed"}
+
+    monkeypatch.setattr(session_mod, "session_scope", no_session)
+    monkeypatch.setattr(verify, "filled_only_where", no_filled)
+    monkeypatch.setattr(verify, "_sample_result", sample)
+    monkeypatch.setattr(refine, "_sample_rows", no_rows)
+    monkeypatch.setattr(refine, "test_item", fake_test_item)
+    monkeypatch.setattr(db_load, "registered_tables", registered)
+
+    lookup = {"id": "lk_a_b", "label": "A with B", "other_table": "b", "params": [],
+              "query": {"select": ["k"]}, "sql": "SELECT 1"}
+    meta = {"table_name": "a", "columns": [{"name": "k", "type": "text"}], "lookups": [lookup]}
+    partner_meta = {"b": {"table_name": "b", "columns": [{"name": "k", "type": "text"}]}}
+    router = FakeRouter({"table_verify": [
+        {"columns": []},
+        {"items": [{"id": "lk_a_b", "verdict": "fix_query", "reason": "r",
+                    "query": {"select": ["k"], "limit": 5}}]}]})
+    await verify.verify_table(meta, router, analysis={}, all_types={"a": {"k": "text"}, "b": {"k": "text"}},
+                              partners=partner_meta, log=lambda *_: None)
+    assert seen and all(p is partner_meta for p in seen)

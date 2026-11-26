@@ -356,13 +356,15 @@ async def verify_table(meta: dict, router, *, analysis: dict, all_types: dict[st
     todo = pending_items(meta) if only_pending else [(sec, it) for sec, it in items(meta)]
     # a lookup reads its partner table too: show that table's documented columns
     others: dict[str, list[dict]] = {}
-    partners = {it.get("other_table") for sec, it in todo if sec == "lookups" and it.get("other_table")}
-    if partners:
+    # (a separate name: ``partners`` is the caller's {table: metadata} that the
+    # query tests below need -- shadowing it with a set of names broke them)
+    partner_names = {it.get("other_table") for sec, it in todo if sec == "lookups" and it.get("other_table")}
+    if partner_names:
         from backend.app.services.structured.db_load import registered_tables
 
         async with session_scope() as s:
             reg = await registered_tables(s)
-        for name in partners:
+        for name in partner_names:
             pm = (reg.get(name) or {}).get("meta") or {}
             others[name] = [{k: c.get(k) for k in ("name", "type", "role", "unit", "description")
                              if c.get(k) is not None} for c in pm.get("columns") or []]
