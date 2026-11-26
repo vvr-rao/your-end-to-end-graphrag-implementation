@@ -285,3 +285,55 @@ async def test_load_stores_valid_values_and_retrieval_checks_them(db, data, tmp_
     bad = plan["calls"][1]
     assert bad["invalid_values"][0]["allowed_values"] == ["Copper", "Crude oil"] and "sql" not in bad
     assert "Crude oil" in router.calls[1][1]                    # valid values reached the retry
+
+
+async def test_candidate_ranking_shared_places_do_not_outvote_the_named_table(db):
+    """Two tables share every place the question names; the third has only
+    some of them but is the one the question's words and topic point to."""
+    import json as _json
+
+    from sqlalchemy import text
+
+    from backend.app.services.structured.retrieval_step import candidate_tables
+
+    texts = {"indicators": "Development indicators by country and year: GDP, population, literacy.",
+             "energy": "Energy statistics by country and year: electricity generation by source.",
+             "fertilizers": "Fertilizer trade by country, product and year: urea, potash imports and exports."}
+    async with db() as s:
+        cls = (await s.execute(text("SELECT id FROM graphrag.ontology_classes LIMIT 1"))).scalar()
+        aid = {}
+        for name, body in texts.items():
+            aid[name] = (await s.execute(text(
+                "INSERT INTO graphrag.intelligence_artifacts (artifact_identifier, artifact_type, text, "
+                "graph_version, extra_metadata) VALUES (:i, 'TableMetadata', :t, 1, CAST(:m AS jsonb)) "
+                "RETURNING id"), {"i": f"tm-{name}", "t": body,
+                                  "m": _json.dumps({"table_name": name})})).scalar()
+        places = []
+        for k in range(6):
+            places.append((await s.execute(text(
+                "INSERT INTO graphrag.entities (entity_identifier, iri, name, normalized_name, class_id) "
+                "VALUES (:i, :i, :n, :n, :c) RETURNING id"),
+                {"i": f"https://ex.org/e#p{k}", "n": f"place{k}", "c": cls})).scalar())
+
+        async def link(table, ent):
+            await s.execute(text(
+                "INSERT INTO graphrag.graph_relationships (source_node_type, source_node_id, "
+                "target_node_type, target_node_id, predicate_iri, relationship_type, "
+                "relationship_source, graph_version) VALUES ('intelligence_artifact', :a, 'entity', :e, "
+                "'https://ex.org/p#assertsAbout', 'tablePlace', 'DOCUMENT_EXTRACTION', 1)"),
+                {"a": aid[table], "e": ent})
+        for p in places:
+            await link("indicators", p)
+            await link("energy", p)
+        for p in places[:2]:
+            await link("fertilizers", p)
+    q = "Which countries imported the most urea in 2023?"
+    scores = {p: 1.0 for p in places}
+    # Raw link counts alone (no question text) put the named table last ...
+    only_graph = await candidate_tables(places, [], None, max_tables=3, entity_scores=scores)
+    assert only_graph[-1]["table"] == "fertilizers"
+    # ... the question's own words lift it into the selector's top two.
+    ranked = await candidate_tables(places, [], None, max_tables=2, entity_scores=scores, question=q)
+    assert "fertilizers" in [c["table"] for c in ranked]
+    assert any(v.startswith("lexical:") for v in next(
+        c for c in ranked if c["table"] == "fertilizers")["via"])
