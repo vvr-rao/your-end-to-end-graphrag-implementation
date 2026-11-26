@@ -2598,6 +2598,18 @@ _SQL_RESULT_NOTE = (
 )
 
 
+_SQL_UNITS_NOTE = (
+    "  (Units of SQL results: a result's 'Units:' line gives the unit of each value "
+    "column, resolved by the program from the table's metadata and data for the query "
+    "that ran. Give every value from such a result with that unit. 'dimensionless' "
+    "means a pure number (a count or a ratio). 'unit unknown' means the table does not "
+    "state one: say the unit is not stated -- never assume a currency or unit. When the "
+    "unit differs by row, give each value with its own row's unit (from the unit column "
+    "or the <column>_unit value shown on that row), and never add, average, compare or "
+    "rank values whose units differ.)"
+)
+
+
 _TABLE_METADATA_NOTE = (
     "  (Items whose id contains TableMetadata_ describe a loaded data table: what it "
     "holds, its source, what one row means, and each column's meaning with counts, "
@@ -2631,6 +2643,9 @@ def _format_evidence_block(evidence_items: list[dict], char_cap: int = 600) -> s
         # Only when `--use-structured-data` produced results, so every other
         # prompt is byte-identical to before.
         lines.append(_SQL_RESULT_NOTE)
+        if any(it.get("kind") == "sql_result" and "Units: " in (it.get("text") or "")
+               for it in evidence_items):
+            lines.append(_SQL_UNITS_NOTE)
     if any(it.get("kind") == "table_metadata" for it in evidence_items):
         lines.append(_TABLE_METADATA_NOTE)
     for it in evidence_items:

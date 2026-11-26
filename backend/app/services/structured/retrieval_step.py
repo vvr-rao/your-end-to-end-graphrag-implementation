@@ -1128,7 +1128,8 @@ async def combination_hints(checks: list[dict]) -> list[dict]:
     return out
 
 
-def _listing_text(head: str, res: SqlResult, char_cap: int, summary: str = "") -> str:
+def _listing_text(head: str, res: SqlResult, char_cap: int, summary: str = "", *,
+                  cols: list[str] | None = None, rows: list[list] | None = None) -> str:
     """Compact layout for a LISTING result: the header once, then one line of
     values per row (about half the size of name=value pairs). ``summary`` (the
     exact change statistics) goes first, so the row cap never cuts it."""
@@ -1136,10 +1137,12 @@ def _listing_text(head: str, res: SqlResult, char_cap: int, summary: str = "") -
         head += summary + " "
     def cell(v) -> str:
         return "" if v is None else str(v).replace("|", "/")
-    lines = [" | ".join(res.columns)]
+    cols = cols if cols is not None else list(res.columns)
+    rows = rows if rows is not None else res.rows
+    lines = [" | ".join(cols)]
     used = len(head) + len(lines[0])
     shown = 0
-    for r in res.rows:
+    for r in rows:
         row = " | ".join(cell(v) for v in r)
         if used + len(row) + 3 > char_cap - 160:
             break
@@ -1148,8 +1151,8 @@ def _listing_text(head: str, res: SqlResult, char_cap: int, summary: str = "") -
         shown += 1
     note = f"{res.row_count} row(s)" + (f" of {res.total_rows if res.total_rows is not None else 'more'}"
                                          " (capped)" if res.truncated else "")
-    if shown < len(res.rows):
-        note += f"; {shown} shown here, {len(res.rows) - shown} more in the returned data"
+    if shown < len(rows):
+        note += f"; {shown} shown here, {len(rows) - shown} more in the returned data"
     return head + f"LISTING, {note}. Rows: " + " ;; ".join(lines)
 
 
@@ -1273,7 +1276,8 @@ def _flat(params: dict) -> list:
     return [v for v in out if isinstance(v, str)]
 
 
-def _evidence_text(rec: dict, res: SqlResult, meta: dict, char_cap: int, stats: dict | None = None) -> str:
+def _evidence_text(rec: dict, res: SqlResult, meta: dict, char_cap: int, stats: dict | None = None,
+                   units: dict | None = None) -> str:
     head = (f"SQL result from table {rec['table']}"
             + (f" ({rec['label']})" if rec.get("label") else "")
             + (f" [{(meta.get('source') or {}).get('rel_path')}]" if meta else "") + ". ")
@@ -1281,19 +1285,22 @@ def _evidence_text(rec: dict, res: SqlResult, meta: dict, char_cap: int, stats: 
         head += "Parameters: " + ", ".join(f"{k}={v}" for k, v in rec["params"].items()) + ". "
     if rec.get("reshape_note"):
         head += f"Reshaped from the stored query's rows: {rec['reshape_note']}. "
+    from backend.app.services.structured.units import units_line
+
+    head += units_line(units)
+    cols, rows = _with_row_units(res, units)
     if rec.get("listing"):
         from backend.app.services.structured.listing_stats import stats_text
 
         if rec.get("empty_excluded"):
             head += EMPTY_EXCLUDED_NOTE.format(columns=", ".join(rec["empty_excluded"])) + " "
-        return _listing_text(head, res, char_cap, stats_text(stats) if stats else "")
-    cols = res.columns
+        return _listing_text(head, res, char_cap, stats_text(stats) if stats else "", cols=cols, rows=rows)
     body = []
     used = len(head)
-    for r in res.rows:
+    for r in rows:
         row = "; ".join(f"{c}={'' if v is None else v}" for c, v in zip(cols, r, strict=False))
         if used + len(row) + 4 > char_cap - 120:
-            body.append(f"... ({len(res.rows) - len(body)} more fetched row(s) not shown)")
+            body.append(f"... ({len(rows) - len(body)} more fetched row(s) not shown)")
             break
         body.append("(" + row + ")")
         used += len(row) + 4
@@ -1306,6 +1313,42 @@ def _evidence_text(rec: dict, res: SqlResult, meta: dict, char_cap: int, stats: 
         tail += (f" Result capped at {res.row_count} of "
                 f"{res.total_rows if res.total_rows is not None else 'more'} rows.")
     return head + f"{res.row_count} row(s): " + " ".join(body) + tail
+
+
+def _with_row_units(res: SqlResult, units: dict | None) -> tuple[list[str], list[list]]:
+    """The result's columns and rows, plus a '<column>_unit' column for each
+    output whose unit the program looked up row by row."""
+    per = (units or {}).get("row_units") or {}
+    cols, rows = list(res.columns), [list(r) for r in res.rows]
+    for name, vals in per.items():
+        if len(vals) != len(rows):
+            continue
+        cols.append(f"{name}_unit")
+        for r, u in zip(rows, vals, strict=True):
+            r.append(u)
+    return cols, rows
+
+
+async def _result_units(rec: dict, res: SqlResult, by_table: dict[str, dict], *,
+                        timeout_ms: int) -> dict | None:
+    """Units of each output column of a result (see :mod:`structured.units`).
+    Never fails the retrieval: an unexpected statement gives no units."""
+    from backend.app.services.structured.units import result_units
+
+    metas = {t: c["meta"] for t, c in by_table.items() if c.get("meta")}
+    meta = metas.get(rec.get("table")) or {}
+    hit = find_item(meta, rec["query_id"]) if rec.get("query_id") else None
+    measure = (hit[1].get("measure") if hit and isinstance(hit[1].get("measure"), dict) else None)
+
+    async def run(sql: str, params: dict, tables: set[str]):
+        r = await run_sql(sql, params, tables, max_rows=600, timeout_ms=timeout_ms)
+        return None if r.error else r.rows
+
+    try:
+        return await result_units(res.sql, res.params, res.columns, res.rows, metas,
+                                  measure=measure, run=run)
+    except Exception:  # units are an aid; the result stands without them
+        return None
 
 
 async def structured_evidence(
@@ -1571,12 +1614,15 @@ async def structured_evidence(
                                            default=str).encode()).hexdigest()[:8]
         frag = f"SqlResult_{rec['table']}_{rec.get('query_id') or 'q'}_{digest}"
         stats = _listing_stats(rec, res, meta)
+        units = await _result_units(rec, res, by_table, timeout_ms=timeout_ms)
         evidence.append({
             "kind": "sql_result",
             "node_id": node,
             "iri": f"{VIAO_NS}#{re.sub(r'[^A-Za-z0-9_]', '_', frag)}",
             "rank": i, "score": 1.0,
-            "text": _evidence_text(rec, res, meta, listing_char_cap if rec.get("listing") else char_cap, stats),
+            "text": _evidence_text(rec, res, meta, listing_char_cap if rec.get("listing") else char_cap, stats,
+                                   units),
+            "units": units,
             "change_stats": stats,
             "char_cap": listing_char_cap if rec.get("listing") else char_cap,
             "listing": bool(rec.get("listing")),
