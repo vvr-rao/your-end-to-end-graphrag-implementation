@@ -204,7 +204,8 @@ default to Metric / Measure / Dimension / TimePeriod).
 - **Models:** `table_profile` on gpt-6.2-sol in the OpenAI presets
   (claude-sonnet-5-5 at high effort in Anthropic mode, the 27B in DeepInfra
   mode); `table_lookups` on gpt-6.1-terra (claude-haiku-5-5). (Anthropic mode's
-  Stage-2 `class_proposal` runs on Opus 5.5 high, ~$4.90 per 12 chunks; for a
+  Stage-2 `class_proposal` runs on Opus 5.5 high, ~$0.40 per class-proposal
+  chunk — see "Class-proposal chunk size" below; for a
   cheaper build offer Haiku 5.5 medium — see the choose-llm-mode skill,
   "Anthropic budget option".)
 - **Cost (measured 2026-11, whole table pipeline: profile here + refine and
@@ -646,6 +647,35 @@ command above when the user wants a per-run value; otherwise edit
 [table-mining] concurrency = 64
 [stage3] dedup concurrency = 8
 ```
+
+### Class-proposal chunk size (`expansion.proposal_chunk_tokens`, default 4000)
+
+Stage 1 and Stage 2 run once per **class-proposal chunk**. Every Stage-2 call
+carries a fixed ~30k-token load (instructions + ontology slice) and its reply is
+about the same size whatever the chunk, so the chunk count drives the cost.
+prune-expand re-cuts the cached summaries at this size; register-documents keeps
+its own 1,200-token pieces (`summarization.summary_chunk_max_tokens`) for
+retrieval, and both read ONE summary cache entry, so changing either never
+re-summarizes. A piece never spans two summary windows, so very large values
+stop helping once a window's summary fits in one piece.
+
+Measured 2026-11-26 (Opus 5.5 high, 6 docs, frozen 77-concept checklist):
+
+| tokens | calls | Stage-2 $ | checklist | new classes | 80-doc calls |
+|---|---|---|---|---|---|
+| 1200 | 12 | $4.93 | 71.5 | 241 | 248 |
+| 2400 | 8 | $3.32 | 69.0 | 193 | 140 |
+| 4000 | 6 | $2.43 | 70.0 | 174 | 100 |
+
+Fewer new classes, mostly secondary ones; the central topics were kept at every
+size. Medium effort scored 5–7 points lower at every size. When sizing a run,
+count calls at the configured chunk size (`deepinfra_sizing.py` scales its Stage
+1–2 ratios automatically). After a smoke test, check `cost.json` for
+`class_proposal` `finish=max_tokens`: bigger chunks can mean longer replies.
+Reply caps: OpenAI presets 64,000 (gpt-6.1-terra allows 128k), Anthropic 64,000,
+DeepInfra 32,768. **DeepInfra / Qwen mode may need the value lowered to 1200**:
+the 27B produced runaway replies even on 1,200-token chunks. Unset the key to
+restore the old cut.
 
 | Knob | Drives | Model / limit | Sane value |
 |---|---|---|---|

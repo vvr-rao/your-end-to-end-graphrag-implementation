@@ -1060,3 +1060,16 @@ def test_deepinfra_mode_uses_only_deepinfra() -> None:
 
     keys = select_llm_mode.MODES["deepinfra"][1]
     assert not [k for k in keys if k.split("_")[0] in {"OPENAI", "ANTHROPIC", "GROQ"}], keys
+
+
+def test_sizing_scales_stage_1_2_calls_for_bigger_proposal_chunks(tmp_path) -> None:
+    base = {"class_proposal": {"per_mtok": 440.0}, "chunk_classification": {"per_mtok": 440.0},
+            "match_dedup": {"per_mtok": 78.0}}
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("expansion:\n  ontology_chunk_size: 50\n", encoding="utf-8")
+    assert sizing.scale_for_proposal_chunks(base, cfg) == base             # unset: unchanged
+    cfg.write_text("expansion:\n  proposal_chunk_tokens: 4000\n", encoding="utf-8")
+    out = sizing.scale_for_proposal_chunks(base, cfg)
+    assert 0.38 < out["class_proposal"]["per_mtok"] / 440 < 0.43           # measured 100/248
+    assert out["chunk_classification"]["per_mtok"] == out["class_proposal"]["per_mtok"]
+    assert out["match_dedup"] == base["match_dedup"] and base["class_proposal"]["per_mtok"] == 440.0

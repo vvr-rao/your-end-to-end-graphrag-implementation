@@ -485,9 +485,17 @@ async def evaluated_summarize_documents_async(
     concurrency: int = 4,
     use_cache: bool = True,
     max_cost_usd: float = 1000.0,
+    split_max_tokens: int | None = None,
 ) -> list[EvaluatedDocSummary]:
-    """Evaluated per-chunk summarization for each document. See module docstring."""
+    """Evaluated per-chunk summarization for each document. See module docstring.
+
+    ``split_max_tokens`` cuts the stored pieces at a different size than
+    ``summary_chunk_max_tokens`` (prune-expand's class-proposal chunks) while
+    the cache key keeps ``summary_chunk_max_tokens``: summaries are cached
+    unsplit, so register-documents and prune-expand share one cache entry
+    whatever size each cuts it at."""
     enc = get_encoder(encoding_name)
+    split_tokens = int(split_max_tokens or summary_chunk_max_tokens)
     model = router.task_spec("evaluated_summary_chunk").get("model", "")
     cost_before = router.total_cost_usd
     cache_read_before = router.cache_read_tokens
@@ -528,7 +536,7 @@ async def evaluated_summarize_documents_async(
                 return EvaluatedDocSummary(
                     path=doc.path,
                     chunk_summaries=_split_with_context(
-                        cached, subject, summary_chunk_max_tokens, enc),
+                        cached, subject, split_tokens, enc),
                     combined="\n\n".join(cached), summarized=True,
                     audit={"summarized": True, "cache": "hit", "source_tokens": n_tok,
                            "subject": info or {"subject": subject, "source": "fallback"}},
@@ -599,7 +607,7 @@ async def evaluated_summarize_documents_async(
         info = await _document_subject(router, doc, enc, sem) if window_summaries else None
         subject = info["subject"] if info else _summary_subject(window_summaries, doc.path)
         stored = _split_with_context(
-            window_summaries, subject, summary_chunk_max_tokens, enc)
+            window_summaries, subject, split_tokens, enc)
         if not stored:  # all windows failed -> fall back to original-text chunks
             stored = [c.text for c in chunk_documents(
                 [doc], chunk_size=chunk_size, chunk_overlap=chunk_overlap,

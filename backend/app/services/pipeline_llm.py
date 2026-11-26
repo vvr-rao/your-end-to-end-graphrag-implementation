@@ -3096,6 +3096,7 @@ async def stream_evaluated_summarize_and_chunk_async(
     batch_size: int = 16,
     max_cost_usd: float | None = None,
     paths: list[Path] | None = None,
+    split_max_tokens: int | None = None,
 ) -> list[TextChunk]:
     """Evaluated (near-lossless) counterpart of stream_summarize_and_chunk_async
     used when `summarization.method == 'evaluated'`. Walks `documents_dir` in
@@ -3134,6 +3135,7 @@ async def stream_evaluated_summarize_and_chunk_async(
             concurrency=concurrency,
             use_cache=use_cache,
             max_cost_usd=max_cost_usd if max_cost_usd is not None else 1000.0,
+            split_max_tokens=split_max_tokens,
         )
         out: list[TextChunk] = []
         for r in results:
@@ -3400,6 +3402,19 @@ async def _run_llm_stages(
     sum_cfg = app_cfg.get("summarization", {}) or {}
     method = "single_pass" if single_pass_summaries else sum_cfg.get("method", "evaluated")
 
+    # Class-proposal chunk size (expansion.proposal_chunk_tokens), separate
+    # from the summary pieces register-documents stores for retrieval
+    # (summarization.summary_chunk_max_tokens) and from chunking.chunk_size.
+    # Each Stage-2 call carries a large fixed load (instructions + ontology
+    # slice) and its reply size barely depends on the chunk, so fewer, larger
+    # chunks cost proportionally less. Unset = the old sizes.
+    _proposal_tokens = (app_cfg.get("expansion", {}) or {}).get("proposal_chunk_tokens")
+    _proposal_tokens = int(_proposal_tokens) if _proposal_tokens else None
+    if _proposal_tokens:
+        chunk_size = _proposal_tokens
+        print(f"[llm] class-proposal chunks up to {_proposal_tokens} tokens "
+              "(expansion.proposal_chunk_tokens)")
+
     if method == "evaluated":
         with timer.stage("summarize"):
             chunks = await stream_evaluated_summarize_and_chunk_async(
@@ -3419,6 +3434,7 @@ async def _run_llm_stages(
                 batch_size=streaming_batch_size,
                 max_cost_usd=max_cost_usd,
                 paths=selected_paths,
+                split_max_tokens=_proposal_tokens,
             )
     else:
         with timer.stage("summarize"):

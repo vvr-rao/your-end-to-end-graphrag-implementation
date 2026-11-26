@@ -266,3 +266,31 @@ def test_without_the_task_the_file_name_is_the_subject(tmp_path, monkeypatch) ->
     out = _asyncio.run(_es.evaluated_summarize_documents_async([doc], router))[0]
     assert out.chunk_summaries[0].startswith("[Document: SDI Audit report 2025.02.21 eng]\n")
     assert out.audit["subject"]["source"] == "fallback" and router.calls == []
+
+
+def test_split_max_tokens_recuts_the_same_cache_entry(tmp_path, monkeypatch) -> None:
+    # prune-expand (expansion.proposal_chunk_tokens) and register-documents
+    # (summary_chunk_max_tokens) cut ONE cached summary at different sizes; the
+    # cache key never depends on the cut, so neither size re-summarizes.
+    monkeypatch.setattr(_es, "_cache_dir", lambda: tmp_path)
+    doc = _doc("report.pdf")
+    # Pieces never span two windows, so each window must exceed the small cut.
+    windows = [f"SECTION {i}\n" + "\n".join(f"- Fact {i}.{j}: value {j}." for j in range(300))
+               for i in range(3)]
+    key = _es._cache_key(doc.text, "m", 3, 12000, 1200)
+    _es._cache_save(tmp_path / f"{key}.json", windows)
+    router = _SubjectRouter("{}", configured=False)
+
+    def run(**kw):
+        return _asyncio.run(_es.evaluated_summarize_documents_async([doc], router, **kw))[0]
+
+    small = run()
+    big = run(split_max_tokens=4000)
+    assert router.calls == []                                   # both from the cache
+    assert len(big.chunk_summaries) < len(small.chunk_summaries)
+    assert max(len(_ENC.encode(c)) for c in small.chunk_summaries) <= 1300
+    def strip(cs):
+        return "".join(c.split("\n", 1)[1] for c in cs).replace("\n", "")
+
+    assert strip(big.chunk_summaries) == strip(small.chunk_summaries)   # same text, re-cut
+    assert [p.name for p in tmp_path.iterdir()] == [f"{key}.json"]      # no second entry

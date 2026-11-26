@@ -51,9 +51,11 @@ active preset is OpenAI). `test_deepinfra_mode_uses_only_deepinfra` enforces it.
 ### Anthropic budget option
 
 In Anthropic mode, `class_proposal` (prune-expand Stage 2, which decides the new
-ontology classes) defaults to **Opus 5.5 at high effort**: about $4.90 per 12
-chunks. When the user wants a cheaper build, offer **Haiku 5.5 at medium effort**
-instead (about $0.11 per 12 chunks, ~45x cheaper). Tell them the trade-off
+ontology classes) defaults to **Opus 5.5 at high effort**: about $0.40 per call,
+one call per class-proposal chunk (4,000 tokens by default,
+`expansion.proposal_chunk_tokens`; 80 supply-chain docs = 100 calls ≈ $40). When
+the user wants a cheaper build, offer **Haiku 5.5 at medium effort** instead
+(about $0.01 per call, ~45x cheaper; measured at 1,200-token chunks). Tell them the trade-off
 plainly: in two 6-document tests Haiku missed the main topic of some documents
 (e.g. helium in a helium-shortage article) and covered 50 of 77 checklist
 concepts vs 71.5 for Opus high. To switch, edit `config/models.yaml` after

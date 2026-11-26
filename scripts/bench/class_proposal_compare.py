@@ -21,6 +21,8 @@ Identical inputs, so only the model (and its own prompt version) differs:
     class_proposal settings (ontology_view, guard, salvage, streaming) and
     the arm's model + prompt_set. The audit log (llm_audit.jsonl) holds every
     parsed reply; costs/ holds tokens, seconds and finish reasons per task.
+  - --proposal-chunk-tokens N sets expansion.proposal_chunk_tokens for the arm
+    (same cached summaries, re-cut; record Stage 1 per chunk size).
 
 OpenAI arms (any preset whose summary models already filled the cache):
     --preset config/models.yaml --provider openai --stage1-provider openai \
@@ -122,6 +124,15 @@ def main(argv: list[str]) -> int:
     from tpm_check import apply_concurrency
 
     apply_concurrency(app_cfg, {"chunk_classification": conc, "class_proposal": conc})
+    split = _arg(argv, "--proposal-chunk-tokens")
+    if split:   # class-proposal chunk size (expansion.proposal_chunk_tokens); same cached summaries
+        import re as _re
+
+        txt = app_cfg.read_text(encoding="utf-8")
+        txt, n = _re.subn(r"(?m)^(  proposal_chunk_tokens: ).*$", rf"\g<1>{int(split)}", txt)
+        if not n:
+            txt = _re.sub(r"(?m)^expansion:\n", f"expansion:\n  proposal_chunk_tokens: {int(split)}\n", txt)
+        app_cfg.write_text(txt, encoding="utf-8")
     os.environ.update({
         "MODELS_CONFIG_PATH": str(models), "APP_CONFIG_PATH": str(app_cfg),
         "GRAPHRAG_CACHE_ROOT": str(Path(_arg(argv, "--cache-root")).resolve()),

@@ -70,7 +70,10 @@ domain_concepts) is ALWAYS merged in as well.
 of every document. It exists because Stage 2 (`class_proposal`) and Stage 3
 (`match_dedup`) are **~95% of prune-expand's cost** and ~66% of its wall time,
 and both scale with chunk count, hence with document count. Measured on a
-30-doc run: $15.77 of $23.06 was Stage 2 alone.
+30-doc run: $15.77 of $23.06 was Stage 2 alone. Since 2026-11-26 Stage 2 runs on
+4,000-token chunks (`expansion.proposal_chunk_tokens`, separate from the 1,200-
+token pieces stored for retrieval): about 60% fewer calls for the same documents,
+at a measured 1.5-point checklist cost.
 
 How the subset is chosen:
 1. Every document is summarized, compressed to ~6000 tokens, type-labelled by a
