@@ -168,7 +168,7 @@ question asking "tirzepatide" still reaches chunks that only ever say "MOUNJARO"
 **Every command on this page refreshes it automatically** — `register-documents`,
 `update-document` (it routes through the same ingest path) and `delete-document`
 (when it affected chunks). It costs little -- an LLM judge (`alias_judge` task:
-gpt-4.1 / claude-sonnet-4-6 / Qwen3.8-27B by mode) checks only NEW pairs, about
+gpt-6.1-terra / claude-sonnet-5-5 / Qwen3.8-27B by mode) checks only NEW pairs, about
 $0.17-0.26 per 600; verdicts are cached --
 and it is idempotent: a full scan
 replaces the table, so pairs whose supporting text is gone are pruned.
@@ -199,6 +199,30 @@ You only need to think about it in three cases:
   the judge").
 - **You skipped it earlier:** the staleness is invisible at query time, so check
   with `mine-aliases --dry-run --show 20` if you're unsure.
+
+## Structured data tables — add, change, or remove (optional)
+Only for a build that loaded data files with `--structured-data` (check
+`uv run python scripts/build_state.py show` for a `structured-data` record);
+otherwise skip this section. Tables are not documents: `register-documents`
+and `delete-document` do not touch them.
+- **Add or change data files:** put them in the same folder and re-run the
+  load. An unchanged file (same sha256) is skipped; a new file is profiled
+  (paid) and loaded; a changed file is reloaded and its old metadata node
+  marked STALE. Each loaded table is then refined and verified again (paid).
+  Smoke a new file with `--structured-table <NAME>` first:
+  ```
+  uv run python -m backend.app.cli extract-entities --structured-only --structured-data "<DATA_DIR>" [--structured-table <NAME>]
+  uv run python -m backend.app.cli db-size
+  uv run python scripts/build_state.py record structured-tables tables=<n> rows=<n>
+  ```
+  The new table's concepts map only to EXISTING classes; to add unmatched ones
+  to the ontology, see `table-ontology-update` in **ingest-corpus** Step 3b.
+- **Remove a table:** there is no per-table delete command yet. Removing the
+  file from the folder does NOT drop the loaded table; only `clear-corpus`
+  (which wipes the whole corpus) drops data tables. Tell the user rather than
+  dropping tables by hand.
+- After any change, answer with `--use-structured-data` (see **ingest-corpus**
+  Step 6) to confirm the tables still answer.
 
 ## Stale artifacts (the follow-on)
 After an update or soft-delete, artifacts that depended **entirely** on the

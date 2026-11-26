@@ -75,6 +75,20 @@ and queries embed on serverless Qwen3-Embedding-4B. The database must be the
 one built in DeepInfra mode (Qwen vectors) — the embedding guard refuses an
 OpenAI-embedded database, so every query fails loudly until they match.
 
+**(e) Structured data tables (only if the build loaded them).** If
+`uv run python scripts/build_state.py show` lists `structured-data` /
+`structured-tables`, the tables are already in the database the app uses (they
+live in its `graphrag` schema), but the deployed backend runs
+`config/config.example.yaml` (the image has no `config/config.yaml`), where
+`qa.use_structured_data` is `false`, and the UI does not send the per-request
+`use_structured_data` field. Ask the user whether the deployed app should
+answer from the tables; if yes, set `qa.use_structured_data: true` (and any
+tuned `qa.structured_*` values) in `config/config.example.yaml`. That file is
+tracked, so the change must be committed and pushed to their fork before
+`render-init` / `render-deploy` — get their explicit OK for the commit and the
+push. API and MCP callers can also pass `use_structured_data: true` per request
+without the config change.
+
 ## Step 1 — BEARER_TOKEN (the app's own API auth)
 This token protects the deployed REST/MCP API and is later pasted into the UI. If
 it's missing, ask the **user** to generate one and add it to `.env` themselves —
