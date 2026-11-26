@@ -147,6 +147,7 @@ async def add_turn(
     max_probes: int = 5,
     rerank: bool | None = None,
     concepts: bool | None = None,
+    use_structured_data: bool | None = None,
     history_window: int = 3,
     verbose: bool = False,
 ) -> dict[str, Any]:
@@ -245,6 +246,7 @@ async def add_turn(
         max_probes=max_probes,
         rerank=rerank,
         concepts=concepts,
+        use_structured_data=use_structured_data,
         conversation_turn_id=turn_uid,
         resolved_query=resolved_query,
         verbose=verbose,

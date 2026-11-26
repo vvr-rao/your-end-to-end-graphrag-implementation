@@ -206,6 +206,10 @@ concurrency:
   # batch count scales with proposals, not chunks: a 30-doc run produced 32
   # batches taking ~15-18 min at 4.
   dedup: 4
+  # prune-expand / extract-entities --structured-data: concurrent table_profile
+  # calls (one per table; replies average ~8-9k tokens on gpt-6.2-sol and
+  # Claude Sonnet 5.5, so scripts/tpm_check.py caps this stage at 16).
+  table_profile: 4
   # prune-expand --tables / register-documents --tables: how many PDFs are
   # extracted CONCURRENTLY. Each PDF runs in its own subprocess
   # (table_extract_worker) so the kernel reclaims its memory on exit -- the
@@ -640,6 +644,33 @@ qa:
   # deep_research, against ~11k before -- roughly $0.09 vs $0.03 per query on
   # gpt-4.1. Raise `chunking.chunk_size` and this together, never separately.
   evidence_char_cap: 5000
+  # Structured data (`query --use-structured-data`; tables loaded by
+  # `extract-entities --structured-data`). Off by default -- answers are then
+  # exactly as before. When on, tables reached through the graph walk (up to
+  # structured_max_tables) go to ONE `table_query_select` call that picks
+  # stored SQL; each statement runs read-only under structured_timeout_ms and
+  # at most structured_max_rows rows reach the prompt (aggregates still run
+  # over the whole table -- the cap bounds only what is shown). A failed or
+  # empty result gets one retry call. structured_char_cap bounds each result's
+  # text in the prompt.
+  use_structured_data: false
+  structured_max_tables: 3
+  structured_max_rows: 50
+  structured_timeout_ms: 5000
+  structured_max_calls: 4
+  structured_char_cap: 5000
+  # A call the selection marks "listing" (list/compare many items) gets a
+  # larger budget: rows fetched (memory ceiling), characters of rows shown to
+  # the answer model (~15k tokens), and the answer's own output length. The
+  # CLI/API return every fetched row, so the full list never depends on the
+  # written answer.
+  structured_listing_max_rows: 2000
+  structured_listing_char_cap: 60000
+  # Text evidence (best-ranked chunks/relationships) shown to the table-selection
+  # step so a value stated in a document can fill a query parameter. 0 = off.
+  structured_doc_context_items: 6
+  structured_doc_context_chars: 4000
+  structured_listing_answer_max_tokens: 8192
   # For comparison/enumeration queries over multiple entities ("compare A vs its
   # competitors"), retrieval fans out ONE vector probe per matched entity so each
   # gets even representation (instead of only the 1-2 a generic decompose named).

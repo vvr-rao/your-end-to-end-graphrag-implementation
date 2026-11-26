@@ -34,6 +34,14 @@ Based on the suggested next step, hand off to the right skill:
 - anything past prune-expand (`db-init`, `register-documents`, …) → **build-app**
   drives the sequence.
 
+**Structured data (optional) is not in the suggested-next order.** If `show`
+lists a `structured-data` record (the folder of data files the user chose),
+the later steps take extra flags — `--structured-data "<DIR>"` on prune-expand
+and extract-entities, `--use-structured-data` on queries and evals, and
+`qa.use_structured_data` for the deploy (see **build-app**, "Structured data").
+If it lists `structured-data` but no `structured-tables`, the tables have not
+been loaded yet (**ingest-corpus** Step 3b).
+
 Never re-run a completed step without asking — the tracker shows what's already
 done, and steps like prune-expand are paid. Confirm before repeating anything.
 

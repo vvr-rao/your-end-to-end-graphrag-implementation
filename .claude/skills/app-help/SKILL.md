@@ -176,7 +176,7 @@ works when a single chunk happens to resolve the second hop.
 
 Cost measured on the same questions: **deep_research is 25-30x simple_qa**
 ($0.0012-0.0021 vs $0.035-0.061 per question) and 1.2-2x the wall time, because
-it synthesises with gpt-4.1 at 4x the token ceiling over 50% more evidence, and
+it synthesised with gpt-4.1 at the time (now `answer_deep_research`: gpt-6.1-terra / Sonnet 5.5) at 4x the token ceiling over 50% more evidence, and
 pays an extra retrieval round when the bridge fires. Both are cheap in absolute
 terms; the ratio only matters at volume.
 
@@ -388,6 +388,76 @@ Other things worth knowing:
   declares no object property whose domain AND range both match this corpus's
   classes -- not that the documents assert nothing.
 
+## Structured data (data files as SQL tables) — OPTIONAL
+Data files (CSV/TSV/JSON/JSONL/Parquet) can sit beside the documents. This is
+entirely optional: without `--structured-data` every command behaves as before.
+Once a folder is used, the later steps take matching flags (all listed below):
+1. `prune-expand --structured-data <DIR>` — an LLM writes each table's metadata
+   (descriptions, metrics, filters, queries, cross-table lookups) and adds the
+   concepts as ontology classes. Each query is stored as a JSON query spec with
+   its parameters listed separately; a deterministic compiler builds the SQL
+   (the LLM never writes SQL). Cached by file content.
+   Flags: `--structured-data <DIR> [--structured-limit N]
+   [--table-profile-concurrency N] [--refresh-table-metadata]` (also on `build`).
+2. `extract-entities --structured-data <DIR>` (or `--structured-only`) — loads
+   the tables into the `graphrag` schema and links each table's metadata node to
+   classes and to EXISTING entities found in key and place columns (it never
+   creates an entity; unknown places and unmatched class proposals are
+   reported). Reads the cache: no new LLM calls when prune-expand already
+   profiled the files. Every stored query is compiled and tested on the data.
+   Then `table-metadata-refine` runs on the loaded tables: measures the
+   structure, defines measures, tests every stored query on the data, and
+   VERIFIES independently (task `table_verify`): column metadata vs the measured
+   data, then each query's SQL vs its label/description (ok / re-describe / fix
+   and re-test / drop; a measure only ok / re-describe / drop). Items without a
+   verdict stay pending for the next run. `--no-verify` skips it, `--reverify`
+   repeats it, `--relink` re-tests everything with no LLM (and migrates older
+   catalogs). Only queries whose exact SQL passed (status passed, not failed or
+   not_exercised) are offered to retrieval.
+   Wide tables are profiled in column batches and refined by candidate id,
+   checkpointed and resumable, with call/token budgets (`continuation:` in
+   models.yaml); unfinished work is labelled, never dropped silently. Measures
+   carry an ordered version rule (precedence vs tie-break; unresolved ties keep
+   a measure unavailable), a population (applied to SQL, parameter values and
+   tests) and subject / uniqueness / dimension columns measured on the data.
+   Each table gets a coverage ledger (`coverage_ledger`: dedicated_measure,
+   generic_query, partial, unexercised, verifier_drop, unsupported,
+   unfinished, gap) and an entity-match report (`entity_matches`: raw value,
+   matched label/id, target type, method, decision).
+   Flags: `--structured-data <DIR> [--structured-only] [--structured-limit N]
+   [--structured-table NAME ...] [--table-profile-concurrency N]
+   [--refresh-table-metadata]`. Re-runnable: an unchanged file is not
+   reloaded; a changed file is reloaded and its old metadata node marked STALE.
+   Optional afterwards: `table-ontology-update --input <PE_DIR>` adds the class
+   proposals the final catalogs could not match to a NEW ontology version and
+   imports it (verify catalog = DB = OWL).
+3. `query --use-structured-data` (simple_qa / deep_research; also the
+   `use_structured_data` field of `POST /qa` and conversation turns) — tables
+   reached through the graph walk are offered to one selection call that picks
+   STORED queries and fills their parameters, or reports no_match; inline SQL
+   or query specs are refused. The stored, tested SQL runs with its parameters
+   validated and bound by the driver; zero rows is an answer, and a retry may
+   not broaden the question. Every statement runs read-only, with a timeout, and at most
+   `qa.structured_max_rows` (50) rows reach the prompt — aggregates still run
+   over the whole table; the cap only bounds what the model reads, and a capped
+   result says "N of M rows". Results are cited as `viao:SqlResult_…`. Off by
+   default (`qa.use_structured_data: false`); without it answers are unchanged.
+   The same flag exists on `conversation turn`, `evaluate-queries` and
+   `eval-questions` (a test set with `"use_structured_data": true` turns it on
+   by itself). The deployed app reads `config/config.example.yaml`, so it uses
+   tables only if `qa.use_structured_data: true` is set there or the request
+   sets `use_structured_data`.
+   Models: selection is `table_query_select` (gpt-6.1-terra; Claude Sonnet 5.5
+   at medium effort in Anthropic mode, Haiku 5.5 as the budget option);
+   profiling/refining gpt-6.2-sol (Sonnet 5.5 high); verify, lookups and
+   concept map gpt-6.1-terra (Haiku 5.5).
+4. Review: `table-metadata-export -o <MD_DIR>`, edit, then
+   `table-metadata-import <MD_DIR> [--dry-run]` (edit the ```json query specs;
+   compiles them, validates with EXPLAIN, shows a diff, rebuilds the table's
+   graph edges, keeps the edit in the cache).
+5. `table-query <TABLE> --query-id <ID> --param name=value [--sql-only]` (or
+   `--spec FILE.json`) builds and runs one table query with no LLM.
+
 ## CLI (single entrypoint)
 `uv run python -m backend.app.cli <subcommand>`. Discover everything with
 `uv run python -m backend.app.cli --help`. Groups: ontology (`merge`, `prune`,
@@ -395,7 +465,9 @@ Other things worth knowing:
 `enrich-geo`, `embed-relationships`, `relink-artifact-entities`, `classify-concepts`,
 `db-init`, `clear-corpus`), evaluation (`eval-corpus`, `eval-typing` and `eval-ontology` (LLM-as-judge yes/no on entity typing and class definitions), `eval-questions`, `eval-dataset`; Recall@K/Precision@K/MRR on `eval_questions/testsets/`; optional LangSmith upload; see `backend/app/evals/README.md`), corpus (`register-documents`, `list-documents`,
 `update-document`, `delete-document`), enrichment (`extract-entities`,
-`enrich-time`, `generate-artifacts`), retrieval (`query`, `evaluate-queries`,
+`enrich-time`, `generate-artifacts`), structured data (`table-metadata-export`,
+`table-metadata-import`, `table-metadata-refine`, `table-ontology-update`,
+`table-query`), retrieval (`query`, `evaluate-queries`,
 `conversation start|turn|show`), deploy (`render-*`).
 
 ## Serving surfaces
@@ -442,10 +514,15 @@ Other things worth knowing:
     corpus took ~4h to summarize at 4 and ~25 min at 32.
   - Settings live under `concurrency:` in `config/config.yaml`
     (`summarization`, `chunk_classification`, `class_proposal`, `dedup`,
-    `table_mining`, `entity_extraction`, `artifact_generation`, `evaluation`).
+    `table_mining`, `table_profile`, `entity_extraction`, `artifact_generation`,
+    `evaluation`).
     Use the tool's per-stage numbers rather than a rule of thumb.
-  - `class_proposal` / `dedup` send 32k-token gpt-4.1 requests; the tool caps
-    them at 16 because concurrent large calls throttle even with TPM to spare.
+  - The tool sizes each stage on its tasks' TYPICAL reply (measured), not the
+    `max_tokens` ceiling (Claude 5.5 tasks carry 64,000 because thinking counts
+    against it). `class_proposal` / `dedup` / `table_profile` replies run to
+    ~10k+ tokens, so the tool caps those stages at 16: many large calls at once
+    throttle even with TPM to spare. `evaluation` is sized on the table
+    selector's ~100k-token prompt when structured data is in use.
   - Flags: most commands take `--concurrency N`; `prune-expand` and `build` take
     three (`--summarization-concurrency`, `--table-mining-concurrency`,
     `--expansion-concurrency`) since they drive three stages on different models.

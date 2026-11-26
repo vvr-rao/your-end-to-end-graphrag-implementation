@@ -127,9 +127,15 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
   prints one row per concurrency knob: **now**, **suggest**, and the **binding
   task**. A stage is sized by the TIGHTEST model among the tasks it runs --
   `entity_extraction` covers seven tasks, one of them
-  (`relationship_orphan_check`) on gpt-4.1; `artifact_generation` also drives
-  Insight / rollup on gpt-4.1 and gpt-5.4. Passing the corpus also sizes
-  `chunking.streaming_batch_size`. Costs ~nothing (one tiny probe per model).
+  (`relationship_orphan_check`) on the big model (gpt-6.1-terra; Haiku 5.5 in
+  Anthropic mode) and `entity_validate` on Sonnet 5.5 in Anthropic mode;
+  `artifact_generation` also drives Insight / rollup on gpt-6.1-terra and
+  gpt-5.4 (Sonnet 5.5). Calls are sized on each task's typical reply, not the
+  `max_tokens` ceiling. Passing the corpus also sizes
+  `chunking.streaming_batch_size`. If the build has a structured-data folder
+  (`build_state.py show` lists a `structured-data` record), add `--structured`
+  so `evaluation` accounts for the table selector's ~100k-token prompts.
+  Costs ~nothing (one tiny probe per model).
 
   If **build-app** step 2b already sized the run (tracker step `sizing`), show
   the table again so the user sees current numbers, but only re-propose changes
@@ -204,7 +210,7 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
   identical at any value. Apply with `--set table_page_vision=N`.
 
   Then **tell the user what you found and propose a number**, e.g.
-  > *"Your gpt-4.1-mini limit is 10M TPM and we're set to 32 — that's using well
+  > *"Your gpt-6-luna limit is 180M TPM and we're set to 32 — that's using well
   > under 1% of it. I can raise it to 64-125 and cut the wall time roughly
   > proportionally. **This won't reduce cost at all** — the same tokens get sent
   > either way; it only makes the run finish sooner. Want me to?"*
@@ -214,7 +220,7 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
   and make clear they can name their own value or keep the defaults. See
   **run-prune-expand** Step 2c for the option table and the four effects to
   state (speed-not-savings, ~2% more spend from cache dilution, 429 risk on the
-  gpt-4.1 stages, HARD KILL risk on `table_extraction` / `table_page_vision`).
+  large-reply stages, HARD KILL risk on `table_extraction` / `table_page_vision`).
 
   **If their TIER is what caps the number** -- not memory, not corpus size --
   say so explicitly and point them at platform.openai.com → Settings → Limits
@@ -236,8 +242,8 @@ All commands use `uv run python …`, which works on Linux, macOS, and Windows.
   - `config.example.yaml` ships a conservative **8** for unknown tiers.
   - **Lower to 4-8 on tier 1-2**, where several large concurrent calls throttle.
   - Do NOT raise `expansion.max_concurrent_llm_calls` to match. It drives
-    `class_proposal` on gpt-4.1 at `max_tokens: 32768` against a ~2M TPM tier
-    (5× tighter); 4-8 is correct there.
+    `class_proposal`, whose replies run to ~10-15k tokens on the big model
+    (measured safe range 4-8 on gpt-4.1 at a ~2M TPM tier).
   - Each command prints its resolved value on startup
     (`[extract-entities] concurrency = 32`) — quote it back when reporting.
 
@@ -315,10 +321,10 @@ rescans the whole corpus, so:
   -- verdicts already made are cached, so it only asks for the rest.
 
 ### Alias judge -- which model, and the GPU in DeepInfra mode
-The judge follows the LLM mode: `gpt-4.1` (OpenAI, Groq+OpenAI),
-`claude-sonnet-4-6` (Anthropic), Qwen3.8-27B (DeepInfra). Not a small model:
-gpt-4.1-mini kept ~85 wrong pairs of 264 on the web-search corpus, the three
-above ~5 each (2026-10-22). In DeepInfra mode it
+The judge follows the LLM mode: `gpt-6.1-terra` (OpenAI, Groq+OpenAI),
+`claude-sonnet-5-5` (Anthropic), Qwen3.8-27B (DeepInfra). Not a small model:
+gpt-4.1-mini kept ~85 wrong pairs of 264 on the web-search corpus, while
+gpt-4.1, claude-sonnet-4-6 and the 27B kept ~5 each (2026-10-22). In DeepInfra mode it
 uses the **dedicated deployment while one is running** and otherwise falls back
 to serverless `Qwen/Qwen3.8-27B` on its own (it checks the deployment's status
 first; the report's `judge (...)` line names the route). Serverless 27B decodes ~20 tok/s, so:
@@ -412,7 +418,7 @@ reference corpus) — see the full-text table at the top. If you pass it, also r
 `--max-cost-usd` (default 5.0 trips almost immediately). Default takes entities from the summary
 ones. Single-line launch:
 ```
-uv run python scripts/run_detached.py <RUN_ID> uv run python -m backend.app.cli extract-entities [--limit 5] [--batch-size 100] [--from-fulltext (OPT-IN: ~4.3x cost, raise --max-cost-usd)] [--max-cost-usd <cap>]
+uv run python scripts/run_detached.py <RUN_ID> uv run python -m backend.app.cli extract-entities [--limit 5] [--batch-size 100] [--from-fulltext (OPT-IN: ~4.3x cost, raise --max-cost-usd)] [--max-cost-usd <cap>] [--structured-data "<DATA_DIR>" (only with a structured-data folder; see Step 3b)]
 uv run python scripts/job_status.py <RUN_ID> 40
 uv run python scripts/build_state.py record extract-entities entities=<n>
 ```
@@ -526,6 +532,85 @@ What to tell the user afterwards:
   fragmentation was repaired. Zero on a large corpus is suspicious.
 - An EXISTING graph has none of these edges until extract-entities re-runs.
 
+## Step 3b — Load structured tables (optional; only with `--structured-data`)
+**Skip this step entirely unless the build has a structured-data folder.**
+Check `uv run python scripts/build_state.py show` for a `structured-data`
+record (written by run-prune-expand), or ask the user whether they have data
+files they want answerable with SQL; it is optional and nothing else depends on
+it. If prune-expand was run with `--structured-data <DIR>`, load the same folder now.
+A folder that prune-expand never saw also works: the tables are profiled now
+(paid; their concepts are only mapped to EXISTING classes, see
+`table-ontology-update` below).
+This creates one Postgres table per data file in the `graphrag` schema (named
+after the file; a source-folder prefix on clashes such as `fred_observations`),
+one `TableMetadata` node per table, and edges from that node to ontology
+classes (columns/metrics/filters) and to EXISTING entities whose names appear
+in key columns. No new entities are created.
+
+It reads the metadata cache written by prune-expand, so it should make **zero**
+profiling calls — confirm the line `metadata: N from cache, 0 profiled now`.
+Anything profiled now means the cache was missed (different files, or a
+different machine); say so before continuing on a large folder.
+
+Smoke-test, then the full folder (ask before the full run). Either run it with
+extract-entities (add `--structured-data "<DIR>"` to the Step 3 launch), or on
+its own after it. A large folder runs detached like the other paid steps:
+```
+uv run python -m backend.app.cli extract-entities --structured-only --structured-data "<DIR>" --structured-limit 2
+uv run python scripts/run_detached.py <RUN_ID> uv run python -m backend.app.cli extract-entities --structured-only --structured-data "<DIR>" [--table-profile-concurrency <N>]
+uv run python scripts/job_status.py <RUN_ID> 40
+uv run python -m backend.app.cli db-size
+uv run python scripts/build_state.py record structured-tables tables=<n> rows=<n>
+```
+Other flags: `--structured-table <NAME>` (repeatable) loads just those tables
+(names as printed at start); `--refresh-table-metadata` re-profiles even when
+cached (hand edits are kept).
+Report: tables loaded / unchanged / failed, rows, class edges, entity edges,
+and the `db-size` delta (data tables count toward the database size).
+Re-running is safe: an unchanged file is not reloaded; a changed file is
+reloaded and its old metadata node marked STALE.
+
+After loading, each table is refined (`table_refine`: gpt-6.2-sol; Sonnet 5.5
+high in Anthropic mode) and then VERIFIED (paid, `table_verify`: gpt-6.1-terra;
+Haiku 5.5 in Anthropic mode — one call for the columns plus one per 8 stored
+queries). The
+verification is an independent check: column descriptions/roles/units against
+the measured data, and every stored query's SQL against its label and
+description (ok / re-described / query fixed and re-tested / dropped). Report
+the `verified --` line per table, the `stored queries: N selectable, N failed,
+N not exercised` line, any dropped queries, measures unresolved after repair,
+and `review` notes. Also report places "not in the graph (not created)" and
+class proposals that match no existing class (structured data never creates
+entities or classes here). Retrieval only runs queries whose exact SQL passed.
+Also report per table the coverage ledger counts (`coverage_ledger` categories:
+dedicated_measure / generic_query / partial / unexercised / verifier_drop /
+unsupported / unfinished / gap) and any entity match left `unresolved` (type
+mismatch or ambiguity). A table whose profiling stopped early says
+`profiling INCOMPLETE ... a re-run resumes from the checkpoint`: re-run the same
+command (only unfinished work is redone) or raise `continuation.max_calls`.
+A table loaded before the verified catalog existed is migrated with no LLM by
+`table-metadata-refine --relink --table <NAME>`. To verify tables that were
+refined before this step existed, or to repeat it:
+```
+uv run python -m backend.app.cli table-metadata-refine
+uv run python -m backend.app.cli table-metadata-refine --reverify --table <NAME>
+```
+
+**Unmatched class proposals (optional follow-up).** Loading never creates
+classes. If the run reports class proposals that match no existing class and
+the user wants them in the ontology, `table-ontology-update` writes a NEW
+ontology version with them, imports it and re-links the catalogs (ask first —
+it changes the ontology):
+```
+uv run python -m backend.app.cli table-ontology-update --input "<PE_DIR>" [--no-import]
+```
+
+Review loop (optional): `table-metadata-export -o <MD_DIR>` writes one
+Markdown file per table; edit the ```json query specs (the ```sql blocks are
+compiled from them and read-only). `table-metadata-import <MD_DIR> --dry-run`
+compiles every spec, validates it (guard + EXPLAIN) and shows the diff, then
+`table-metadata-import <MD_DIR>` applies it (node, embedding, edges, cache).
+
 ## Step 4 — enrich-time (short)
 Temporal enrichment (Year/Quarter/Month/Day, parent creation + gap-fill). Fast and
 cheap — run in the foreground. Chunk kind is automatic (follows the corpus); the
@@ -581,7 +666,7 @@ finished until both have run: Step 6 checks it.
 
 ## Step 5 — generate-artifacts (Claims/Findings/… ; long, paid)
 Per-chunk `Claim`/`Finding`/`Observation`/`Event` + per-doc `Summary`. Opt-in
-cross-cluster `Insight`/`Recommendation` via `--type` (gpt-4.1 — more expensive),
+cross-cluster `Insight`/`Recommendation` via `--type` (gpt-6.1-terra / Sonnet 5.5 — more expensive),
 and `--rollup` for hierarchical consolidation. Chunk kind is automatic (follows the
 corpus). **Formerly: add `--from-fulltext` if Step 2
 recorded `fulltext=yes`** (consistent with Steps 3 & 4). Single-line launch:
@@ -638,6 +723,19 @@ runs line up. With no key nothing is sent; say so in the hand-back.
 If the user has an evaluation question set, also
 run `uv run python -m backend.app.cli eval-questions <file>` (question parse
 cost only) and report what the questions tie to and what the walk finds.
+
+**If structured tables were loaded (Step 3b),** every answer command needs the
+flag, or the tables are never read (`qa.use_structured_data` is off by default):
+```
+uv run python -m backend.app.cli query --mode simple_qa --use-structured-data "<question>"
+uv run python -m backend.app.cli eval-questions <file> --use-structured-data [--answer]
+uv run python -m backend.app.cli evaluate-queries --questions <file> --use-structured-data
+```
+(`conversation turn` takes the same flag; a test set with
+`"use_structured_data": true` turns it on by itself.) Try one question the
+tables answer and report whether a `viao:SqlResult_…` citation came back. To
+make it the default for this machine set `qa.use_structured_data: true` in
+`config/config.yaml`; for the deployed app see the **deploy** skill.
 
 Before handing back, confirm Step 4b ran -- both commands are silent when
 skipped. `build_state.py` must show an `enrich-geo` record for this build, and

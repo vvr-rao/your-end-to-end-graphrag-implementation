@@ -79,11 +79,28 @@ def trace_from_result(question: str, result: Any) -> dict[str, Any]:
     return {"question": question, "answer": result.answer or "",
             "run_id": str(result.retrieval_run_id) if result.retrieval_run_id else None,
             "evidence_chunk_ids": [str(ev["node_id"]) for ev in chunks],
+            **({"structured_calls": [
+                {k: c.get(k) for k in ("table", "query_id", "params", "listing", "row_count", "error",
+                                       "retry", "unranked_rows", "unsupported_identifiers", "from_calls",
+                                       # what actually ran, to diagnose a wrong answer from the trace
+                                       "sql", "query", "substituted", "missing_values", "empty_excluded")
+                 if k in ("table", "query_id", "params", "listing", "row_count", "error") or c.get(k)}
+                for c in (result.parsed.get("structured_data") or {}).get("calls") or []]}
+               if (result.parsed.get("structured_data") or {}).get("calls") else {}),
+            # measurement: what this question cost and how long it took
+            "seconds": round(float(getattr(result, "wall_seconds", 0.0) or 0.0), 2),
+            "cost_usd": round(float(getattr(result, "cost_usd", 0.0) or 0.0), 6),
+            **({"structured_seconds": result.parsed["structured_seconds"]}
+               if result.parsed.get("structured_seconds") is not None else {}),
+            **({"structured_needed": bool((result.parsed.get("structured_data") or {}).get("needed"))}
+               if result.parsed.get("structured_data") is not None else {}),
+            **({"usage_by_task": result.parsed["usage_by_task"]}
+               if result.parsed.get("usage_by_task") else {}),
             **(result.parsed.get("eval_trace") or {})}
 
 
 async def traces_by_retrieval(questions: list[str], *, mode: str = "simple_qa",
-                              answer: bool = False, log=print
+                              answer: bool = False, log=print, structured: bool = False,
                               ) -> tuple[list[dict[str, Any]], float]:
     from backend.app.services.retrieval import retrieve_and_answer
 
@@ -91,7 +108,8 @@ async def traces_by_retrieval(questions: list[str], *, mode: str = "simple_qa",
     cost = 0.0
     for i, q in enumerate(questions, 1):
         res = await retrieve_and_answer(q, mode=mode, persist=False, answer_question=answer,
-                                        multi_round=answer)
+                                        multi_round=answer,
+                                        use_structured_data=True if structured else None)
         cost += res.cost_usd
         traces.append(trace_from_result(q, res))
         log(f"[eval-questions] {i}/{len(questions)} traced")
@@ -100,7 +118,8 @@ async def traces_by_retrieval(questions: list[str], *, mode: str = "simple_qa",
 
 def traces_in_batches(questions: list[str], *, mode: str = "simple_qa",
                       answer: bool = False, batch_size: int = 25,
-                      traces_dir: Path, log=print) -> tuple[list[dict[str, Any]], float]:
+                      traces_dir: Path, log=print, structured: bool = False,
+                      ) -> tuple[list[dict[str, Any]], float]:
     """Run retrieval `batch_size` questions per child process, saving each batch's
     traces under `traces_dir`. One process for a whole test set holds its memory
     for hours (two at once took down a 2.7 GB machine); a crash here loses one
@@ -130,6 +149,8 @@ def traces_in_batches(questions: list[str], *, mode: str = "simple_qa",
                    "--batch-questions", str(qfile), "--batch-out", str(out), "--mode", mode]
             if answer:
                 cmd.append("--answer")
+            if structured:
+                cmd.append("--use-structured-data")
             log(f"[eval-questions] batch {b + 1}/{n_batches} "
                 f"(questions {b * size + 1}-{b * size + len(batch)})")
             rc = subprocess.run(cmd, check=False).returncode
@@ -145,10 +166,11 @@ def traces_in_batches(questions: list[str], *, mode: str = "simple_qa",
 
 
 async def run_batch_file(questions_file: Path, out: Path, *, mode: str,
-                         answer: bool) -> None:
+                         answer: bool, structured: bool = False) -> None:
     """Child side of traces_in_batches: trace one batch and write it atomically."""
     questions = json.loads(questions_file.read_text(encoding="utf-8"))
-    traces, cost = await traces_by_retrieval(questions, mode=mode, answer=answer)
+    traces, cost = await traces_by_retrieval(questions, mode=mode, answer=answer,
+                                             structured=structured)
     tmp = out.with_suffix(".tmp")
     tmp.write_text(json.dumps({"traces": traces, "cost_usd": cost}, default=str,
                               ensure_ascii=False), encoding="utf-8")
@@ -264,6 +286,9 @@ def _row(t: dict[str, Any], tq: Any, kinds: dict, levels: dict, names: dict,
         "bridge": t.get("fulltext_bridge") or {},
         "ranked_documents": ranked[:max(k, 20)],
         "evidence_chunk_ids": t.get("evidence_chunk_ids") or [],
+        **({"structured_calls": t["structured_calls"]} if t.get("structured_calls") else {}),
+        **{k: t[k] for k in ("seconds", "cost_usd", "structured_seconds", "structured_needed",
+                             "usage_by_task") if k in t},
         "gold_documents": gold,
         "retrieval": retrieval_metrics(ranked, gold, k) if gold else None,
         "answers": (answer_metrics(

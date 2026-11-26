@@ -206,3 +206,115 @@ def test_prefer_ipv4_restores_getaddrinfo():
     with sd.prefer_ipv4(True):
         assert socket.getaddrinfo is not orig
     assert socket.getaddrinfo is orig
+
+
+# ------------------------------------------------------- supply-chain bundle
+
+
+def _args(**kw):
+    a = sd.build_parser().parse_args(["owid-energy"])
+    for k, v in kw.items():
+        setattr(a, k, v)
+    return a
+
+
+def test_owid_energy_keeps_the_wide_table_and_codebook(tmp_path):
+    f = FakeFetcher({"owid-energy-data.csv": b"country,year,iso_code,oil_production\nJapan,2024,JPN,1.5\nAsia,2024,,9\n",
+                     "codebook": b"column,description,unit\noil_production,Oil production,TWh\n"})
+    snap = sd.Snapshot(tmp_path, "owid", "energy", "t")
+    sd.run_owid_energy(_args(), f, snap)
+    rows = read(snap.norm / "energy.csv")
+    assert [r["country"] for r in rows] == ["Japan", "Asia"] and rows[1]["iso_code"] == ""
+    m = json.loads((snap.dir / "manifest.json").read_text())
+    assert m["data_dictionary_urls"] == ["native/owid-energy-codebook.csv"]
+
+
+def test_faostat_reencodes_latin1_and_keeps_rows(tmp_path):
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("Inputs_X_E_All_Data_(Normalized).csv",
+                   "Area,Item,Element,Year,Unit,Value,Flag\nC\xf4te d'Ivoire,Urea,Production,2023,t,10,A\n"
+                   .encode("latin-1"))
+        z.writestr("Inputs_X_E_Flags.csv", b"Flag,Description\n")
+    f = FakeFetcher({"Fertilizers": buf.getvalue()})
+    snap = sd.Snapshot(tmp_path, "faostat", "fertilizers", "t")
+    sd.run_faostat(_args(fao_dataset="products"), f, snap)
+    (row,) = read(snap.norm / "fertilizer_products.csv")
+    assert row["Area"] == "Côte d'Ivoire" and row["Value"] == "10"
+
+
+def test_wdi_flattens_pages_and_reports_empty_indicators(tmp_path):
+    page = [{"page": 1, "pages": 1, "total": 2},
+            [{"indicator": {"id": "A.B", "value": "Thing"}, "country": {"id": "JP", "value": "Japan"},
+              "countryiso3code": "JPN", "date": "2024", "value": 1.0, "unit": "", "obs_status": ""},
+             {"indicator": {"id": "A.B", "value": "Thing"}, "country": {"id": "1W", "value": "World"},
+              "countryiso3code": "WLD", "date": "2024", "value": None, "unit": "", "obs_status": ""}]]
+    f = FakeFetcher({"indicator/A.B": json.dumps(page).encode(), "indicator/C.D": b'[{"message": []}]'})
+    snap = sd.Snapshot(tmp_path, "worldbank", "wdi", "t")
+    sd.run_wdi(_args(indicators="A.B,C.D", countries="JPN,WLD", years="2024"), f, snap)
+    rows = read(snap.norm / "development_indicators.csv")
+    assert [(r["economy_iso3"], r["value"]) for r in rows] == [("JPN", "1"), ("WLD", "")]
+    m = json.loads((snap.dir / "manifest.json").read_text())
+    assert any("C.D" in w for w in m["warnings"]) and f.calls[0][1]["date"] == "2024:2024"
+
+
+def test_imf_filters_years_and_labels_economy_kind(tmp_path):
+    f = FakeFetcher({
+        "v1/indicators": json.dumps({"indicators": {"X": {"label": "Growth", "unit": "%",
+                                                          "source": "World Economic Outlook (October 2026)"}}}).encode(),
+        "v1/countries": json.dumps({"countries": {"JPN": {"label": "Japan"}}}).encode(),
+        "v1/regions": json.dumps({"regions": {"APQ": {"label": "Asia and Pacific"}}}).encode(),
+        "v1/groups": json.dumps({"groups": {}}).encode(),
+        "v1/X": json.dumps({"values": {"X": {"JPN": {"1999": 1, "2024": 0.1, "2031": 2},
+                                             "APQ": {"2030": 4.0}}}}).encode()})
+    snap = sd.Snapshot(tmp_path, "imf", "weo", "t")
+    sd.run_imf(_args(indicators="X", years="2000:2030"), f, snap)
+    rows = read(snap.norm / "weo_indicators.csv")
+    assert {(r["economy_code"], r["year"], r["economy_kind"], r["value"]) for r in rows} == {
+        ("JPN", "2024", "country", "0.1"), ("APQ", "2030", "region", "4")}
+    assert rows[0]["edition"] == "World Economic Outlook (October 2026)"
+
+
+def test_imf_years_flag_is_validated():
+    with pytest.raises(sd.UsageError):
+        sd._years("2000-2030", (2000, 2030))
+
+
+def test_comtrade_marks_capped_calls_partial(tmp_path):
+    full = {"data": [{"refYear": 2024, "reporterCode": 1, "partnerCode": i, "primaryValue": 5.0}
+                     for i in range(sd.COMTRADE_CAP)]}
+    f = FakeFetcher({"reporterCode=1&": json.dumps(full).encode(),
+                     "reporterCode=2&": json.dumps({"data": [], "error": ""}).encode()})
+    snap = sd.Snapshot(tmp_path, "comtrade", "trade-flows", "t")
+    sd.run_comtrade(_args(reporters="1,2", hs="31", comtrade_years="2024", pause=0), f, snap)
+    rows = read(snap.norm / "trade_flows.csv")
+    assert len(rows) == sd.COMTRADE_CAP and rows[0]["primaryValue"] == "5"
+    m = json.loads((snap.dir / "manifest.json").read_text())
+    assert m["snapshot_kind"] == "partial" and any("31/2/2024" in w for w in m["warnings"])
+
+
+def test_comtrade_quota_stops_cleanly_and_resume_skips_saved_calls(tmp_path):
+    import requests
+
+    class Quota(FakeFetcher):
+        def get(self, url, params=None, dest=None, allow_404=False):
+            if params and params.get("reporterCode") == "2":
+                resp = requests.Response()
+                resp.status_code, resp.reason = 403, "Quota Exceeded"
+                resp.headers["Retry-After"] = "60"
+                raise requests.HTTPError(response=resp)
+            return super().get(url, params, dest, allow_404)
+
+    ok = json.dumps({"data": [{"refYear": 2024, "reporterCode": 1, "partnerCode": 0, "primaryValue": 1.0}]}).encode()
+    snap = sd.Snapshot(tmp_path, "comtrade", "trade-flows", "t")
+    sd.run_comtrade(_args(reporters="1,2", hs="31", comtrade_years="2024", pause=0), Quota({"reporterCode=1&": ok}), snap)
+    m = json.loads((snap.dir / "manifest.json").read_text())
+    assert m["snapshot_kind"] == "partial" and any("31/2/2024" in w and "Retry-After 60s" in w for w in m["warnings"])
+    # resume: the saved call is read from disk, only the missing one is fetched
+    snap2 = sd.Snapshot(tmp_path, "comtrade", "trade-flows", "t", overwrite=True)
+    f2 = FakeFetcher({"reporterCode=2&": ok})
+    sd.run_comtrade(_args(reporters="1,2", hs="31", comtrade_years="2024", pause=0), f2, snap2)
+    assert [c[1]["reporterCode"] for c in f2.calls] == ["2"]
+    assert json.loads((snap2.dir / "manifest.json").read_text())["snapshot_kind"] == "full"

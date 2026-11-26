@@ -88,6 +88,81 @@ def parse_question_file(path: Path) -> list[tuple[str, bool]]:
     return out
 
 
+JUDGE_TASKS = ("judge_comprehensiveness", "judge_no_hallucination",
+               "judge_gap_detection", "judge_consistency")
+
+
+def infer_provider(model: str) -> str | None:
+    """Provider for a bare model name, or None when the name does not say.
+
+    `claude-*` -> anthropic; `gpt-*`, `o<digit>*`, `chatgpt-*` -> openai; an
+    `org/model` id (e.g. `Qwen/...`, `deepseek-ai/...`) -> deepinfra. Anything
+    else (e.g. Groq's `llama-*`) needs an explicit `provider:model`.
+    """
+    m = model.strip().lower()
+    if m.startswith("claude-"):
+        return "anthropic"
+    if m.startswith(("gpt-", "chatgpt-")) or re.match(r"o\d", m):
+        return "openai"
+    if "/" in m:
+        return "deepinfra"
+    return None
+
+
+def override_judge_model(router: Any, judge_model: str) -> None:
+    """Point every judge_* task at `judge_model` for this run (in memory only;
+    models.yaml on disk is untouched).
+
+    Accepts `model` or `provider:model`. Same provider as the preset's judge
+    task: only the model changes (timeouts, caps and streaming are kept).
+    Different provider: settings that belong to the old provider are dropped
+    -- `reasoning_effort` (the new model's default applies), `thinking` and
+    `prompt_set` (DeepInfra-only), `temperature` on Anthropic, `stream` on
+    Groq -- and the router's own config checks run again, so a bad choice
+    fails here rather than mid-run.
+    """
+    provider, _, model = judge_model.partition(":") if ":" in judge_model else ("", "", judge_model)
+    provider, model = provider.strip().lower(), model.strip()
+    if not model:
+        raise ValueError(f"--judge-model {judge_model!r}: no model name")
+    for tname in JUDGE_TASKS:
+        if tname not in router._tasks:
+            continue
+        spec = dict(router._tasks[tname])
+        # explicit provider, else inferred from the name, else the preset's
+        new_provider = provider or infer_provider(model) or spec.get("provider")
+        if new_provider not in router._providers:
+            raise ValueError(
+                f"--judge-model {judge_model!r} needs provider {new_provider!r}, which is not "
+                f"configured (set {str(new_provider).upper()}_API_KEY, or pass provider:model)")
+        if new_provider != spec.get("provider"):
+            for k in ("reasoning_effort", "thinking", "prompt_set"):
+                spec.pop(k, None)
+            if new_provider == "anthropic":
+                spec.pop("temperature", None)
+            if new_provider == "groq":
+                spec.pop("stream", None)
+        elif spec.get("model") != model:
+            spec.pop("reasoning_effort", None)   # tuned for the preset's model
+        spec["provider"], spec["model"] = new_provider, model
+        router._tasks[tname] = spec
+    router._validate_stream_support()
+    router._validate_thinking()
+    router._validate_reasoning_effort()
+
+
+def describe_judge_models(router: Any) -> str:
+    """`provider:model` of the judge tasks (comma-joined if they differ)."""
+    seen = []
+    for tname in JUDGE_TASKS:
+        spec = getattr(router, "_tasks", {}).get(tname)
+        if spec:
+            d = f"{spec.get('provider')}:{spec.get('model')}"
+            if d not in seen:
+                seen.append(d)
+    return ", ".join(seen) or "unknown"
+
+
 def _judge_prompt(router: Any, task_name: str) -> Any:
     """`prompt_set: deepseek` on the judge task selects DeepSeek's own judge
     prompt (prompts_deepseek.py); otherwise the shared one."""
@@ -134,7 +209,8 @@ async def evaluate_questions(
     questions_path: Path,
     mode: str = "simple_qa",
     runs_per_question: int = 3,
-    judge_model: str = "gpt-4.1",
+    judge_model: str | None = None,
+    use_structured_data: bool | None = None,
     output_json: Path | None = None,
     output_md: Path | None = None,
     max_cost_usd: float = 10.0,
@@ -144,29 +220,23 @@ async def evaluate_questions(
 ) -> dict[str, Any]:
     """Driver. See `evaluate-queries` CLI for argument semantics.
 
-    `judge_model` is informational; the actual model used per judge
-    task comes from `config/models.yaml`. Pass `gpt-4o-mini` to
-    deliberately override (the CLI patches models.yaml in-process).
+    `judge_model` None = the judge_* tasks run on the models configured in
+    `config/models.yaml`. Any other value (`model` or `provider:model`)
+    replaces the model of all four judge tasks for this run only; see
+    `override_judge_model`.
     """
     questions = parse_question_file(questions_path)
     if not questions:
         raise ValueError(f"no usable questions in {questions_path}")
 
+    router = LLMRouter()
+    if judge_model:
+        override_judge_model(router, judge_model)
+    judge_model = describe_judge_models(router)
     print(
         f"[eval] {len(questions)} question(s) x {runs_per_question} run(s) "
         f"in mode={mode} with judge={judge_model}"
     )
-
-    # Optionally override judge tasks' model. We mutate the LLMRouter's
-    # in-memory config (does NOT touch models.yaml on disk).
-    router = LLMRouter()
-    if judge_model != "gpt-4.1":
-        for tname in (
-            "judge_comprehensiveness", "judge_no_hallucination",
-            "judge_gap_detection", "judge_consistency",
-        ):
-            if tname in router._tasks:
-                router._tasks[tname]["model"] = judge_model
 
     cost_before = router.total_cost_usd
     cost_limit_hit = asyncio.Event()
@@ -192,6 +262,7 @@ async def evaluate_questions(
                     res = await retrieve_and_answer(
                         q, mode=mode,
                         max_cost_usd=query_max_cost_usd,
+                        use_structured_data=use_structured_data,
                     )
                     qres.runs.append({
                         "answer": res.answer,
@@ -377,6 +448,7 @@ async def evaluate_questions(
             "mode": mode,
             "runs_per_question": runs_per_question,
             "judge_model": judge_model,
+            "use_structured_data": use_structured_data,
         },
         "results": [
             {

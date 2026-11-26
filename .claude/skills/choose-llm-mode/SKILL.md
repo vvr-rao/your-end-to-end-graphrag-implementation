@@ -44,9 +44,31 @@ active preset is OpenAI). `test_deepinfra_mode_uses_only_deepinfra` enforces it.
 | Mode | `<mode>` arg | Keys required in `.env` | Notes |
 |---|---|---|---|
 | **Groq + OpenAI** (default) | `groq-openai` | `OPENAI_API_KEY`, `GROQ_API_KEY` | Groq runs chunk_classification (best disambiguation); OpenAI everything else. |
-| **OpenAI only** | `openai` | `OPENAI_API_KEY` | Simplest; one provider. chunk_classification → `gpt-4.1-mini`. |
-| **Anthropic + OpenAI** | `anthropic` | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` | Claude for chat (haiku cheap tasks / sonnet synthesis); OpenAI for embeddings only. |
+| **OpenAI only** | `openai` | `OPENAI_API_KEY` | Simplest; one provider. chunk_classification → `gpt-6-luna`. |
+| **Anthropic + OpenAI** | `anthropic` | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` | Claude for chat (haiku cheap tasks / sonnet synthesis; `class_proposal` on Opus 5.5 at high effort); OpenAI for embeddings only. See "Anthropic budget option" below. |
 | **DeepInfra (Qwen + DeepSeek)** | `deepinfra` | `DEEPINFRA_API_KEY`, `DEEPINFRA_FLASH_MODEL` | Knowledge creation on a **dedicated** Qwen3.8-27B deployment (rented GPUs, billed per GPU-hour while it exists); relationships, repair, judges and **all Q&A** on serverless DeepSeek-V4.1-Flash; table vision `Qwen3-VL-235B-A22B` (only when pdfplumber cannot build the table; **host it on its own short-lived deployment — recommended**, serverless is the slow fallback); embeddings `Qwen3-Embedding-4B`@1024. No OpenAI/Anthropic key. Needs its OWN database (vectors can't mix with OpenAI ones; a guard refuses). See "DeepInfra mode" below. |
+
+### Anthropic budget option
+
+In Anthropic mode, `class_proposal` (prune-expand Stage 2, which decides the new
+ontology classes) defaults to **Opus 5.5 at high effort**: about $4.90 per 12
+chunks. When the user wants a cheaper build, offer **Haiku 5.5 at medium effort**
+instead (about $0.11 per 12 chunks, ~45x cheaper). Tell them the trade-off
+plainly: in two 6-document tests Haiku missed the main topic of some documents
+(e.g. helium in a helium-shortage article) and covered 50 of 77 checklist
+concepts vs 71.5 for Opus high. To switch, edit `config/models.yaml` after
+selecting the mode:
+
+```yaml
+  class_proposal:
+    provider: anthropic
+    model: claude-haiku-5-5
+    reasoning_effort: medium
+    timeout: 2400
+    max_tokens: 64000
+    stream: true
+    response_format: json_object
+```
 
 How to describe DeepInfra when presenting the options: **cheapest to run, rented
 GPUs to build.** Q&A costs ~$0.009 per deep-research question (vs ~$0.10 on

@@ -40,6 +40,7 @@ STAGE_MODULES = {
     ],
     "summarization": ["backend/app/services/evaluated_summarizer.py"],
     "evaluation": ["backend/app/services/eval_judge.py"],
+    "table_profile": ["backend/app/services/structured/profiler.py"],
 }
 
 
@@ -104,7 +105,38 @@ def test_the_suggestion_is_capped():
 def test_large_output_calls_are_capped_even_with_tpm_to_spare():
     """class_proposal / match_dedup (32k output on gpt-4.1): TPM alone says 128
     on a 30M account, but concurrent large calls throttle."""
-    assert tpm.suggest({"tpm": 30_000_000, "rpm": 10_000}, 32_768) == tpm.LARGE_CALL_CAP
+    assert tpm.suggest({"tpm": 30_000_000, "rpm": 10_000}, 12_000, large=True) == tpm.LARGE_CALL_CAP
+    assert tpm.call_shape("class_proposal", {"max_tokens": 64_000})[2] is True
+    assert tpm.call_shape("entity_extract", {"max_tokens": 64_000})[2] is False
+
+
+def test_sizing_uses_typical_reply_not_the_max_tokens_ceiling():
+    """Claude 5.5 tasks carry max_tokens 64,000 because thinking counts against
+    it; sizing on that ceiling suggested 1-3 workers for every Anthropic stage."""
+    lim = {"itpm": 2_000_000, "otpm": 400_000, "rpm": 4_000}
+    tin, tout, large = tpm.call_shape("entity_extract", {"max_tokens": 64_000})
+    assert tout == tpm.OUTPUT_TOKENS_PER_CALL
+    assert tpm.suggest(lim, tout, tin, large) > 16
+    # a cap below the typical reply still wins
+    assert tpm.call_shape("class_proposal", {"max_tokens": 4_096})[1] == 4_096
+
+
+def test_large_input_tasks_are_sized_on_their_input():
+    """table_query_select carries ~100k tokens of table catalogs per call."""
+    lim = {"itpm": 2_000_000, "otpm": 400_000, "rpm": 4_000}
+    tin, tout, large = tpm.call_shape("table_query_select", {"max_tokens": 64_000})
+    assert tin >= 90_000
+    assert tpm.suggest(lim, tout, tin, large) == int(2_000_000 * tpm.TARGET_UTILISATION / tin)
+
+
+@pytest.mark.parametrize("stage", sorted(tpm.STAGE_TASKS))
+def test_every_stage_is_a_concurrency_key_the_code_reads(stage):
+    """--apply writes concurrency.<stage>; a key no code reads is a silent no-op
+    (the structured-data stage was once written as `structured_data`, while
+    the profiler reads `table_profile`)."""
+    src = "\n".join(p.read_text(encoding="utf-8") for p in (ROOT / "backend").rglob("*.py")
+                    if "tests" not in p.parts)
+    assert re.search(r"[\"']" + re.escape(stage) + r"[\"']", src), stage
 
 
 # --------------------------------------------------------------------------
@@ -125,7 +157,8 @@ def test_a_mixed_stage_is_bound_by_its_tight_model(monkeypatch):
     }
     sg = tpm.stage_suggestions(limits)["entity_extraction"]
     assert sg["task"] == "relationship_orphan_check"
-    assert sg["value"] == tpm.suggest(limits[("openai", "big")], 8192)
+    tin, tout, large = tpm.call_shape("relationship_orphan_check", specs["relationship_orphan_check"])
+    assert sg["value"] == tpm.suggest(limits[("openai", "big")], tout, tin, large)
 
 
 def test_a_failed_probe_is_reported_not_guessed(monkeypatch):
@@ -230,3 +263,13 @@ def test_table_concurrency_splits_memory_between_workers_and_pages() -> None:
 
 def test_set_accepts_table_page_vision() -> None:
     assert tpm._parse_sets(["--set", "table_page_vision=4"]) == {"table_page_vision": 4}
+
+
+def test_table_selector_binds_evaluation_only_when_structured_data_is_used(monkeypatch):
+    specs = {"answer_simple_qa": {"provider": "anthropic", "model": "m", "max_tokens": 64_000},
+             "table_query_select": {"provider": "anthropic", "model": "m", "max_tokens": 64_000}}
+    monkeypatch.setattr(tpm, "_task_specs", lambda: specs)
+    monkeypatch.setattr(tpm, "STAGE_TASKS", {"evaluation": tuple(specs)})
+    lim = {("anthropic", "m"): {"itpm": 2_000_000, "otpm": 400_000, "rpm": 4_000}}
+    assert tpm.stage_suggestions(lim, structured=True)["evaluation"]["task"] == "table_query_select"
+    assert tpm.stage_suggestions(lim, structured=False)["evaluation"]["task"] == "answer_simple_qa"

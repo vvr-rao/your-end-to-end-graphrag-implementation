@@ -17,11 +17,18 @@ Passage level, for questions with `answer_strings` (`answer_metrics`):
   answer_mrr     = 1 / rank of the first evidence chunk holding any string, else 0
   answer_in_reply = the same recall over the generated answer (only with --answer)
 
-Matching is case-insensitive substring after collapsing whitespace; figures
-are matched as written ("29,031,560"), as the source documents write them.
+Matching is case-insensitive substring after collapsing whitespace and
+folding typography (curly quotes and dashes, accents, non-breaking spaces).
+An answer string that is a plain number ("7.7", "84", "6.0%", "$31.4",
+"29,031,560") also matches any number in the text that gives it when rounded
+to the same decimal places -- read as written, or scaled to thousands /
+millions / billions / trillions ("$7,709,020,032" and "7.71 billion" both
+match "7.7"; "83.82%" matches "84"). Nothing here depends on a dataset.
 """
 from __future__ import annotations
 
+import re
+import unicodedata
 from typing import Any
 
 from backend.app.core.config import get_settings
@@ -62,8 +69,62 @@ def retrieval_metrics(ranked: list[str], gold: list[str], k: int) -> dict[str, A
     }
 
 
+_TYPO = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'",
+                       "\u2032": "'", "\u201c": '"', "\u201d": '"', "\u201e": '"',
+                       "\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-",
+                       "\u2014": "-", "\u2212": "-", "\u00a0": " ", "\u202f": " ",
+                       "\u2009": " "})
+
+
 def _norm(text: str) -> str:
-    return " ".join((text or "").split()).casefold()
+    folded = unicodedata.normalize("NFKD", (text or "").translate(_TYPO))
+    folded = "".join(c for c in folded if not unicodedata.combining(c))
+    return " ".join(folded.split()).casefold()
+
+
+# A plain number, optionally with a currency sign and/or percent sign.
+_EXPECTED_NUMBER = re.compile(r"\s*(?:us)?[$\u20ac\u00a3\u00a5]?\s*(-?\d[\d,]*(?:\.\d+)?)\s*%?\s*", re.I)
+# Numbers in running text: grouped thousands or plain digits, optional scale word.
+_TEXT_NUMBER = re.compile(
+    r"(?<![\w.])(-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)"
+    r"(?:\s*(trillion|tn|billion|bn|million|mn|mln|thousand|k)\b)?", re.I)
+_SCALE = {"trillion": 1e12, "tn": 1e12, "billion": 1e9, "bn": 1e9, "million": 1e6,
+          "mn": 1e6, "mln": 1e6, "thousand": 1e3, "k": 1e3}
+
+
+def _expected_number(answer: str) -> tuple[float, int] | None:
+    """(value, decimal places) when the answer string is a plain number."""
+    m = _EXPECTED_NUMBER.fullmatch(answer or "")
+    if not m:
+        return None
+    raw = m.group(1)
+    if "," in raw and not re.fullmatch(r"-?\d{1,3}(?:,\d{3})+(?:\.\d+)?", raw):
+        return None
+    raw = raw.replace(",", "")
+    return float(raw), len(raw.split(".")[1]) if "." in raw else 0
+
+
+def _number_in(answer: str, text: str) -> bool:
+    """True when some number in `text`, read as written or scaled to a larger
+    unit, rounds to the expected number at its own decimal places."""
+    exp = _expected_number(answer)
+    if exp is None:
+        return False
+    want, places = exp
+    for m in _TEXT_NUMBER.finditer(text or ""):
+        value = float(m.group(1).replace(",", "")) * _SCALE.get((m.group(2) or "").lower(), 1.0)
+        for unit in (1.0, 1e3, 1e6, 1e9, 1e12):
+            if unit > 1 and abs(value) < unit:
+                break
+            if round(value / unit, places) == round(want, places):
+                return True
+    return False
+
+
+def _contains(answer: str, normed_text: str) -> bool:
+    if _expected_number(answer) is not None:     # whole numbers only: "31.4" is not in "131.4"
+        return _number_in(answer, normed_text)
+    return _norm(answer) in normed_text
 
 
 def answer_metrics(evidence_texts: list[str], answer_strings: list[str], *,
@@ -75,9 +136,9 @@ def answer_metrics(evidence_texts: list[str], answer_strings: list[str], *,
         return None
     needed = 1 if match == "any" else len(wanted)
     texts = [_norm(t) for t in evidence_texts]
-    found = [a for a in wanted if any(_norm(a) in t for t in texts)]
+    found = [a for a in wanted if any(_contains(a, t) for t in texts)]
     first = next((i for i, t in enumerate(texts, 1)
-                  if any(_norm(a) in t for a in wanted)), None)
+                  if any(_contains(a, t) for a in wanted)), None)
     out: dict[str, Any] = {
         "answer_recall": round(min(len(found), needed) / needed, 4),
         "answer_found": int(len(found) >= needed),
@@ -87,6 +148,7 @@ def answer_metrics(evidence_texts: list[str], answer_strings: list[str], *,
         "answers_missed": [a for a in wanted if a not in found],
     }
     if reply:
-        in_reply = [a for a in wanted if _norm(a) in _norm(reply)]
+        normed_reply = _norm(reply)
+        in_reply = [a for a in wanted if _contains(a, normed_reply)]
         out["answer_in_reply"] = round(min(len(in_reply), needed) / needed, 4)
     return out

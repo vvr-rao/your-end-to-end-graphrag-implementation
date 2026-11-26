@@ -433,6 +433,36 @@ def _add_suggestions_flag(p: argparse.ArgumentParser) -> None:
     )
 
 
+
+def _add_structured_profile_flags(p: argparse.ArgumentParser) -> None:
+    """--structured-data for prune-expand/build (profiling + new classes)."""
+    p.add_argument(
+        "--structured-data", type=Path, default=None, metavar="DIR",
+        help=(
+            "Opt-in: a folder of structured tables (CSV/TSV/JSON/Parquet, or "
+            "downloader snapshots -- newest snapshot's normalized/ files). After "
+            "Stage 4 an LLM writes per-table metadata (column descriptions, "
+            "metrics, filters, Postgres SQL, cross-table lookups) and their "
+            "concepts become ontology classes. Metadata is cached and reused by "
+            "extract-entities --structured-data. One table_profile call per "
+            "table (wide tables: several, in column batches) plus one "
+            "table_lookups call. Default: OFF."
+        ),
+    )
+    p.add_argument(
+        "--structured-limit", type=int, default=None, metavar="N",
+        help="Profile only the first N tables (alphabetical) -- smoke testing.",
+    )
+    p.add_argument(
+        "--table-profile-concurrency", type=int, default=None, metavar="N",
+        help="Concurrent table_profile calls. Unset => concurrency.table_profile in config.yaml (4).",
+    )
+    p.add_argument(
+        "--refresh-table-metadata", action="store_true",
+        help=("Re-profile tables even when cached metadata exists (hand-edited "
+              "metadata from table-metadata-import is kept)."),
+    )
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ypo",
@@ -546,6 +576,7 @@ def build_parser() -> argparse.ArgumentParser:
              "evaluated summarizer (see prune-expand --single-pass-summaries).",
     )
     for _p in (p_pe, p_build):
+        _add_structured_profile_flags(_p)
         _p.add_argument(
             "--summarization-concurrency", type=int, default=None, metavar="N",
             help=(
@@ -830,6 +861,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_eq.add_argument("--logs", type=Path, nargs="+", default=None,
                       help="`query` output files; their RUN_ID lines are read.")
     p_eq.add_argument("--mode", default="simple_qa", choices=["simple_qa", "deep_research"])
+    p_eq.add_argument("--use-structured-data", action="store_true",
+                      help="Run the questions with structured data (tables via SQL). "
+                           "A test set with \"use_structured_data\": true does this "
+                           "without the flag.")
     p_eq.add_argument("--out", type=Path, default=None, help="Write the JSON report here.")
     p_eq.add_argument("--json", action="store_true", help="Print JSON instead of text.")
     p_eq.add_argument("--batch-size", type=int, default=None,
@@ -1396,7 +1431,116 @@ def build_parser() -> argparse.ArgumentParser:
             "`embed-relationships` can backfill later."
         ),
     )
+    p_ext.add_argument(
+        "--structured-data", type=Path, default=None, metavar="DIR",
+        help=(
+            "Opt-in: after extraction, load the structured tables in DIR as "
+            "Postgres tables (graphrag.<table>) and link each table's metadata "
+            "node to ontology classes and existing entities. Metadata comes from "
+            "the cache written by prune-expand --structured-data (no LLM calls); "
+            "a table missing from the cache is profiled now. Default: OFF."
+        ),
+    )
+    p_ext.add_argument("--structured-limit", type=int, default=None, metavar="N",
+                       help="Load only the first N tables (alphabetical) -- smoke testing.")
+    p_ext.add_argument("--structured-table", action="append", default=None, metavar="NAME",
+                       help=("Load/profile only this table (repeatable). NAME is the table name "
+                             "discovery assigns over the whole folder (printed at start)."))
+    p_ext.add_argument("--table-profile-concurrency", type=int, default=None, metavar="N",
+                       help="Concurrent table_profile calls for cache misses (default config).")
+    p_ext.add_argument("--refresh-table-metadata", action="store_true",
+                       help="Re-profile tables even when cached metadata exists.")
+    p_ext.add_argument("--structured-only", action="store_true",
+                       help="Skip entity extraction; only load/link --structured-data.")
     p_ext.set_defaults(func=_cmd_extract_entities)
+
+    # ---------- structured data: review loop ----------
+    p_tme = sub.add_parser(
+        "table-metadata-export",
+        help="Write the loaded tables' metadata (descriptions, metrics, filters, "
+             "SQL, lookups) as one editable Markdown file per table.",
+    )
+    p_tme.add_argument("--table", action="append", default=None, metavar="NAME",
+                       help="Table to export (repeatable). Default: every loaded table.")
+    p_tme.add_argument("-o", "--output-dir", required=True, type=Path,
+                       help="Folder for the <table>.md files (created if missing).")
+    p_tme.set_defaults(func=_cmd_table_metadata_export)
+
+    p_tmi = sub.add_parser(
+        "table-metadata-import",
+        help="Read edited table-metadata Markdown back: validate every SQL "
+             "statement (guard + EXPLAIN), show the diff, update the metadata "
+             "node + embedding, rebuild its graph edges, and keep the edit in "
+             "the metadata cache (edited: true).",
+    )
+    p_tmi.add_argument("paths", nargs="+", type=Path,
+                       help="Markdown file(s) or folder(s) of <table>.md files.")
+    p_tmi.add_argument("--dry-run", action="store_true",
+                       help="Validate and show the diff; change nothing.")
+    p_tmi.add_argument("--no-entity-links", action="store_true",
+                       help="Rebuild only the class edges (skip matching key values to entities).")
+    p_tmi.set_defaults(func=_cmd_table_metadata_import)
+
+    p_tmr = sub.add_parser(
+        "table-metadata-refine",
+        help="Second metadata pass on LOADED tables: measure each table's "
+             "structure with SQL (grain, columns that only identify the report "
+             "a value came from), define its MEASURES with one LLM call, then "
+             "test every stored query on the data (repair once, drop what "
+             "still fails). Runs automatically after extract-entities "
+             "--structured-data; already-refined tables make no LLM call.",
+    )
+    p_tmr.add_argument("--table", action="append", default=None, metavar="NAME",
+                       help="Table to refine (repeatable). Default: every loaded table.")
+    p_tmr.add_argument("--refresh", action="store_true",
+                       help="Refine again even when the metadata is already refined.")
+    p_tmr.add_argument("--relink", action="store_true",
+                       help="For already-refined tables: NO model and NO embedding call; re-compile "
+                            "and re-test every stored query, re-derive query tags and the graph links "
+                            "(classes, entities, periods, places). Verdicts whose SQL changed become "
+                            "stale (a later run without --relink re-verifies them).")
+    p_tmr.add_argument("--no-verify", action="store_true",
+                       help="Skip the independent verification (task table_verify) of the column "
+                            "metadata and of every stored query against its label/description.")
+    p_tmr.add_argument("--reverify", action="store_true",
+                       help="Verify again even when the metadata is already verified.")
+    p_tmr.add_argument("--no-entity-links", action="store_true",
+                       help="Rebuild only the class edges (skip matching key values to entities).")
+    p_tmr.add_argument("--json", action="store_true", help="Print the per-table reports as JSON.")
+    p_tmr.set_defaults(func=_cmd_table_metadata_refine)
+
+    p_tou = sub.add_parser(
+        "table-ontology-update",
+        help="Add the class proposals that table-metadata-refine persisted for the FINAL "
+             "verified catalogs (concepts no existing class matched) to a NEW ontology "
+             "version (existing dedup/parent resolution, configured base IRI), import it, "
+             "resolve the catalogs to the new IRIs and verify catalog = DB = OWL. "
+             "No measure discovery is re-run; repeating it reuses IRIs.",
+    )
+    p_tou.add_argument("--input", type=Path, required=True,
+                       help="Ontology version folder to extend (holds merged.json).")
+    p_tou.add_argument("--output-dir", type=Path, default=Path("output_ontologies"))
+    p_tou.add_argument("--no-import", action="store_true",
+                       help="Write the version folder only; do not import it or relink catalogs.")
+    p_tou.add_argument("--json", action="store_true")
+    p_tou.set_defaults(func=_cmd_table_ontology_update)
+
+    p_tq = sub.add_parser(
+        "table-query",
+        help="Build and run one table query with no LLM: a stored metric/filter/"
+             "query/lookup by id, or a JSON query spec. The SQL is compiled "
+             "deterministically from the spec and runs read-only.",
+    )
+    p_tq.add_argument("table", help="Loaded table name (see table-metadata-export).")
+    g_tq = p_tq.add_mutually_exclusive_group(required=True)
+    g_tq.add_argument("--query-id", help="Stored item id from the table's metadata.")
+    g_tq.add_argument("--spec", type=Path, help="JSON file holding a query spec.")
+    p_tq.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
+                      help="Parameter value (repeatable). Lists: comma-separated.")
+    p_tq.add_argument("--sql-only", action="store_true", help="Print the compiled SQL; do not run it.")
+    p_tq.add_argument("--max-rows", type=int, default=50)
+    p_tq.add_argument("--json", action="store_true", help="Print the result as JSON.")
+    p_tq.set_defaults(func=_cmd_table_query)
 
     # ---------- Phase 2: Milestone E (artifacts) ----------
     p_art = sub.add_parser(
@@ -1734,6 +1878,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_q.add_argument(
+        "--use-structured-data", action=argparse.BooleanOptionalAction, default=None,
+        help=(
+            "Let simple_qa / deep_research read the loaded data tables "
+            "(extract-entities --structured-data): tables reached through the "
+            "graph walk are offered to one selection call that picks stored "
+            "SQL; results are row-capped (qa.structured_max_rows) and cited. "
+            "Unset => qa.use_structured_data (off)."
+        ),
+    )
+    p_q.add_argument(
         "--json", action="store_true",
         help="Print the full response envelope as JSON.",
     )
@@ -1781,10 +1935,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_ev.add_argument("--runs-per-question", type=int, default=3)
     p_ev.add_argument(
+        "--use-structured-data", action=argparse.BooleanOptionalAction, default=None,
+        help="Answer with the loaded data tables too (see `query --use-structured-data`). "
+             "Unset => qa.use_structured_data (off).",
+    )
+    p_ev.add_argument(
         "--judge-model",
-        choices=("gpt-4.1", "gpt-4o-mini"),
-        default="gpt-4.1",
-        help="Override the judge model. gpt-4o-mini is ~10x cheaper but less reliable.",
+        default=None,
+        metavar="[PROVIDER:]MODEL",
+        help="Run the four judge_* tasks on this model instead of the ones in "
+             "config/models.yaml (default). Any model: the provider is inferred "
+             "from the name (claude-* -> anthropic, gpt-*/o* -> openai, org/model "
+             "-> deepinfra) or given as provider:model (e.g. groq:llama-3.3-70b-"
+             "versatile). Its API key must be set.",
     )
     p_ev.add_argument("--output", type=Path, default=None,
                       help="Detailed JSON log.")
@@ -1851,6 +2014,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_conv_turn.add_argument(
         "--no-concepts", action="store_true",
         help="Turn off the concept layer for this turn (see `query --no-concepts`).",
+    )
+    p_conv_turn.add_argument(
+        "--use-structured-data", action=argparse.BooleanOptionalAction, default=None,
+        help=(
+            "Let simple_qa / deep_research read the loaded data tables "
+            "(extract-entities --structured-data): tables reached through the "
+            "graph walk are offered to one selection call that picks stored "
+            "SQL; results are row-capped (qa.structured_max_rows) and cited. "
+            "Unset => qa.use_structured_data (off)."
+        ),
     )
     p_conv_turn.add_argument(
         "--history-window", type=int, default=3,
@@ -2067,6 +2240,10 @@ def _cmd_prune_expand(args: argparse.Namespace) -> int:
             classification_concurrency=getattr(args, "classification_concurrency", None),
             proposal_concurrency=getattr(args, "proposal_concurrency", None),
             dedup_concurrency=getattr(args, "dedup_concurrency", None),
+            structured_data=getattr(args, "structured_data", None),
+            structured_limit=getattr(args, "structured_limit", None),
+            table_profile_concurrency=getattr(args, "table_profile_concurrency", None),
+            refresh_table_metadata=getattr(args, "refresh_table_metadata", False),
         )
     )
     print(f"\nPRUNED+EXPANDED ontology written to: {version_dir}")
@@ -2102,6 +2279,10 @@ def _cmd_build(args: argparse.Namespace) -> int:
             classification_concurrency=getattr(args, "classification_concurrency", None),
             proposal_concurrency=getattr(args, "proposal_concurrency", None),
             dedup_concurrency=getattr(args, "dedup_concurrency", None),
+            structured_data=getattr(args, "structured_data", None),
+            structured_limit=getattr(args, "structured_limit", None),
+            table_profile_concurrency=getattr(args, "table_profile_concurrency", None),
+            refresh_table_metadata=getattr(args, "refresh_table_metadata", False),
         )
     )
     print(f"\nBUILT ontology written to: {version_dir}")
@@ -2161,7 +2342,7 @@ def _cmd_import_ontology(args: argparse.Namespace) -> int:
     print(f"  instances seen    : {summary.instances_total}")
     print(f"  embed cost        : ${summary.cost_usd:.4f}")
     if summary.dry_run:
-        print(f"  (DRY RUN -- no DB writes happened)")
+        print("  (DRY RUN -- no DB writes happened)")
     return 0
 
 
@@ -2195,7 +2376,11 @@ def _cmd_graph_stats(args: argparse.Namespace) -> int:
     from backend.app.core.config import get_settings
     from backend.app.db.session import session_scope
     from backend.app.services.run_stats import (
-        diff_against_snapshot, format_graph_stats, format_ontology_stats, graph_stats, ontology_stats,
+        diff_against_snapshot,
+        format_graph_stats,
+        format_ontology_stats,
+        graph_stats,
+        ontology_stats,
     )
 
     roots = _concept_roots_from_config()
@@ -2308,7 +2493,8 @@ def _cmd_eval_questions(args: argparse.Namespace) -> int:
         from backend.app.evals.question_eval import run_batch_file
 
         asyncio.run(run_batch_file(args.batch_questions, args.batch_out,
-                                   mode=args.mode, answer=args.answer))
+                                   mode=args.mode, answer=args.answer,
+                                   structured=args.use_structured_data))
         return 0
 
     runs = [(r, "") for r in (args.run_ids or [])]
@@ -2335,6 +2521,7 @@ def _cmd_eval_questions(args: argparse.Namespace) -> int:
     from backend.app.evals.question_eval import traces_in_batches
 
     batch_size = args.batch_size if args.batch_size is not None else configured_batch_size()
+    structured = bool(args.use_structured_data or (testset and testset.use_structured_data))
     questions = [] if runs else [q.question for q in testset.questions]
     batched = bool(questions) and batch_size > 0 and len(questions) > batch_size
     pre: tuple[list[dict[str, Any]], float] | None = None
@@ -2346,7 +2533,8 @@ def _cmd_eval_questions(args: argparse.Namespace) -> int:
               f"traces in {traces_dir}")
         try:
             pre = traces_in_batches(questions, mode=args.mode, answer=args.answer,
-                                    batch_size=batch_size, traces_dir=traces_dir)
+                                    batch_size=batch_size, traces_dir=traces_dir,
+                                    structured=structured)
         except (RuntimeError, ValueError) as exc:
             print(f"eval-questions: {exc}", file=sys.stderr)
             return 1
@@ -2359,7 +2547,7 @@ def _cmd_eval_questions(args: argparse.Namespace) -> int:
             traces = await traces_from_runs(runs)
         else:
             traces, cost = await traces_by_retrieval(
-                questions, mode=args.mode, answer=args.answer)
+                questions, mode=args.mode, answer=args.answer, structured=structured)
         report = await describe(traces, testset, args.k)
         report["summary"]["cost_usd"] = round(cost, 4)
         return report
@@ -2416,7 +2604,7 @@ def _cmd_db_migrate(args: argparse.Namespace) -> int:
     cfg = AlembicConfig("alembic.ini")
     print(f"[db-migrate] upgrading to revision: {args.revision}")
     command.upgrade(cfg, args.revision)
-    print(f"[db-migrate] DONE")
+    print("[db-migrate] DONE")
     return 0
 
 
@@ -2428,7 +2616,7 @@ def _cmd_db_downgrade(args: argparse.Namespace) -> int:
     cfg = AlembicConfig("alembic.ini")
     print(f"[db-downgrade] target revision: {args.revision}")
     command.downgrade(cfg, args.revision)
-    print(f"[db-downgrade] DONE")
+    print("[db-downgrade] DONE")
     return 0
 
 
@@ -2500,7 +2688,7 @@ def _cmd_db_init(args: argparse.Namespace) -> int:
         print("=" * 64)
         print(f"DB-INIT: step 3/4 -- import from {args.input}")
         print("=" * 64)
-        summary = asyncio.run(import_ontology_folder(
+        asyncio.run(import_ontology_folder(
             input_folder=args.input,
             limit=args.limit,
             dry_run=False,
@@ -2729,8 +2917,275 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
         except Exception as exc:
             print(f"[eval-corpus] skipped: {type(exc).__name__}: {exc}")
 
-    asyncio.run(_extract_then_classify())
+    _sd = getattr(args, "structured_data", None)
+    if _sd is not None:
+        # Fail before the paid extraction when the folder is wrong.
+        from backend.app.services.structured.prune_expand_hook import check_folder
+
+        check_folder(Path(_sd), getattr(args, "structured_limit", None),
+                     when="and load after entity extraction",
+                     tables=getattr(args, "structured_table", None))
+
+    async def _structured() -> None:
+        from backend.app.services.structured.graph_hook import run_structured_load
+        from backend.app.services.structured.prune_expand_hook import resolve_concurrency
+
+        await run_structured_load(
+            Path(_sd),
+            limit=getattr(args, "structured_limit", None),
+            tables=getattr(args, "structured_table", None),
+            concurrency=resolve_concurrency(getattr(args, "table_profile_concurrency", None),
+                                            get_settings_app_config()),
+            refresh=getattr(args, "refresh_table_metadata", False),
+        )
+
+    async def _all() -> None:
+        if not getattr(args, "structured_only", False):
+            await _extract_then_classify()
+        if _sd is not None:
+            await _structured()
+
+    if getattr(args, "structured_only", False) and _sd is None:
+        print("[extract-entities] --structured-only needs --structured-data DIR")
+        return 2
+    asyncio.run(_all())
     return 0
+
+
+def _cmd_table_metadata_export(args: argparse.Namespace) -> int:
+    from backend.app.services.structured.review import export_tables
+
+    written, missing = asyncio.run(export_tables(args.output_dir, args.table))
+    for p in written:
+        print(f"[table-metadata-export] wrote {p}")
+    for n in missing:
+        print(f"[table-metadata-export] not loaded: {n}")
+    if not written and not missing:
+        print("[table-metadata-export] no structured tables are loaded "
+              "(extract-entities --structured-data DIR)")
+    return 1 if missing else 0
+
+
+def _cmd_table_metadata_import(args: argparse.Namespace) -> int:
+    from backend.app.services.structured.cache import MetadataCache
+    from backend.app.services.structured.review import import_markdown
+
+    async def go():
+        embed = None
+        if not args.dry_run:
+            from backend.app.db.embedding_guard import ensure_embedding_model
+            from backend.app.services.embeddings import Embedder
+
+            embedder = Embedder()
+            await ensure_embedding_model(embedder)
+            embed = embedder.embed
+        return await import_markdown(args.paths, dry_run=args.dry_run, embed=embed,
+                                     cache=MetadataCache(), link_entities=not args.no_entity_links)
+
+    reports = asyncio.run(go())
+    bad = 0
+    for r in reports:
+        name = r.table or r.path.name
+        if r.diff:
+            print(r.diff, end="" if r.diff.endswith("\n") else "\n")
+        if r.errors:
+            bad += 1
+            print(f"[table-metadata-import] {name}: NOT applied -- {len(r.errors)} error(s):")
+            for e in r.errors:
+                print(f"    {e}")
+        elif not r.changed:
+            print(f"[table-metadata-import] {name}: no changes")
+        elif r.applied:
+            print(f"[table-metadata-import] {name}: applied; edges rebuilt "
+                  f"({r.class_edges} class, {r.entity_edges} entity); cache marked edited")
+        else:
+            print(f"[table-metadata-import] {name}: valid (dry run, nothing changed)")
+    if not reports:
+        print("[table-metadata-import] no .md files found")
+        return 2
+    return 1 if bad else 0
+
+
+def _print_verification(table: str, v: dict) -> None:
+    print(f"[table-metadata-refine] {table}: verified -- {len(v['columns_fixed'])} column(s) "
+          f"corrected, {len(v['ok'])} ok, {len(v['text_fixed'])} re-described, "
+          f"{len(v['query_fixed'])} query fixed, {len(v['dropped'])} dropped, "
+          f"{len(v.get('renamed') or [])} renamed, {len(v.get('added') or [])} added, "
+          f"{len(v['unverified'])} still pending a verdict"
+          + (" (only the items pending from an earlier run)" if v.get("only_pending") else ""))
+    for r in v.get("rejected_verdicts") or []:
+        print(f"    verdict {r['verdict']!r} not allowed for {r['id']} (allowed: {', '.join(r['allowed'])}); asked again")
+    for c in v["columns_fixed"]:
+        print(f"    column {c['column']}: {c['problem']}")
+    for t in v["text_fixed"]:
+        print(f"    re-described {t['id']}: {t['reason']}")
+    for q in v["query_fixed"]:
+        print(f"    query fixed {q['id']}: {q['reason']}")
+    for r in v.get("renamed") or []:
+        print(f"    renamed {r['from']} -> {r['to']}")
+    for a in v.get("added") or []:
+        print(f"    added {a['id']} (from {a['from']}): {a['reason']}")
+    for a in v.get("add_failed") or []:
+        print(f"    add from {a['from']} failed: {a['error']}")
+    for d in v["dropped"]:
+        print(f"    dropped {d['section']}/{d['id']}: {d['reason']}"
+              + (f" (fix failed: {d['fix_error']})" if d.get("fix_error") else ""))
+
+
+def _cmd_table_ontology_update(args: argparse.Namespace) -> int:
+    from backend.app.core.config import get_settings
+    from backend.app.services.structured.concepts import (
+        apply_class_proposals,
+        check_agreement,
+    )
+    from backend.app.services.structured.refine import refine_registered
+
+    onto = (get_settings().app_config or {}).get("ontology") or {}
+    base_iri = onto.get("default_base_iri") or "https://veerla-ramrao.ai/ontology/merged#"
+
+    async def go():
+        rep = await apply_class_proposals(args.input, output_root=args.output_dir, base_iri=base_iri,
+                                          parent_iri=onto.get("default_parent_iri"),
+                                          import_db=not args.no_import)
+        if args.no_import:
+            return rep
+        from backend.app.db.embedding_guard import ensure_embedding_model
+        from backend.app.services.embeddings import Embedder
+        from backend.app.services.structured.cache import MetadataCache
+
+        embedder = Embedder()
+        await ensure_embedding_model(embedder)
+        # relink = no LLM: concepts resolve to the imported IRIs, edges are rebuilt
+        rep["relinked"] = await refine_registered(None, relink=True, cache=MetadataCache(),
+                                                  embed=embedder.embed)
+        rep["agreement"] = await check_agreement(Path(rep["version_dir"]) / "merged.owl")
+        return rep
+
+    rep = asyncio.run(go())
+    if args.json:
+        print(json.dumps(rep, indent=2, default=str))
+    print(f"[table-ontology-update] {rep['proposals']} proposal(s), {len(rep['created'])} new class(es) "
+          f"-> {rep['version_dir']}")
+    ag = rep.get("agreement")
+    if ag:
+        print(f"[table-ontology-update] catalog/DB/OWL agreement: {'OK' if ag['ok'] else 'MISMATCH'} "
+              f"({ag['checked']} class refs; {len(ag['missing_in_db'])} missing in DB, "
+              f"{len(ag['missing_in_owl'])} missing in OWL)")
+        return 0 if ag["ok"] else 1
+    return 0
+
+
+def _cmd_table_metadata_refine(args: argparse.Namespace) -> int:
+    from backend.app.services.llm_router import LLMRouter
+    from backend.app.services.structured.cache import MetadataCache
+    from backend.app.services.structured.refine import refine_registered
+
+    async def go():
+        embed = None
+        if not args.relink:
+            # a relink makes NO model or embedding call: the metadata node keeps
+            # its stored vector (refresh it with a later non-relink run)
+            from backend.app.db.embedding_guard import ensure_embedding_model
+            from backend.app.services.embeddings import Embedder
+
+            embedder = Embedder()
+            await ensure_embedding_model(embedder)
+            embed = embedder.embed
+        router = LLMRouter()        # a relink only reads its config (no calls)
+        reports = await refine_registered(router, tables=args.table, refresh=args.refresh,
+                                          relink=args.relink,
+                                          verify=False if args.no_verify else None,
+                                          reverify=args.reverify,
+                                          cache=MetadataCache(), embed=embed,
+                                          link_entities=not args.no_entity_links)
+        return reports, router
+
+    reports, router = asyncio.run(go())
+    if args.json:
+        print(json.dumps(reports, indent=2, default=str))
+    for r in reports:
+        if "error" in r:
+            print(f"[table-metadata-refine] {r['table']}: FAILED -- {r['error']}")
+            continue
+        if r.get("relinked"):
+            t = r.get("test_status") or {}
+            print(f"[table-metadata-refine] {r['table']}: "
+                  f"{'migrated to the verified catalog' if r.get('migrated') else 'relinked'} (no LLM call)"
+                  + (f" -- {t.get('passed', 0)} selectable, {t.get('failed', 0)} failed, "
+                     f"{t.get('not_exercised', 0)} not exercised" if t else ""))
+            continue
+        if r.get("verified"):
+            _print_verification(r["table"], r["verified"])
+        if r.get("verified_only"):
+            continue
+        print(f"[table-metadata-refine] {r['table']}: measures {', '.join(r['measures']) or 'none'}; "
+              f"repaired {len(r['repaired'])}, dropped {len(r['dropped'])}, "
+              f"typical questions {r['questions']}")
+        t = r.get("test_status") or {}
+        if t:
+            print(f"    stored queries: {t.get('passed', 0)} selectable, {t.get('failed', 0)} failed, "
+                  f"{t.get('not_exercised', 0)} not exercised (not offered to retrieval)")
+        for d in r["dropped"]:
+            print(f"    dropped {d['section']}/{d['id']}: {d['error']}")
+        for m in r["rejected_measures"]:
+            print(f"    measure rejected {m['measure']}: {m['error']}")
+        for mid in r.get("failed_measures") or []:
+            print(f"    measure unresolved after repair (kept in failed_measures, not selectable): {mid}")
+        for mid, notes in (r.get("review") or {}).items():
+            for n in notes:
+                print(f"    review {mid}: {n}")
+    try:
+        print(f"[table-metadata-refine] LLM cost ${router.total_cost_usd:.4f}")
+    except Exception:
+        pass
+    return 1 if any("error" in r for r in reports) else 0
+
+
+def _cmd_table_query(args: argparse.Namespace) -> int:
+    from backend.app.services.structured import query_runner as qrun
+    from backend.app.services.structured.query_builder import QuerySpecError
+    from backend.app.services.structured.sql_guard import SqlGuardError
+
+    try:
+        params = qrun.parse_param_args(args.param)
+        spec = None
+        if args.spec is not None:
+            spec = json.loads(args.spec.read_text(encoding="utf-8"))
+        if args.sql_only:
+            qr = asyncio.run(qrun.prepare(args.table, query_id=args.query_id, spec=spec))
+        else:
+            qr = asyncio.run(qrun.run(args.table, params, query_id=args.query_id, spec=spec,
+                                      max_rows=args.max_rows))
+    except (qrun.QueryRunError, QuerySpecError, SqlGuardError, json.JSONDecodeError, OSError) as exc:
+        print(f"[table-query] {exc}")
+        return 2
+    res = qr.result
+    if args.json:
+        print(json.dumps({"table": qr.table, "query_id": qr.query_id, "sql": qr.built.sql,
+                          "params": qr.built.params, **({} if res is None else {
+                              "bound": res.params, "columns": res.columns, "rows": res.rows,
+                              "row_count": res.row_count, "truncated": res.truncated,
+                              "total_rows": res.total_rows, "error": res.error,
+                              "seconds": res.seconds})}, indent=2, default=str))
+        return 1 if res is not None and res.error else 0
+    print(f"[table-query] {qr.table}" + (f" / {qr.query_id}" if qr.query_id else " / spec"))
+    print("  params: " + (", ".join(f"{p['name']} ({p['type']}, {p['column'] or '-'})"
+                                    for p in qr.built.params) or "none"))
+    print("  sql:    " + qr.built.sql)
+    if res is None:
+        return 0
+    if res.error:
+        print(f"  error:  {res.error}")
+        return 1
+    print(f"  bound:  {res.params}  ({res.seconds}s)")
+    print(res.as_markdown())
+    return 0
+
+
+def get_settings_app_config() -> dict:
+    from backend.app.core.config import get_settings
+
+    return get_settings().app_config
 
 
 def _cmd_classify_concepts(args: argparse.Namespace) -> int:
@@ -2749,12 +3204,11 @@ def _cmd_classify_concepts(args: argparse.Namespace) -> int:
 
 
 def _cmd_enrich_geo(args: argparse.Namespace) -> int:
+    from backend.app.core.config import get_settings
     from backend.app.services.db_geo_enrich import (
         DEFAULT_GEO_CLASS_LABELS,
         enrich_geography,
     )
-
-    from backend.app.core.config import get_settings
 
     labels = tuple(
         args.class_labels
@@ -3050,6 +3504,7 @@ def _cmd_mine_aliases(args: argparse.Namespace) -> int:
 
 def _cmd_query(args: argparse.Namespace) -> int:
     import json as _json
+
     from backend.app.services.retrieval import retrieve_and_answer
 
     # Accept the hyphenated spelling (artifact-only) as an alias for the
@@ -3070,6 +3525,7 @@ def _cmd_query(args: argparse.Namespace) -> int:
             verbose=args.verbose,
             multi_round=getattr(args, "multi_round", True),
             persist=getattr(args, "persist", True),
+            use_structured_data=getattr(args, "use_structured_data", None),
         )
     )
 
@@ -3119,7 +3575,25 @@ def _cmd_query(args: argparse.Namespace) -> int:
         elif kind == "artifact":
             snip = (ev["text"] or "").replace("\n", " ")[:140]
             line += f"\n        ({ev['artifact_type']}) {snip}"
+        elif kind == "sql_result":
+            line += (f"\n        table: {ev.get('table')}  query: {ev.get('query_id') or '(new SQL)'}"
+                     f"  rows: {ev.get('row_count')}"
+                     + (f" of {ev.get('total_rows') or 'more'} (capped)" if ev.get("truncated") else ""))
+            line += "\n        sql: " + " ".join((ev.get("sql") or "").split())[:200]
+        elif kind == "table_metadata":
+            line += f"\n        table: {ev.get('table')}  (metadata: description, columns, measured ranges)"
         print(line)
+    # A listing is returned in full, not only through the written answer.
+    for ev in result.evidence:
+        if ev.get("kind") == "sql_result" and ev.get("listing") and ev.get("rows"):
+            print()
+            print(f"DATA: table {ev.get('table')} -- {ev.get('row_count')} row(s)"
+                  + (f" of {ev.get('total_rows') or 'more'} (capped)" if ev.get("truncated") else ""))
+            cols = ev.get("columns") or []
+            print("| " + " | ".join(cols) + " |")
+            print("|" + "---|" * len(cols))
+            for r in ev["rows"]:
+                print("| " + " | ".join("" if v is None else str(v) for v in r) + " |")
     return 0
 
 
@@ -3138,6 +3612,7 @@ def _cmd_evaluate_queries(args: argparse.Namespace) -> int:
             mode=args.mode,
             runs_per_question=args.runs_per_question,
             judge_model=args.judge_model,
+            use_structured_data=args.use_structured_data,
             output_json=args.output,
             output_md=args.output_md,
             max_cost_usd=args.max_cost_usd,
@@ -3151,6 +3626,7 @@ def _cmd_evaluate_queries(args: argparse.Namespace) -> int:
 
 def _cmd_conversation_start(args: argparse.Namespace) -> int:
     import json as _json
+
     from backend.app.services.db_conversation import start_conversation
 
     result = asyncio.run(start_conversation(title=args.title))
@@ -3165,6 +3641,7 @@ def _cmd_conversation_start(args: argparse.Namespace) -> int:
 
 def _cmd_conversation_turn(args: argparse.Namespace) -> int:
     import json as _json
+
     from backend.app.services.db_conversation import add_turn
 
     # Accept the hyphenated spelling (artifact-only) as an alias for the
@@ -3183,6 +3660,7 @@ def _cmd_conversation_turn(args: argparse.Namespace) -> int:
             max_probes=args.max_probes,
             rerank=True if getattr(args, "rerank", False) else None,
             concepts=False if getattr(args, "no_concepts", False) else None,
+            use_structured_data=getattr(args, "use_structured_data", None),
             history_window=args.history_window,
             verbose=args.verbose,
         )
@@ -3207,6 +3685,7 @@ def _cmd_conversation_turn(args: argparse.Namespace) -> int:
 
 def _cmd_conversation_show(args: argparse.Namespace) -> int:
     import json as _json
+
     from backend.app.services.db_conversation import replay_conversation
 
     result = asyncio.run(replay_conversation(conversation_iri=args.conv))
@@ -3382,8 +3861,10 @@ def _cmd_render_init(args: argparse.Namespace) -> int:
     .env, no dashboard click-through. Idempotent: skips services that
     already exist by name. Cross-links FRONTEND_ORIGIN <-> VITE_API_BASE_URL
     after both services have URLs."""
-    import yaml
     from pathlib import Path
+
+    import yaml
+
     from backend.app.services.render_client import RenderClient
 
     repo_root = Path(__file__).resolve().parents[3]

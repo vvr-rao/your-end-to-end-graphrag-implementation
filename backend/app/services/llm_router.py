@@ -54,6 +54,16 @@ class ChatResult:
     # "not parseable JSON", and they have opposite remedies. Cost a 65-minute
     # run to a dedup batch whose true cause could not be named.
     finish_reason: str | None = None
+    # Reasoning tokens a provider reports separately. They are PART of
+    # completion_tokens on OpenAI (completion_tokens_details.reasoning_tokens),
+    # so totals never add them again; visible output = completion - reasoning.
+    reasoning_tokens: int | None = None
+    # Output cap the caller asked for vs the one sent (clamped to the model's
+    # supported output and the context left after the prompt), and the attempt
+    # that succeeded (1 = no retry). Filled by LLMRouter.chat.
+    requested_max_tokens: int | None = None
+    effective_max_tokens: int | None = None
+    attempts: int | None = None
 
 
 class Provider(Protocol):
@@ -104,11 +114,23 @@ _PRICING_PER_1K = {
     "gpt-4.1-mini": (0.0004, 0.0016),
     "gpt-5.4": (0.0025, 0.015),        # $2.50 in / $15 out per 1M (cached in $0.25)
     "gpt-5.4-mini": (0.00075, 0.0045),
+    # GPT-6 family, list prices 2026-11 ($2/$10 and $0.10/$0.50 per 1M; cached
+    # input $0.10 / $0.01 per 1M -- the router's flat 0.5x cache rate overstates it).
+    "gpt-6.2-sol": (0.002, 0.010),
+    "gpt-6-luna": (0.0001, 0.0005),
+    # gpt-6.1-terra list price 2026-11 ($1 / $5 per 1M; cached input $0.05) --
+    # from public pricing aggregators, not yet checked on OpenAI's own page.
+    "gpt-6.1-terra": (0.001, 0.005),
     "gpt-4o": (0.0025, 0.010),
     "gpt-4o-mini": (0.00015, 0.00060),
     "llama-3.3-70b-versatile": (0.00059, 0.00079),
     "llama-3.1-8b-instant": (0.00005, 0.00008),
     # Anthropic (per-1K tokens; $5/$25, $3/$15, $1/$5 per-1M respectively)
+    "claude-opus-5-5": (0.004, 0.02),
+    "claude-sonnet-5-5": (0.002, 0.01),
+    # Haiku 5.5: $0.10/$0.50 up to 100K-token prompts ($0.50/$2.50 beyond --
+    # not modelled here; long prompts are under-costed by up to 5x).
+    "claude-haiku-5-5": (0.0001, 0.0005),
     "claude-opus-4-8": (0.005, 0.025),
     "claude-sonnet-4-6": (0.003, 0.015),
     "claude-haiku-4-5": (0.001, 0.005),
@@ -173,10 +195,16 @@ _MODEL_CONTEXT_WINDOW = {
     "gpt-4.1-mini": 1_047_576,
     "gpt-5.4": 400_000,
     "gpt-5.4-mini": 400_000,
+    "gpt-6.2-sol": 922_000,      # input limit (1.05M total incl. output)
+    "gpt-6-luna": 922_000,
+    "gpt-6.1-terra": 922_000,    # same family limit assumed (1M class); output cap measured
     "gpt-4o": 128_000,
     "gpt-4o-mini": 128_000,
     "llama-3.3-70b-versatile": 131_072,
     "llama-3.1-8b-instant": 131_072,
+    "claude-opus-5-5": 1_000_000,
+    "claude-sonnet-5-5": 1_000_000,
+    "claude-haiku-5-5": 1_000_000,
     "claude-opus-4-8": 200_000,
     "claude-sonnet-4-6": 200_000,
     "claude-haiku-4-5": 200_000,
@@ -195,6 +223,51 @@ _MODEL_CONTEXT_WINDOW = {
 }
 _DEFAULT_CONTEXT_WINDOW = 128_000
 
+# Maximum OUTPUT tokens per model (documented limits). A requested cap above it
+# is clamped (and logged) instead of failing with a 400. Unlisted models are
+# not clamped: the API judges. For models whose context entry is an INPUT
+# limit, the total window below (input + output) bounds input + output.
+_MODEL_MAX_OUTPUT = {
+    "gpt-4.1": 32_768,
+    "gpt-4.1-mini": 32_768,
+    "gpt-4o": 16_384,
+    "gpt-4o-mini": 16_384,
+    "gpt-5.4": 128_000,
+    "gpt-5.4-mini": 128_000,
+    "gpt-6.2-sol": 128_000,
+    "gpt-6-luna": 128_000,
+    "gpt-6.1-terra": 128_000,    # API: "at most 128000 completion tokens" (2026-11-25)
+    "claude-opus-5-5": 128_000,
+    "claude-sonnet-5-5": 128_000,
+    "claude-haiku-5-5": 128_000,
+    "claude-opus-4-8": 128_000,
+    "claude-sonnet-4-6": 64_000,
+    "claude-haiku-4-5": 64_000,
+    "llama-3.3-70b-versatile": 32_768,
+    "llama-3.1-8b-instant": 32_768,
+}
+# Input + output window where it differs from the input limit above.
+_MODEL_TOTAL_WINDOW = {"gpt-6.2-sol": 1_050_000, "gpt-6-luna": 1_050_000, "gpt-6.1-terra": 1_050_000}
+
+
+def max_output_for(model: str) -> int | None:
+    return _MODEL_MAX_OUTPUT.get(model)
+
+
+def effective_max_tokens(model: str, requested: int, prompt_tokens: int) -> int:
+    """The output cap actually sent: the requested cap, at most the model's
+    supported output, and at most what the context window leaves after the
+    prompt (never below 1)."""
+    cap = requested
+    limit = max_output_for(model)
+    if limit:
+        cap = min(cap, limit)
+    total = _MODEL_TOTAL_WINDOW.get(model) or context_window_for(model)
+    left = total - prompt_tokens
+    if left > 0:
+        cap = min(cap, left)
+    return max(1, cap)
+
 
 class PromptTooLargeError(ValueError):
     """The rendered prompt cannot fit the model's context window.
@@ -208,9 +281,21 @@ def context_window_for(model: str) -> int:
     return _MODEL_CONTEXT_WINDOW.get(model, _DEFAULT_CONTEXT_WINDOW)
 
 
-# OpenAI GPT-5.x and o-series models reject `max_tokens` and non-default
+def _cap_for(spec: dict, model: str) -> int | None:
+    """A task's output cap, optionally per model: ``max_tokens_by_model:
+    {<model>: N}`` overrides ``max_tokens`` for that model."""
+    by_model = spec.get("max_tokens_by_model") or {}
+    return by_model.get(model) or spec.get("max_tokens")
+
+
+# OpenAI GPT-5.x / GPT-6.x and o-series models reject `max_tokens` and non-default
 # `temperature`: they require `max_completion_tokens` and omit sampling params.
-_OPENAI_COMPLETION_TOKEN_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+_OPENAI_COMPLETION_TOKEN_PREFIXES = ("gpt-5", "gpt-6", "o1", "o3", "o4")
+
+
+# Values the OpenAI `reasoning_effort` parameter takes; which ones a given
+# model accepts is the API's call (it answers 400 for an unsupported level).
+REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 
 
 def _openai_uses_completion_tokens(model: str) -> bool:
@@ -266,6 +351,7 @@ class OpenAIProvider:
         cache_prefix: str | None = None,
         stream: bool = False,
         thinking: bool | None = None,
+        reasoning_effort: str | None = None,
     ) -> ChatResult:
         # Tier A -- source-first ordering. OpenAI AUTOMATICALLY caches identical
         # leading prefixes (>=1024 tokens); putting the large stable source before
@@ -288,6 +374,9 @@ class OpenAIProvider:
             kwargs["max_tokens"] = max_tokens
         if response_format == "json_object" and self._json_mode_allowed(thinking):
             kwargs["response_format"] = {"type": "json_object"}
+        if reasoning_effort is not None:
+            # Only sent when the task sets it; otherwise the model's default applies.
+            kwargs["reasoning_effort"] = reasoning_effort
         kwargs.update(self._extra_kwargs(thinking, model))
 
         if stream:
@@ -318,7 +407,10 @@ class OpenAIProvider:
         details = getattr(usage, "prompt_tokens_details", None) if usage else None
         cached = (getattr(details, "cached_tokens", 0) or 0) if details is not None else 0
         uncached = (prompt_tokens or 0) - cached
+        cdetails = getattr(usage, "completion_tokens_details", None) if usage else None
+        reasoning = getattr(cdetails, "reasoning_tokens", None) if cdetails is not None else None
         return ChatResult(
+            reasoning_tokens=reasoning if isinstance(reasoning, int) else None,
             finish_reason=finish,
             text=text,
             model=model,
@@ -416,7 +508,25 @@ _ANTHROPIC_NO_SAMPLING_PREFIXES = (
     "claude-opus-4-8",
     "claude-fable",
     "claude-mythos",
+    # Claude 5 family: Opus 5/5.5 reject sampling params; Sonnet 5.5 and
+    # Haiku 5.5 reject any non-default value (Sonnet 5 removed them).
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-haiku-5",
 )
+
+
+# Anthropic `output_config.effort` (adaptive-thinking models). Sent only when a
+# task sets reasoning_effort; absent = the model's own default.
+ANTHROPIC_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+_ANTHROPIC_EFFORT_PREFIXES = (
+    "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8", "claude-opus-5",
+    "claude-sonnet-4-6", "claude-sonnet-5", "claude-haiku-5", "claude-fable", "claude-mythos",
+)
+
+
+def _anthropic_takes_effort(model: str) -> bool:
+    return model.startswith(_ANTHROPIC_EFFORT_PREFIXES)
 
 
 def _anthropic_accepts_temperature(model: str) -> bool:
@@ -457,6 +567,7 @@ class AnthropicProvider:
         response_format: str | None,
         cache_prefix: str | None = None,
         stream: bool = False,
+        reasoning_effort: str | None = None,
     ) -> ChatResult:
         # Anthropic takes the system prompt as a top-level arg, not a message.
         sys_prompt = system
@@ -488,6 +599,8 @@ class AnthropicProvider:
         # Opus 4.6+/Fable/Mythos 400 on sampling params.
         if _anthropic_accepts_temperature(model):
             kwargs["temperature"] = temperature
+        if reasoning_effort:
+            kwargs["output_config"] = {"effort": reasoning_effort}
 
         if stream:
             # Unlike OpenAI, Anthropic needs no include_usage equivalent: usage
@@ -652,6 +765,7 @@ class LLMRouter:
         self.reset_counters()
         self._validate_stream_support()
         self._validate_thinking()
+        self._validate_reasoning_effort()
         _register_for_cost_dump(self)
 
     def reset_counters(self) -> None:
@@ -685,6 +799,12 @@ class LLMRouter:
         # record of where its capacity went -- and what sizing projects from.
         self._in_tokens_by_task: dict[str, int] = {}
         self._seconds_by_task: dict[str, float] = {}
+        # Per task: reasoning tokens (subset of out tokens), finish reasons,
+        # retried attempts, requested vs effective output caps.
+        self._reasoning_by_task: dict[str, int] = {}
+        self._finish_by_task: dict[str, dict[str, int]] = {}
+        self._retries_by_task: dict[str, int] = {}
+        self._caps_by_task: dict[str, dict[str, int]] = {}
 
     def _validate_stream_support(self) -> None:
         """Fail at config load, not mid-run, on an unsupportable `stream: true`.
@@ -718,6 +838,30 @@ class LLMRouter:
                 f"tasks {sorted(bad)} set `thinking` but are not routed to "
                 "provider 'deepinfra' -- only DeepInfra/Qwen supports it."
             )
+
+    def _validate_reasoning_effort(self) -> None:
+        """`reasoning_effort` (optional, per task): OpenAI reasoning models
+        (gpt-5.x / gpt-6.x / o-series: none..xhigh) and Anthropic adaptive-
+        thinking models (sent as output_config.effort: low..max). Absent = the
+        model's own default (nothing is sent)."""
+        bad = []
+        for name, spec in self._tasks.items():
+            if spec.get("reasoning_effort") is None:
+                continue
+            effort = str(spec["reasoning_effort"]).lower()
+            model = str(spec.get("model") or "")
+            if spec.get("provider") == "openai" and _openai_uses_completion_tokens(model):
+                allowed = REASONING_EFFORTS
+            elif spec.get("provider") == "anthropic" and _anthropic_takes_effort(model):
+                allowed = ANTHROPIC_EFFORTS
+            else:
+                bad.append(f"{name} (only OpenAI reasoning models and Anthropic adaptive-"
+                           "thinking models take reasoning_effort)")
+                continue
+            if effort not in allowed:
+                bad.append(f"{name} ({effort!r} is not one of {sorted(allowed)})")
+        if bad:
+            raise ValueError("invalid reasoning_effort: " + "; ".join(bad))
 
     @property
     def total_cost_usd(self) -> float:
@@ -758,6 +902,11 @@ class LLMRouter:
                     "in_tokens": self._in_tokens_by_task.get(t, 0),
                     "out_tokens": sum(self._out_tokens_by_task.get(t, [])),
                     "call_seconds": round(self._seconds_by_task.get(t, 0.0), 1),
+                    # reasoning is INCLUDED in out_tokens (provider semantics)
+                    "reasoning_tokens": self._reasoning_by_task.get(t, 0),
+                    "finish_reasons": dict(self._finish_by_task.get(t, {})),
+                    "retries": self._retries_by_task.get(t, 0),
+                    **({"caps": self._caps_by_task[t]} if t in self._caps_by_task else {}),
                     **self._output_stats(t),
                 }
                 for t, c in by_task.items()
@@ -814,7 +963,7 @@ class LLMRouter:
 
     async def chat(
         self, task: str, *, system: str, user: str, cache_prefix: str | None = None,
-        model: str | None = None,
+        model: str | None = None, max_tokens: int | None = None,
     ) -> ChatResult:
         """`model` overrides the task's model for this call only (same
         provider and settings) -- e.g. a dedicated deployment with a
@@ -828,8 +977,18 @@ class LLMRouter:
             )
         provider = self._providers[provider_name]
         model = model or spec["model"]
-        max_tokens = int(spec.get("max_tokens", 4096))
+        requested = int(max_tokens or _cap_for(spec, model) or 4096)
+        prompt_est = count_tokens(system) + count_tokens(user) + (count_tokens(cache_prefix) if cache_prefix else 0)
+        max_tokens = effective_max_tokens(model, requested, prompt_est)
+        if max_tokens != requested:
+            log.info("task=%s model=%s output cap: requested %d, effective %d (model limit %s, "
+                     "prompt ~%d tokens)", task, model, requested, max_tokens, max_output_for(model), prompt_est)
+        caps = self._caps_by_task.setdefault(task, {"requested": requested, "effective": max_tokens})
+        caps["requested"], caps["effective"] = max(caps["requested"], requested), max(caps["effective"], max_tokens)
         timeout = int(spec.get("timeout", 120))
+        # a per-call larger output budget brings its own time budget (the
+        # same tokens/20 floor the task configs follow)
+        timeout = max(timeout, max_tokens // 20)
         retryer = self._make_retryer(task, provider_name, model)
 
         self._preflight_size(
@@ -853,8 +1012,21 @@ class LLMRouter:
                     # Only sent when the task sets it, so non-deepinfra calls
                     # are unchanged (_validate_thinking rejects it elsewhere).
                     **({"thinking": bool(spec["thinking"])} if "thinking" in spec else {}),
+                    # Only sent when the task sets it (validated to OpenAI
+                    # reasoning models by _validate_reasoning_effort).
+                    **({"reasoning_effort": str(spec["reasoning_effort"]).lower()}
+                       if spec.get("reasoning_effort") is not None else {}),
                 )
                 elapsed = time.monotonic() - started
+                result.requested_max_tokens = requested
+                result.effective_max_tokens = max_tokens
+                result.attempts = attempt.retry_state.attempt_number
+                if result.reasoning_tokens:
+                    self._reasoning_by_task[task] = self._reasoning_by_task.get(task, 0) + result.reasoning_tokens
+                fin = self._finish_by_task.setdefault(task, {})
+                fin[str(result.finish_reason)] = fin.get(str(result.finish_reason), 0) + 1
+                if result.attempts and result.attempts > 1:
+                    self._retries_by_task[task] = self._retries_by_task.get(task, 0) + result.attempts - 1
                 # A call sitting near its deadline is the signal that precedes a
                 # timeout-and-retry spiral. Without it, a healthy-but-slow run is
                 # indistinguishable from a deadlocked one from the outside --

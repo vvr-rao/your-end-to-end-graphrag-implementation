@@ -7,138 +7,158 @@
 # IMPORTANT: Anthropic has no embeddings API, so the `embeddings` task stays on
 # OpenAI (text-embedding-3-small @ 1024). This preset therefore needs BOTH
 # ANTHROPIC_API_KEY (chat) AND OPENAI_API_KEY (embeddings). GROQ_API_KEY is not
-# used. table_extract_vision also stays on OpenAI (the Anthropic provider in
-# llm_router.py is text-only; vision input is not wired).
+# used. Table vision (table_extract_vision / table_extract_page_vision) runs on
+# Claude too: table_extract.py sends the page image as an Anthropic image block.
 #
-# Model tiers: claude-haiku-4-5 for cheap/high-volume tasks; claude-sonnet-4-6
-# for harder reasoning; claude-opus-4-8 only for genuine synthesis (qa_synthesis).
+# Model tiers (Claude 5.5 family):
+#   - claude-haiku-5-5  cheap / high-volume tasks: document summaries and the
+#     evaluated-summary loop, extraction, parsing, ontology judges, simple
+#     answers, table vision, table verify/lookups/concept map
+#   - claude-sonnet-5-5 harder reasoning: dedup, concept grouping, entity
+#     validation, insights/recommendations, merges, deep research, alias and
+#     eval judges; table profiling/refining (high effort) and table query
+#     selection (medium effort)
+#   - claude-opus-5-5   class_proposal (high effort; see that task)
+#   (qa_synthesis is a legacy entry no code calls.)
 # Notes:
-#   - Opus 4.6+/Fable reject temperature (the router omits it automatically for
-#     those models). Sonnet/Haiku accept it.
+#   - All 5.5 models reject non-default sampling parameters, so this preset sets
+#     no temperature (the router would drop it anyway).
+#   - All 5.5 models think by default (adaptive thinking), and thinking tokens
+#     count against max_tokens. Small caps truncate replies, so every chat task
+#     streams with max_tokens 64000; the cap is a ceiling, not a cost.
+#     Effort is the model default (Haiku medium, Sonnet high, Opus medium)
+#     unless a task sets reasoning_effort.
+#   - Table vision calls are not streamed, so those two tasks keep max_tokens
+#     16384 (non-streamed requests above ~16k risk SDK HTTP timeouts).
 #   - Anthropic has no JSON-mode flag; the router instructs bare JSON + strips
 #     ```json fences, so `response_format: json_object` still works here.
-#   - max_tokens kept <= 8192 (the router is non-streaming; larger risks SDK
-#     HTTP timeouts). Bump per-task if your corpus needs longer outputs.
 # =============================================================================
 
 tasks:
   chunk_classification:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 600
-    temperature: 0.0
-    max_tokens: 8192
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
 
+  # Stage 2 decides which concepts become ontology classes, so this preset puts
+  # the strongest model here. Measured 2026-11-26 on two independent 6-document
+  # sets (frozen checklists): Opus 5.5 at high effort missed no central topic and
+  # kept the most secondary concepts (71.5/77 vs 64.5 at medium effort, 50 for
+  # Haiku 5.5). Cost per 12 chunks: ~$4.90 (Opus high) vs ~$0.11 (Haiku).
+  # BUDGET OPTION: model claude-haiku-5-5, reasoning_effort medium — ~45x cheaper,
+  # but it missed main topics of some documents on both test sets.
+  # Replies reach ~21k tokens, so the call streams with a 64k cap.
   class_proposal:
     provider: anthropic
-    model: claude-sonnet-4-6
-    timeout: 600
-    temperature: 0.0
-    max_tokens: 8192
+    model: claude-opus-5-5
+    reasoning_effort: high
+    timeout: 2400
+    max_tokens: 64000
+    stream: true
     response_format: json_object
 
   match_dedup:
     provider: anthropic
-    model: claude-sonnet-4-6
+    model: claude-sonnet-5-5
     timeout: 2400
-    temperature: 0.0
     # Dedup echoes the whole deduplicated batch back, so output size tracks
     # input size. At 4096 the JSON truncated mid-object, the parse returned
     # nothing, and the stage silently passed its input through undeduplicated.
     # pipeline_llm._dedup sizes its batches against this value.
-    max_tokens: 32768
+    max_tokens: 64000
+    stream: true
     response_format: json_object
 
   concept_grouping:
     provider: anthropic
-    model: claude-sonnet-4-6
-    timeout: 600
-    temperature: 0.0
-    max_tokens: 8192
+    model: claude-sonnet-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
 
   compact_description:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 150
-    temperature: 0.0
-    max_tokens: 2048
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
 
   document_summarize:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 600
-    temperature: 0.0
-    max_tokens: 4096
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
     stream: true
 
   # Evaluated (near-lossless) document summarizer -- new default ingestion path.
-  # Uses the synthesis-tier sonnet (NOT haiku): the lossless-preservation + JSON
-  # eval loop needs strong instruction-following. The AnthropicProvider handles
-  # the json_object tasks by instructing bare JSON + stripping ```json fences.
+  # Haiku 5.5 (2026-11-26): the whole evaluated-summary loop ran on Haiku 5.5 in
+  # the 2026-11-26 Claude builds, the same tier as OpenAI's Luna for these
+  # tasks. The AnthropicProvider handles the json_object tasks by instructing
+  # bare JSON + stripping ```json fences.
   evaluated_summary_chunk:
     provider: anthropic
-    model: claude-sonnet-4-6
-    timeout: 600
-    temperature: 0.0
-    max_tokens: 8192
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
     stream: true
   summary_question_gen:
     provider: anthropic
-    model: claude-sonnet-4-6
-    timeout: 300
-    temperature: 0.0
-    max_tokens: 4096
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
   summary_evaluate:
     provider: anthropic
-    model: claude-sonnet-4-6
-    timeout: 300
-    temperature: 0.0
-    max_tokens: 4096
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
   summary_revise:
     provider: anthropic
-    model: claude-sonnet-4-6
-    timeout: 600
-    temperature: 0.0
-    max_tokens: 8192
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
     stream: true
   # One call per summarized document: who/what it is about, from its opening
   # text. Starts every stored summary piece ("[Document: ...]"). Optional:
   # without this task the summary's title line or the file name is used.
   document_subject:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 90
-    temperature: 0.0
-    max_tokens: 400
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
 
   classification_audit:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 300
-    temperature: 0.0
-    max_tokens: 4096
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
 
   class_summarization:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 90
-    temperature: 0.2
-    max_tokens: 1024
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
   # Corpus selection (prune-expand --select-subset): name each document's TYPE
   # so every type is guaranteed a document in the subset. One call per
   # document, so it MUST stay on a cheap model.
   document_type_label:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 60
-    temperature: 0.0
-    max_tokens: 256
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
   # Corpus selection: shrink an oversize document summary to fit the embedding
   # model's input cap. max_tokens MUST comfortably exceed
   # corpus_selection.embed_target_tokens -- a small cap silently truncates the
@@ -147,17 +167,18 @@ tasks:
   # 260 tokens through a 256-token task).
   embed_compress:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 600
-    temperature: 0.2
-    max_tokens: 8192
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
 
-  # Highest-reasoning task — gets Opus. Opus rejects temperature; router omits it.
+  # Highest-reasoning task — gets Opus (default effort).
   qa_synthesis:
     provider: anthropic
-    model: claude-opus-4-8
-    timeout: 300
-    max_tokens: 4096
+    model: claude-opus-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
 
   # Embeddings ALWAYS run on OpenAI (Anthropic has no embeddings API).
   embeddings:
@@ -168,26 +189,26 @@ tasks:
 
   artifact_chunk_extract:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 600
-    temperature: 0.0
-    max_tokens: 8192          # entity-grounded artifact JSON on dense chunks exceeds 2048 -> truncation
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
 
   artifact_chunk_extract_with_entities:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 600
-    temperature: 0.0
-    max_tokens: 8192          # entity-grounded artifact JSON on dense chunks exceeds 2048 -> truncation
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
 
   entity_extract:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 600
-    temperature: 0.0
-    max_tokens: 8192          # dense chunks w/ many entities (50 candidate classes) exceed 2048 -> truncation
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
   # Second extraction pass over the SAME chunk, asking only for the CONCEPTS
   # the passage develops (freight rates, consolidation, overcapacity) rather
@@ -196,29 +217,29 @@ tasks:
   # synthesis, and the narrowed one-job prompt is what carries the quality.
   concept_extract:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 600
-    temperature: 0.0
-    max_tokens: 4096          # <=5 concepts per chunk; far smaller than entity_extract
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
   # Review pass over what entity_extract just produced. Only runs with
   # --validate-entities (off by default).
   #
   # DELIBERATELY a different, stronger model than entity_extract -- a model
   # reviewing its own output rubber-stamps it. Sonnet is the next tier above
-  # this preset's claude-haiku-4-5 extractor.
+  # this preset's claude-haiku-5-5 extractor.
   #
-  # COST WARNING: at $3/$15 per 1M this is roughly 13x the OpenAI validator
+  # COST WARNING: at $2/$10 per 1M (Sonnet 5.5) this is roughly 9x the OpenAI validator
   # (gpt-4.1-mini) and will exceed the default --max-cost-usd 5.0 on a few
   # hundred chunks. You already need OPENAI_API_KEY for embeddings, so
   # repointing just this task to `provider: openai, model: gpt-4.1-mini` is a
   # reasonable choice.
   entity_validate:
     provider: anthropic
-    model: claude-sonnet-4-6
-    timeout: 300
-    temperature: 0.0
-    max_tokens: 4096
+    model: claude-sonnet-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
   # Second pass of Milestone C: relationships between entities already
   # extracted from a chunk. Separate from entity_extract so the predicate menu
   # can be narrowed to the entities' ACTUAL classes -- see
@@ -226,10 +247,10 @@ tasks:
   # the output is a small JSON list.
   relationship_extract:
     provider: anthropic
-    model: claude-haiku-4-5
+    model: claude-haiku-5-5
     timeout: 900
-    temperature: 0.0
-    max_tokens: 16384   # up to one relationship per entity (ceiling 100) per chunk, each with a quote
+    max_tokens: 64000
+    stream: true
   # Third pass: does each relationship's quoted evidence actually SUPPORT the
   # claim, in the stated direction? The structural checks verify a quote occurs
   # in the chunk and names both ends; they cannot tell that "lawsuits filed
@@ -238,10 +259,10 @@ tasks:
   # so give it room to answer for every claim in a chunk.
   relationship_verify:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 420
-    temperature: 0.0
-    max_tokens: 8192   # a verdict per claim; up to ~100 claims per dense chunk
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
   # Orphan check: after both relationship passes, the chunk's entities that
   # still have no relationship are listed and the model either returns a
   # relationship the passage states for each or flags why there is none
@@ -250,27 +271,27 @@ tasks:
   # targeted re-read, and a weaker model mostly repeats pass 1's misses.
   relationship_orphan_check:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 420
-    temperature: 0.0
-    max_tokens: 8192   # relationships for up to ~100 orphans, plus a flag per unlinked one
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
   # Rescue pass: re-home relationship claims whose evidence is sound but whose
   # predicate failed the domain/range check, using a WIDER predicate menu. The
   # strict menu offered a median of 8 of 620 predicates on the news corpus, so
   # real relationships were being forced onto wrong predicates and dropped.
   relationship_repair:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 120
-    temperature: 0.0
-    max_tokens: 2048
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
 
   question_parse:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 90
-    temperature: 0.0
-    max_tokens: 1024
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
 
   # Parses the RELATIONSHIPS a question implies, for relationship-aware
@@ -278,10 +299,10 @@ tasks:
   # OpenAI preset uses gpt-4.1-mini: multi-step decomposition.
   question_relations:
     provider: anthropic
-    model: claude-sonnet-4-6
-    timeout: 90
-    temperature: 0.0
-    max_tokens: 1024
+    model: claude-sonnet-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
 
   # enrich-geo: which named places contain which other named places. A
@@ -289,26 +310,26 @@ tasks:
   # the cheap model is right; one call per 40 places.
   geographic_containment:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 240
-    temperature: 0.0
-    max_tokens: 4096
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
 
   concept_expansion:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 90
-    temperature: 0.0
-    max_tokens: 1024
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
 
   query_decompose:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 90
-    temperature: 0.0
-    max_tokens: 1024
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
 
   # Iterative-retrieval planner: decides whether a question needs a second,
@@ -321,95 +342,95 @@ tasks:
   # two-round retrieval silently never ran. Keep it present in ALL presets.
   retrieval_rounds_plan:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 90
-    temperature: 0.0
-    max_tokens: 1024
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
 
   # Per-entity probe fan-out (cheap templating -> haiku).
   entity_probes:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 90
-    temperature: 0.0
-    max_tokens: 1024
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
 
   chunk_relevance_filter:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 300
-    temperature: 0.0
-    max_tokens: 4096
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
 
   answer_simple_qa:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 90
-    temperature: 0.0
-    max_tokens: 1024
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
 
   answer_deep_research:
     provider: anthropic
-    model: claude-sonnet-4-6
-    timeout: 600
-    temperature: 0.1
-    max_tokens: 8192          # 7-section deep_research answers over evidence-rich corpora exceed 4096
+    model: claude-sonnet-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
 
   follow_up_resolution:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 90
-    temperature: 0.0
-    max_tokens: 512
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
 
   answer_conversation_turn:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 150
-    temperature: 0.1
-    max_tokens: 2048
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
 
   insight_gen:
     provider: anthropic
-    model: claude-sonnet-4-6
-    timeout: 150
-    temperature: 0.2
-    max_tokens: 2048
+    model: claude-sonnet-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
 
   recommendation_gen:
     provider: anthropic
-    model: claude-sonnet-4-6
-    timeout: 150
-    temperature: 0.2
-    max_tokens: 2048
+    model: claude-sonnet-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
 
   # Artifact rollup (clustered merge) + lossless evaluate->revise loop. Sonnet
   # (not haiku): lossless dedup + loss-detection need strong instruction-following.
   artifact_merge:
     provider: anthropic
-    model: claude-sonnet-4-6
-    timeout: 600
-    temperature: 0.2
-    max_tokens: 8192
+    model: claude-sonnet-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
   artifact_merge_evaluate:
     provider: anthropic
-    model: claude-sonnet-4-6
-    timeout: 300
-    temperature: 0.0
-    max_tokens: 4096
+    model: claude-sonnet-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
   artifact_merge_revise:
     provider: anthropic
-    model: claude-sonnet-4-6
-    timeout: 600
-    temperature: 0.2
-    max_tokens: 8192
+    model: claude-sonnet-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
 
   # Summary rollup uses a MORE CAPABLE model than the short-artifact merge:
@@ -418,89 +439,160 @@ tasks:
   # the cheaper artifact_merge* (gpt-4.1) -- so no premium is paid there.
   summary_merge:
     provider: anthropic
-    model: claude-sonnet-4-6
-    timeout: 600
-    temperature: 0.2
-    max_tokens: 8192
+    model: claude-sonnet-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
   summary_merge_evaluate:
     provider: anthropic
-    model: claude-sonnet-4-6
-    timeout: 300
-    temperature: 0.0
-    max_tokens: 4096
+    model: claude-sonnet-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
   summary_merge_revise:
     provider: anthropic
-    model: claude-sonnet-4-6
-    timeout: 600
-    temperature: 0.2
-    max_tokens: 8192
+    model: claude-sonnet-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
   judge_comprehensiveness:
     provider: anthropic
-    model: claude-sonnet-4-6
-    timeout: 90
-    temperature: 0.0
-    max_tokens: 1024
+    model: claude-sonnet-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
 
   judge_no_hallucination:
     provider: anthropic
-    model: claude-sonnet-4-6
-    timeout: 90
-    temperature: 0.0
-    max_tokens: 1024
+    model: claude-sonnet-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
 
   judge_gap_detection:
     provider: anthropic
-    model: claude-sonnet-4-6
-    timeout: 90
-    temperature: 0.0
-    max_tokens: 1024
+    model: claude-sonnet-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
 
   judge_consistency:
     provider: anthropic
-    model: claude-sonnet-4-6
-    timeout: 150
-    temperature: 0.0
-    max_tokens: 2048
+    model: claude-sonnet-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
 
   artifact_document_summary:
     provider: anthropic
-    model: claude-sonnet-4-6      # parity: OpenAI preset uses gpt-4.1 (instruction-following tier)
-    timeout: 300
-    temperature: 0.2
-    max_tokens: 4096
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
 
-  # Vision input is NOT wired for the Anthropic provider — keep on OpenAI.
+  # Table vision on Claude: table_extract.py sends the cropped PNG as an
+  # Anthropic image block. Not streamed, so the cap stays at 16384
+  # with a timeout that allows 20 tok/s (test_timeout_budgets).
   table_extract_vision:
     provider: anthropic          # Anthropic vision (base64 PNG) -- keeps --tables fully OpenAI-free
-    model: claude-haiku-4-5
-    timeout: 300
-    temperature: 0.0
-    max_tokens: 4096
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 16384
     response_format: json_object
   # Whole-page vision (--tables): a figure-dense page whose tables the
   # line-based detector missed (borderless financial statements). Same
   # model as table_extract_vision; a full statement page runs 3-6k tokens.
   table_extract_page_vision:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 420
-    temperature: 0.0
-    max_tokens: 8192
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 16384
     response_format: json_object
 
   table_concept_grouping:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 150
-    temperature: 0.0
-    max_tokens: 2048
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
+    response_format: json_object
+
+  # Structured data (prune-expand / extract-entities --structured-data):
+  # one call per table writes its metadata + metrics/filters/queries SQL, and
+  # also repairs SQL the validator rejected (services/structured/profiler.py).
+  table_profile:
+    provider: anthropic
+    model: claude-sonnet-5-5
+    timeout: 3280
+    max_tokens: 64000
+    stream: true
+    continuation: {batch: 40, max_calls: 40, max_output_tokens: 1500000, no_progress_calls: 2}   # wide tables: columns per call + per-table budgets
+    response_format: json_object
+    max_tokens_by_model: {gpt-6.2-sol: 65536, claude-sonnet-5-5: 65536, claude-opus-5-5: 65536}
+    reasoning_effort: high
+
+  # Second, data-driven pass on a LOADED table (refine): measured structure ->
+  # measures, usage notes, typical questions; also repairs queries that fail
+  # their data test. One call per table, cached with the metadata.
+  table_refine:
+    provider: anthropic
+    model: claude-sonnet-5-5
+    timeout: 1640
+    max_tokens: 64000
+    stream: true
+    continuation: {batch: 15, max_calls: 40, max_output_tokens: 1500000, no_progress_calls: 2}   # candidate ids per call + per-table budgets
+    response_format: json_object
+    reasoning_effort: high
+
+  # Independent check after table_refine (on by default): column metadata vs
+  # the measured data, then every stored query's SQL vs its label/description.
+  # One call for the columns + one per 8 stored queries. enabled: false skips it.
+  table_verify:
+    provider: anthropic
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
+    response_format: json_object
+
+  # One call over all tables: shared keys -> LOOKUP join queries.
+  table_lookups:
+    provider: anthropic
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
+    response_format: json_object
+
+  # Final catalog -> ontology concepts (after verification): reuse a class or propose one.
+  table_concept_map:
+    provider: anthropic
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
+    response_format: json_object
+
+  # query --use-structured-data: is a table needed, and which stored SQL to run.
+  # Measured 2026-11-26 on 15 table questions (same catalog, only this task
+  # changed): correct of 13 answerable -- Haiku 5.5 medium 10, Sonnet 5.5 medium
+  # 11, Sonnet high 10, Opus medium 11, Opus high 10. Cost per question ~$0.03
+  # (Haiku), ~$0.20 (Sonnet), ~$0.40 (Opus): the prompt carries the candidate
+  # tables' catalogs (~100K input tokens). Budget option: claude-haiku-5-5.
+  table_query_select:
+    provider: anthropic
+    model: claude-sonnet-5-5
+    reasoning_effort: medium
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
 
   # mine-aliases judge (alias_judge.py, migration 0013): drops mined synonym
@@ -514,23 +606,23 @@ tasks:
   # small model here.
   alias_judge:
     provider: anthropic
-    model: claude-sonnet-4-6   # ~$0.26 per 600 new pairs
+    model: claude-sonnet-5-5
     enabled: true
     pairs_per_call: 40
     concurrency: 8
-    timeout: 300
-    temperature: 0.0
-    max_tokens: 2048   # 40 ids ~200 tokens
+    timeout: 820
+    max_tokens: 64000
+    stream: true
 
   # Stage 3b duplicate-class merge: OFF in this preset (enabled only in the
   # deepinfra preset, which ships the model-specific judge prompt).
   class_synonym_judge:
     provider: anthropic
-    model: claude-haiku-4-5
+    model: claude-haiku-5-5
     enabled: false
-    timeout: 600
-    temperature: 0.0
-    max_tokens: 4096   # 60 decisions ~1.5k tokens
+    timeout: 820
+    max_tokens: 64000
+    stream: true
 
   # Reviews each chunk's concepts against the passage: keep, move to a better
   # listed class, or drop. A different model from concept_extract where possible.
@@ -538,11 +630,11 @@ tasks:
   # Set enabled: true to run it.
   concept_review:
     provider: anthropic
-    model: claude-haiku-4-5
+    model: claude-haiku-5-5
     enabled: false        # off until it beats the blind test; see concept_review.py
-    timeout: 300
-    temperature: 0.0
-    max_tokens: 4096
+    timeout: 820
+    max_tokens: 64000
+    stream: true
     response_format: json_object
 
   # Named things vs concepts among entities typed under the concept roots
@@ -550,34 +642,34 @@ tasks:
   # 25 entities with no verdict. enabled: false skips it.
   concept_kind_judge:
     provider: anthropic
-    model: claude-haiku-4-5
+    model: claude-haiku-5-5
     enabled: true
     entities_per_call: 25
     concurrency: 8
-    timeout: 300
-    temperature: 0.0
-    max_tokens: 2048        # 25 decisions ~400 tokens
+    timeout: 820
+    max_tokens: 64000
+    stream: true
 
   # Standing LLM-as-judge evaluations (eval-typing after extract-entities;
   # eval-ontology after prune-expand). Yes/no per item with a short reason;
   # nothing is changed. ~1 call per 20 items.
   eval_typing_judge:
     provider: anthropic
-    model: claude-haiku-4-5
+    model: claude-haiku-5-5
     items_per_call: 20
     concurrency: 8
-    timeout: 300
-    temperature: 0.0
-    max_tokens: 4096        # 20 verdicts with reasons ~1k tokens
+    timeout: 820
+    max_tokens: 64000
+    stream: true
 
   eval_definition_judge:
     provider: anthropic
-    model: claude-haiku-4-5
+    model: claude-haiku-5-5
     items_per_call: 20
     concurrency: 8
-    timeout: 300
-    temperature: 0.0
-    max_tokens: 4096
+    timeout: 820
+    max_tokens: 64000
+    stream: true
 
   # prune-expand: review classes created from relation endpoints (parent was
   # copied from the other end, definition a placeholder): keep/drop, pick a
@@ -585,12 +677,12 @@ tasks:
   # task or set enabled: false to skip. ~100-150 classes per build.
   endpoint_class_review:
     provider: anthropic
-    model: claude-haiku-4-5
+    model: claude-haiku-5-5
     items_per_call: 20
     concurrency: 8
-    timeout: 300
-    temperature: 0.0
-    max_tokens: 4096        # 20 decisions with one-sentence definitions ~2k tokens
+    timeout: 820
+    max_tokens: 64000
+    stream: true
 
 
   # Stage 3c: generic parent for qualified concept classes
@@ -599,31 +691,31 @@ tasks:
   # ~1 call per 25 groups. enabled: false skips the pass.
   concept_head_judge:
     provider: anthropic
-    model: claude-haiku-4-5
+    model: claude-haiku-5-5
     enabled: true
     min_members: 3          # 2 let in chance groups: replay 2026-11-03, 3 cut bad heads 23 -> 7 (finance) and 32 -> 17 (pharma)
     groups_per_call: 25
     max_groups: 300
-    timeout: 600
-    temperature: 0.0
-    max_tokens: 4096        # 25 decisions ~1.5k tokens
+    timeout: 820
+    max_tokens: 64000
+    stream: true
 
   # Pairwise-dedup judges. UNUSED in this preset: they run only when
   # match_dedup sets `method: pairwise`, which only the deepinfra preset does
   # (this mode keeps the echo dedup). Defined so every preset has one task set.
   class_pair_judge:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 300
-    temperature: 0.0
-    max_tokens: 4096
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
 
   class_validity_judge:
     provider: anthropic
-    model: claude-haiku-4-5
-    timeout: 400
-    temperature: 0.0
-    max_tokens: 6144
+    model: claude-haiku-5-5
+    timeout: 820
+    max_tokens: 64000
+    stream: true
 
 defaults:
   retries:

@@ -537,7 +537,8 @@ def test_preset_selects_qwen_prompt_only_for_class_proposal() -> None:
         "alias_judge", "class_proposal", "class_synonym_judge", "concept_head_judge", "concept_kind_judge",
         "concept_review", "endpoint_class_review", "eval_definition_judge", "eval_typing_judge",
         "judge_comprehensiveness", "judge_consistency",
-        "judge_gap_detection", "judge_no_hallucination", "relationship_extract", "relationship_repair"]
+        "judge_gap_detection", "judge_no_hallucination", "relationship_extract", "relationship_repair",
+        "table_profile"]
 
 
 def test_deepinfra_preset_is_deepinfra_only() -> None:

@@ -176,7 +176,7 @@ def main(argv: list[str]) -> int:
         qfile = _arg(argv, "--questions")
         stem = f"judge-{Path(qfile).stem}-{mode}-{stamp}"
         cmd = ["uv", "run", "python", "-m", "backend.app.cli", "evaluate-queries", "--questions", qfile,
-               "--mode", mode, "--runs-per-question", _arg(argv, "--runs", "2"), "--judge-model", "gpt-4.1",
+               "--mode", mode, "--runs-per-question", _arg(argv, "--runs", "2"),
                "--max-cost-usd", _arg(argv, "--max-cost-usd", "10"),
                "--output", str(base / "eval" / f"{stem}.json"),
                "--output-md", str(base / "eval" / f"{stem}.md")]

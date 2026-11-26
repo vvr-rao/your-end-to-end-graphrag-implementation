@@ -16,6 +16,25 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.12", "3.13", "3.14"]
+    # A throwaway pgvector database so the DB round-trip tests run instead of
+    # skipping (structured-data load/link/SQL, staging store, Stage-2
+    # streaming). Service containers are Linux-only on GitHub, so these run
+    # here and self-skip in the macOS/Windows job. The database name must end
+    # in _test: test_structured_db TRUNCATEs graph tables.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: yegi
+          POSTGRES_PASSWORD: yegi
+          POSTGRES_DB: yegi_ci_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U yegi -d yegi_ci_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      ONTOLOGY_BUILD_TEST_DSN: postgresql://yegi:yegi@localhost:5432/yegi_ci_test
     steps:
       - uses: actions/checkout@v4
 
@@ -29,6 +48,12 @@ jobs:
 
       - name: Install dependencies
         run: uv sync --dev --extra hf --extra structured --python ${{ matrix.python-version }}
+
+      - name: Migrate the test database
+        env:
+          DATABASE_URL: postgresql://yegi:yegi@localhost:5432/yegi_ci_test
+          BEARER_TOKEN: ci-only
+        run: uv run --python ${{ matrix.python-version }} python -m backend.app.cli db-migrate
 
       - name: Run tests with coverage
         # The fast suite (-m 'not slow', from pyproject addopts) needs no
@@ -112,3 +137,24 @@ jobs:
           backend/tests/unit/test_table_page_vision.py
           backend/tests/unit/test_table_cache.py
           backend/tests/unit/test_generic_concepts.py
+
+      # Structured-data support: discovery, profiling, the two-tier metadata
+      # cache (atomic UTF-8 writes, cache hits make zero LLM calls), the SQL
+      # guard, Markdown export/import and the LLM profiler with a fake router.
+      # Paths with spaces/Unicode and byte-exact fixtures are the OS-sensitive
+      # parts. test_structured_db needs Postgres and self-skips here.
+      - name: Test structured-data pipeline (cross-platform)
+        run: >-
+          uv run --python 3.12 pytest -v
+          backend/tests/unit/test_structured_discovery.py
+          backend/tests/unit/test_structured_profiling.py
+          backend/tests/unit/test_structured_cache.py
+          backend/tests/unit/test_structured_sql_guard.py
+          backend/tests/unit/test_table_metadata_md.py
+          backend/tests/unit/test_structured_profiler.py
+          backend/tests/unit/test_structured_retrieval.py
+          backend/tests/unit/test_structured_query_builder.py
+          backend/tests/unit/test_structured_value_domains.py
+          backend/tests/unit/test_structured_db.py
+          backend/tests/unit/test_structured_refine.py
+          backend/tests/unit/test_structured_graph_links.py backend/tests/unit/test_structured_listing_stats.py backend/tests/unit/test_structured_rounds.py backend/tests/unit/test_structured_column_stats.py backend/tests/unit/test_structured_totals_chaining.py

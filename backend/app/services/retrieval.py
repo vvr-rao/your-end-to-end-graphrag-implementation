@@ -432,6 +432,51 @@ def _validate_citations(
     return cleaned, invalid
 
 
+def task_usage(router) -> dict[str, dict[str, float]]:
+    """Per-task LLM usage of one question: {task: {cost_usd, seconds, calls,
+    in_tokens, out_tokens}} (measurement only)."""
+    out = {}
+    try:
+        for t, n in router.calls_by_task.items():
+            out[t] = {"cost_usd": round(router.cost_by_task.get(t, 0.0), 6),
+                      "seconds": round(router._seconds_by_task.get(t, 0.0), 2),
+                      "calls": n,
+                      "in_tokens": router._in_tokens_by_task.get(t, 0),
+                      "out_tokens": sum(router._out_tokens_by_task.get(t, []))}
+    except AttributeError:   # a router without usage counters (tests)
+        return {}
+    return out
+
+
+def merge_task_usage(*usages: dict[str, dict[str, float]] | None) -> dict[str, dict[str, float]]:
+    out: dict[str, dict[str, float]] = {}
+    for u in usages:
+        for t, row in (u or {}).items():
+            acc = out.setdefault(t, {k: 0 for k in row})
+            for k, v in row.items():
+                acc[k] = round(acc.get(k, 0) + v, 6)
+    return out
+
+
+def structured_doc_context(evidence: list[dict[str, Any]], *, items: int = 6,
+                           chars: int = 4000) -> list[dict[str, Any]]:
+    """The best-ranked text evidence (chunks and graph relationships), as the
+    table-selection step sees it: facts there may fill a query parameter (the
+    city a company is based in, the drug a trial tested). ``items`` 0 = off."""
+    if items <= 0:
+        return []
+    out = []
+    for ev in sorted((e for e in evidence if e.get("kind") in {"chunk", "relationship"}),
+                     key=lambda e: e.get("rank") or 0):
+        text = " ".join(str(ev.get("text") or "").split())
+        if not text:
+            continue
+        out.append({"id": ev.get("iri"), "text": text[:chars]})
+        if len(out) >= items:
+            break
+    return out
+
+
 async def retrieve_and_answer(
     question: str,
     *,
@@ -449,7 +494,10 @@ async def retrieve_and_answer(
     multi_round: bool = True,
     persist: bool = True,
     answer_question: bool = True,
+    use_structured_data: bool | None = None,
     _round_depth: int = 0,
+    _carry_sql_evidence: list[dict[str, Any]] | None = None,
+    _table_question: str | None = None,
 ) -> RetrievalResult:
     """Driver. `resolved_query` skips the follow-up resolution step
     (the caller -- typically Milestone G -- already resolved it).
@@ -465,6 +513,12 @@ async def retrieve_and_answer(
     writes, leaving `retrieval_run_id` None. Lets the CLI be pointed at a
     deployed database for testing without leaving rows in it; the API
     path always persists.
+
+    `use_structured_data=True` (simple_qa / deep_research only) lets the
+    answer read the loaded data tables: tables reached through the graph
+    walk are offered to a selection call that picks stored SQL, and the
+    capped results join the evidence as `sql_result` items. None falls back
+    to `qa.use_structured_data` (off when unset).
 
     `answer_question=False` stops before the answer call: retrieval and the
     evidence packet are complete, `answer` is empty. Used by the question
@@ -511,7 +565,11 @@ async def retrieve_and_answer(
                 plan["round1_question"], mode="simple_qa",
                 hops=hops, max_cost_usd=max_cost_usd, decompose=decompose,
                 max_probes=max_probes, rerank=rerank, concepts=concepts, verbose=verbose,
-                multi_round=False, persist=persist, _round_depth=1,
+                multi_round=False, persist=persist,
+                use_structured_data=use_structured_data, _round_depth=1,
+                # tables answer the USER's question: the bridge/final rewrites
+                # steer document retrieval and can narrow it ("the major ...")
+                _table_question=resolved_query,
             )
             # Round 2 (final): enrich the question with round-1 findings so the
             # pipeline seeds on the discovered entities AND the synthesis uses them.
@@ -533,7 +591,13 @@ async def retrieve_and_answer(
                 max_probes=max_probes, rerank=rerank, concepts=concepts,
                 conversation_turn_id=conversation_turn_id,
                 verbose=verbose, multi_round=False, persist=persist,
-                _round_depth=1,
+                use_structured_data=use_structured_data, _round_depth=1,
+                # The prior-research block cites round 1's SQL results; table
+                # rows are not re-retrieved by text search, so hand them over
+                # or the final synthesis cannot cite them.
+                _carry_sql_evidence=[ev for ev in r1.evidence
+                                     if ev.get("kind") in ("sql_result", "table_metadata")],
+                _table_question=resolved_query,
             )
             # Merge: r2 is the final answer; fold in round-1 evidence + all cost.
             # artifact_only only ever surfaces artifact evidence, so skip folding
@@ -547,6 +611,10 @@ async def retrieve_and_answer(
                     r2.evidence.append(ev)
             planning_cost = router.total_cost_usd - cost_before
             r2.cost_usd += r1.cost_usd + planning_cost
+            r2.parsed["usage_by_task"] = merge_task_usage(
+                r1.parsed.get("usage_by_task"), r2.parsed.get("usage_by_task"), task_usage(router))
+            r2.parsed["structured_seconds"] = round(
+                (r1.parsed.get("structured_seconds") or 0) + (r2.parsed.get("structured_seconds") or 0), 2)
             r2.resolved_query = resolved_query  # report the user's original query
             r2.parsed["rounds"] = {
                 "round1_question": plan["round1_question"],
@@ -1743,6 +1811,51 @@ async def retrieve_and_answer(
             "confidence": info["confidence"],
         })
 
+    # -------- step 11b: structured data (opt-in) --------
+    # Tables are reached through the graph walk (entities + matched classes),
+    # read ONLY through guarded, row-capped SQL. Off unless asked for, so
+    # every other run is unchanged.
+    _use_sd = (use_structured_data if use_structured_data is not None
+               else _qa_flag("use_structured_data", False))
+    _tq = table_selection_question(resolved_query, _table_question, _carry_sql_evidence)
+    if _use_sd and _tq is None:
+        parsed["structured_data"] = {"reused_from_round1": len(_carry_sql_evidence or [])}
+    elif _use_sd and mode in ("simple_qa", "deep_research"):
+        from backend.app.services.structured.retrieval_step import structured_evidence
+
+        _sd_t0 = time.time()
+        try:
+            _sd_ev, _sd_plan = await structured_evidence(
+                _tq, router=router,
+                entity_ids=list(expanded_entity_ids),
+                class_ids=[c["id"] for c in matched_classes if c.get("id")],
+                qvec=qvec,
+                max_tables=int(_qa_cfg("structured_max_tables", 3)),
+                max_rows=int(_qa_cfg("structured_max_rows", 50)),
+                timeout_ms=int(_qa_cfg("structured_timeout_ms", 5000)),
+                max_calls=int(_qa_cfg("structured_max_calls", 4)),
+                char_cap=int(_qa_cfg("structured_char_cap", 5000)),
+                verbose=verbose,
+                time_ids=list(expanded_time_ids) if seed_time_ids else [],
+                listing_max_rows=int(_qa_cfg("structured_listing_max_rows", 2000)),
+                listing_char_cap=int(_qa_cfg("structured_listing_char_cap", 60000)),
+                doc_context=structured_doc_context(
+                    evidence, items=int(_qa_cfg("structured_doc_context_items", 6)),
+                    chars=int(_qa_cfg("structured_doc_context_chars", 4000))),
+            )
+        except Exception as exc:  # never lose the text answer to a table problem
+            log.warning("structured-data step failed: %s", exc)
+            _sd_ev, _sd_plan = [], {"error": str(exc)[:500]}
+        for _ev in _sd_ev:
+            _ev.setdefault("char_cap", int(_qa_cfg("structured_char_cap", 5000)))
+        # Ahead of the text evidence: exact figures first.
+        evidence[:0] = _sd_ev
+        parsed["structured_data"] = _sd_plan
+        parsed["structured_seconds"] = round(time.time() - _sd_t0, 2)
+    if _carry_sql_evidence:
+        _have = {ev.get("iri") for ev in evidence}
+        evidence[:0] = [ev for ev in _carry_sql_evidence if ev.get("iri") not in _have]
+
     _walk_ids = {cid for cid, _ in ent_chunks}
     async with session_scope() as session:
         _walk_summary = await retrieval_sql.summary_chunk_ids(session, _walk_ids)
@@ -1757,6 +1870,11 @@ async def retrieve_and_answer(
     # -------- step 12: answer generation --------
     answer_task_name = _ANSWER_TASK_BY_MODE[mode]
     answer_prompt_fn = PROMPTS[answer_task_name]
+    # A listing (a table result over many items) gets an analysis-style answer
+    # in simple_qa: 1-3 sentences can only name a few examples. Same task/model.
+    _listing = any(ev.get("kind") == "sql_result" and ev.get("listing") for ev in evidence)
+    if _listing and answer_task_name == "answer_simple_qa":
+        answer_prompt_fn = PROMPTS["answer_listing_analysis"]
     _evidence_cap = int(
         get_settings().app_config.get("qa", {}).get("evidence_char_cap", 600)
     )
@@ -1779,10 +1897,27 @@ async def retrieve_and_answer(
         answer = ""
     else:
         try:
-            out = await router.chat(answer_task_name, system=sys_p, user=user_p)
+            # A listing result is answered in full: give the answer room for it.
+            out = await (router.chat(answer_task_name, system=sys_p, user=user_p,
+                                     max_tokens=int(_qa_cfg("structured_listing_answer_max_tokens", 8192)))
+                         if _listing else router.chat(answer_task_name, system=sys_p, user=user_p))
             answer = out.text.strip()
         except Exception as exc:
             answer = f"(answer generation failed: {exc})"
+
+    # A listing answer's per-item table is appended exactly from the computed
+    # statistics (the model writes the analysis; copying dozens of rows is
+    # where it abbreviates or slips).
+    # Not on a deep_research BRIDGE round (simple_qa at depth 1): its answer
+    # becomes part of the final round's question and probes.
+    if answer and _listing and not (_round_depth and mode == "simple_qa"):
+        from backend.app.services.structured.listing_stats import stats_table
+
+        for _ev in evidence:
+            if _ev.get("listing") and _ev.get("change_stats"):
+                _frag = str(_ev.get("iri") or "").rsplit("#", 1)[-1]
+                answer += "\n\n" + stats_table(_ev["change_stats"], f"[viao:{_frag}]" if _frag else "",
+                                                 plain=mode != "simple_qa")
 
     # Every cited id must resolve to something we actually retrieved.
     answer, invalid_citations = _validate_citations(answer, evidence)
@@ -1803,6 +1938,7 @@ async def retrieve_and_answer(
         )
 
     cost = router.total_cost_usd - cost_before
+    parsed["usage_by_task"] = task_usage(router)
     result = RetrievalResult(
         answer=answer,
         mode=mode,
@@ -2916,6 +3052,18 @@ async def _entity_probes(
     return [p for p in probes if isinstance(p, str) and p.strip()]
 
 
+def table_selection_question(resolved_query: str, table_question: str | None,
+                             carried_sql: list[dict[str, Any]] | None) -> str | None:
+    """The question the structured-data step selects tables for, or None to
+    reuse what an earlier round already returned. Tables answer the USER's
+    question: deep_research's bridge/final rewrites steer document retrieval
+    and can narrow it ("the major commodities"). A final round that carries
+    round 1's results for that same question would only select them again."""
+    if table_question and carried_sql:
+        return None
+    return table_question or resolved_query
+
+
 async def _plan_rounds(router: LLMRouter, q: str) -> dict[str, Any]:
     """Decide whether `q` needs a 2nd (dependent) retrieval round. Conservative
     by design -- only genuine bridge questions (must discover entities first, or
@@ -3009,6 +3157,8 @@ async def _persist_run(
                     "relations": [_relation_text(r) for r in result.parsed.get("relations") or []],
                     "graph_walk": result.parsed.get("graph_walk"),
                     "eval_trace": result.parsed.get("eval_trace"),
+                    **({"structured_data": result.parsed["structured_data"]}
+                       if result.parsed.get("structured_data") else {}),
                     # Persisted so citation quality is trendable across runs
                     # rather than only visible in a log line.
                     "invalid_citations": result.invalid_citations,
@@ -3038,7 +3188,10 @@ async def _persist_run(
             ev_rows.append({
                 "id": uuid.uuid4(),
                 "retrieval_run_id": run_id,
-                "evidence_kind": ev["kind"],
+                # A SQL result is persisted against its table's metadata
+                # node (an intelligence artifact); the SQL itself is in
+                # retrieval_plan.structured_data.
+                "evidence_kind": "artifact" if ev["kind"] in ("sql_result", "table_metadata") else ev["kind"],
                 "evidence_uuid": node_id,
                 "evidence_iri": ev["iri"],
                 "rank": ev["rank"],

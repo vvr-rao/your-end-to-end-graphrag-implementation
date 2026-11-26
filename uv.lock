@@ -1762,6 +1762,15 @@ wheels = [
 ]
 
 [[package]]
+name = "pycountry"
+version = "26.2.16"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/de/1d/061b9e7a48b85cfd69f33c33d2ef784a531c359399ad764243399673c8f5/pycountry-26.2.16.tar.gz", hash = "sha256:5b6027d453fcd6060112b951dd010f01f168b51b4bf8a1f1fc8c95c8d94a0801", size = 7711342, upload-time = "2026-02-17T03:42:52.367Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9c/42/7703bd45b62fecd44cd7d3495423097e2f7d28bc2e99e7c1af68892ab157/pycountry-26.2.16-py3-none-any.whl", hash = "sha256:115c4baf7cceaa30f59a4694d79483c9167dbce7a9de4d3d571c5f3ea77c305a", size = 8044600, upload-time = "2026-02-17T03:42:49.777Z" },
+]
+
+[[package]]
 name = "pycparser"
 version = "3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2469,6 +2478,15 @@ asyncio = [
 ]
 
 [[package]]
+name = "sqlglot"
+version = "30.31.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/89/de/aa6cc05536bec18c7ad7d3def4d724d1d7086cbc9e96dc1e39fdaf83965d/sqlglot-30.31.0.tar.gz", hash = "sha256:448404736cb0ed1335774e34399a3a99d28274778fb718877556fb7d475d8808", size = 6198638, upload-time = "2026-11-10T18:02:51.359Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/92/68/e351109f7732f193133c67fbf104178f79b534a925db8f69c074fd190c2c/sqlglot-30.31.0-py3-none-any.whl", hash = "sha256:51a876a43edecf8ee6fd4c872cf6713d899c4234256bba0be96a8c7c8d8781e8", size = 811981, upload-time = "2026-11-10T18:02:49.108Z" },
+]
+
+[[package]]
 name = "sse-starlette"
 version = "3.4.2"
 source = { registry = "https://pypi.org/simple" }
@@ -3132,6 +3150,7 @@ dependencies = [
     { name = "pdfplumber" },
     { name = "pgvector" },
     { name = "pillow" },
+    { name = "pycountry" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "pypdf" },
@@ -3144,6 +3163,7 @@ dependencies = [
     { name = "redis" },
     { name = "requests" },
     { name = "sqlalchemy", extra = ["asyncio"] },
+    { name = "sqlglot" },
     { name = "structlog" },
     { name = "tenacity" },
     { name = "tiktoken" },
@@ -3204,6 +3224,7 @@ requires-dist = [
     { name = "pgvector", specifier = ">=0.3.6" },
     { name = "pillow", specifier = ">=10.0" },
     { name = "pyarrow", marker = "extra == 'structured'", specifier = ">=15" },
+    { name = "pycountry", specifier = ">=24.6.1" },
     { name = "pydantic", specifier = ">=2.10" },
     { name = "pydantic-settings", specifier = ">=2.7" },
     { name = "pypdf", specifier = ">=5.1" },
@@ -3220,6 +3241,7 @@ requires-dist = [
     { name = "requests", specifier = ">=2.33.1" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.8" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.36" },
+    { name = "sqlglot", specifier = ">=25" },
     { name = "structlog", specifier = ">=24.4" },
     { name = "tenacity", specifier = ">=9.0" },
     { name = "tiktoken", specifier = ">=0.8" },

@@ -133,7 +133,13 @@ Two points worth stating explicitly, because users assume otherwise:
 If they choose the subset, Step 2d runs the preview — after the Step 2c
 sizing gate, whose concurrency values it needs.
 
-## Step 2 — Mention the `--tables` option and ask what they prefer
+## Step 2 — Mention the table options and ask what they prefer
+Two independent, OPTIONAL table features — mention both and ask; never pick
+silently, and never scan their folders for data files yourself:
+- `--tables` — tables INSIDE the PDFs (below);
+- `--structured-data <DIR>` — separate data files (CSV / TSV / JSON / JSONL /
+  Parquet) loaded as SQL tables; see "`--structured-data DIR`" below.
+
 Proactively tell the user that prune-expand has an optional `--tables` flag, and
 ask their preference — don't silently pick. Lay out the trade-off:
 - **Without `--tables` (default):** faster and free; tables inside PDFs get read as
@@ -175,6 +181,58 @@ domain check an earlier build filed `Nausea` and `NonFatalStroke` as siblings of
 
 Retrieval does NOT need this flag — StructuredTable artifacts reach Phase 2 from
 `--tables` alone.
+
+### `--structured-data DIR` — data files (CSV / TSV / JSON / JSONL / Parquet)
+**Optional — off unless the user passes a folder.** Ask once: *"Do you also have
+data files (CSV, TSV, JSON, Parquet) you want answerable with SQL? This is
+optional; the build works without it."* If they say no, nothing below applies
+and every later command is unchanged. Ask about this when the user has **data files** next to the documents, e.g. a
+folder made by `source_documents/structured_download.py`,
+`supplementary_download.py` or `hf_dataset.py pull` (snapshot layouts are
+understood: the newest snapshot per dataset, `normalized/` files only). It is
+separate from `--tables`, which is about tables INSIDE PDFs.
+
+What it does, after Stage 4: one `table_profile` LLM call per table (column
+profile + 20 sample rows, never the whole file) writes the table's metadata —
+table/column descriptions, metrics, filters, Postgres SQL queries — plus one
+`table_lookups` call over all tables for shared keys (join queries stored in
+both tables). Every statement is checked (one SELECT, own table only, real
+columns); a failing one gets one repair call, then is dropped and logged.
+Concepts behind columns/metrics/filters become ontology classes (parents
+default to Metric / Measure / Dimension / TimePeriod).
+
+- **Models:** `table_profile` on gpt-6.2-sol in the OpenAI presets
+  (claude-sonnet-5-5 at high effort in Anthropic mode, the 27B in DeepInfra
+  mode); `table_lookups` on gpt-6.1-terra (claude-haiku-5-5). (Anthropic mode's
+  Stage-2 `class_proposal` runs on Opus 5.5 high, ~$4.90 per 12 chunks; for a
+  cheaper build offer Haiku 5.5 medium — see the choose-llm-mode skill,
+  "Anthropic budget option".)
+- **Cost (measured 2026-11, whole table pipeline: profile here + refine and
+  verify at load):** 5 tables ≈ $1.10 / 10 min on gpt-6.2-sol; 7 tables ≈
+  $3.20 / 44 min in Anthropic mode. Roughly $0.20–0.45 per table, more for very
+  wide tables (profiled in column batches). Profiling alone is the smaller part.
+- **Cache:** keyed on the file's bytes, not the model. Results land in the run
+  folder (`structured/<table>.metadata.json`) and the user cache, so a re-run —
+  and `extract-entities --structured-data` later — makes **zero** profiling
+  calls. `--refresh-table-metadata` forces a re-profile (hand-edited entries
+  are still kept).
+- **Smoke-test first:** add `--structured-limit 2` (first N tables
+  alphabetically), check the two metadata files and the `table_class_added`
+  audit records, then ask before the full folder.
+- Flags: `--structured-data <DIR> [--structured-limit N] [--table-profile-concurrency N] [--refresh-table-metadata]`.
+  Without `--structured-data` the run is unchanged.
+- **If they pass a folder, the rest of the build changes — record it** so every
+  later step (and a later session) adds the matching flags:
+  ```
+  uv run python scripts/build_state.py record structured-data dir="<DATA_DIR>" tables=<n>
+  ```
+  | Step | With a structured-data folder |
+  |---|---|
+  | Step 2c sizing | `tpm_check.py "<DOCS>" --structured` (sizes `table_profile` and the selector's ~100k-token prompts in `evaluation`) |
+  | Step 3 launch (here) | append `--structured-data "<DATA_DIR>"` (+ `--table-profile-concurrency <N>`) |
+  | ingest-corpus Step 3 / 3b | `extract-entities ... --structured-data "<DATA_DIR>"`, or `--structured-only` on its own |
+  | queries and evals | `query` / `conversation turn` / `evaluate-queries` / `eval-questions` with `--use-structured-data` |
+  | deploy | `qa.use_structured_data: true` in `config/config.example.yaml`, or the deployed app never reads the tables |
 
 ## Step 2b — Compact the class descriptions first (cheap; cuts the big step)
 **This is a default step.** prune-expand (and expand / build) compacts any
@@ -280,9 +338,15 @@ for every model `config/models.yaml` routes to -- OpenAI and Groq
 so it is ignored), Anthropic's separate input/output token limits + requests.
 Each row of the output is one knob with **now**, **suggest**, and the
 **binding task**: a stage is sized by the tightest model among the tasks it
-runs, and within a model by whichever of TPM / RPM runs out first. Tasks with
-a 32k output budget (`class_proposal`, `match_dedup`) are additionally capped at
-16, because concurrent large gpt-4.1 calls throttle even with TPM to spare.
+runs, and within a model by whichever of TPM / RPM runs out first. Each call is
+sized on the task's TYPICAL reply (measured on the GPT-6 and Claude 5.5 runs),
+not its `max_tokens` ceiling — Claude 5.5 tasks carry 64,000 because thinking
+counts against it, and sizing on that suggested 1–3 workers for every
+Anthropic stage. Large-reply tasks (`class_proposal`, `match_dedup`,
+`table_profile`, `table_refine`; ~10k+ tokens each) are additionally capped at
+16, because many large calls at once throttle even with TPM to spare (measured
+on gpt-4.1). Pass `--structured` when the user gave a structured-data folder:
+`evaluation` then also accounts for the table selector's ~100k-token prompts.
 Cost is one tiny probe per model.
 
 **Writing the choice:** once the user picks, apply it with
@@ -315,8 +379,9 @@ Knobs, grouped by what actually constrains them:
 | **Memory** | `concurrency.table_extraction`, `concurrency.table_page_vision` | ~152 MB per PDF subprocess + ~5 MB per page-vision call in flight | 1, 1 |
 | **DB connection pool** | `database.pool_size` + `max_overflow` (and `evaluation` concurrency) | Supabase session mode caps the PROJECT at 15 clients | 10 + 2 |
 | **Memory (cheap) + caps concurrency** | `chunking.streaming_batch_size` | ~50 MB at 16 docs | 8 |
-| **Rate limit of the stage's tightest model** | `summarization`, `chunk_classification`, `table_mining`, `entity_extraction` (incl. gpt-4.1 orphan check), `artifact_generation` (incl. gpt-4.1 / gpt-5.4 rollup) | measured ~3% of a 10M-TPM tier at 32 | 32 |
-| **Rate limit + 32k-request cap (16)** | `class_proposal`, `dedup` | measured **6.2% of a 2M-TPM tier at 4** | 4 |
+| **Rate limit of the stage's tightest model** | `summarization`, `chunk_classification`, `table_mining`, `entity_extraction` (incl. the big-model orphan check), `artifact_generation` (incl. Insight and the gpt-5.4 / Sonnet 5.5 rollup) | measured ~3% of a 10M-TPM tier at 32 | 32 |
+| **Rate limit + large-reply cap (16)** | `class_proposal`, `dedup` | measured **6.2% of a 2M-TPM tier at 4** (gpt-4.1) | 4 |
+| **Rate limit + large-reply cap (16)**, only with `--structured-data` | `table_profile` | one call per table (wide tables: several) | 4 |
 
 Per-run flags on prune-expand/build (each falls back to its config key):
 ```
@@ -368,9 +433,10 @@ State all four effects, because users reliably guess wrong about at least one:
    reduce the bill is counter-intuitive.
 2. **It costs slightly MORE** -- about 2% -- because a higher value lowers the
    prompt-cache hit rate (measured 69% -> 49% going 4 -> 32).
-3. **Too high on the gpt-4.1 stages risks 429s**, which cost time in backoff
-   rather than failing outright. 12/8 measured clean; treat 16 as the ceiling
-   and raise incrementally.
+3. **Too high on the large-reply stages (`class_proposal`, `dedup`,
+   `table_profile`) risks 429s**, which cost time in backoff rather than
+   failing outright. 12/8 measured clean; treat 16 as the ceiling and raise
+   incrementally.
 4. **Too high on `table_extraction` / `table_page_vision` risks a HARD KILL**, not
    a slowdown, on a swapless box. These are the only knobs where being wrong
    loses the run, which is why both come from measured free memory, never a
@@ -378,10 +444,11 @@ State all four effects, because users reliably guess wrong about at least one:
 
 ### When THEIR LIMITS are the binding constraint
 
-If `tpm_check.py` reports a low tier (roughly: gpt-4.1 under ~800k TPM, or RPM
-in the hundreds), say so explicitly rather than just proposing small numbers:
+If `tpm_check.py` reports a low tier (roughly: the `class_proposal` model under
+~800k TPM — or, on Anthropic, under ~100k output tokens per minute — or RPM in
+the hundreds), say so explicitly rather than just proposing small numbers:
 
-> *"Your gpt-4.1 limit is 200k TPM, which caps `class_proposal` around 4 no
+> *"Your gpt-6.1-terra limit is 200k TPM, which caps `class_proposal` around 4 no
 > matter what else we change -- Stage 2 will take roughly N hours. That is an
 > account limit, not a setting. You can request a higher usage tier at
 > platform.openai.com → Settings → Limits; tiers rise with cumulative spend and
@@ -522,7 +589,9 @@ uv run python scripts/build_state.py record select-corpus docs=<n> selected=<n> 
 Choose a fresh, unique `RUN_ID` (e.g. `prune_expand_<date+time>`). Launch it detached
 via the harness as a **single-line command** (works in any shell). Append `--tables`
 only if the user opted in, `--table-mining` only if they opted in AND the corpus is
-financial, and `--no-table-vision` to skip vision.
+financial, and `--no-table-vision` to skip vision. Append `--structured-data
+"<DATA_DIR>"` (and `--table-profile-concurrency <N>` from Step 2c) only if they
+gave a structured-data folder — smoke it first with `--structured-limit 2`.
 
 If they approved a subset in Step 2d, append `--select-subset --yes` (plus any
 `--selection-k-max` / `--outlier-sigma` they settled on). **Only add `--yes`
@@ -537,7 +606,7 @@ uv run python scripts/run_detached.py <RUN_ID> uv run python -m backend.app.cli 
 ```
 `--expansion-concurrency` is the legacy flag that sets Stage 1 AND Stage 2 together;
 prefer the separate `--classification-concurrency` / `--proposal-concurrency`, because
-tying them pins cheap gpt-4.1-mini work to gpt-4.1's safe value.
+tying them pins cheap mini-model work to the big model's safe value.
 The harness runs this command **unchanged**, so the two-tier table cache
 (`output_ontologies/.../tables/` + `~/.cache/.../tables/`) and the evaluated-
 summary cache (`~/.cache/.../eval_summaries/`) work exactly as before. A re-run
@@ -555,16 +624,17 @@ on different models with different rate limits:
 ```
 --summarization-concurrency N     # evaluated summarizer      (mini, ~10M TPM)
 --classification-concurrency N    # Stage 1 chunk_classification (mini, ~10M TPM)
---proposal-concurrency N          # Stage 2 class_proposal     (gpt-4.1, ~2M TPM)
---dedup-concurrency N             # Stage 3 match_dedup        (gpt-4.1, ~2M TPM)
+--proposal-concurrency N          # Stage 2 class_proposal     (big model: gpt-6.1-terra / Opus 5.5)
+--dedup-concurrency N             # Stage 3 match_dedup        (big model: gpt-6.1-terra / Sonnet 5.5)
+--table-profile-concurrency N     # --structured-data only: table_profile (gpt-6.2-sol / Sonnet 5.5)
 --table-mining-concurrency N      # --tables --table-mining    (mini, ~10M TPM)
 --expansion-concurrency N         # LEGACY: sets Stage 1 + 2 together
 ```
 
 **`--proposal-concurrency` and `--dedup-concurrency` matter most.** Measured on a
 30-doc run: `class_proposal` is 65% of spend and `match_dedup` 22%, and together
-they were 60% of wall time. They are also the two capped by the tighter gpt-4.1
-tier, so they are the numbers to get right. Measured at 12 and 8 respectively:
+they were 60% of wall time. They are also the two capped by the big model's
+tighter tier, so they are the numbers to get right. Measured (on gpt-4.1) at 12 and 8 respectively:
 zero 429s, Stage 2 fell from an estimated ~29 min to **9m 03s**.
 
 Each falls back to its config key when unset. Append them to the detached
@@ -582,8 +652,9 @@ command above when the user wants a per-run value; otherwise edit
 | `concurrency.summarization` | evaluated summarizer | mini, ~10M TPM | 32-64 (tier 3+), 8 (tier 1-2) |
 | `concurrency.chunk_classification` | Stage 1 | mini, ~10M TPM | 32-64 (tier 3+), 8 (tier 1-2) |
 | `concurrency.table_mining` | one call per table, `--tables --table-mining` only | mini, ~10M TPM | 32-64 (tier 3+), 8 (tier 1-2) |
-| `concurrency.class_proposal` | Stage 2 | gpt-4.1 @ 32k, ~2M TPM | **12** measured safe; 16 is the ceiling |
-| `concurrency.dedup` | Stage 3 batches | gpt-4.1 @ 32k, ~2M TPM | **8** measured safe |
+| `concurrency.class_proposal` | Stage 2 | big model, ~10-15k-token replies | **12** measured safe (gpt-4.1); 16 is the ceiling |
+| `concurrency.dedup` | Stage 3 batches | big model, ~10-15k-token replies | **8** measured safe (gpt-4.1) |
+| `concurrency.table_profile` | one call per data table (`--structured-data` only) | gpt-6.2-sol / Sonnet 5.5 high | 4 shipped; tpm_check suggests up to 16 |
 | `concurrency.table_extraction` | PDF subprocesses | **MEMORY**, not rate | ~1 per 200 MB free |
 | `concurrency.table_page_vision` | page-vision calls per PDF | **MEMORY**, not rate | up to 8, ~5 MB each, sized with the line above |
 
@@ -647,7 +718,7 @@ speed of its slowest document, so one 60k-token doc holds up its whole batch.
 
 It reads OpenAI's own rate-limit headers and suggests a concurrency per stage.
 Then say what you found and propose raising it, e.g.
-> *"Your gpt-4.1-mini limit is 10M TPM; summarization is set to 32, using well
+> *"Your gpt-6-luna limit is 180M TPM; summarization is set to 32, using well
 > under 1%. I can take it to 64-125 and cut wall time roughly proportionally.
 > **It won't cost less** — same tokens either way — it just finishes sooner."*
 
@@ -658,8 +729,8 @@ lower prompt-cache hit rate — measured 69% → 49% at 4 → 32).
 Measured at concurrency 32: **~0.5% sustained TPM** and **zero** burst pressure
 on the token bucket. On tier 3+ the provider limit is not the constraint.
 
-Do **not** raise `expansion.max_concurrent_llm_calls` to match — it drives
-gpt-4.1 at 32k max_tokens on a 5×-tighter tier, where concurrent large calls
+Do **not** raise `expansion.max_concurrent_llm_calls` to match — it drives the
+big model's large replies on a tighter tier, where concurrent large calls
 throttle and time out.
 
 Also relevant to throughput: `chunking.streaming_batch_size` (default 8) is a
@@ -716,6 +787,13 @@ the user to review. **LangSmith:** when `LANGSMITH_API_KEY` is installed, the
 report uploads by itself to the `graphrag-corpus-evals` tracing project (the
 output ends with a `[langsmith] project ...` line; check with `uv run python scripts/check_env.py LANGSMITH_API_KEY`, which
 never prints the key). With no key nothing is sent; say so.
+
+**With `--structured-data`:** also report the `[structured] N table(s): N
+profiled, N from cache, N failed; N new class(es); N lookup(s)` line, any
+`[structured] WARN` lines, and where the metadata landed (`<PE_DIR>/structured/`),
+and make sure the `structured-data` record from Step 2 exists
+(`uv run python scripts/build_state.py show`). Tell the user the tables are
+loaded later, in **ingest-corpus** Step 3b.
 
 Report: version-folder path, total cost, any preflight warnings, the ontology
 evaluation's Yes / judged and Yes / all (all, concept classes, new classes),

@@ -21,6 +21,15 @@ Sources (no API keys needed):
                          national tables, plus a cut for --drugs)
     rxnorm               NLM RxNorm: ingredient -> branded / clinical products
     faers                openFDA FAERS: top reactions + report totals per drug
+    owid-energy          Our World in Data energy dataset (one wide row per
+                         country-year, ~130 columns; codebook kept as native)
+    faostat-fertilizer   FAOSTAT fertilizers by product (bulk, normalized form)
+    worldbank-wdi        World Bank World Development Indicators API, long
+                         (indicator, economy, year) for --indicators x --countries
+    imf-weo              IMF World Economic Outlook via the DataMapper API, long
+                         (indicator, economy, year) incl. projection years
+    comtrade             UN Comtrade public preview (no key; <= 500 rows per
+                         call): annual trade by partner for --hs x --reporters x --years
 
 Examples:
 
@@ -62,6 +71,21 @@ PHARMA_DRUGS = ("semaglutide tirzepatide dulaglutide liraglutide exenatide lixis
                 "sitagliptin").split()
 OWID_CHARTS = ["electric-car-sales", "electric-car-stocks", "electric-car-sales-share",
                "share-car-stocks-electric"]
+
+
+# Default scopes of the supply-chain bundle (overridable on the command line).
+WDI_INDICATORS = ("NY.GDP.MKTP.KD.ZG NY.GDP.MKTP.CD NY.GDP.PCAP.CD FP.CPI.TOTL.ZG NV.IND.MANF.ZS "
+                  "NV.IND.MANF.CD NE.EXP.GNFS.ZS NE.IMP.GNFS.ZS TX.VAL.TECH.MF.ZS TM.VAL.FUEL.ZS.UN "
+                  "TX.VAL.FUEL.ZS.UN AG.CON.FERT.ZS EG.IMP.CONS.ZS EG.ELC.RNEW.ZS BX.KLT.DINV.WD.GD.ZS").split()
+WDI_COUNTRIES = ("CHN JPN KOR IND IDN VNM THA MYS PHL SGP BGD PAK LKA KHM MMR LAO MNG NPL AUS NZL HKG "
+                 "SAU ARE IRN IRQ KWT QAT OMN ISR TUR EGY USA CAN MEX BRA ARG DEU FRA GBR ITA NLD ESP "
+                 "RUS UKR POL NOR ZAF NGA KEN MAR WLD EAS EAP SAS MEA ECS NAC LCN SSF HIC LMY").split()
+IMF_INDICATORS = ("NGDP_RPCH NGDPD NGDPDPC PCPIPCH PCPIEPCH LUR BCA_NGDPD GGXWDG_NGDP "
+                  "GGXCNL_NGDP PPPSH").split()
+# UN M49 reporter codes (490 = "Other Asia, nes", Comtrade's code for Taiwan)
+COMTRADE_REPORTERS = "156 392 410 699 490 704 458 702 764 842 276 528 682 784 36".split()
+COMTRADE_HS = ["8542", "31", "2709"]          # integrated circuits, fertilizers, crude oil
+COMTRADE_YEARS = ["2022", "2023", "2024"]
 
 
 class UsageError(Exception):
@@ -114,7 +138,8 @@ class Fetcher:
                 return None
             if r.status_code in (429, 500, 502, 503, 504) and attempt < self.retries:
                 wait = r.headers.get("Retry-After")
-                time.sleep(float(wait) if wait and wait.isdigit() else 2 * (attempt + 1))
+                time.sleep(float(wait) if wait and wait.isdigit()
+                           else (15 if r.status_code == 429 else 2) * (attempt + 1))
                 continue
             r.raise_for_status()
             if dest is not None:
@@ -571,6 +596,279 @@ def _pinned(a, n: int) -> list[str]:
     return a.url
 
 
+# ------------------------------------------------------- supply-chain bundle
+
+
+def _csv_list(v: str | None, default) -> list[str]:
+    return [x.strip() for x in v.split(",") if x.strip()] if v else list(default)
+
+
+def _years(v: str | None, default: tuple[int, int]) -> tuple[int, int]:
+    if not v:
+        return default
+    m = re.fullmatch(r"(\d{4})(?::(\d{4}))?", v.strip())
+    if not m:
+        raise UsageError(f"--years must be YYYY or YYYY:YYYY, got {v!r}")
+    lo = int(m.group(1))
+    return lo, int(m.group(2) or lo)
+
+
+def _num(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
+def _cached_get(f: Fetcher, url: str, params: dict | None, dest: Path) -> bytes:
+    """Reuse a file an interrupted run already saved (resume with --snapshot <ts> --overwrite)."""
+    if dest.exists() and dest.stat().st_size:
+        return dest.read_bytes()
+    return f.get(url, params=params, dest=dest)
+
+
+def _quota_stop(e: requests.HTTPError) -> str | None:
+    """A rate/quota refusal that retrying now cannot fix: the message to record, else None."""
+    r = e.response
+    if r is None or r.status_code not in (403, 429):
+        return None
+    wait = r.headers.get("Retry-After")
+    return f"HTTP {r.status_code} {r.reason}" + (f" (Retry-After {wait}s)" if wait else "")
+
+
+OWID_ENERGY = "https://raw.githubusercontent.com/owid/energy-data/master/"
+
+
+def run_owid_energy(a, f: Fetcher, snap: Snapshot) -> Path:
+    urls = {"owid-energy-data.csv": OWID_ENERGY + "owid-energy-data.csv",
+            "owid-energy-codebook.csv": OWID_ENERGY + "owid-energy-codebook.csv"}
+    if a.url:
+        urls["owid-energy-data.csv"] = a.url[0]
+    if a.dry_run:
+        return _plan(urls.values())
+    for n, u in urls.items():
+        f.get(u, dest=snap.native / n)
+    nat = [snap.add(snap.native / n, "native") for n in urls]
+    with (snap.native / "owid-energy-data.csv").open(newline="", encoding="utf-8-sig") as fh:
+        rows = list(csv.DictReader(fh))
+    if not rows:
+        raise UsageError("owid-energy-data.csv is empty")
+    snap.write_csv("energy.csv", rows, list(rows[0]), derived=[nat[0]])
+    print(f"  energy.csv {len(rows):,} rows x {len(rows[0])} columns")
+    return snap.finish(
+        mode="bulk", snapshot_kind="full", source_release="owid/energy-data (GitHub master)",
+        params={"urls": list(urls.values())},
+        transformations=["energy.csv: owid-energy-data.csv unchanged (UTF-8, values as text)"],
+        attribution="Our World in Data energy dataset (Energy Institute Statistical Review, Ember, EIA and others)",
+        terms_urls=["https://github.com/owid/energy-data#license"],
+        data_dictionary_urls=[nat[1]],
+        warnings=["Entities include regions and aggregates (World, Asia, Non-OECD, ...): iso_code is empty for them",
+                  "Column units and sources are in native/owid-energy-codebook.csv"])
+
+
+FAOSTAT_BULK = "https://bulks-faostat.fao.org/production/"
+FAOSTAT_DATASETS = {"products": ("Inputs_FertilizersProduct_E_All_Data_(Normalized)", "fertilizer_products.csv"),
+                    "nutrients": ("Inputs_FertilizersNutrient_E_All_Data_(Normalized)", "fertilizer_nutrients.csv")}
+
+
+def run_faostat(a, f: Fetcher, snap: Snapshot) -> Path:
+    import io
+    import zipfile
+
+    stem, out_name = FAOSTAT_DATASETS[a.fao_dataset]
+    url = a.url[0] if a.url else f"{FAOSTAT_BULK}{stem}.zip"
+    if a.dry_run:
+        return _plan([url])
+    dest = snap.native / f"{stem}.zip"
+    f.get(url, dest=dest)
+    nat = snap.add(dest, "native")
+    zf = zipfile.ZipFile(dest)
+    members = [n for n in zf.namelist() if n.endswith(".csv") and "All_Data" in n]
+    if not members:
+        raise UsageError(f"{dest.name} holds no *All_Data*.csv")
+    raw = zf.read(members[0])
+    try:
+        text, enc = raw.decode("utf-8-sig"), "utf-8"
+    except UnicodeDecodeError:
+        text, enc = raw.decode("latin-1"), "latin-1"
+    rows = list(csv.DictReader(io.StringIO(text, newline="")))
+    if not rows:
+        raise UsageError(f"{members[0]} is empty")
+    snap.write_csv(out_name, rows, list(rows[0]), derived=[nat])
+    print(f"  {out_name} {len(rows):,} rows")
+    return snap.finish(
+        mode="bulk", snapshot_kind="full", source_release=f"FAOSTAT bulk {stem}",
+        params={"url": url, "member": members[0]},
+        transformations=[f"{members[0]} re-encoded {enc} -> UTF-8, rows unchanged"],
+        attribution="FAO. FAOSTAT. Food and Agriculture Organization of the United Nations",
+        terms_urls=["https://www.fao.org/contact-us/terms/db-terms-of-use/en/"],
+        warnings=["Area includes regional and world aggregates (Area Code >= 5000)",
+                  "Flag marks estimated/imputed values (see FAOSTAT flag list)"])
+
+
+WDI_API = "https://api.worldbank.org/v2/country/{countries}/indicator/{indicator}"
+
+
+def run_wdi(a, f: Fetcher, snap: Snapshot) -> Path:
+    inds = _csv_list(a.indicators, WDI_INDICATORS)
+    ctry = _csv_list(a.countries, WDI_COUNTRIES)
+    lo, hi = _years(a.years, (2000, 2025))
+    params = {"format": "json", "date": f"{lo}:{hi}", "per_page": "20000"}
+    urls = [WDI_API.format(countries=";".join(ctry), indicator=i) for i in inds]
+    if a.dry_run:
+        return _plan(urls)
+    rows, missing, stopped, left = [], [], None, []
+    for k, (ind, u) in enumerate(zip(inds, urls, strict=True)):
+        dest = snap.native / f"wdi_{ind}.json"
+        fresh = not dest.exists()
+        try:
+            body = _cached_get(f, u, params, dest)
+        except requests.HTTPError as e:
+            stopped = _quota_stop(e)
+            if not stopped:
+                raise
+            left = inds[k:]
+            break
+        if fresh:
+            time.sleep(a.pause)
+        j = json.loads(body)
+        if not isinstance(j, list) or len(j) < 2 or not j[1]:
+            missing.append(ind)
+            continue
+        for r in j[1]:
+            rows.append({"indicator_id": r["indicator"]["id"], "indicator": r["indicator"]["value"],
+                         "economy_iso3": r.get("countryiso3code") or r["country"]["id"],
+                         "economy": r["country"]["value"], "year": r.get("date", ""),
+                         "value": _num(r.get("value")), "unit": r.get("unit", ""),
+                         "obs_status": r.get("obs_status", "")})
+    nat = [snap.add(p, "native") for p in sorted(snap.native.iterdir())]
+    snap.write_csv("development_indicators.csv", rows, derived=nat)
+    print(f"  development_indicators.csv {len(rows):,} rows ({len(inds) - len(missing)} indicators)")
+    if stopped:
+        print(f"  stopped: {stopped}; {len(left)} indicator(s) left -- rerun with --snapshot "
+              f"{snap.dir.name} --overwrite to resume")
+    return snap.finish(
+        mode="api", snapshot_kind="partial" if stopped else "full",
+        source_release="World Development Indicators (API v2, source 2)",
+        params={"indicators": inds, "countries": ctry, "years": [lo, hi]},
+        transformations=["one row per indicator x economy x year; value empty when the API has none"],
+        attribution="World Bank, World Development Indicators",
+        terms_urls=["https://www.worldbank.org/en/about/legal/terms-of-use-for-datasets"],
+        warnings=[*(["indicators with no data: " + ", ".join(missing)] if missing else []),
+                  *([f"stopped by {stopped}; not fetched: {', '.join(left)}"] if stopped else []),
+                  "Economies include World Bank aggregates (WLD, EAS, SAS, HIC, ...)",
+                  "Taiwan is not covered by WDI"])
+
+
+IMF_API = "https://www.imf.org/external/datamapper/api/v1/"
+
+
+def run_imf(a, f: Fetcher, snap: Snapshot) -> Path:
+    inds = _csv_list(a.indicators, IMF_INDICATORS)
+    lo, hi = _years(a.years, (2000, 2030))
+    meta_urls = {n: IMF_API + n for n in ("indicators", "countries", "regions", "groups")}
+    if a.dry_run:
+        return _plan([*meta_urls.values(), *(IMF_API + i for i in inds)])
+    meta = {n: json.loads(f.get(u, dest=snap.native / f"{n}.json")) for n, u in meta_urls.items()}
+    ind_meta = meta["indicators"].get("indicators", {})
+    names = {}
+    for n, kind in (("countries", "country"), ("regions", "region"), ("groups", "group")):
+        for code, v in (meta[n].get(n) or {}).items():
+            names.setdefault(code, ((v or {}).get("label") or "", kind))
+    rows, missing = [], []
+    for ind in inds:
+        body = json.loads(f.get(IMF_API + ind, dest=snap.native / f"weo_{ind}.json"))
+        series = (body.get("values") or {}).get(ind) or {}
+        if not series:
+            missing.append(ind)
+            continue
+        im = ind_meta.get(ind, {})
+        for code, by_year in series.items():
+            label, kind = names.get(code, ("", ""))
+            for y, v in sorted(by_year.items()):
+                if y.isdigit() and lo <= int(y) <= hi:
+                    rows.append({"indicator_id": ind, "indicator": im.get("label", ""), "unit": im.get("unit", ""),
+                                 "economy_code": code, "economy": label, "economy_kind": kind,
+                                 "year": y, "value": _num(v), "edition": im.get("source", "")})
+    nat = [snap.add(p, "native") for p in sorted(snap.native.iterdir())]
+    snap.write_csv("weo_indicators.csv", rows, derived=nat)
+    editions = sorted({r["edition"] for r in rows if r["edition"]})
+    print(f"  weo_indicators.csv {len(rows):,} rows; edition {', '.join(editions)}")
+    return snap.finish(
+        mode="api", snapshot_kind="full", source_release="; ".join(editions),
+        params={"indicators": inds, "years": [lo, hi]},
+        transformations=["one row per indicator x economy x year within the year range"],
+        attribution="International Monetary Fund, World Economic Outlook database (DataMapper)",
+        terms_urls=["https://www.imf.org/en/About/copyright-and-terms"],
+        warnings=[*(["indicators with no data: " + ", ".join(missing)] if missing else []),
+                  "Years after the latest actual are IMF projections; the API does not mark the "
+                  "per-economy start of projections",
+                  "economy_kind separates countries from regions and analytical groups"])
+
+
+COMTRADE_API = "https://comtradeapi.un.org/public/v1/preview/C/A/HS"
+COMTRADE_FIELDS = ["refYear", "reporterCode", "reporterISO", "reporterDesc", "flowCode", "flowDesc",
+                   "partnerCode", "partnerISO", "partnerDesc", "classificationCode", "cmdCode", "cmdDesc",
+                   "aggrLevel", "qtyUnitAbbr", "qty", "netWgt", "cifvalue", "fobvalue", "primaryValue",
+                   "isReported", "isAggregate"]
+COMTRADE_CAP = 500
+
+
+def run_comtrade(a, f: Fetcher, snap: Snapshot) -> Path:
+    reps = _csv_list(a.reporters, COMTRADE_REPORTERS)
+    hs = _csv_list(a.hs, COMTRADE_HS)
+    years = _csv_list(a.comtrade_years, COMTRADE_YEARS)
+    calls = [(r, y, c) for c in hs for r in reps for y in years]
+    if a.dry_run:
+        return _plan(f"{COMTRADE_API}?reporterCode={r}&period={y}&cmdCode={c}&flowCode=M,X" for r, y, c in calls)
+    rows, capped, empty, errors, stopped, left = [], [], [], [], None, []
+    for k, (r, y, c) in enumerate(calls):
+        params = {"reporterCode": r, "period": y, "cmdCode": c, "flowCode": "M,X", "includeDesc": "true"}
+        dest = snap.native / f"comtrade_{c}_{r}_{y}.json"
+        fresh = not dest.exists()
+        try:
+            body = _cached_get(f, COMTRADE_API, params, dest)
+        except requests.HTTPError as e:
+            stopped = _quota_stop(e)
+            if not stopped:
+                raise
+            left = [f"{c2}/{r2}/{y2}" for r2, y2, c2 in calls[k:]]
+            break
+        j = json.loads(body or b"{}")
+        if j.get("error"):
+            errors.append(f"{c}/{r}/{y}: {j['error']}")
+        data = j.get("data") or []
+        if not data:
+            empty.append(f"{c}/{r}/{y}")
+        if len(data) >= COMTRADE_CAP:
+            capped.append(f"{c}/{r}/{y}")
+        rows.extend({col: _num(d.get(col)) for col in COMTRADE_FIELDS} for d in data)
+        if fresh:
+            time.sleep(a.pause)
+    nat = [snap.add(p, "native") for p in sorted(snap.native.iterdir())]
+    snap.write_csv("trade_flows.csv", rows, COMTRADE_FIELDS, derived=nat)
+    print(f"  trade_flows.csv {len(rows):,} rows from {len(calls) - len(left)}/{len(calls)} calls "
+          f"({len(empty)} empty, {len(capped)} capped)")
+    if stopped:
+        print(f"  stopped: {stopped}; {len(left)} call(s) left -- rerun with --snapshot "
+              f"{snap.dir.name} --overwrite to resume")
+    return snap.finish(
+        mode="api", snapshot_kind="partial" if capped or stopped else "full",
+        source_release="UN Comtrade public preview API (HS, annual, as reported classification)",
+        params={"reporters": reps, "hs": hs, "years": years, "flows": ["M", "X"]},
+        transformations=["one row per reporter x year x flow x partner x commodity; selected columns, values as text"],
+        attribution="United Nations Comtrade Database",
+        terms_urls=["https://comtradeplus.un.org/TradeFlow/Terms"],
+        warnings=[*([f"calls at the {COMTRADE_CAP}-row preview cap (rows may be missing): {', '.join(capped)}"]
+                    if capped else []),
+                  *([f"calls with no data: {', '.join(empty)}"] if empty else []),
+                  *([f"stopped by {stopped}; not fetched: {', '.join(left)}"] if stopped else []),
+                  *(errors[:20]),
+                  "partnerCode 0 / partnerDesc 'World' is the reporter's total across partners",
+                  "reporterCode 490 'Other Asia, nes' is Comtrade's code for Taiwan"])
+
+
 def _plan(urls) -> Path:
     for u in urls:
         print(f"  [plan] GET {u}")
@@ -585,6 +883,11 @@ SOURCES: dict[str, tuple[str, str, Callable]] = {
     "cms-partd": ("cms", "partd-spending", run_cms),
     "rxnorm": ("rxnorm", "drug-crosswalk", run_rxnorm),
     "faers": ("openfda", "faers-reaction-counts", run_faers),
+    "owid-energy": ("owid", "energy", run_owid_energy),
+    "faostat-fertilizer": ("faostat", "fertilizers", run_faostat),
+    "worldbank-wdi": ("worldbank", "wdi", run_wdi),
+    "imf-weo": ("imf", "weo", run_imf),
+    "comtrade": ("comtrade", "trade-flows", run_comtrade),
 }
 
 
@@ -602,6 +905,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--top", type=int, default=100, help="faers: reactions kept per drug (max 1000)")
     p.add_argument("--year", type=int, help="usgs-mcs: MCS edition (default: current year)")
     p.add_argument("--charts", help="owid-iea-ev: comma-separated OWID chart slugs")
+    p.add_argument("--indicators", help="worldbank-wdi / imf-weo: comma-separated indicator ids")
+    p.add_argument("--countries", help="worldbank-wdi: comma-separated ISO3 economy codes (aggregates allowed)")
+    p.add_argument("--years", help="worldbank-wdi / imf-weo: YYYY or YYYY:YYYY")
+    p.add_argument("--reporters", help="comtrade: comma-separated UN M49 reporter codes")
+    p.add_argument("--hs", help="comtrade: comma-separated HS codes (2-6 digits)")
+    p.add_argument("--comtrade-years", help="comtrade: comma-separated years")
+    p.add_argument("--pause", type=float, default=1.0, help="comtrade: seconds between calls")
+    p.add_argument("--fao-dataset", choices=list(FAOSTAT_DATASETS), default="products",
+                   help="faostat-fertilizer: which bulk table")
     p.add_argument("--snapshot", help="snapshot folder name (default: UTC timestamp)")
     p.add_argument("--overwrite", action="store_true", help="replace an existing snapshot folder")
     p.add_argument("--dry-run", action="store_true", help="print the URLs to fetch; download nothing")

@@ -68,7 +68,34 @@ shrinking Stage 2's prompts by 78%. It is the DEFAULT: prune-expand runs it
 itself on an uncompacted input (skip only with `--no-summarize-descriptions`);
 running it first just lets the user see its cost separately. THEN ask for the
 corpus, mention the `--tables` option (plus `--table-mining` if the corpus is
-financial) and ask their preference, and run prune-expand. Walk it one step at a time; never race ahead to a paid step.
+financial) and ask their preference, ask whether they also have DATA FILES
+(CSV / TSV / JSON / Parquet) to load as SQL tables — `--structured-data`,
+optional, see "Structured data" below — and run prune-expand. Walk it one step at a time; never race ahead to a paid step.
+
+## Structured data (optional) — carry the folder through every later step
+Data files beside the documents (CSV / TSV / JSON / JSONL / Parquet, or a folder
+made by `source_documents/structured_download.py` / `supplementary_download.py`)
+can be loaded as Postgres tables in the same database as the graph, with a
+verified catalog of parameterized queries per table that questions can run.
+**It is optional:** ask once (step 3); if the user has no data files, skip every
+item below — no command changes. Never look through their folders for data
+files yourself; ask for the path.
+
+When they give a folder, record it right away so later steps (and a restarted
+session) know to add the flags:
+`uv run python scripts/build_state.py record structured-data dir="<DATA_DIR>"`.
+From then on:
+
+| Step | Change |
+|---|---|
+| 2b sizing | `tpm_check.py "<DOCS>" --structured` (sizes `table_profile` and the selector's ~100k-token prompts in `evaluation`) |
+| 3 prune-expand | `--structured-data "<DATA_DIR>"` (+ `--table-profile-concurrency <N>`); smoke with `--structured-limit 2` |
+| 4 ingest-corpus | Step 3b: `extract-entities --structured-data "<DATA_DIR>"` (or `--structured-only`) loads, refines and verifies the tables |
+| 4 queries + evals | `--use-structured-data` on `query`, `conversation turn`, `eval-questions`, `evaluate-queries` |
+| 5 deploy | `qa.use_structured_data: true` in `config/config.example.yaml`, or the deployed app never reads the tables |
+
+The run-prune-expand and ingest-corpus skills carry the details (cost, cache,
+review loop, `table-ontology-update`).
 
 ## The sequence
 
@@ -126,8 +153,11 @@ another model.
 Do this after steps 1 and 2 (it reads the active `models.yaml` and the DB
 settings) and before any paid step:
 ```
-uv run python scripts/tpm_check.py "<DOCS>"
+uv run python scripts/tpm_check.py "<DOCS>"                 # add --structured with a structured-data folder
 ```
+Each call is sized on the task's typical reply (measured on GPT-6 and Claude
+5.5), not the `max_tokens` ceiling — the Claude 5.5 preset sets 64,000 on every
+chat task because thinking counts against it.
 
 **Read the `Build memory` line out in every mode.** It projects the peak memory
 of prune-expand's Stage 4 + OWL export for THIS corpus and checks it against
@@ -151,7 +181,8 @@ whichever of its seven tasks has the least headroom. Two rules to tell the user:
 
 Present conservative / recommended / aggressive options (the table and the
 four effects to state are in **run-prune-expand** Step 2c: speed not savings,
-~2% more spend from cache dilution, 429 risk on the 32k-token gpt-4.1 stages,
+~2% more spend from cache dilution, 429 risk on the large-reply stages
+(`class_proposal`, `dedup`, `table_profile`),
 hard-kill risk on `table_extraction` / `table_page_vision`). Besides the rate-limit
 stages, the memory-bound table knobs come from the same run: `table_extraction` (PDF
 workers) and `table_page_vision` (whole-page vision calls in flight per PDF),
@@ -180,8 +211,9 @@ document per cluster, one per document type, and every outlier; several-fold
 cheaper, and ingestion still uses every document), **mention the `--tables` flag
 and ask their preference** (and `--table-mining` only for a FINANCIAL corpus --
 it mints ontology classes from table labels, which Phase 2 cannot correct
-later), then launch prune-expand **detached**, monitoring to
-completion. First multi-hour paid step;
+later), **ask whether they have data files for `--structured-data`** (optional;
+see "Structured data" above — record the folder if yes), then launch
+prune-expand **detached**, monitoring to completion. First multi-hour paid step;
 capture the resulting `v*-prune-expand/` folder. Note the edit-and-resubmit gotcha
 (hand-edited `merged.owl` needs `--use-owl` or a re-merge, or edits are ignored).
 
@@ -195,12 +227,16 @@ artifacts, and **finishes with a real `mine-aliases`** (corpus synonyms, checked
 automatic refresh inside register-documents only warns on failure) — the long
 paid steps run detached and monitored via the same harness, with `--limit`
 smoke-tests, the 500 MB DB-size guardrail, and a tracker record per step.
+With a structured-data folder it also loads the tables (its Step 3b) and runs
+the hand-back queries and evaluations with `--use-structured-data`.
 
 ### 5. Deploy to Render  →  invoke skill **deploy**
 Guides the user through forking the repo, setting `RENDER_API_KEY` + generating a
 `BEARER_TOKEN` in `.env`, `render-init` to create the backend + frontend services,
 monitoring the build, and the final manual UI token paste. Requires a **cloud**
 DB (not the local docker one). Records `deploy` (with URLs) to the tracker.
+With structured tables loaded, the deploy skill turns on
+`qa.use_structured_data` in the deployed config (its precondition (e)).
 In DeepInfra mode the deployed app needs NO GPU: Q&A runs on serverless
 DeepSeek-V4.1-Flash and queries embed on serverless Qwen; the deploy skill sets
 `MODELS_CONFIG_PATH` + `DEEPINFRA_API_KEY` on the backend.

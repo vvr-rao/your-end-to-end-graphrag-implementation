@@ -456,6 +456,7 @@ async def fetch_candidate_artifacts_for_entities(
            AND gr.target_node_type = 'entity'
            AND gr.target_node_id = ANY(CAST(:entity_ids AS uuid[]))
          WHERE a.status = 'ACTIVE'
+           AND a.artifact_type <> 'TableMetadata'
            {type_clause}
          GROUP BY a.id
          ORDER BY hits DESC
@@ -1059,6 +1060,7 @@ async def artifact_seed_entities(
         SELECT DISTINCT gr.target_node_id
           FROM (SELECT id FROM graphrag.intelligence_artifacts
                  WHERE embedding IS NOT NULL AND status = 'ACTIVE'
+                   AND artifact_type <> 'TableMetadata'
                  ORDER BY embedding <-> CAST(:q AS vector) LIMIT :n) a
           JOIN graphrag.graph_relationships gr
             ON gr.source_node_id = a.id
@@ -1091,6 +1093,7 @@ async def vector_search_all_artifacts(
         sql_text("""
         SELECT id FROM graphrag.intelligence_artifacts
          WHERE embedding IS NOT NULL AND status = 'ACTIVE'
+           AND artifact_type <> 'TableMetadata'
          ORDER BY embedding <-> CAST(:probe AS vector)
          LIMIT :limit
         """),

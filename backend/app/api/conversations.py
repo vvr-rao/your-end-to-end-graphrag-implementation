@@ -52,6 +52,15 @@ class TurnRequest(BaseModel):
     decompose: bool = True
     max_probes: int = Field(5, ge=1, le=8)
     history_window: int = Field(3, ge=0, le=10)
+    use_structured_data: bool | None = Field(
+        None,
+        description=(
+            "Let the answer read the loaded data tables (via guarded, "
+            "row-capped SQL picked from each table's stored queries). "
+            "simple_qa / deep_research only. Null = qa.use_structured_data "
+            "in config (off when unset)."
+        ),
+    )
 
 
 class TurnResponse(BaseModel):
@@ -155,6 +164,7 @@ async def conversation_turn(
             decompose=req.decompose,
             max_probes=req.max_probes,
             history_window=req.history_window,
+            use_structured_data=req.use_structured_data,
         )
     except ValueError as exc:
         raise HTTPException(
