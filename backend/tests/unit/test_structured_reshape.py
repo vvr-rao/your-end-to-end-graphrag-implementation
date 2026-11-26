@@ -179,3 +179,13 @@ async def test_reshaped_and_listed_calls_run_on_the_stored_rows(pg):
     rec, res, err = await _execute({**base, "reshape": {"group_by": ["value"]}}, _by_table(),
                                    max_rows=50, timeout_ms=5000, all_tables={"t_obs"})
     assert res is None and err.startswith("reshape refused")
+
+
+def test_selection_prompt_has_the_generic_ranking_rule():
+    from backend.app.services.prompts import table_query_select
+
+    system, _user = table_query_select("Which item had the largest value?", [])
+    rule = system[system.index("WHICH IS LARGEST / SMALLEST"):]
+    assert "prefer a stored ranking query" in rule
+    assert "RESHAPE" in rule and "order_by" in rule
+    assert "only a total" in rule
