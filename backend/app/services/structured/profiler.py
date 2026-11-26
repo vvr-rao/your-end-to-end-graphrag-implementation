@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Any
 
 from backend.app.services.structured import cache as tcache
+from backend.app.services.structured import wide_profile as wide
+from backend.app.services.structured.continuation import continuation_settings
 from backend.app.services.structured.discovery import TableSource, discover_tables, sanitize_identifier
 from backend.app.services.structured.metadata import (
     COLUMN_ROLES,
@@ -37,7 +39,9 @@ from backend.app.services.structured.metadata import (
 from backend.app.services.structured.profiling import ProfileError, profile_markdown, profile_table
 from backend.app.services.structured.query_builder import compact
 
-PROMPT_VERSION = "table_profile@v2"
+PROMPT_VERSION = "table_profile@v3"     # v3: coverage inventory (roles, candidates, countables)
+COLUMN_INVENTORY_ROLES = ("quantity", "identifier", "dimension", "period", "unit", "qualifier", "weight",
+                          "denominator", "descriptive", "unresolved")
 ANCHOR_LABELS = ("Metric", "Measure", "Dimension", "TimePeriod")
 _MAX_CANDIDATES = 40
 _STOP = {"the", "of", "and", "a", "an", "in", "for", "to", "by", "id", "no", "nr", "num",
@@ -197,10 +201,20 @@ def _norm_item(raw: dict, used: set[str], *, with_concept: bool) -> dict | None:
         "query": raw["query"],
         "params": _norm_params(raw.get("params")),
         "sql": "",
+        **({"claimed_capability": str(raw["capability"])[:500]} if raw.get("capability") else {}),
+        **({"capability_ids": [str(x) for x in raw["capability_ids"]]}
+           if isinstance(raw.get("capability_ids"), list) else {}),
     }
     if with_concept:
         item["_concept"] = _concept(raw.get("concept"))
     return item
+
+
+def _norm_candidate(c: dict) -> dict:
+    keep = ("id", "candidate_id", "label", "source_columns", "indicator", "unit", "observation", "calculations",
+            "group_by", "filter_by", "display", "across_entities", "across_time",
+            "weight_or_denominator", "period_rule", "evidence", "uncertain")
+    return {k: c.get(k) for k in keep if c.get(k) not in (None, "", [])}
 
 
 def build_metadata(src: TableSource, profile, reply: dict, *, key: str, model: str) -> dict:
@@ -216,6 +230,13 @@ def build_metadata(src: TableSource, profile, reply: dict, *, key: str, model: s
             "unit": r.get("unit") or None, "entity_kind": r.get("entity_kind") or None,
             "examples": [v for v, _n in c.top_values[:5]] if c.type in {"text", "boolean"} else [],
             "class_iri": None, "class_label": None, "_concept": _concept(r.get("concept")),
+            "roles": [x for x in (r.get("roles") or []) if x in COLUMN_INVENTORY_ROLES]
+            or ["unresolved"],
+            "evidence": str(r.get("evidence") or "")[:400],
+            "uncertain": bool(r.get("uncertain")) or not r,
+            **({"family": str(r["family"])} if r.get("family") else {}),
+            **({"related": [x for x in r["related"] if isinstance(x, dict)]}
+               if isinstance(r.get("related"), list) and r["related"] else {}),
         })
     used: set[str] = set()
     meta = {
@@ -232,6 +253,13 @@ def build_metadata(src: TableSource, profile, reply: dict, *, key: str, model: s
         "ontology": {"MATCHES FOUND": [], "MATCH NOT FOUND": []},
         "dropped": [], "model": model, "edited": False,
         "profile": profile.to_dict(),
+        "inventory": {
+            "candidates": [_norm_candidate(c) for c in reply.get("candidates") or [] if isinstance(c, dict)],
+            "countables": reply.get("countables") if isinstance(reply.get("countables"), dict) else {},
+            "remaining_candidates": [c for c in reply.get("remaining_candidates") or [] if c],
+            **({"relationships": reply["relationships"]} if reply.get("relationships") else {}),
+            "columns_missing": [c.name for c in profile.columns if c.name not in by_name],
+        },
     }
     for sec in ("metrics", "filters", "queries"):
         for raw in reply.get(sec) or []:
@@ -411,7 +439,10 @@ async def _profile_lookups(metas: dict[str, dict], router, audit: AuditFn | None
               "columns": [j["column"] for j in joins], "class_iri": None, "class_label": None,
               "query": raw.get("query") if isinstance(raw.get("query"), dict) else None,
               "params": _norm_params(raw.get("params")), "sql": "",
-              "table": a, "other_table": b, "join": joins}
+              "table": a, "other_table": b, "join": joins,
+              **({"cardinality": str(raw["cardinality"]).lower()}
+                 if str(raw.get("cardinality") or "").lower() in
+                 {"many_to_one", "one_to_one", "one_to_many", "many_to_many"} else {})}
         if it["query"] is not None:
             it["query"] = {**it["query"], "from": a,
                            "join": it["query"].get("join") or {"table": b, "on": joins}}
@@ -437,6 +468,7 @@ async def profile_folder(
     class_index: ClassIndex | None = None,
     concurrency: int = 4,
     limit: int | None = None,
+    tables: list[str] | None = None,
     refresh: bool = False,
     allow_llm: bool = True,
     audit: AuditFn | None = None,
@@ -451,7 +483,9 @@ async def profile_folder(
     """
     cache = cache or tcache.MetadataCache()
     disc = discover_tables(Path(folder))
-    sources = disc.tables[:limit] if limit else disc.tables
+    from backend.app.services.structured.discovery import select_tables
+
+    sources = select_tables(disc.tables, limit, tables)
     run = ProfileRun(sources={s.table_name: s for s in sources}, skipped_files=disc.skipped)
     index = class_index or ClassIndex((ontology or {}).get("classes_dict"))
     salvage = False
@@ -471,6 +505,9 @@ async def profile_folder(
         key = tcache.table_key(src.file_sha)
         hit = cache.get(key, src.table_name)
         if hit and refresh and not hit.get("edited"):
+            hit = None
+        if hit and allow_llm and (hit.get("profile_run") or {}).get("complete") is False:
+            log(f"[structured] {src.table_name}: cached profile is incomplete -> resuming unfinished work")
             hit = None
         if hit:
             if hit["table_name"] != src.table_name:
@@ -502,20 +539,40 @@ async def profile_folder(
             builder = PROMPTS["table_profile"]
             if use_qwen:
                 from backend.app.services.prompts_qwen import qwen_table_profile as builder
-            system, user = builder(profile_markdown(profile, max_sample=max_sample), cands)
-            try:
-                res = await router.chat("table_profile", system=system, user=user)
-            except Exception as exc:
-                run.failed.append((src.table_name, f"LLM call failed: {exc}"))
-                return
-            run.llm_calls += 1
-            reply = _parse_json(res.text, salvage)
+            batch, budget = continuation_settings(router, "table_profile", wide.COLUMN_BATCH)
+            wide_report = None
+            if len(profile.columns) > batch:
+                # wide table: column batches + synthesis + capabilities, checkpointed
+                try:
+                    reply, wide_report = await wide.profile_wide(src, profile, router, cands=cands, cache=cache,
+                                                                 column_batch=batch, budget=budget, log=log)
+                except Exception as exc:
+                    run.failed.append((src.table_name, f"LLM call failed (wide profiling): {exc}"))
+                    return
+                run.llm_calls += sum(st["calls"] for st in wide_report["stages"])
+            else:
+                system, user = builder(profile_markdown(profile, max_sample=max_sample), cands)
+                try:
+                    res = await router.chat("table_profile", system=system, user=user)
+                except Exception as exc:
+                    run.failed.append((src.table_name, f"LLM call failed: {exc}"))
+                    return
+                run.llm_calls += 1
+                reply = _parse_json(res.text, salvage)
             if not reply or not isinstance(reply.get("columns"), list):
                 run.failed.append((src.table_name, "LLM reply was not the expected JSON"))
                 if audit:
                     audit("table_profile_unparsed", {"table": src.table_name, "reply_head": res.text[:500]})
                 return
             meta = build_metadata(src, profile, reply, key=key, model=_model_tag(router, "table_profile"))
+            if wide_report is not None:
+                meta["profile_run"] = wide_report
+                meta["inventory"]["coverage"] = wide_report["coverage"]
+                if not wide_report["complete"]:
+                    log(f"[structured] {src.table_name}: profiling INCOMPLETE "
+                        f"({sum(1 for v in wide_report['coverage']['columns'].values() if v != 'done')} column(s), "
+                        f"{sum(1 for v in wide_report['coverage']['candidates'].values() if v.startswith('incomplete'))}"
+                        " candidate(s) unfinished); a re-run resumes from the checkpoint")
             run.llm_calls += await _validate_and_repair(meta, router, audit, salvage)
             _apply_concepts(meta, index)
             cache.put(meta)
@@ -536,19 +593,34 @@ async def profile_folder(
     else:
         log(f"[structured] all {len(run.cached)} table(s) from cache (no LLM calls)")
 
-    # ---- cross-table lookups (cached on the set of table keys)
-    if len(metas) > 1:
-        lk_key = tcache.lookups_key([m["cache_key"] for m in metas.values()])
+    # ---- cross-table lookups (cached on the set of table keys). With a table
+    # selection, the folder's other tables take part from the cache (never
+    # profiled here), so a selected table keeps its cross-table lookups.
+    partners: dict[str, dict] = {}
+    if tables:
+        chosen = {s.table_name for s in sources}
+        for src in disc.tables:
+            if src.table_name in chosen:
+                continue
+            hit = cache.get(tcache.table_key(src.file_sha), src.table_name)
+            if hit and hit.get("table_name") == src.table_name:
+                partners[src.table_name] = hit
+        if partners:
+            log(f"[structured] lookups also consider {len(partners)} cached table(s) of the folder: "
+                f"{', '.join(sorted(partners))}")
+    if len(metas) + len(partners) > 1:
+        lk_metas = {**partners, **metas}
+        lk_key = tcache.lookups_key([m["cache_key"] for m in lk_metas.values()])
         hit = None if refresh else cache.get_lookups(lk_key)
         if hit is not None:
             lookups = hit["lookups"]
             run.lookups_cached = True
         elif allow_llm:
             try:
-                lookups, calls, dropped = await _profile_lookups(metas, router, audit)
+                lookups, calls, dropped = await _profile_lookups(lk_metas, router, audit)
                 run.llm_calls += calls
                 cache.put_lookups({"format": tcache.FORMAT, "cache_key": lk_key,
-                                   "tables": sorted(metas), "lookups": lookups, "dropped": dropped,
+                                   "tables": sorted(lk_metas), "lookups": lookups, "dropped": dropped,
                                    "model": _model_tag(router, "table_lookups")})
                 log(f"[structured] lookups: {len(lookups)} kept, {len(dropped)} dropped")
             except Exception as exc:
@@ -557,7 +629,7 @@ async def profile_folder(
         else:
             lookups = []
         run.lookups = lookups
-        _attach_lookups(metas, lookups)
+        _attach_lookups(lk_metas, lookups)
         if cache.run_dir is not None:
             for meta in metas.values():  # readable run-folder copy with lookups merged in
                 tcache.atomic_write_json(cache.run_dir / f"{meta['table_name']}.metadata.json", meta)

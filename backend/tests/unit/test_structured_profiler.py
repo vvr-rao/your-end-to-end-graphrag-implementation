@@ -27,6 +27,8 @@ class FakeRouter:
         self.spec = spec or {"provider": "fake", "model": "m1"}
 
     def task_spec(self, task):
+        if task == "table_concept_map" and task not in self.replies:
+            return None          # concept mapping only where a test scripts it
         return self.spec
 
     async def chat(self, task, *, system, user, **kw):

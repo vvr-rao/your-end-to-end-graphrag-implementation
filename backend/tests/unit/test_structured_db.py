@@ -193,7 +193,7 @@ async def test_retrieval_finds_table_via_entity_and_runs_stored_sql(db, data, tm
     ev, plan = await structured_evidence("copper price?", router=router, entity_ids=[copper],
                                          class_ids=[], qvec=None)
     assert len(ev) == 1 and ev[0]["rows"] == [["Copper", "2024-01-01", "8500"]]
-    assert plan["retried"] and "neither query_id nor query" in plan["calls"][1]["error"]
+    assert plan["retried"] and "Inline SQL or a query spec is refused" in plan["calls"][1]["error"]
     async with db() as s:                                 # model-written SQL is never run
         assert (await s.execute(text('SELECT count(*) FROM graphrag."prices"'))).scalar() == 3
 
@@ -238,7 +238,8 @@ async def test_export_edit_import_updates_node_edges_and_cache(db, data, tmp_pat
             "WHERE artifact_type = 'TableMetadata' AND title = 'prices' AND status = 'ACTIVE'"))).one()
         n_edges = (await s.execute(text(
             "SELECT count(*) FROM graphrag.graph_relationships gr JOIN graphrag.intelligence_artifacts a "
-            "ON a.id = gr.source_node_id WHERE a.title = 'prices'"))).scalar()
+            "ON a.id = gr.source_node_id WHERE a.title = 'prices' "
+            "AND gr.relationship_type NOT IN ('tableTime', 'tablePlace')"))).scalar()
     assert "Monthly commodity spot prices" in row[0] and row[1]["edited"] is True
     assert n_edges == rep.class_edges + rep.entity_edges        # rebuilt, not duplicated
     entry = cache.get(row[1]["cache_key"], "prices")

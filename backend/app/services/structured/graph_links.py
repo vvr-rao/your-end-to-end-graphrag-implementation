@@ -12,14 +12,15 @@ question about "October 2024" reach a table linked to 2024.
 
 **Places.** Columns that hold places (from their entity kind, class or name)
 are read; ISO 3166 country and subdivision codes become names (``AU`` ->
-Australia, ``CN-ZJ`` -> Zhejiang); values are matched to existing place
-entities and minted as place entities when missing (typed with the
-ontology's Country / subdivision / City class). Containment is written where
-the data states it: a subdivision code names its country, and a row that
-holds a city, a region and a country (columns sharing a prefix) says the city
-is in that region and country. Edges ``table -[assertsAbout]-> place``
-(``tablePlace``). enrich-geo then rolls the minted places up further
-(country -> region -> continent) like any other place entity.
+Australia, ``CN-ZJ`` -> Zhejiang); values are matched to EXISTING place
+entities only. Structured data never mints a place entity -- on the first
+load or on relink: a place the graph does not know stays unresolved (it is
+reported, and the table still holds it). Containment is written where the data
+states it between places that exist: a subdivision code names its country,
+and a row that holds a city, a region and a country (columns sharing a
+prefix) says the city is in that region and country. Edges
+``table -[assertsAbout]-> place`` (``tablePlace``). Time instances follow
+their own policy above (minted like enrich-time does).
 """
 
 from __future__ import annotations
@@ -38,6 +39,8 @@ TIME_LEVELS = ("year", "quarter", "month")
 MAX_PERIOD_VALUES = 20000
 MAX_PLACE_VALUES = 500          # per column
 MAX_PLACE_COMBOS = 5000
+VALUE_PLACE_MIN_SHARE = 0.5     # columns found by their values: share of distinct values that are places
+VALUE_PLACE_MIN_HITS = 3
 PLACE_WORDS = {
     # word in a column's entity kind / class / name -> level (1 city .. 3 country)
     "city": 1, "town": 1, "municipality": 1, "locality": 1,
@@ -163,12 +166,13 @@ async def ensure_time_instances(session, identifiers: set[str], gv: int) -> dict
 
 def period_columns(meta: dict) -> list[str]:
     """Columns holding the period a VALUE covers: the measures' period
-    columns, else time columns in the measured grain; never a column that
-    only identifies the report. Empty before the table is analysed."""
-    from backend.app.services.structured.analysis import report_columns
+    columns, else time columns in the measured grain; never a column a
+    measure definition confirmed as the version of a value. Empty before the
+    table is analysed."""
+    from backend.app.services.structured.analysis import version_columns
 
     analysis = meta.get("analysis") or {}
-    report = set(report_columns(analysis))
+    report = set(version_columns(meta, analysis))
     cols = []
     for it in meta.get("measures") or []:
         for c in (it.get("measure") or {}).get("period_columns") or []:
@@ -257,6 +261,52 @@ def _country_name(c) -> str:
     return getattr(c, "common_name", None) or c.name
 
 
+def _level_of_class(label: str | None) -> int | None:
+    low = (label or "").lower()
+    for lvl, labels in CLASS_FOR_LEVEL.items():
+        if low in {x.lower() for x in labels}:
+            return lvl
+    return None
+
+
+def value_place_level(values: list[Any], known_places: dict[str, int | None]) -> int | None:
+    """Level of a column judged from its VALUES, whatever the column is called:
+    a value counts when it names a place the graph already holds
+    (``known_places``: normalised name -> level, None when the class does not
+    say) or a country (ISO 3166 name or 3-letter code). Two-letter values are
+    not evidence -- state, language and unit codes collide with ISO alpha-2.
+    A place column when at least VALUE_PLACE_MIN_HITS values and
+    VALUE_PLACE_MIN_SHARE of the distinct values count; the level is the most
+    common level among them (country when only countries / unknown levels)."""
+    import pycountry
+
+    from backend.app.services.db_entity_extract import _normalize_name
+
+    vals = [str(v).strip() for v in values if v is not None and str(v).strip()]
+    if len(vals) < VALUE_PLACE_MIN_HITS:
+        return None
+    votes: dict[int, int] = {}
+    hits = 0
+    for v in vals:
+        n = _normalize_name(v)
+        hit, lvl = False, None
+        if n in known_places:
+            hit, lvl = True, known_places[n]
+        if not re.fullmatch(r"[A-Za-z]{2}", v) and not re.fullmatch(r"[\d\W_]+", v):
+            try:
+                pycountry.countries.lookup(v)
+                hit, lvl = True, lvl or 3
+            except LookupError:
+                pass
+        if hit:
+            hits += 1
+            if lvl:
+                votes[lvl] = votes.get(lvl, 0) + 1
+    if hits < VALUE_PLACE_MIN_HITS or hits / len(vals) < VALUE_PLACE_MIN_SHARE:
+        return None
+    return max(votes, key=lambda k: (votes[k], k)) if votes else 3
+
+
 def place_groups(columns: list[dict]) -> list[list[tuple[str, int]]]:
     """Place columns that describe ONE place (same name prefix, e.g. an
     address block), each [(column, level)] ordered city -> country."""
@@ -284,24 +334,43 @@ async def _place_class_ids(session) -> dict[int, Any]:
     return out
 
 
-async def link_places(session, meta: dict, gv: int, *, embed: EmbedFn | None = None,
-                      mint: bool = True) -> dict[str, Any]:
-    """Resolve the table's place values to place entities (minting missing
-    ones), write containment stated by the data. Returns
-    {"entities": {entity_id: {columns, values}}, "minted": n, "containment": n}."""
-    from backend.app.services.db_entity_extract import _entity_iri, _normalize_name
+async def link_places(session, meta: dict, gv: int, *, embed: EmbedFn | None = None) -> dict[str, Any]:
+    """Resolve the table's place values to EXISTING place entities and write
+    the containment the data states between them. Never creates an entity.
+    Returns {"entities": {entity_id: {columns, values}}, "minted": 0,
+    "unresolved": [place names], "containment": n}."""
+    from backend.app.services.db_entity_extract import _normalize_name
     from backend.app.services.db_geo_enrich import DEFAULT_GEO_CLASS_LABELS, _place_entities
 
     table = meta["table_name"]
-    groups = place_groups(meta.get("columns") or [])
-    out: dict[str, Any] = {"entities": {}, "minted": 0, "containment": 0}
-    if not groups:
-        return out
+    columns = meta.get("columns") or []
+    groups = place_groups(columns)
+    out: dict[str, Any] = {"entities": {}, "minted": 0, "unresolved": [], "containment": 0,
+                           "found_by_values": []}
     # existing places by normalised name
     existing: dict[str, Any] = {}
-    for eid, name, _label, _cid in await _place_entities(session, DEFAULT_GEO_CLASS_LABELS):
+    known_levels: dict[str, int | None] = {}
+    for eid, name, label, _cid in await _place_entities(session, DEFAULT_GEO_CLASS_LABELS):
         existing.setdefault(_normalize_name(name), eid)
-    classes = await _place_class_ids(session)
+        known_levels.setdefault(_normalize_name(name), _level_of_class(label))
+
+    # columns the words did not mark: judge them by their values. Each one is
+    # its own group -- nothing says two such columns describe the same place
+    # (a reporter and a partner country), so no containment is read from them.
+    named = {c for g in groups for c, _ in g}
+    for c in columns:
+        if (c["name"] in named or c.get("type", "text") != "text"
+                or c.get("role") in {"measure", "text"}):
+            continue
+        vals = (await session.execute(sql_text(
+            f"SELECT {_q(c['name'])} FROM {SCHEMA}.{_q(table)} WHERE {_q(c['name'])} IS NOT NULL "
+            f"GROUP BY 1 ORDER BY COUNT(*) DESC LIMIT {MAX_PLACE_VALUES}"))).scalars().all()
+        lvl = value_place_level(list(vals), known_levels)
+        if lvl is not None:
+            groups.append([(c["name"], lvl)])
+            out["found_by_values"].append(c["name"])
+    if not groups:
+        return out
 
     resolved: dict[tuple[str, str], dict] = {}       # (column, raw) -> place
     for group in groups:
@@ -321,34 +390,12 @@ async def link_places(session, meta: dict, gv: int, *, embed: EmbedFn | None = N
         if p.get("country"):
             wanted.setdefault((p["country"], 3), {"name": p["country"], "level": 3})
     ids: dict[tuple[str, int], Any] = {}
-    to_mint = []
     for key, p in wanted.items():
         eid = existing.get(_normalize_name(p["name"]))
         if eid is not None:
             ids[key] = eid
-        elif mint and classes.get(p["level"]):
-            to_mint.append(p)
-    if to_mint:
-        vecs = (await embed([f"{p['name']} -- place" for p in to_mint])) if embed else [None] * len(to_mint)
-        cls_iris = dict((await session.execute(sql_text(
-            f"SELECT id, iri FROM {SCHEMA}.ontology_classes WHERE id = ANY(CAST(:ids AS uuid[]))"),
-            {"ids": [str(v) for v in classes.values()]})).all())
-        for p, vec in zip(to_mint, vecs, strict=True):
-            cid = classes[p["level"]]
-            ident = _entity_iri(p["name"], cls_iris[cid])
-            row = (await session.execute(sql_text(f"""
-                INSERT INTO {SCHEMA}.entities (entity_identifier, iri, name, normalized_name, class_id,
-                                               status, embedding, extra_metadata)
-                VALUES (:i, :i, :n, :nn, :c, 'ACTIVE', CAST(:v AS vector), CAST(:x AS jsonb))
-                ON CONFLICT (entity_identifier) DO UPDATE SET status = 'ACTIVE'
-                RETURNING id
-            """), {"i": ident, "n": p["name"], "nn": _normalize_name(p["name"]), "c": cid,
-                   "v": None if vec is None else "[" + ",".join(f"{x:.7g}" for x in vec) + "]",
-                   "x": json.dumps({"minted_by": "structured-data", "table": table,
-                                    **({"iso_code": p["code"]} if p.get("code") else {})})})).scalar()
-            ids[(p["name"], p["level"])] = row
-            existing[_normalize_name(p["name"])] = row
-            out["minted"] += 1
+        elif p["name"] not in out["unresolved"]:
+            out["unresolved"].append(p["name"])
 
     # table -> place, per entity
     for (col, raw), p in resolved.items():
@@ -413,7 +460,7 @@ async def _write_containment(session, pairs, gv: int, table: str) -> int:
 
 
 async def time_and_place_edges(session, node_id, meta: dict, gv: int, *, embed: EmbedFn | None = None,
-                               time_level: str = "year", mint_places: bool = True) -> tuple[list[dict], dict]:
+                               time_level: str = "year") -> tuple[list[dict], dict]:
     """Edges table -> time instances and table -> places, plus a summary."""
     from backend.app.services.predicates import TIME_HAS_TIME, VIAO_ASSERTS_ABOUT
 
@@ -432,7 +479,7 @@ async def time_and_place_edges(session, node_id, meta: dict, gv: int, *, embed: 
                 "relationship_type": "tableTime", "relationship_source": "TIME_ENRICHMENT",
                 "is_authoritative": True, "source_artifact_id": node_id, "graph_version": gv,
                 "extra_metadata": json.dumps({"table": meta["table_name"], "columns": cols})})
-    places = await link_places(session, meta, gv, embed=embed, mint=mint_places)
+    places = await link_places(session, meta, gv, embed=embed)
     for eid, h in places["entities"].items():
         edges.append({
             "source_node_type": "intelligence_artifact", "source_node_id": node_id,
@@ -443,6 +490,8 @@ async def time_and_place_edges(session, node_id, meta: dict, gv: int, *, embed: 
             "extra_metadata": json.dumps({"table": meta["table_name"], "columns": sorted(h["columns"]),
                                           "values": h["values"]})})
     summary = {"time_level": level, "periods": len(idents), "time_columns": cols,
-               "places": len(places["entities"]), "places_minted": places["minted"],
-               "containment": places["containment"]}
+               "places": len(places["entities"]), "places_minted": 0,
+               "places_unresolved": places["unresolved"][:50],
+               "containment": places["containment"],
+               "place_columns_by_values": places.get("found_by_values") or []}
     return edges, summary

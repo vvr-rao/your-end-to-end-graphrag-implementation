@@ -12,6 +12,7 @@ from backend.app.services.structured.graph_links import (
     place_groups,
     place_level,
     resolve_place,
+    value_place_level,
 )
 from backend.app.services.structured.metadata import item_tags
 from backend.app.services.structured.retrieval_step import rank_items
@@ -95,6 +96,22 @@ def test_items_are_tagged_and_ranked_by_what_the_question_reached():
 
 # ------------------------------------------------------------------ database
 
+def test_place_columns_are_found_by_their_values():
+    """A column whose name, kind and class carry no place word is still a
+    place column when its values are places: countries (names or 3-letter
+    codes) or places the graph already holds. Two-letter codes are not
+    evidence (state / language / unit codes collide with ISO alpha-2)."""
+    assert value_place_level(["Japan", "Rep. of Korea", "Viet Nam", "Germany", "Other Asia, nes"], {}) == 3
+    assert value_place_level(["JPN", "KOR", "TWN", "DEU"], {}) == 3
+    known = {"ontario": 2, "quebec": 2, "alberta": 2}
+    assert value_place_level(["Ontario", "Quebec", "Alberta", "Yukon"], known) == 2
+    assert value_place_level(["CA", "IN", "DE", "FR"], {}) is None          # two-letter codes: no evidence
+    assert value_place_level(["Urea", "Copper", "Crude oil, Brent", "Gold"], {}) is None
+    assert value_place_level(["Japan", "Gold", "Urea", "Tin", "Zinc"], {}) is None    # 1 of 5 is not half
+    assert value_place_level(["Japan", "Chad"], {}) is None                  # too few values to judge
+    assert value_place_level(["2024", "2025", "-", "1.5"], {}) is None
+
+
 db_only = pytest.mark.skipif(not _SAFE, reason="set ONTOLOGY_BUILD_TEST_DSN to a migrated *_test database")
 
 PLACES_CSV = (b"name,hq_city,hq_region,hq_country,year,value\n"
@@ -147,7 +164,10 @@ def _profile_reply():
 
 
 @db_only
-async def test_table_links_to_minted_places_and_time_instances(db, tmp_path):
+async def test_table_links_known_places_only_and_mints_time_instances(db, tmp_path):
+    """Graph identity policy: a known place (Chile) gets an edge; an unknown one
+    (Canada, Toronto, ...) stays unresolved; no entity is created on load or
+    on relink. Time instances keep their own policy (minted)."""
     from sqlalchemy import text
 
     from backend.app.services.structured import cache as tc
@@ -158,34 +178,33 @@ async def test_table_links_to_minted_places_and_time_instances(db, tmp_path):
     async def embed(texts):
         return [[0.01] * 1024 for _ in texts]
 
+    async def n_entities():
+        async with db() as s:
+            return (await s.execute(text("SELECT count(*) FROM graphrag.entities"))).scalar()
+
+    before = await n_entities()
     root = tmp_path / "d"
     _write(root, "hq.csv", PLACES_CSV)
     cache = tc.MetadataCache()
     run = await profile_folder(root, FakeRouter({"table_profile": [_profile_reply()]}), cache=cache,
                                log=lambda *_: None)
     await load_and_link(run, root_name="d", cache=cache, embed=embed, log=lambda *_: None)
+    assert await n_entities() == before                       # load minted nothing
     refine = {"columns": [], "usage_notes": [], "common_questions": [],
               "measures": [{"id": "value", "label": "Value", "value_column": "value",
-                            "entity_columns": ["name"], "period_columns": ["year"], "qualifier_columns": []}]}
-    await refine_registered(FakeRouter({"table_refine": [refine]}), cache=cache, embed=embed,
+                            "identity_columns": ["name"], "period_columns": ["year"],
+                            "qualifier_columns": []}]}
+    await refine_registered(FakeRouter({"table_refine": [refine]}), verify=False, cache=cache, embed=embed,
                             log=lambda *_: None)
+    await refine_registered(FakeRouter({}), verify=False, relink=True, cache=cache, embed=embed,
+                            log=lambda *_: None)
+    assert await n_entities() == before                       # refine + relink minted nothing
     async with db() as s:
         places = dict((await s.execute(text(
             "SELECT e.name, c.label FROM graphrag.graph_relationships r "
             "JOIN graphrag.entities e ON e.id = r.target_node_id JOIN graphrag.ontology_classes c ON c.id = e.class_id "
             "WHERE r.relationship_type = 'tablePlace'"))).all())
-        assert places["Chile"] == "Country" and places["Canada"] == "Country"
-        assert places["Santiago"] == "City" and places["Toronto"] == "City"
-        assert any(n.startswith("Ontario") and lab == "AdministrativeArea" for n, lab in places.items())
-        n_chile = (await s.execute(text("SELECT count(*) FROM graphrag.entities WHERE normalized_name = 'chile'"))).scalar()
-        assert n_chile == 1                                   # existing place reused, not minted again
-        contained = set((await s.execute(text(
-            "SELECT c.name, p.name FROM graphrag.graph_relationships r "
-            "JOIN graphrag.entities c ON c.id = r.source_node_id JOIN graphrag.entities p ON p.id = r.target_node_id "
-            "WHERE r.relationship_type = 'locatedInPlace'"))).all())
-        assert ("Toronto", "Ontario") in contained and ("Ontario", "Canada") in contained
-        assert any(c == "Santiago" and p.startswith("Santiago") for c, p in contained) or \
-            any(c == "Santiago" for c, _p in contained)       # city -> its region (nearest rung)
+        assert places == {"Chile": "Country"}                 # known place linked, unknown unresolved
         times = sorted((await s.execute(text(
             "SELECT t.time_identifier FROM graphrag.graph_relationships r JOIN graphrag.time_instances t "
             "ON t.id = r.target_node_id WHERE r.relationship_type = 'tableTime'"))).scalars().all())
@@ -195,3 +214,41 @@ async def test_table_links_to_minted_places_and_time_instances(db, tmp_path):
     assert stats["year"]["periods"] == {"year": [2022, 2023]} and stats["name"]["distinct"] == 3
     tags = next(it["tags"] for it in meta["filters"] if it["id"] == "by_country")
     assert tags["place_columns"] == ["hq_country"]
+
+
+@db_only
+async def test_place_column_without_a_place_word_links_by_its_values(db, tmp_path):
+    """`reporter` / `economy_code` are named, described and typed with no
+    place word; their values (country names, ISO-3 codes) still link the table
+    to the country the graph holds -- and nothing is minted."""
+    from sqlalchemy import text
+
+    from backend.app.services.structured import cache as tc
+    from backend.app.services.structured.db_load import load_and_link
+    from backend.app.services.structured.profiler import profile_folder
+
+    async def embed(texts):
+        return [[0.01] * 1024 for _ in texts]
+
+    root = tmp_path / "t"
+    _write(root, "flows.csv", b"reporter,economy_code,year,value\nChile,CHL,2023,1\nJapan,JPN,2023,2\n"
+                              b"Germany,DEU,2023,3\nPeru,PER,2024,4\n")
+    reply = {"description": "trade by reporting economy", "grain": "one row per reporter and year",
+             "columns": [{"name": c, "description": c, "role": r, "concept": None} for c, r in
+                         [("reporter", "attribute"), ("economy_code", "identifier"),
+                          ("year", "time"), ("value", "measure")]],
+             "metrics": [], "filters": [], "queries": []}
+    cache = tc.MetadataCache()
+    run = await profile_folder(root, FakeRouter({"table_profile": [reply]}), cache=cache, log=lambda *_: None)
+    lines: list[str] = []
+    async with db() as s:
+        before = (await s.execute(text("SELECT count(*) FROM graphrag.entities"))).scalar()
+    await load_and_link(run, root_name="t", cache=cache, embed=embed, log=lines.append)
+    async with db() as s:
+        rows = (await s.execute(text(
+            "SELECT e.name, r.extra_metadata FROM graphrag.graph_relationships r "
+            "JOIN graphrag.entities e ON e.id = r.target_node_id WHERE r.relationship_type = 'tablePlace'"))).all()
+        after = (await s.execute(text("SELECT count(*) FROM graphrag.entities"))).scalar()
+    assert [r[0] for r in rows] == ["Chile"] and after == before          # known place only, nothing minted
+    assert sorted(rows[0][1]["columns"]) == ["economy_code", "reporter"]
+    assert any("found by their values: reporter, economy_code" in ln for ln in lines)

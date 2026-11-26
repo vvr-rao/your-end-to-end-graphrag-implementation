@@ -552,6 +552,30 @@ and the `db-size` delta (data tables count toward the database size).
 Re-running is safe: an unchanged file is not reloaded; a changed file is
 reloaded and its old metadata node marked STALE.
 
+After loading, each table is refined and then VERIFIED (paid, gpt-4.1 in the
+OpenAI presets: one call for the columns plus one per 8 stored queries). The
+verification is an independent check: column descriptions/roles/units against
+the measured data, and every stored query's SQL against its label and
+description (ok / re-described / query fixed and re-tested / dropped). Report
+the `verified --` line per table, the `stored queries: N selectable, N failed,
+N not exercised` line, any dropped queries, measures unresolved after repair,
+and `review` notes. Also report places "not in the graph (not created)" and
+class proposals that match no existing class (structured data never creates
+entities or classes here). Retrieval only runs queries whose exact SQL passed.
+Also report per table the coverage ledger counts (`coverage_ledger` categories:
+dedicated_measure / generic_query / partial / unexercised / verifier_drop /
+unsupported / unfinished / gap) and any entity match left `unresolved` (type
+mismatch or ambiguity). A table whose profiling stopped early says
+`profiling INCOMPLETE ... a re-run resumes from the checkpoint`: re-run the same
+command (only unfinished work is redone) or raise `continuation.max_calls`.
+A table loaded before the verified catalog existed is migrated with no LLM by
+`table-metadata-refine --relink --table <NAME>`. To verify tables that were
+refined before this step existed, or to repeat it:
+```
+uv run python -m backend.app.cli table-metadata-refine
+uv run python -m backend.app.cli table-metadata-refine --reverify --table <NAME>
+```
+
 Review loop (optional): `table-metadata-export -o <MD_DIR>` writes one
 Markdown file per table; edit the ```json query specs (the ```sql blocks are
 compiled from them and read-only). `table-metadata-import <MD_DIR> --dry-run`

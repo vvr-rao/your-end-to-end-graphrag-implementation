@@ -13,6 +13,7 @@ import uuid
 import pytest
 
 from backend.app.services.structured import retrieval_step as rs
+from backend.app.services.structured.metadata import CATALOG_VERSION, finalize_item, items, record_test
 from backend.app.services.structured.sql_exec import SqlResult
 from backend.tests.unit.test_structured_profiler import FakeRouter
 
@@ -25,9 +26,12 @@ META = {
     "metrics": [{"id": "avg_price", "label": "Average price",
                  "query": {"select": [{"agg": "avg", "column": "value", "as": "avg_value"}],
                            "where": [{"column": "commodity", "op": "=", "param": "c"}]},
-                 "params": [{"name": "c", "type": "text", "column": "commodity", "example": "Copper"}],
-                 "sql": "(compiled at run time)"}],
-    "filters": [], "queries": [],
+                 "params": [{"name": "c", "type": "text", "column": "commodity", "example": "Copper"}]}],
+    "filters": [],
+    "queries": [{"id": "commodity_counts", "label": "Rows per commodity",
+                 "query": {"select": ["commodity", {"agg": "count", "as": "n"}]}, "params": []},
+                {"id": "all_prices", "label": "Every price",
+                 "query": {"select": ["commodity", "period", "value"]}, "params": []}],
     "lookups": [{"id": "company_prices", "other_table": "companies", "params": [],
                  "join": [{"column": "commodity", "other_column": "commodity"}],
                  "query": {"select": ["companies.company", "value"]}}],
@@ -38,6 +42,19 @@ AVG_SQL = ('SELECT AVG("value") AS "avg_value", COUNT(*) AS "rows_aggregated", '
 COMPANIES = {"table_name": "companies", "columns": [{"name": "company", "type": "text"},
                                                     {"name": "commodity", "type": "text"}]}
 NODE = uuid.uuid4()
+
+
+def _verify_catalog(meta: dict, partners: dict) -> dict:
+    """What ingestion does: finalise every item's SQL and record a passed test."""
+    types = {n: {c["name"]: c["type"] for c in m["columns"]} for n, m in partners.items()}
+    for sec, it in items(meta):
+        assert finalize_item(meta, sec, it, types, partners=partners) is None
+        record_test(it, "passed")
+    meta["catalog_version"] = CATALOG_VERSION
+    return meta
+
+
+_verify_catalog(META, {"prices": META, "companies": COMPANIES})
 
 
 @pytest.fixture
@@ -97,23 +114,29 @@ async def test_not_needed_runs_no_sql(patched):
     assert ev == [] and calls == [] and plan["needed"] is False
 
 
-async def test_failed_catalog_query_gets_one_retry_with_a_query_spec(patched):
+async def test_failed_catalog_query_gets_one_retry_with_a_stored_query(patched):
     calls, results = patched
     results.append(SqlResult(sql="", error="column \"x\" does not exist"))
     router = FakeRouter({"table_query_select": [
         {"needed": True, "calls": [{"table": "prices", "query_id": "avg_price", "params": {"c": "Cu"}}]},
-        {"needed": True, "calls": [{"table": "prices", "purpose": "max price",
-                                    "query": {"select": [{"agg": "max", "column": "value", "as": "m"}]},
-                                    "params": {}}]},
+        {"needed": True, "calls": [{"table": "prices", "query_id": "avg_price", "params": {"c": "Cu"}}]},
     ]})
     ev, plan = await _go(router)
     assert len(router.calls) == 2 and "PREVIOUS ATTEMPT FAILED" in router.calls[1][1]
     assert 'column \\"x\\" does not exist' in router.calls[1][1]
-    assert plan["retried"] and len(ev) == 1 and ev[0]["sql_source"] == "spec"
-    assert ev[0]["query_id"] is None
-    assert calls[1][0] == ('SELECT MAX("value") AS "m", COUNT(*) AS "rows_aggregated", '
-                           'MIN("period") AS "first_period", MAX("period") AS "last_period" FROM "prices"')
-    assert calls[1][2] == {"prices"}
+    assert plan["retried"] and len(ev) == 1 and ev[0]["sql_source"] == "catalog"
+    assert ev[0]["query_id"] == "avg_price" and calls[1] == (AVG_SQL, {"c": "Cu"}, {"prices"})
+
+
+async def test_retry_may_not_change_a_value_not_shown_invalid(patched):
+    calls, results = patched
+    results.append(SqlResult(sql="", error="timeout"))
+    router = FakeRouter({"table_query_select": [
+        {"needed": True, "calls": [{"table": "prices", "query_id": "avg_price", "params": {"c": "Cu"}}]},
+        {"needed": True, "calls": [{"table": "prices", "query_id": "avg_price", "params": {"c": "Copper"}}]}]})
+    ev, plan = await _go(router)
+    assert len(calls) == 1 and ev == []
+    assert any("changes commodity" in (c.get("error") or "") for c in plan["calls"])
 
 
 async def test_model_written_sql_is_never_run(patched):
@@ -124,19 +147,75 @@ async def test_model_written_sql_is_never_run(patched):
     ]})
     ev, plan = await _go(router)
     assert ev == [] and calls == []
-    assert "neither query_id nor query" in plan["calls"][0]["error"]
-    assert "does not compile" in plan["calls"][1]["error"]
+    assert all("Inline SQL or a query spec is refused" in c["error"] for c in plan["calls"])
 
 
-async def test_empty_result_also_retries_and_only_once(patched):
-    _, results = patched
-    results.extend([SqlResult(sql="", columns=["avg_value"]), SqlResult(sql="", columns=["avg_value"])])
+async def test_inline_spec_is_refused_even_with_a_valid_query_id(patched):
+    calls, _ = patched
     router = FakeRouter({"table_query_select": [
-        {"needed": True, "calls": [{"table": "prices", "query_id": "avg_price", "params": {"c": "Zinc"}}]},
-        {"needed": True, "calls": [{"table": "prices", "query_id": "avg_price", "params": {"c": "zinc"}}]},
-    ]})
+        {"needed": True, "calls": [{"table": "prices", "query_id": "avg_price", "params": {"c": "Copper"},
+                                    "sql": "SELECT * FROM prices"}]},
+        {"needed": False}]})
     ev, plan = await _go(router)
-    assert ev == [] and plan["retried"] and len(router.calls) == 2   # no third call
+    assert ev == [] and calls == [] and "refused (found: sql)" in plan["calls"][0]["error"]
+
+
+async def test_query_id_resolves_only_within_the_named_table(patched):
+    calls, _ = patched
+    router = FakeRouter({"table_query_select": [
+        {"needed": True, "calls": [{"table": "companies", "query_id": "avg_price", "params": {"c": "Copper"}}]},
+        {"needed": False}]})
+    ev, plan = await _go(router)
+    assert ev == [] and calls == [] and plan["calls"][0]["error"]
+
+
+async def test_zero_rows_is_a_valid_result_and_not_retried(patched):
+    calls, results = patched
+    results.append(SqlResult(sql="", columns=["avg_value"]))
+    router = FakeRouter({"table_query_select": [
+        {"needed": True, "calls": [{"table": "prices", "query_id": "avg_price", "params": {"c": "Copper"}}]}]})
+    _ev, plan = await _go(router)
+    assert len(router.calls) == 1 and not plan["retried"] and len(calls) == 1
+    assert plan["calls"][0].get("error") is None
+
+
+async def test_retry_that_broadens_the_question_is_refused(patched):
+    calls, results = patched
+    results.append(SqlResult(sql="", error="timeout"))
+    router = FakeRouter({"table_query_select": [
+        {"needed": True, "calls": [{"table": "prices", "query_id": "avg_price", "params": {"c": "Copper"}}]},
+        {"needed": True, "calls": [{"table": "prices", "query_id": "commodity_counts", "params": {}}]}]})
+    ev, plan = await _go(router)
+    assert len(calls) == 1 and ev == []                    # the broader retry never ran
+    assert any("cannot filter commodity" in (c.get("error") or "") for c in plan["calls"])
+
+
+async def test_explicit_no_match_reaches_the_answer(patched):
+    calls, _ = patched
+    router = FakeRouter({"table_query_select": [
+        {"needed": True, "calls": [], "no_match": [{"part": "copper margin", "reason": "no stored query"}]}]})
+    ev, plan = await _go(router)
+    assert calls == [] and plan["no_match"][0]["part"] == "copper margin"
+    assert any("copper margin" in e["text"] for e in ev)
+
+
+async def test_unverified_catalog_is_unavailable_with_the_rebuild_action(patched, monkeypatch):
+    import copy
+
+    calls, _ = patched
+    stale = copy.deepcopy(META)
+    stale["catalog_version"] = None
+
+    async def cands(*a, **k):
+        return [{"id": NODE, "table": "prices", "meta": stale, "score": 2.0, "via": ["entity:1"]}]
+
+    monkeypatch.setattr(rs, "candidate_tables", cands)
+    router = FakeRouter({"table_query_select": [
+        {"needed": True, "calls": [{"table": "prices", "query_id": "avg_price", "params": {"c": "Copper"}}]},
+        {"needed": False}]})
+    _ev, plan = await _go(router)
+    assert calls == [] and plan["unavailable"]
+    assert any("table-metadata-refine --table prices --relink" in a for a in plan["unavailable_action"])
 
 
 async def test_unknown_query_id_is_a_failure_not_a_crash(patched):
@@ -147,13 +226,13 @@ async def test_unknown_query_id_is_a_failure_not_a_crash(patched):
     ]})
     ev, plan = await _go(router)
     assert ev == [] and calls == [] and plan["retried"]
-    assert "unknown query_id" in plan["calls"][0]["error"]
+    assert "'nope' is not a stored query" in plan["calls"][0]["error"]
 
 
 async def test_lookup_may_read_its_partner_table(patched):
     calls, _ = patched
     router = FakeRouter({"table_query_select": [
-        {"needed": True, "calls": [{"table": "companies", "query_id": "company_prices", "params": {}}]}]})
+        {"needed": True, "calls": [{"table": "prices", "query_id": "company_prices", "params": {}}]}]})
     ev, _ = await _go(router)
     assert calls[0][2] == {"prices", "companies"} and ev[0]["table"] == "prices"
 
@@ -247,6 +326,19 @@ def test_compared_values_finds_literals_params_and_in_lists():
         == [{"table": "prices", "column": "commodity", "value": "Iron ore", "context": []}]
 
 
+def test_stored_query_literals_are_not_value_checked():
+    """A stored query's fixed ``IN (...)`` list is set membership from its tested
+    definition: checking each literal under the bound filters refused valid calls
+    (an item that exists in only one of the listed units)."""
+    cols = {"obs": {"item": "text", "unit": "text", "value": "numeric"}}
+    sql = ("SELECT value FROM obs WHERE unit IN ('u1', 'u2', 'u3') "
+           "AND (CAST(:item AS text) IS NULL OR item = CAST(:item AS text)) AND unit = CAST(:unit AS text)")
+    got = rs.compared_values(sql, {"item": "A", "unit": "u1"}, cols, {"obs": {"item"}}, bound_only=True)
+    assert sorted((c["column"], c["value"]) for c in got) == [("item", "A"), ("unit", "u1")]
+    every = rs.compared_values(sql, {"item": "A", "unit": "u1"}, cols, {"obs": {"item"}})
+    assert {c["value"] for c in every} == {"A", "u1", "u2", "u3"}       # default still lists literals
+
+
 async def test_missing_value_is_refused_before_the_query_runs_and_retried(patched, monkeypatch):
     calls, _ = patched
     seen = []
@@ -284,10 +376,10 @@ async def test_one_absent_value_of_a_list_keeps_the_rest(monkeypatch):
 
 async def test_identical_retry_result_is_deduplicated(patched):
     _, results = patched
-    # 1st: Copper succeeds (default), Zinc comes back empty -> retry, which
-    # repeats Copper (identical SQL + params) and fixes Zinc.
+    # 1st: Copper succeeds, Zinc fails -> retry, which repeats Copper
+    # (identical SQL + params) and runs Zinc again.
     results.extend([SqlResult(sql="", columns=["avg_value"], rows=[["8500"]], row_count=1),
-                    SqlResult(sql="", columns=["avg_value"])])
+                    SqlResult(sql="", error="timeout")])
     router = FakeRouter({"table_query_select": [
         {"needed": True, "calls": [
             {"table": "prices", "query_id": "avg_price", "params": {"c": "Copper"}},
@@ -301,7 +393,7 @@ async def test_identical_retry_result_is_deduplicated(patched):
     assert [e["rank"] for e in ev] == [1, 2]
 
 
-async def test_empty_result_retry_gets_existing_combinations(patched, monkeypatch):
+async def test_empty_result_is_an_answer_not_a_retry(patched, monkeypatch):
     _, results = patched
     results.append(SqlResult(sql="", columns=["avg_value"]))       # empty, values all exist
 
@@ -319,8 +411,7 @@ async def test_empty_result_retry_gets_existing_combinations(patched, monkeypatc
         {"needed": False},
     ]})
     _, plan = await _go(router)
-    assert plan["retried"] and "($/dmtu)" in router.calls[1][1]
-    assert plan["calls"][0]["value_combinations"][0]["where"] == {"commodity": "Iron ore, cfr spot"}
+    assert not plan["retried"] and len(router.calls) == 1
 
 
 def test_carried_sql_evidence_reaches_the_final_round():
@@ -355,8 +446,7 @@ async def test_listing_call_gets_the_listing_budget_and_compact_rows(patched, mo
 
     monkeypatch.setattr(rs, "run_sql", fake_run)
     router = FakeRouter({"table_query_select": [{"needed": True, "calls": [
-        {"table": "prices", "listing": True, "purpose": "all prices",
-         "query": {"select": ["commodity", "period", "value"]}, "params": {}}]}]})
+        {"table": "prices", "listing": True, "query_id": "all_prices", "params": {}}]}]})
     ev, plan = await _go(router, max_rows=50, listing_max_rows=2000, listing_char_cap=60000)
     assert seen["max_rows"] == 2000 and plan["calls"][0]["listing"]
     e = ev[0]
@@ -364,8 +454,8 @@ async def test_listing_call_gets_the_listing_budget_and_compact_rows(patched, mo
     assert "LISTING, 120 row(s)" in e["text"] and "commodity | period | value ;; c0 | 2024 | 100" in e["text"]
     assert "c119 | 2024 | 219" in e["text"]                      # every row fits the listing budget
     ev2, _ = await _go(FakeRouter({"table_query_select": [{"needed": True, "calls": [
-        {"table": "prices", "listing": True, "query": {"select": ["commodity", "period", "value"]},
-         "params": {}}]}]}), listing_char_cap=600)
+        {"table": "prices", "listing": True, "query_id": "all_prices", "params": {}}]}]}),
+        listing_char_cap=600)
     assert "more in the returned data" in ev2[0]["text"]          # shown part is cut; data is not
     assert len(ev2[0]["rows"]) == 120
 
@@ -389,8 +479,7 @@ async def test_chained_call_takes_its_param_from_an_earlier_result(patched):
     results.append(SqlResult(sql="", columns=["commodity", "n"], rows=[["Copper", "3"], ["Zinc", "2"]],
                              row_count=2))
     router = FakeRouter({"table_query_select": [{"needed": True, "calls": [
-        {"table": "prices", "purpose": "which commodities",
-         "query": {"select": ["commodity", {"agg": "count", "as": "n"}]}, "params": {}},
+        {"table": "prices", "query_id": "commodity_counts", "params": {}},
         {"table": "prices", "query_id": "avg_price",
          "params": {"c": {"from_call": 1, "column": "commodity"}}}]}]})
     ev, plan = await _go(router)

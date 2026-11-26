@@ -157,7 +157,7 @@ async def test_refine_defines_measures_tests_queries_and_caches(db, tmp_path):
 
     cache = await _load(tmp_path)
     router = FakeRouter({"table_refine": [REFINE_REPLY, REPAIR_REPLY]})
-    reps = await refine_registered(router, cache=cache, embed=_fake_embed, log=lambda *_: None)
+    reps = await refine_registered(router, verify=False, cache=cache, embed=_fake_embed, log=lambda *_: None)
     assert [c[0] for c in router.calls] == ["table_refine", "table_refine"]     # define + one repair
     rep = reps[0]
     assert rep["measures"] == ["measure_sales"]
@@ -193,7 +193,8 @@ async def test_refine_defines_measures_tests_queries_and_caches(db, tmp_path):
 
     # second run: already refined -> no LLM call; the cache carries it too
     again = FakeRouter({})
-    assert await refine_registered(again, cache=cache, embed=_fake_embed, log=lambda *_: None) == []
+    assert await refine_registered(again, verify=False, cache=cache, embed=_fake_embed,
+                                   log=lambda *_: None) == []
     assert again.calls == []
     # relink rebuilds the measure queries from their definitions, still no LLM
     sql_before = meta["measures"][0]["sql"]

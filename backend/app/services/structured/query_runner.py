@@ -1,10 +1,11 @@
 """Build and run a table query with no LLM (CLI ``table-query``).
 
-Given a loaded table and either a stored item id (metric/filter/query/lookup)
-or a JSON query spec, plus parameter values: compile the spec to SQL with
-:mod:`query_builder`, then run it through the guard (read-only transaction,
-statement timeout, row cap). Retrieval uses the same two steps after the
-model has picked a query and its parameter values.
+Given a loaded table and either a stored item id (metric/filter/query/lookup/
+measure) or a JSON query spec, plus parameter values. A stored id runs its
+VERIFIED stored SQL exactly as retrieval does (refused, with the rebuild
+action, when it is not verified); a spec is an operator diagnostic, compiled
+with :mod:`query_builder`. Both run through the guard (read-only transaction,
+statement timeout, row cap).
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from backend.app.services.structured.metadata import column_types, compile_item, find_item, items
+from backend.app.services.structured.metadata import column_types, find_item, items
 from backend.app.services.structured.query_builder import Built, build_sql
 from backend.app.services.structured.sql_exec import SqlResult, run_sql
 
@@ -64,9 +65,20 @@ async def prepare(table: str, *, query_id: str | None = None, spec: dict | None 
             ids = ", ".join(it["id"] for _s, it in items(meta))
             raise QueryRunError(f"no stored query {query_id!r} in {table} (ids: {ids})")
         section, item = hit
-        built = compile_item(meta, section, item, types, totals=totals)
-        declared = item.get("params") if isinstance(item.get("query"), dict) else built.params
-        return QueryRun(table=table, query_id=query_id, built=built, declared=declared or [])
+        # Same as retrieval: the exact SQL ingestion verified, never a recompile.
+        from backend.app.services.structured.metadata import item_tables, rebuild_action, selectable
+
+        # a person running one stored query by hand may run one that awaits its
+        # semantic review (retrieval may not); the data test still applies
+        ok, why = selectable(meta, item, semantic=False)
+        if not ok:
+            raise QueryRunError(f"stored query {query_id!r} is unavailable: {why}. "
+                                f"Rebuild: {rebuild_action(table, why)}")
+        built = Built(sql=item["sql"], params=list(item["params"]),
+                      tables=set(item.get("tables") or item_tables(meta, section, item)),
+                      empty_excluded=list(item.get("empty_excluded") or []),
+                      added_conditions=list(item.get("added_conditions") or []))
+        return QueryRun(table=table, query_id=query_id, built=built, declared=list(item["params"]))
     from backend.app.services.structured.metadata import time_columns
 
     built = build_sql(spec, table, types, time_columns={table: time_columns(meta)}, totals=totals)
@@ -76,6 +88,14 @@ async def prepare(table: str, *, query_id: str | None = None, spec: dict | None 
 async def run(table: str, params: dict[str, Any], *, query_id: str | None = None,
               spec: dict | None = None, max_rows: int = 50, timeout_ms: int = 5000) -> QueryRun:
     qr = await prepare(table, query_id=query_id, spec=spec)
+    if query_id is not None:
+        from backend.app.services.structured.value_domains import validate_call_params
+
+        params, bad, _subs = validate_call_params(params, qr.declared)
+        if bad:
+            raise QueryRunError("parameter value(s) refused: " + "; ".join(
+                f"{b.get('param') or b.get('combination')}: {b.get('error') or 'not a valid value'}"
+                for b in bad))
     missing = [p["name"] for p in qr.built.params if p["name"] not in params and not p.get("optional")]
     if missing:
         raise QueryRunError(f"missing --param value(s): {', '.join(missing)}")

@@ -22,6 +22,14 @@ Identical inputs, so only the model (and its own prompt version) differs:
     the arm's model + prompt_set. The audit log (llm_audit.jsonl) holds every
     parsed reply; costs/ holds tokens, seconds and finish reasons per task.
 
+OpenAI arms (any preset whose summary models already filled the cache):
+    --preset config/models.yaml --provider openai --stage1-provider openai \
+    --stage1-model gpt-6-luna [--reasoning-effort low] [--stream] --summary-model real
+  `--summary-model real` keeps the preset's own summary models (their cache
+  keys then match the run that made the summaries); check the costs/ dump
+  shows $0 for every summary task. `--reasoning-effort` sets class_proposal's
+  optional OpenAI `reasoning_effort` (left out = the model's default).
+
 PAID: Stage 2 calls (and Stage 1 when recording).
 """
 from __future__ import annotations
@@ -50,17 +58,30 @@ def _arg(argv, name, default=None):
     return argv[argv.index(name) + 1] if name in argv and argv.index(name) + 1 < len(argv) else default
 
 
-def render_models(out: Path, class_model: str, prompt_set: str, stage1_model: str) -> Path:
+def render_models(out: Path, class_model: str, prompt_set: str, stage1_model: str, *,
+                  preset: str = "config/models.deepinfra.example.yaml", provider: str = "deepinfra",
+                  stage1_provider: str = "deepinfra", placeholder_summaries: bool = True,
+                  reasoning_effort: str | None = None, stream: bool | None = None) -> Path:
     import yaml
 
-    doc = yaml.safe_load((ROOT / "config" / "models.deepinfra.example.yaml").read_text())
+    doc = yaml.safe_load((ROOT / preset).read_text())
     t = doc["tasks"]
-    for name in SUMMARY_TASKS:
-        if name in t:
-            t[name]["model"] = PLACEHOLDER
-    t["chunk_classification"].update({"provider": "deepinfra", "model": stage1_model})
+    if placeholder_summaries:
+        for name in SUMMARY_TASKS:
+            if name in t:
+                t[name]["model"] = PLACEHOLDER
+    t["chunk_classification"].update({"provider": stage1_provider, "model": stage1_model})
     t["chunk_classification"].pop("prompt_set", None)
-    t["class_proposal"].update({"provider": "deepinfra", "model": class_model, "prompt_set": prompt_set})
+    t["class_proposal"].update({"provider": provider, "model": class_model})
+    if prompt_set and prompt_set != "default":
+        t["class_proposal"]["prompt_set"] = prompt_set
+    else:
+        t["class_proposal"].pop("prompt_set", None)
+    t["class_proposal"].pop("reasoning_effort", None)
+    if reasoning_effort and reasoning_effort != "default":
+        t["class_proposal"]["reasoning_effort"] = reasoning_effort
+    if stream is not None:
+        t["class_proposal"]["stream"] = stream
     for name, spec in t.items():            # any other dedicated-model task: unused here
         if "__DEEPINFRA_FLASH_MODEL__" in str(spec.get("model", "")):
             spec["model"] = PLACEHOLDER
@@ -87,8 +108,15 @@ def main(argv: list[str]) -> int:
     (out / "pe").mkdir(parents=True)
     (out / "costs").mkdir()
 
+    real_summaries = _arg(argv, "--summary-model") == "real"
     models = render_models(out, _arg(argv, "--class-model"), _arg(argv, "--prompt-set"),
-                           _arg(argv, "--stage1-model", "deepseek-ai/DeepSeek-V4.1-Flash"))
+                           _arg(argv, "--stage1-model", "deepseek-ai/DeepSeek-V4.1-Flash"),
+                           preset=_arg(argv, "--preset", "config/models.deepinfra.example.yaml"),
+                           provider=_arg(argv, "--provider", "deepinfra"),
+                           stage1_provider=_arg(argv, "--stage1-provider", "deepinfra"),
+                           placeholder_summaries=not real_summaries,
+                           reasoning_effort=_arg(argv, "--reasoning-effort"),
+                           stream=True if "--stream" in argv else None)
     app_cfg = out / "config.yaml"
     shutil.copy(ROOT / "config" / "config.yaml", app_cfg)
     from tpm_check import apply_concurrency
@@ -103,10 +131,11 @@ def main(argv: list[str]) -> int:
     import backend.app.services.evaluated_summarizer as es
     import backend.app.services.pipeline_llm as pl
 
-    old = _arg(argv, "--summary-model")
-    ek, dk = es._cache_key, pl._doc_summary_cache_key
-    es._cache_key = lambda text, model, *a: ek(text, old if model == PLACEHOLDER else model, *a)
-    pl._doc_summary_cache_key = lambda text, model: dk(text, old if model == PLACEHOLDER else model)
+    if not real_summaries:
+        old = _arg(argv, "--summary-model")
+        ek, dk = es._cache_key, pl._doc_summary_cache_key
+        es._cache_key = lambda text, model, *a: ek(text, old if model == PLACEHOLDER else model, *a)
+        pl._doc_summary_cache_key = lambda text, model: dk(text, old if model == PLACEHOLDER else model)
 
     stage1 = json.loads(stage1_path.read_text()) if stage1_path.exists() else {}
     if not record and not stage1:

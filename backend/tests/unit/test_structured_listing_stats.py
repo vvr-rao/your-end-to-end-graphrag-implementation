@@ -83,7 +83,7 @@ def test_testset_flag_and_trace_carry_structured_calls():
     res = SimpleNamespace(evidence=[], answer="a", retrieval_run_id=None,
                           parsed={"structured_data": {"calls": [call]}})
     tr = trace_from_result("q", res)
-    assert tr["structured_calls"] == [{k: v for k, v in call.items() if k != "sql"}]
+    assert tr["structured_calls"] == [call]          # the SQL that ran is kept for diagnosis
 
 
 def test_report_rows_keep_the_structured_calls():

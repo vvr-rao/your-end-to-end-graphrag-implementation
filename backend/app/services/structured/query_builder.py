@@ -20,12 +20,15 @@ Spec shape::
                                          # "optional": true on a single-param filter: a null /
                                          # omitted value drops the filter (every value)
       "group_by": [COL],                 # optional: derived from select
-      "order_by": [{"column": COL | "alias", "dir": "asc|desc"}],
+      "order_by": [{"column": COL | "alias", "dir": "asc|desc",
+                    "nulls": "first|last"}],   # default: desc -> NULLS LAST
       "limit":    10 | {"param": "n"}
     }
 
     COL = "name" | "table.name" | {"column": "name", "table": "t", "fn": "year|month|quarter|lower"}
-    OP  = = != < <= > >= between in contains ilike is_null not_null
+    OP  = = != < <= > >= between in not_in contains ilike is_null not_null
+          (not_in: literal values only -- a population exclusion; NULL is kept
+           out of an exclusion, i.e. NULL rows stay)
 
 Parameter types are taken from the column the parameter is compared with,
 and every parameter is bound (``:name``) and cast, never pasted into the SQL.
@@ -55,7 +58,7 @@ AGGS = {"sum": "SUM", "avg": "AVG", "min": "MIN", "max": "MAX", "count": "COUNT"
         "count_distinct": "COUNT"}
 FNS = {"year": "integer", "month": "integer", "quarter": "integer", "lower": "text"}
 COMPARE = {"=": "=", "!=": "<>", "<>": "<>", "<": "<", "<=": "<=", ">": ">", ">=": ">="}
-OPS = set(COMPARE) | {"between", "in", "contains", "ilike", "is_null", "not_null"}
+OPS = set(COMPARE) | {"between", "in", "not_in", "contains", "ilike", "is_null", "not_null"}
 MAX_LIMIT = 1000
 _NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 _SPEC_KEYS = {"from", "select", "distinct", "distinct_on", "join", "where", "group_by", "order_by", "limit"}
@@ -73,6 +76,9 @@ class Built:
     # Output columns of a listing (DISTINCT / DISTINCT ON / GROUP BY keys)
     # whose rows are left out when every key is empty (NULL or '').
     empty_excluded: list[str] = field(default_factory=list)
+    # WHERE conditions the compiler added on its own (total rows vs parts,
+    # empty listing keys) -- not written in the spec.
+    added_conditions: list[str] = field(default_factory=list)
 
 
 def _q(ident: str) -> str:
@@ -248,6 +254,13 @@ def _where(ctx: _Ctx, cond: dict) -> str:
             raise QuerySpecError(f"between on '{out}' needs two params, e.g. [\"start\", \"end\"]")
         lo, hi = ((ctx.param(p, ctype, out) for p in pair) if has_param else (_lit(v) for v in pair))
         return f"{sql} BETWEEN {lo} AND {hi}"
+    if op == "not_in":
+        if has_param:
+            raise QuerySpecError(f"not_in on '{out}' takes literal values (a fixed exclusion), not a param")
+        vals = cond["value"] if isinstance(cond["value"], list) else [cond["value"]]
+        if not vals:
+            raise QuerySpecError(f"not_in on '{out}' needs at least one value")
+        return f"({sql} IS NULL OR {sql} NOT IN ({', '.join(_lit(v) for v in vals)}))"
     if op == "in":
         if has_param and cond.get("optional"):
             rhs = ctx.param(cond["param"], ctype + "[]", out, optional=True)
@@ -363,6 +376,28 @@ def _empty_key_condition(ctx: _Ctx, spec: dict, keys: list) -> tuple[str | None,
     return f"COALESCE({', '.join(parts)}) IS NOT NULL", names
 
 
+def _all_empty_expr(ctx: _Ctx, selected: list, keys: set[str]) -> str | None:
+    """SQL that is TRUE when every selected value column (numbers first; any
+    non-key column when none is a number) is empty on a row."""
+    refs = []
+    for raw in selected:
+        try:
+            sql, ctype, _t, _o = ctx.ref(raw)
+        except QuerySpecError:
+            continue
+        if sql not in keys and all(sql != r[0] for r in refs):
+            refs.append((sql, ctype))
+    nums = [r for r in refs if r[1] in {"integer", "numeric"}]
+    refs = nums or refs
+    if not refs:
+        return None
+    if len(refs) == 1:
+        sql, ctype = refs[0]
+        return f"(NULLIF({sql}, '') IS NULL)" if ctype == "text" else f"({sql} IS NULL)"
+    parts = [f"NULLIF({sql}, '')" if ctype == "text" else f"CAST({sql} AS text)" for sql, ctype in refs]
+    return f"(COALESCE({', '.join(parts)}) IS NULL)"
+
+
 def build_sql(spec: dict, table: str, columns: dict[str, dict[str, str]], *,
               time_columns: dict[str, list[str]] | None = None,
               totals: dict[str, dict[str, Any]] | None = None) -> Built:
@@ -436,7 +471,8 @@ def build_sql(spec: dict, table: str, columns: dict[str, dict[str, str]], *,
             conds.append(f"{_q(table)}.{_q(a)} = {_q(ctx.other)}.{_q(b)}")
         sql += f" JOIN {_q(ctx.other)} ON " + " AND ".join(conds)
 
-    where = [_where(ctx, c) for c in spec.get("where") or []] + _total_conditions(ctx, spec)
+    added = _total_conditions(ctx, spec)
+    where = [_where(ctx, c) for c in spec.get("where") or []] + added
     if distinct_on:
         keys = list(spec.get("distinct_on") or [])
     elif has_agg:
@@ -449,6 +485,7 @@ def build_sql(spec: dict, table: str, columns: dict[str, dict[str, str]], *,
     empty_cond, empty_excluded = _empty_key_condition(ctx, spec, keys)
     if empty_cond:
         where.append(empty_cond)
+        added = [*added, empty_cond]
     if where:
         sql += " WHERE " + " AND ".join(where)
 
@@ -480,7 +517,10 @@ def build_sql(spec: dict, table: str, columns: dict[str, dict[str, str]], *,
                 else:
                     raise QuerySpecError(f"order_by {col!r}: in an aggregate query order by a "
                                          "selected/grouped column or an aggregate alias")
-        order.append(f"{expr} {d.upper()}" + (" NULLS LAST" if d == "desc" else ""))
+        nulls = str(o.get("nulls") or ("last" if d == "desc" else "")).lower()
+        if nulls not in {"", "first", "last"}:
+            raise QuerySpecError(f"nulls must be first or last (got {nulls!r})")
+        order.append(f"{expr} {d.upper()}" + (f" NULLS {nulls.upper()}" if nulls else ""))
     if distinct_on:
         # Postgres: DISTINCT ON expressions must lead the ORDER BY.
         lead = []
@@ -489,7 +529,11 @@ def build_sql(spec: dict, table: str, columns: dict[str, dict[str, str]], *,
             if hit is not None:
                 order.remove(hit)
             lead.append(hit or f"{e} ASC")
-        order = lead + order
+        # A row whose selected values are ALL empty is never the one to keep:
+        # it goes after every row that has one (then the spec's own order).
+        empty = _all_empty_expr(ctx, [r for r in sel if not (isinstance(r, dict) and r.get("agg"))],
+                                set(distinct_on))
+        order = lead + ([f"{empty} ASC"] if empty else []) + order
     if order:
         sql += " ORDER BY " + ", ".join(order)
 
@@ -502,7 +546,7 @@ def build_sql(spec: dict, table: str, columns: dict[str, dict[str, str]], *,
         else:
             raise QuerySpecError(f"limit must be 1..{MAX_LIMIT} or {{\"param\": \"n\"}}")
     return Built(sql=sql, params=list(ctx.params.values()), tables=set(ctx.tables),
-                 empty_excluded=empty_excluded)
+                 empty_excluded=empty_excluded, added_conditions=added)
 
 
 def merge_params(built: Built, declared: list[dict] | None) -> list[dict]:
@@ -516,7 +560,11 @@ def merge_params(built: Built, declared: list[dict] | None) -> list[dict]:
         out.append({"name": p["name"], "type": p["type"], "column": p["column"] or None,
                     "description": str(d.get("description") or ""),
                     "example": None if ex in (None, "") else (ex if isinstance(ex, list) else str(ex)),
-                    **({"optional": True} if p.get("optional") else {})})
+                    **({"optional": True} if p.get("optional") else {}),
+                    # the value domain measured on the loaded table stays while
+                    # the parameter still reads the same column
+                    **({k: d[k] for k in ("allowed_values", "range") if k in d}
+                       if d.get("column") == (p["column"] or None) else {})})
     return out
 
 
@@ -553,3 +601,104 @@ def example_value(ptype: str):
     v = {"integer": 1, "numeric": 1, "date": date(2000, 1, 1).isoformat(),
          "timestamp": "2000-01-01T00:00:00", "boolean": True}.get(base, "x")
     return [v] if ptype.endswith("[]") else v
+
+
+# ------------------------------------------------------------------ parameter names
+
+
+def safe_param_name(name: Any, column: str | None, taken: set[str]) -> str:
+    """A stable bind-parameter name: snake_case, starts with a letter, not an
+    SQL key word (then ``<name>_<column>``, else ``<name>_value``), unique
+    among ``taken`` (``_2``, ``_3``...). The same input always gives the same
+    output for the same ``taken`` set."""
+    base = re.sub(r"[^a-z0-9_]+", "_", str(name or "").lstrip(":").lower()).strip("_") or "param"
+    if not base[0].isalpha():
+        base = f"p_{base}"
+    if base in PG_RESERVED:
+        col = re.sub(r"[^a-z0-9_]+", "_", str(column or "").lower()).strip("_")
+        base = f"{base}_{col}" if col and col != base else f"{base}_value"
+    base = base[:56]
+    out, i = base, 2
+    while out in taken:
+        out, i = f"{base}_{i}", i + 1
+    return out
+
+
+def _where_params(spec: dict) -> list[tuple[dict, str | None]]:
+    """(where entry, its column name) for every entry binding a param."""
+    out = []
+    for w in spec.get("where") or []:
+        if isinstance(w, dict) and w.get("param") not in (None, ""):
+            c = w.get("column")
+            out.append((w, c if isinstance(c, str) else (c or {}).get("column")))
+    return out
+
+
+def sanitize_param_names(item: dict) -> dict[str, str]:
+    """Rename unsafe/reserved/colliding bind parameters of an item's query
+    spec BEFORE compilation, and carry each rename through everything that
+    names the parameter: the spec (where params, between pairs, limit), the
+    declared params, examples and allowed combinations. Returns
+    {old: new} (empty when nothing changed); renames are also recorded on the
+    item (``param_renames``)."""
+    spec = item.get("query")
+    if not isinstance(spec, dict):
+        return {}
+    split: dict[str, str] = {}
+    for w, _col in _where_params(spec):
+        # a range given ONE param name: two bounds <name>_from / <name>_to
+        if str(w.get("op") or "").lower() == "between" and isinstance(w["param"], str):
+            one = w["param"].lstrip(":")
+            w["param"] = [f"{one}_from", f"{one}_to"]
+            split[one] = f"{one}_from,{one}_to"
+            decl = [p for p in item.get("params") or [] if isinstance(p, dict)
+                    and str(p.get("name") or "").lstrip(":") == one]
+            if decl:
+                item["params"] = [p for p in item["params"] if p not in decl] + [
+                    {**decl[0], "name": f"{one}_from"}, {**decl[0], "name": f"{one}_to"}]
+    names: list[tuple[str, str | None]] = []
+    for w, col in _where_params(spec):
+        ps = w["param"] if isinstance(w["param"], list) else [w["param"]]
+        names += [(str(p).lstrip(":"), col) for p in ps if isinstance(p, str)]
+    lim = spec.get("limit")
+    if isinstance(lim, dict) and isinstance(lim.get("param"), str):
+        names.append((lim["param"].lstrip(":"), None))
+    ren: dict[str, str] = {}
+    taken: set[str] = set()
+    good = {n for n, _c in names if _NAME.match(n) and n.lower() not in PG_RESERVED and n == n.lower()}
+    for n, col in names:
+        if n in ren or n in taken:
+            continue
+        if n in good:
+            taken.add(n)
+            continue
+        new = safe_param_name(n, col, taken | (good - {n}))
+        ren[n] = new
+        taken.add(new)
+    if not ren:
+        if split:
+            item["param_renames"] = {**(item.get("param_renames") or {}), **split}
+        return split
+
+    def _r(p):
+        if isinstance(p, list):
+            return [_r(x) for x in p]
+        return ren.get(str(p).lstrip(":"), p) if isinstance(p, str) else p
+
+    for w, _c in _where_params(spec):
+        w["param"] = _r(w["param"])
+    if isinstance(lim, dict) and lim.get("param"):
+        lim["param"] = _r(lim["param"])
+    for p in item.get("params") or []:
+        if isinstance(p, dict) and str(p.get("name") or "").lstrip(":") in ren:
+            p["name"] = ren[str(p["name"]).lstrip(":")]
+    for ex in item.get("examples") or []:
+        if isinstance(ex, dict) and isinstance(ex.get("params"), dict):
+            from backend.app.services.structured.metadata import rename_params
+
+            ex["params"] = rename_params(ex["params"], ren)
+    combos = item.get("allowed_combinations")
+    if isinstance(combos, dict) and isinstance(combos.get("params"), list):
+        combos["params"] = [ren.get(k, k) for k in combos["params"]]
+    item["param_renames"] = {**(item.get("param_renames") or {}), **split, **ren}
+    return {**split, **ren}

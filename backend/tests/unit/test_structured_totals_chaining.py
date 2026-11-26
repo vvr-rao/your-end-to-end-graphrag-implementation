@@ -121,6 +121,17 @@ META = {
 ITYPES = {"items": {"item_id": "text", "source_file": "text", "item_name": "text", "kind": "text", "n": "integer"}}
 
 
+async def test_guard_allows_a_name_whose_words_the_question_states_in_any_order():
+    """An identifier that is a multi-word NAME is stated by the question when
+    all its significant words are, whatever their order."""
+    sql = "SELECT n FROM items WHERE item_id = CAST(:id AS text)"
+    kw = {"types": ITYPES, "metas": {"items": META}, "seen_values": set()}
+    assert await identifier_guard(sql, {"id": "Crude oil, Brent"},
+                                  question="What was the annual Brent crude oil price?", **kw) == []
+    # (a name with a word the question lacks goes on to the row check -- the
+    # DB-backed tests below cover what that check refuses)
+
+
 def test_entity_id_columns_skip_few_valued_identifiers():
     assert entity_id_columns(META) == {"item_id"}
     assert name_columns(META, "item_id") == ["item_name"]     # 'kind' has 3 values: not a name
@@ -240,6 +251,17 @@ async def test_guard_refuses_a_guessed_id_and_says_what_it_is(pg):
     out = await identifier_guard(sql, {"id": "ID099"}, question="Which sites did SURVEY-2 have?",
                                  seen_values=set(), types=types, metas={"t_items": meta})
     assert out and out[0]["value"] == "ID099"
+    # a NAME-like id carries its own distinctive word: 'Brent' names one row
+    # even though the question omits 'crude'; 'oil' alone (shared) would not
+    async with pg() as s:
+        await s.execute(text("INSERT INTO graphrag.t_items VALUES ('Crude oil, Brent', 'misc a', 0), "
+                             "('Crude oil, WTI', 'misc b', 0), ('Palm oil', 'misc c', 0)"))
+    kw = {"seen_values": set(), "types": types, "metas": {"t_items": meta}}
+    assert await identifier_guard(sql, {"id": "Crude oil, Brent"},
+                                  question="How did the monthly Brent oil price move?", **kw) == []
+    out = await identifier_guard(sql, {"id": "Crude oil, WTI"},
+                                 question="How did the monthly Brent oil price move?", **kw)
+    assert out and out[0]["value"] == "Crude oil, WTI" and out[0]["row_values"] == ["misc b"]
 
 
 def test_function_words_never_count_as_shared_words():
@@ -418,3 +440,68 @@ def test_evidence_says_empty_values_were_left_out_and_keeps_the_other_notes():
     assert EMPTY_EXCLUDED_NOTE.format(columns="country") in out
     assert UNRANKED_NOTE.format(column="period", rows=1) in out      # a capped result kept it
     assert "Result capped at 2 of 9 rows." in out
+
+
+@db_only
+async def test_one_row_per_key_prefers_a_row_that_has_the_values(pg):
+    from sqlalchemy import text
+
+    from backend.app.services.structured.sql_exec import run_sql
+    async with pg() as s:
+        await s.execute(text("CREATE TABLE IF NOT EXISTS graphrag.t_wide (item text, period text, "
+                             "v_y1 numeric, v_y2 numeric)"))
+        await s.execute(text("DELETE FROM graphrag.t_wide"))
+        # each item has a row without the yearly values (another period) and one with them
+        await s.execute(text("INSERT INTO graphrag.t_wide VALUES ('a','P2',NULL,NULL),('a',NULL,1,2),"
+                             "('b',NULL,3,4),('b','P2',NULL,NULL),('c','P2',NULL,NULL)"))
+    try:
+        b = build_sql({"select": ["item", "v_y1", "v_y2"], "distinct_on": ["item"]}, "t_wide",
+                      {"t_wide": {"item": "text", "period": "text", "v_y1": "numeric", "v_y2": "numeric"}})
+        res = await run_sql(b.sql, {}, {"t_wide"}, max_rows=10, timeout_ms=5000)
+        got = {r[0]: (r[1], r[2]) for r in res.rows}
+        assert got["a"] == ("1", "2") and got["b"] == ("3", "4")
+        assert got["c"] == (None, None)          # no row with values: still listed
+    finally:
+        async with pg() as s:
+            await s.execute(text("DROP TABLE IF EXISTS graphrag.t_wide"))
+
+
+# ------------------------------------------------- typography in pattern values
+
+def test_fold_text_keeps_one_character_per_input_character():
+    from backend.app.services.structured.retrieval_step import fold_text
+    for s in ("C\u00f4te d\u2019Ivoire", "2024\u201325", "A\u00a0B", "\u0130stanbul", "Stra\u00dfe"):
+        assert len(fold_text(s)) == len(s)
+    assert fold_text("C\u00f4te d\u2019Ivoire") == fold_text("cote d'ivoire") == "cote d'ivoire"
+
+
+def test_pattern_values_finds_like_params_but_not_user_wildcards():
+    from backend.app.services.structured.retrieval_step import pattern_values
+    sql = ("SELECT item_id FROM t_items WHERE item_name ILIKE '%' || CAST(:name AS text) || '%' "
+           "AND item_id = CAST(:id AS text)")
+    assert pattern_values(sql, {"name": "x", "id": "ID001"}, {"t_items": ITYPES["items"]}) == [
+        {"table": "t_items", "column": "item_name", "param": "name", "value": "x"}]
+    assert pattern_values(sql, {"name": "x%", "id": "ID001"}, {"t_items": ITYPES["items"]}) == []
+
+
+@db_only
+async def test_pattern_value_is_rewritten_to_the_tables_spelling(pg):
+    """A name copied from a document with a curly apostrophe (or without its
+    accent) finds the table's straight-apostrophe spelling; a value the table
+    does not hold is left alone."""
+    from sqlalchemy import text
+
+    from backend.app.services.structured.retrieval_step import prevalidate_values
+    async with pg() as s:
+        await s.execute(text("INSERT INTO graphrag.t_items VALUES ('ID900', 'C\u00f4te d''Ivoire', 1)"))
+    types = {"t_items": {"item_id": "text", "item_name": "text", "n": "integer"}}
+    sql = "SELECT item_id FROM t_items WHERE item_name ILIKE '%' || CAST(:name AS text) || '%'"
+    for asked in ("C\u00f4te d\u2019Ivoire", "cote d\u2019ivoire", "C\u00f4te d'Ivoire"):
+        params, missing, subs = await prevalidate_values(sql, {"name": asked}, col_types=types)
+        assert not missing
+        async with pg() as s:
+            n = (await s.execute(text("SELECT count(*) FROM graphrag.t_items WHERE item_name ILIKE "
+                                    "'%' || :n || '%'"), {"n": params["name"]})).scalar()
+        assert n == 1, (asked, params, subs)
+    params, missing, subs = await prevalidate_values(sql, {"name": "Atlantis"}, col_types=types)
+    assert params == {"name": "Atlantis"} and subs == []

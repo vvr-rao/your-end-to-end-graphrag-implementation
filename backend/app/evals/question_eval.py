@@ -81,7 +81,9 @@ def trace_from_result(question: str, result: Any) -> dict[str, Any]:
             "evidence_chunk_ids": [str(ev["node_id"]) for ev in chunks],
             **({"structured_calls": [
                 {k: c.get(k) for k in ("table", "query_id", "params", "listing", "row_count", "error",
-                                       "retry", "unranked_rows", "unsupported_identifiers", "from_calls")
+                                       "retry", "unranked_rows", "unsupported_identifiers", "from_calls",
+                                       # what actually ran, to diagnose a wrong answer from the trace
+                                       "sql", "query", "substituted", "missing_values", "empty_excluded")
                  if k in ("table", "query_id", "params", "listing", "row_count", "error") or c.get(k)}
                 for c in (result.parsed.get("structured_data") or {}).get("calls") or []]}
                if (result.parsed.get("structured_data") or {}).get("calls") else {}),

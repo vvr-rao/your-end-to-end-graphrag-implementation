@@ -4208,8 +4208,15 @@ _QUERY_SPEC_RULES = (
     "is count(*). Plain columns in a select that has aggregates are grouped by "
     "automatically. order_by may name a select alias.\n"
     "- Parameter types and casts come from the column they are compared with -- do not "
-    "write casts. Every param is REQUIRED (no optional filters); use a constant \"value\" "
-    "for a fixed filter (e.g. a category column = one of its values).\n"
+    "write casts. A param is REQUIRED unless its where entry (a single = or in) has "
+    "\"optional\": true: left out, that filter is dropped (every value), or, on a column "
+    "whose total rows are listed, the published total rows are read. Use a constant "
+    "\"value\" for a fixed filter (e.g. a category column = one of its values).\n"
+    "- GROUP vs FILTER vs DISPLAY: grouping by a column (a plain column next to an aggregate) "
+    "gives one result per value; a where param on it restricts the population to the given "
+    "value(s); a plain column in a row listing only displays it. One template may group by a "
+    "dimension AND take an optional filter param on it (left out: one result per value; "
+    "given: that value only).\n"
     "- \"params\" lists each parameter once: {\"name\", \"description\", \"example\"}. The "
     "example must be a real value from the profile (keep leading zeros).\n"
     + _QUALIFIER_RULE +
@@ -4245,17 +4252,36 @@ def table_profile(profile_md: str, candidate_classes: list[dict[str, str]]) -> t
         "(free text). unit when evident (USD, $/bbl, %, count). entity_kind when values "
         "name real-world things (the kind of thing, e.g. organization, product, place, "
         "person, ...), else null.\n\n"
-        "METRICS: aggregates worth asking for: totals, averages, MIN/MAX ranges, counts "
-        "per category, latest value, values for two periods to compare. One query each, "
-        "usually parameterised by the main dimension(s) (the entity or item a row is about).\n"
-        "FILTERS: the columns users would filter on (the entity, a place, a date "
-        "range, a category, a status). One query each that returns the matching rows' key "
-        "columns with that filter applied as a parameter.\n"
-        "QUERIES: other useful retrievals: lookup of one record by key, latest rows for "
-        "an entity, time series for an entity, top-N rankings, distinct values of a "
-        "dimension (no params).\n"
-        "Write 4-12 metrics, one filter per filterable column (max 10) and 3-10 queries. "
-        "ids are short snake_case, unique across all three lists.\n\n"
+        "INVENTORY: account for EVERY source column. Identify candidate quantities, "
+        "identifiers, dimensions, periods, units, qualifiers, weights, denominators and "
+        "descriptive fields; a column may have several roles (roles). Consider quantities "
+        "encoded in row VALUES (a low-cardinality indicator column naming what a numeric "
+        "column holds, or a long-format table with many indicators in one column) as well as "
+        "quantities stored in separate numeric columns. Record the evidence for each "
+        "interpretation (column name, values, profile statistics) and flag uncertainty "
+        "(uncertain: true) for the post-load refinement pass, which measures the loaded data.\n"
+        "- candidates: one entry per candidate quantity or coherent indicator family: its "
+        "source columns or the indicator column + values that select it, unit, what one "
+        "observation is, the calculations that are meaningful (value, sum, average, weighted "
+        "average, min/max, count, change), the dimensions it can be grouped by, filtered by or "
+        "only displayed with, how it aggregates across entities and across time (separately), "
+        "the weight, denominator or period rule a ratio, price, percentage, average or "
+        "snapshot needs, and the evidence.\n"
+        "- countables: what one ROW counts, and which distinct things can be counted (distinct "
+        "values of which key columns) -- a row count and a distinct-entity count differ "
+        "whenever an entity has several rows.\n"
+        "- If your output budget runs short, list the candidates you could not describe in "
+        "remaining_candidates (label + source) -- never drop them silently.\n\n"
+        "QUERY CAPABILITIES: for each candidate quantity propose meaningful calculations, "
+        "grouping dimensions and filters the profile supports, as stored queries:\n"
+        "METRICS: a calculation over a quantity, with its grouping columns and filter params.\n"
+        "FILTERS: record discovery / key lookup: the rows matching a filterable column (an "
+        "entity, a place, a date range, a category, a status), returning their key columns.\n"
+        "QUERIES: other retrievals: one record by key, latest rows, a time series, a top-N "
+        "ranking, the distinct values of a dimension.\n"
+        "Cover the candidates; there is no fixed number. ids are short snake_case, unique "
+        "across all three lists. For each item say in \"capability\" what it calculates, "
+        "groups by, filters by and only displays.\n\n"
         "ONTOLOGY CONCEPTS: for each column (except pure keys, free text and row ids) and "
         "each metric/filter give \"concept\": the general KIND of thing it measures or "
         "classifies (a kind of quantity, category, place, period or event), never a "
@@ -4277,10 +4303,19 @@ def table_profile(profile_md: str, candidate_classes: list[dict[str, str]]) -> t
         f"{profile_md}\n\nCANDIDATE CLASSES (IRI | label):\n{menu}\n\n"
         "Return JSON:\n"
         '{"description": "...", "grain": "...",\n'
-        ' "columns": [{"name": "...", "description": "...", "role": "...", "unit": null, '
+        ' "columns": [{"name": "...", "description": "...", "role": "<main role>", '
+        '"roles": ["quantity|identifier|dimension|period|unit|qualifier|weight|denominator|'
+        'descriptive|unresolved"], "evidence": "...", "uncertain": false, "unit": null, '
         '"entity_kind": null, "concept": {"iri": null, "label": "...", "parent_label": "..."}}],\n'
+        ' "candidates": [{"id": "...", "label": "...", "source_columns": ["..."], '
+        '"indicator": {"column": "...", "values": ["..."]} | null, "unit": null, '
+        '"observation": "...", "calculations": ["..."], "group_by": ["..."], "filter_by": ["..."], '
+        '"display": ["..."], "across_entities": "...", "across_time": "...", '
+        '"weight_or_denominator": null, "period_rule": null, "evidence": "...", "uncertain": false}],\n'
+        ' "countables": {"row": "...", "distinct": [{"columns": ["..."], "counts": "..."}]},\n'
+        ' "remaining_candidates": [{"label": "...", "source": "..."}],\n'
         ' "metrics": [{"id": "...", "label": "...", "description": "...", "columns": ["..."], '
-        '"concept": {...} | null, "query": {QUERY SPEC}, '
+        '"concept": {...} | null, "capability": "...", "query": {QUERY SPEC}, '
         '"params": [{"name": "...", "description": "...", "example": "..."}]}],\n'
         ' "filters": [same shape as metrics],\n'
         ' "queries": [same shape as metrics, concept omitted]}'
@@ -4288,18 +4323,160 @@ def table_profile(profile_md: str, candidate_classes: list[dict[str, str]]) -> t
     return system, user
 
 
+_WIDE_TABLE_CONTEXT = (
+    "The table is too wide to document in one reply, so the work is split. You always see "
+    "the COMPLETE compact schema (every column) and STRUCTURAL EVIDENCE measured on the "
+    "data: single-column keys, column families sharing a stem with a period suffix, "
+    "possible indicator columns (low-cardinality text naming what a numeric column "
+    "holds), unit-like columns and date columns. Use them to relate fields that are "
+    "documented in other calls.\n")
+
+
+def _menu(candidate_classes: list[dict[str, str]]) -> str:
+    return "\n".join(f"- {c['iri']} | {c['label']}" for c in candidate_classes) or "(none)"
+
+
+def table_profile_columns(header: dict[str, Any], schema: list[str], evidence: dict[str, Any],
+                          batch_md: str, batch: list[str],
+                          candidate_classes: list[dict[str, str]]) -> tuple[str, str]:
+    """Wide-table profiling, step 1: document ONE batch of columns (by name).
+
+    The model gets the whole compact schema and the measured structural
+    evidence, plus the detailed profile of its batch, and must return one
+    complete record per assigned column. Domain-neutral."""
+    system = (
+        "You are a data analyst documenting a database table for a question-answering "
+        "system that may ONLY read it through stored queries.\n" + _WIDE_TABLE_CONTEXT +
+        "THIS CALL documents only the ASSIGNED columns: exactly one record per assigned "
+        "column, same name, nothing for other columns. Complete each record before the "
+        "next; if your output would run out, stop after a complete record -- the rest is "
+        "asked again.\n"
+        "Each record: description (what the column means; for a cryptic name infer it from "
+        "the values and say so); role, one of identifier, dimension, measure, time, "
+        "attribute, text; roles (quantity|identifier|dimension|period|unit|qualifier|weight|"
+        "denominator|descriptive|unresolved, several allowed); unit when evident; "
+        "entity_kind when values name real-world things; family: the stem it shares with "
+        "other columns when the evidence lists it in a column family, else null; related: "
+        "other columns (anywhere in the schema) it must be read with -- its unit column, "
+        "the indicator column naming it, its denominator, the version or report column -- "
+        "with the relation; evidence; uncertain; concept as in the rules below.\n"
+        "ONTOLOGY CONCEPT: the general KIND of thing the column measures or classifies, "
+        "never a value or a sentence. A fitting CANDIDATE CLASS -> its iri and label; "
+        "otherwise iri null, a new UpperCamelCase label and parent_label (a candidate "
+        "label, or Metric, Measure, Dimension, TimePeriod). Never a new class for an "
+        "identifier or code column; concept null for keys, row ids and free text.\n"
+        "Return JSON only, no markdown fences.")
+    user = ("TABLE: " + json.dumps(header, ensure_ascii=False) + "\n\nSCHEMA (all columns):\n"
+            + "\n".join(schema) + "\n\nSTRUCTURAL EVIDENCE:\n"
+            + json.dumps(evidence, ensure_ascii=False, default=str) + "\n\nASSIGNED COLUMNS:\n"
+            + json.dumps(batch, ensure_ascii=False) + "\n\nPROFILE OF THE ASSIGNED COLUMNS:\n"
+            + batch_md + "\n\nCANDIDATE CLASSES (IRI | label):\n" + _menu(candidate_classes) + "\n\n"
+            'Return JSON: {"columns": [{"name": "...", "description": "...", "role": "...", '
+            '"roles": ["..."], "unit": null, "entity_kind": null, "family": null, '
+            '"related": [{"column": "...", "relation": "unit|indicator|denominator|weight|version|'
+            'period|identifier_of|other"}], "evidence": "...", "uncertain": false, '
+            '"concept": {"iri": null, "label": "...", "parent_label": "..."} | null}]}')
+    return system, user
+
+
+def table_profile_synthesis(header: dict[str, Any], digest: list[dict[str, Any]], evidence: dict[str, Any],
+                            sample_rows: list[dict], candidate_classes: list[dict[str, str]], *,
+                            already_listed: list[str] | None = None) -> tuple[str, str]:
+    """Wide-table profiling, step 2: table description, grain, cross-column
+    relationships and the candidate-quantity inventory, from a digest of the
+    column results. Continued while ``more_candidates`` is true."""
+    system = (
+        "You are a data analyst documenting a database table for a question-answering "
+        "system.\n" + _WIDE_TABLE_CONTEXT +
+        "Every column was already documented (COLUMN DIGEST: role, roles, unit, family, a "
+        "short summary). Now describe the table as a whole:\n"
+        "- description: 2-4 sentences: what the table holds, its source if evident, time "
+        "coverage, what it can answer.\n"
+        "- grain: what one row is. Use the measured keys: a composite key when no single "
+        "column is unique.\n"
+        "- relationships: cross-column structure -- composite keys, indicator/value pairs "
+        "(which text column names what a numeric column holds), unit columns, version or "
+        "report columns, column families sharing a stem with a period suffix (one quantity "
+        "over several periods).\n"
+        "- candidates: one entry per candidate quantity or coherent indicator family (a "
+        "column family is ONE candidate, not one per column): source columns or the "
+        "indicator column + values selecting it, unit, what one observation is, meaningful "
+        "calculations, dimensions it can be grouped / filtered by or only displayed with, "
+        "how it aggregates across entities and across time, the weight / denominator / "
+        "period rule a ratio, price, percentage, average or snapshot needs, evidence.\n"
+        "- countables: what one ROW counts, and which distinct things can be counted.\n"
+        "Candidates already listed in earlier calls are named under ALREADY LISTED: do not "
+        "repeat them. If your output would run out, stop after a complete candidate and set "
+        "more_candidates true; you will be called again.\n"
+        "Return JSON only, no markdown fences.")
+    user = ("TABLE: " + json.dumps(header, ensure_ascii=False) + "\n\nCOLUMN DIGEST:\n"
+            + "\n".join(json.dumps(d, ensure_ascii=False) for d in digest)
+            + "\n\nSTRUCTURAL EVIDENCE:\n" + json.dumps(evidence, ensure_ascii=False, default=str)
+            + "\n\nSAMPLE ROWS:\n" + "\n".join(json.dumps(r, ensure_ascii=False, default=str)
+                                                for r in sample_rows)
+            + "\n\nALREADY LISTED: " + json.dumps(already_listed or [])
+            + "\n\nCANDIDATE CLASSES (IRI | label):\n" + _menu(candidate_classes) + "\n\n"
+            'Return JSON: {"description": "...", "grain": "...", '
+            '"relationships": [{"kind": "composite_key|indicator_value|unit|version|family|other", '
+            '"columns": ["..."], "note": "..."}], '
+            '"candidates": [{"id": "...", "label": "...", "source_columns": ["..."], '
+            '"indicator": {"column": "...", "values": ["..."]} | null, "unit": null, '
+            '"observation": "...", "calculations": ["..."], "group_by": ["..."], "filter_by": ["..."], '
+            '"display": ["..."], "across_entities": "...", "across_time": "...", '
+            '"weight_or_denominator": null, "period_rule": null, "evidence": "...", "uncertain": false}], '
+            '"countables": {"row": "...", "distinct": [{"columns": ["..."], "counts": "..."}]}, '
+            '"more_candidates": false}')
+    return system, user
+
+
+def table_profile_capabilities(header: dict[str, Any], digest: list[dict[str, Any]], evidence: dict[str, Any],
+                               candidates: list[dict[str, Any]], sample_rows: list[dict]) -> tuple[str, str]:
+    """Wide-table profiling, step 3: stored queries for a batch of candidate
+    quantities (by candidate id), one capability record per candidate."""
+    system = (
+        "You write the stored queries a question-answering system uses to read ONE "
+        "database table.\n" + _WIDE_TABLE_CONTEXT +
+        "THIS CALL covers only the listed CANDIDATES: exactly one record per candidate id "
+        "with its metrics, filters and queries (each a stored query), or status "
+        "unsupported_by_source / semantic_ambiguity with a reason when no correct query "
+        "exists. Complete each record before the next; if your output would run out, stop "
+        "after a complete record -- the rest is asked again.\n"
+        "METRICS: a calculation over the quantity, with grouping columns and filter params.\n"
+        "FILTERS: record discovery / key lookup by a filterable column.\n"
+        "QUERIES: other retrievals (one record by key, latest rows, a time series, top-N, the "
+        "distinct values of a dimension).\n"
+        "ids are short snake_case and unique; for each item say in \"capability\" what it "
+        "calculates, groups by, filters by and only displays.\n\n"
+        + _QUERY_SPEC_RULES + "\nReturn JSON only, no markdown fences.")
+    user = ("TABLE: " + json.dumps(header, ensure_ascii=False) + "\n\nCOLUMN DIGEST:\n"
+            + "\n".join(json.dumps(d, ensure_ascii=False) for d in digest)
+            + "\n\nSTRUCTURAL EVIDENCE:\n" + json.dumps(evidence, ensure_ascii=False, default=str)
+            + "\n\nSAMPLE ROWS:\n" + "\n".join(json.dumps(r, ensure_ascii=False, default=str)
+                                                for r in sample_rows)
+            + "\n\nCANDIDATES:\n" + json.dumps(candidates, ensure_ascii=False, default=str) + "\n\n"
+            'Return JSON: {"capabilities": [{"id": "<candidate id>", "status": null, "reason": null, '
+            '"metrics": [{"id": "...", "label": "...", "description": "...", "columns": ["..."], '
+            '"concept": {...} | null, "capability": "...", "query": {QUERY SPEC}, '
+            '"params": [{"name": "...", "description": "...", "example": "..."}]}], '
+            '"filters": [same shape], "queries": [same shape, concept omitted]}]}')
+    return system, user
+
+
 def table_sql_repair(table_name: str, columns_md: str, failures: list[dict[str, Any]]) -> tuple[str, str]:
     """Fix query specs the compiler rejected (one attempt)."""
     system = (
-        "You fix JSON query specs that the query compiler rejected. Keep each query's "
-        "purpose; change as little as possible.\n\n" + _QUERY_SPEC_RULES +
+        "You fix JSON query specs that were rejected by the compiler or failed their test "
+        "on the data. Change as little as possible.\n" + _PRESERVE_MEANING +
+        "Return null for an item whose intent the data cannot support, with the reason.\n\n"
+        + _AVERAGE_RULE + "\n" + _QUERY_SPEC_RULES +
         "\nReturn JSON only."
     )
     lines = "\n\n".join(
         f"id: {f['id']}\nerror: {f['error']}\nparams: {json.dumps(f.get('params') or [], ensure_ascii=False)}\n"
         f"query: {json.dumps(f.get('query'), ensure_ascii=False)}" for f in failures)
     user = (f"TABLE {table_name}\nCOLUMNS:\n{columns_md}\n\nREJECTED STATEMENTS:\n{lines}\n\n"
-            'Return JSON: {"items": [{"id": "...", "params": [...], "query": {QUERY SPEC}}]}')
+            'Return JSON: {"items": [{"id": "...", "params": [...], "query": {QUERY SPEC} | null, '
+            '"reason": "<when null: why the data cannot support it>"}]}')
     return system, user
 
 
@@ -4313,7 +4490,11 @@ def table_lookups(tables: list[dict[str, Any]]) -> tuple[str, str]:
         "Only propose joins whose values would actually match (same format, e.g. both "
         "zero-padded). For each pair define ONE lookup query that joins the two tables on "
         "the key and returns the useful columns of both, filtered by one parameter on the "
-        "key or a name column. A table may join several others. Skip pairs with no real key.\n\n"
+        "key or a name column. A table may join several others. Skip pairs with no real key. "
+        "The join must use the COMPLETE key (every column needed to match one row); give "
+        "its cardinality from A's side (many_to_one: several A rows per B row, each A row "
+        "matches at most one B row). It is checked on the data, and a lookup whose join "
+        "would count the same rows several times in a sum or count is refused.\n\n"
         + _QUERY_SPEC_RULES +
         "- In a lookup, the join is given by \"join\" (do not repeat it in the query). "
         "Name a column of the other table as \"<other_table>.<column>\"; an unqualified "
@@ -4324,83 +4505,412 @@ def table_lookups(tables: list[dict[str, Any]]) -> tuple[str, str]:
             'Return JSON: {"lookups": [{"id": "lk_<short_snake>", "label": "...", '
             '"description": "...", "table": "<table A>", "other_table": "<table B>", '
             '"join": [{"column": "<column of A>", "other_column": "<column of B>"}], '
+            '"cardinality": "many_to_one|one_to_one|one_to_many|many_to_many", '
             '"query": {QUERY SPEC over A joined to B}, '
             '"params": [{"name": "...", "description": "...", "example": "..."}]}]}')
     return system, user
 
 
-def table_refine(table: dict[str, Any]) -> tuple[str, str]:
+_TABLE_STRUCTURE_HELP = (
+    "STRUCTURE you get (measured on the data with SQL):\n"
+    "- grain: columns that together identify one row.\n"
+    "- determines {a: [b, ...]}: each value of a has exactly one value of b (b is a label or "
+    "property of a). mostly_determines {a: [b, ...]}: the same with a few exceptions (a "
+    "spelling variant, a one-off change) -- b mostly describes a, but some a values have "
+    "several b values.\n"
+    "- values_repeated_across {measure: [{columns, share_of_groups_repeated, "
+    "share_identical}]}: EVIDENCE, not a conclusion. When only these columns change, the "
+    "measure often keeps the same value: share_of_groups_repeated is the share of groups "
+    "(all other columns fixed) that have several rows, share_identical the share of those "
+    "where every row holds the same value. This is how a column that only identifies the "
+    "report, version, release or snapshot a value was published in behaves -- but a real "
+    "dimension can also repeat (a price unchanged for several years, a rate that is the "
+    "same in several regions). Decide from what the column MEANS whether it is a version "
+    "of the same observation.\n"
+    "- item_columns {column: top_values}: a grain column whose values name DIFFERENT "
+    "quantities (one row per item); top_values are those shared by most entities.\n"
+    "- total_rows [{column, value, meaning}]: rows with that value hold the TOTAL of the other "
+    "rows of their group. The program keeps totals and parts apart: a query that does not "
+    "use the column reads only the total rows; one that selects or groups by it reads only "
+    "the parts.\n\n"
+)
+
+_MEASURE_DEFINITION = (
+    "   - id (snake_case), label, description (what the quantity is, its population and "
+    "unit);\n"
+    "   - value_column: the numeric column holding the value;\n"
+    "   - item: ONLY for a column listed in item_columns (an indicator column: never a "
+    "time, identity or qualifier column), {\"column\": ..., \"values\": [...]} with EVERY "
+    "value that names this same quantity (variants of one quantity under different naming "
+    "conventions). A FAMILY of indicators that share one definition, unit and aggregation "
+    "rule may be one parameterised measure: give \"values\" all of them and set "
+    "\"family\": true (the indicator value becomes a parameter). null for a wide table;\n"
+    "   - identity_columns: the INDEPENDENT columns that together say what one value is "
+    "about -- every one of them is needed (e.g. a plan AND a product; a company AND a "
+    "segment). Each becomes a filter the user can set. A column of total_rows belongs "
+    "here only for a measure of the PARTS; leave it out to measure the total;\n"
+    "   - display_columns: labels that one identity column determines (its name, its "
+    "code) -- shown with the value, never part of what identifies it. Use only columns "
+    "listed under determines for an identity column; anything else is an identity "
+    "column;\n"
+    "   - period_columns: the columns that identify the period the VALUE covers (never a "
+    "column that only dates the report);\n"
+    "   - qualifier_columns: columns whose values make it a different quantity (unit, "
+    "currency, scale, price basis, frequency, period length...);\n"
+    "   - subject_columns: the identifier of the thing each value is ABOUT (one or more "
+    "identity columns). Prefer the column that identifies the subject itself (a row key "
+    "listed under row_keys, a code or id) over descriptive columns that happen to be "
+    "unique together. Every other identity column is only there to keep observations "
+    "apart;\n"
+    "   - dimension_columns: descriptive or filter columns returned with the value and "
+    "usable as filters, but not needed to tell observations apart;\n"
+    "   - version_order + version_reason: ONLY when rows that differ in just these columns "
+    "are restatements of the SAME observation (report, filing, vintage, release, "
+    "snapshot). An ordered list of {\"column\", \"direction\": \"desc\"|\"asc\", "
+    "\"nulls\": \"last\"|\"first\", \"basis\": \"precedence\"|\"tie_break\"}: the first "
+    "row in this order is kept. basis precedence = the source says this order decides "
+    "which value is current (a later restatement, a later release); tie_break = only "
+    "makes the choice deterministic, it is NOT evidence of which value is current. Say "
+    "why in version_reason. Put EVERY ordering field the description promises in the "
+    "list. If rows can tie on every precedence field with different values, a tie-break "
+    "alone does not make the measure correct: give tie_policy (an explicit, source-"
+    "supported rule) or the measure stays unavailable. null when every row is its own "
+    "observation -- the identity, period and qualifier columns must then tell all rows "
+    "apart;\n"
+    "   - population: the fixed rows the quantity is defined over, as "
+    "{\"include\": [{\"column\", \"op\", \"value\"}], \"exclude\": [...]} (op one of "
+    "= != in not_in is_null not_null < <= > >=). When the description restricts the "
+    "population (only some units, kinds, statuses, scopes), the restriction MUST be "
+    "here -- the SQL applies only what is here. Two quantities stored in the same "
+    "column (e.g. two scales or kinds told apart by another column) are two measures "
+    "with disjoint populations;\n"
+    "   - unit: the unit of the value (from a unit column, the description or the values), "
+    "or null;\n"
+    "   - calculations: the calculations that are VALID for this quantity (value, sum, "
+    "average, weighted_average, min, max, count, change);\n"
+    "   - group_by_columns / filter_columns: the dimensions it can be grouped by and "
+    "filtered by;\n"
+    "   - aggregation_across_entities and aggregation_across_time, assessed SEPARATELY: "
+    "sum | average | weighted_average | last | none (a stock or snapshot is not summed "
+    "over time; a rate is not summed over entities);\n"
+    "   - weight_column / denominator_column / period_rule: what a ratio, price, "
+    "percentage, average or snapshot needs to be combined correctly (an average of "
+    "individual observations and an average of already aggregated values answer different "
+    "questions), with a one-line explanation in calculation_note; null when none is "
+    "needed; missing_evidence when the data cannot tell.\n"
+    "   One value per (identity, item, period, qualifier) combination is checked on the data: "
+    "a definition whose columns do not tell the rows apart, or that loses observations, "
+    "fails.\n"
+)
+
+_MEASURE_JSON = ('{"id": "...", "label": "...", "description": "...", '
+                 '"value_column": "...", "item": {"column": "...", "values": ["..."], "family": false} | null, '
+                 '"identity_columns": ["..."], "display_columns": ["..."], '
+                 '"period_columns": ["..."], "qualifier_columns": ["..."], '
+                 '"subject_columns": ["..."], "dimension_columns": ["..."], '
+                 '"version_order": [{"column": "...", "direction": "desc", "nulls": "last", '
+                 '"basis": "precedence|tie_break"}] | null, "version_reason": "..." | null, '
+                 '"tie_policy": null, '
+                 '"population": {"include": [{"column": "...", "op": "...", "value": "..."}], '
+                 '"exclude": []} | null, '
+                 '"unit": "..." | null, "calculations": ["..."], '
+                 '"group_by_columns": ["..."], "filter_columns": ["..."], '
+                 '"aggregation_across_entities": "...", "aggregation_across_time": "...", '
+                 '"weight_column": null, "denominator_column": null, "period_rule": null, '
+                 '"calculation_note": "...", "missing_evidence": null}')
+
+_PRESERVE_MEANING = (
+    "PRESERVE THE INTENDED MEANING: keep the intended quantity, calculation, population, "
+    "output grain, unit, and total-versus-component meaning of what you repair. If the "
+    "available data cannot support the original intent, do not substitute a different "
+    "question: report the reason instead.\n"
+)
+
+_AVERAGE_RULE = (
+    "AVERAGES AND RATIOS: identify WHAT is being averaged, at WHAT grain, and whether "
+    "weighting is required. An average of individual observations and an average of "
+    "previously aggregated values (per-group averages, rates, prices, percentages) can "
+    "answer different questions; averaging rates or prices without their weights is valid "
+    "only when the stated purpose is the unweighted mean of those values. Never add "
+    "identifiers, flags or running totals; never add a total row to its parts.\n"
+)
+
+
+def table_refine(table: dict[str, Any], *, batch: dict[str, Any] | None = None) -> tuple[str, str]:
     """Second, data-driven metadata pass over ONE loaded table.
 
-    The model gets what was MEASURED on the data (grain, columns that only
-    identify the report/version a value came from, functional dependencies,
-    item columns and their most shared values) plus the valid values, a few
-    sample rows and the current query catalog, and defines the table's
-    MEASURES, usage rules and typical questions. Domain-neutral: nothing in
-    this prompt names a dataset, a field or a value."""
+    The model gets what was MEASURED on the data (grain, functional
+    dependencies, repeat statistics, item columns, total rows), the candidate
+    inventory from profiling, the valid values, a few sample rows and the
+    current query catalog. It reconciles the inventory against the data, defines
+    the measures, proposes query templates for missing calculations and
+    breakdowns, and records a coverage status for every candidate. ``batch``
+    (continuation): which candidates are still to be covered and which ids are
+    already defined. Domain-neutral: nothing here names a dataset, field or value."""
     system = (
         "You design how a question-answering system must query ONE database table. "
         "You get its columns with their valid values, STRUCTURE measured on the data, "
-        "sample rows and the current catalog of stored queries. Use the structure; do "
-        "not guess what it contradicts.\n\n"
-        "STRUCTURE you get:\n"
-        "- grain: columns that together identify one row.\n"
-        "- values_repeated_across {measure: [columns]}: the measure keeps the SAME value "
-        "when only these columns change. They identify the report, version, release or "
-        "snapshot a value was published in -- not what the value is about and not the "
-        "period it covers. The same figure appears once per report, so summing or "
-        "averaging across these columns counts it several times, and a period-like "
-        "column among them (e.g. the year of the report) is NOT the period of the value.\n"
-        "- determines {a: [b, ...]}: each value of a has exactly one value of b.\n"
-        "- item_columns {column: top_values}: a grain column whose values name DIFFERENT "
-        "quantities (one row per item); top_values are those shared by most entities.\n\n"
+        "the candidate inventory proposed when the file was profiled, sample rows and the "
+        "current catalog of stored queries. Use the structure; do not guess what it "
+        "contradicts.\n\n"
+        + _TABLE_STRUCTURE_HELP +
         "DEFINE\n"
         "1. columns: ONLY columns whose role or description must change in the light of "
         "the structure (a column that identifies the report/version, a period column, a "
         "label determined by a key). role is one of identifier, dimension, measure, "
         "time, attribute, text. Omit unchanged columns.\n"
-        "2. measures: the quantities people ask for first (up to 15), ONE measure per "
-        "quantity -- two different quantities are two measures, never one measure with "
-        "both in its item values. For a table with an item column, pick the most asked-for "
-        "quantities among its top_values. Each:\n"
-        "   - id (snake_case), label, description;\n"
-        "   - value_column: the numeric column holding the value;\n"
-        "   - item: ONLY for a column listed in item_columns (never a time, entity or "
-        "qualifier column), {\"column\": ..., \"values\": [...]} "
-        "with EVERY valid value that names this same quantity (variants of the same "
-        "quantity under different naming conventions, at most 8); null for a wide table;\n"
-        "   - entity_columns: what the value is about, the lookup key first (labels it "
-        "determines may follow);\n"
-        "   - period_columns: the columns that identify the period the VALUE covers "
-        "(never a report/version column);\n"
-        "   - qualifier_columns: columns whose values make it a different quantity "
-        "(unit, currency, scale, price basis, frequency, period length...); never a "
-        "column listed in values_repeated_across;\n"
-        "   - latest_by: when the measure's values are repeated across report columns, "
-        "the report column whose highest value is the latest report (to keep one value "
-        "per period); else null;\n"
-        "   - additive_over_time: true only when values of consecutive periods add up "
-        "to the longer period without overlap.\n"
-        "3. usage_notes: 2-6 short rules for querying this table correctly, derived from "
-        "the structure (which columns identify the period, which only the report, what "
-        "must never be summed, which qualifiers must be fixed).\n"
-        "4. common_questions: 5-12 typical questions an analyst asks of this table, in "
-        "general form, each answered by ONE catalog id or measure id with params filled "
-        "from valid values or sample rows. A measure takes params <first entity column>, "
-        "its item column when the item has more than 8 values, "
-        "one param per qualifier column with more than one valid value, and "
-        "<last period column>_from / <last period column>_to.\n\n"
-        "Use only column names and values that appear in the input. Return JSON only."
+        "2. measures: reconcile the candidate inventory against the loaded data. Account "
+        "for EVERY candidate quantity or coherent indicator family (every numeric column and "
+        "every family of quantities named by an indicator column's values) -- there is no "
+        "maximum. For each, identify its definition, source columns or discriminator "
+        "values, observation grain, unit, valid calculations, supported grouping dimensions "
+        "and filter parameters. Assess aggregation across entities and across time "
+        "separately. When a calculation needs weights or a denominator, identify them and "
+        "explain the calculation. If the evidence is insufficient, record what is missing. "
+        "ONE measure per quantity -- two different quantities are two measures (or one "
+        "family when their definitions agree). Each:\n"
+        + _MEASURE_DEFINITION +
+        "3. templates: compare this inventory with the existing catalog. Identify missing "
+        "calculations and breakdowns -- including a standalone filter whose dimension the "
+        "relevant aggregate cannot apply -- and return them as query templates for ingestion "
+        "to materialize and verify: a fixed calculation and grouping with declared params for "
+        "the supported filter values (one template serves every value of its params). "
+        "\"Quantity by dimension\" returns one result per dimension value; \"quantity for "
+        "one dimension value\" filters the population; one template may do both (group by "
+        "the dimension AND take an optional filter param on it). Give each template the "
+        "measure it serves and say in capability what it calculates, groups by and "
+        "filters by.\n"
+        "4. inventory: one entry per candidate (from the input inventory and any quantity "
+        "you found in the data) with status materialized (a measure or template covers it), "
+        "supported_not_materialized (the data supports it, no query yet), unsupported (the "
+        "data cannot support it) or unresolved (the evidence is insufficient), and the "
+        "reason for every status other than materialized.\n"
+        "5. usage_notes: 2-6 short rules for querying this table correctly, derived from "
+        "the structure (which columns identify the period, which only the version, what "
+        "must never be summed, which qualifiers must be fixed, which rows are totals).\n"
+        "6. common_questions: 5-12 typical questions an analyst asks of this table, in "
+        "general form, each answered by ONE catalog id, measure id or template id with "
+        "params filled from valid values or sample rows. A measure takes one OPTIONAL param "
+        "per identity column (named like the column; leave it out to list every value), its "
+        "item column when it is a family, one param per qualifier column with more than one "
+        "valid value, and <last period column>_from / <last period column>_to.\n"
+        "7. Every candidate has a candidate_id. Cover ONLY the candidate_ids you are asked "
+        "for (all of them when no list is given): one inventory entry per id, with that "
+        "candidate_id. Complete each entry before starting the next; if your output would "
+        "run out, stop after a complete entry -- you will be called again for the rest. "
+        "status: materialized (a measure or template answers it), supported_not_materialized, "
+        "unsupported_by_source (the data cannot answer it), semantic_ambiguity (the data "
+        "could answer it in several incompatible ways; say which in reason), unresolved.\n\n"
+        + _AVERAGE_RULE + "\n" + _QUERY_SPEC_RULES +
+        "\nUse only column names and values that appear in the input. Return JSON only."
+    )
+    cont = ""
+    if batch:
+        first = batch.get("first_call")
+        cont = (("\n\nTHIS CALL: return columns, usage_notes and common_questions as well. "
+                 if first else
+                 "\n\nCONTINUATION: columns and usage_notes were already returned (leave them "
+                 "out). Measures and templates already defined are listed under "
+                 "already_defined -- reuse their ids, do not repeat them. ")
+                + "Cover exactly these candidate_ids now:\n"
+                + json.dumps({k: v for k, v in batch.items() if k != "first_call"},
+                             ensure_ascii=False, indent=1, default=str))
+    user = ("TABLE:\n" + json.dumps(table, ensure_ascii=False, indent=1, default=str) + cont + "\n\n"
+            'Return JSON: {"columns": [{"name": "...", "role": "...", "description": "..."}], '
+            '"measures": [' + _MEASURE_JSON + '], '
+            '"templates": [{"id": "...", "label": "...", "description": "...", "measure": "<measure id>", '
+            '"capability": "...", "query": {QUERY SPEC}, '
+            '"params": [{"name": "...", "description": "...", "example": "..."}]}], '
+            '"inventory": [{"candidate_id": "<candidate_id>", "candidate": "<label>", '
+            '"source": "<columns or indicator values>", '
+            '"status": "materialized|supported_not_materialized|unsupported_by_source|'
+            'semantic_ambiguity|unresolved", '
+            '"measure": "<measure id>" | null, "reason": "..."}], '
+            '"usage_notes": ["..."], '
+            '"common_questions": [{"question": "...", "query_id": "<catalog, measure or template id>", '
+            '"params": {"name": value}}]}')
+    return system, user
+
+
+def table_measure_repair(table: dict[str, Any], failures: list[dict[str, Any]]) -> tuple[str, str]:
+    """Correct measure DEFINITIONS that failed their data test (bounded,
+    ingestion time). Same definition schema as table_refine. The program
+    rebuilds and re-tests every correction before it is published.
+    Domain-neutral."""
+    system = (
+        "Measures of ONE database table failed their test on the data. A program built "
+        "each measure's query from its definition; the definition, the built query and "
+        "the failure are given. Correct the DEFINITION so the measure returns exactly one "
+        "value per observation and every observation the source rows hold. Typical "
+        "causes: an identity or qualifier column missing (rows that differ in it come back "
+        "twice), a column taken for a display label that does not follow from the identity "
+        "columns, a column wrongly treated as a version (observations merged away), "
+        "restatements with no version rule, or several versions that tie with different "
+        "values (name a column that breaks the tie, or report it). Change as little as "
+        "possible; keep the same id. If the quantity cannot be measured as one value per "
+        "observation from this table, return null for it with the reason in reasons.\n\n"
+        + _PRESERVE_MEANING + "\n"
+        + _TABLE_STRUCTURE_HELP +
+        "DEFINITION fields:\n" + _MEASURE_DEFINITION +
+        "\nUse only column names and values that appear in the input. Return JSON only."
     )
     user = ("TABLE:\n" + json.dumps(table, ensure_ascii=False, indent=1, default=str) + "\n\n"
-            'Return JSON: {"columns": [{"name": "...", "role": "...", "description": "..."}], '
-            '"measures": [{"id": "...", "label": "...", "description": "...", '
-            '"value_column": "...", "item": {"column": "...", "values": ["..."]} | null, '
-            '"entity_columns": ["..."], "period_columns": ["..."], "qualifier_columns": ["..."], '
-            '"latest_by": "..." | null, "additive_over_time": false}], '
-            '"usage_notes": ["..."], '
-            '"common_questions": [{"question": "...", "query_id": "<catalog id or measure id>", '
-            '"params": {"name": value}}]}')
+            "FAILED MEASURES:\n" + json.dumps(failures, ensure_ascii=False, indent=1, default=str)
+            + "\n\nReturn JSON: {\"measures\": [" + _MEASURE_JSON + " | null], "
+            "\"reasons\": {\"<measure id>\": \"why it cannot be repaired\"}}")
+    return system, user
+
+
+def table_concept_map(table: dict[str, Any], concepts: list[dict[str, Any]],
+                      candidate_classes: list[dict[str, str]]) -> tuple[str, str]:
+    """Map the concepts of a table's FINAL verified catalog (quantities measured,
+    dimensions grouped or filtered by, unit/period qualifiers, quantities named
+    by indicator values) to ontology classes. Only concepts the program could
+    not resolve by exact label are sent. Domain-neutral."""
+    menu = "\n".join(f"- {c['iri']} | {c['label']}" for c in candidate_classes) or "(none)"
+    system = (
+        "You map the concepts of ONE database table's verified query catalog to ontology "
+        "classes. Each concept has a key, its role (measured quantity, grouping dimension, "
+        "filter dimension, unit or period qualifier), the columns or indicator values it "
+        "comes from and their description. A concept is the general KIND of thing (a kind "
+        "of quantity, category, place, period or event), never a specific value, an "
+        "aggregation ('Total...', 'Average...', 'Count...') or an identifier code.\n"
+        "- If a CANDIDATE CLASS means the same thing, return its IRI (reuse it).\n"
+        "- If several candidates could fit and the description does not decide, return "
+        "iri null and list them in ambiguous.\n"
+        "- Otherwise propose a new class: iri null, label an UpperCamelCase class name, "
+        "parent_label the most specific candidate label it is a kind of (or Metric for a "
+        "quantity, Dimension for a category, TimePeriod for a period).\n"
+        "- concept null when nothing general applies (a pure key or free text).\n"
+        "A concept with role counts is the COUNTED SUBJECT (counted_subject: the things in a "
+        "column, or what one row of the table is): map it to the class of the counted thing, "
+        "never to a class for the number or the act of counting. identifies = the identifier "
+        "of the subject a per-subject query takes; qualifies = a qualifier or period column.\n"
+        "Map a concept shared by several queries once (one key). Return JSON only."
+    )
+    user = ("TABLE:\n" + json.dumps(table, ensure_ascii=False, indent=1, default=str)
+            + "\n\nCONCEPTS:\n" + json.dumps(concepts, ensure_ascii=False, indent=1, default=str)
+            + f"\n\nCANDIDATE CLASSES (IRI | label):\n{menu}\n\n"
+            'Return JSON: {"concepts": [{"key": "...", "iri": "..." | null, "label": "..." | null, '
+            '"parent_label": "..." | null, "ambiguous": ["<iri>"], "reason": "..."}]}')
+    return system, user
+
+
+def table_verify_columns(table: dict[str, Any]) -> tuple[str, str]:
+    """Independent check of ONE loaded table's column metadata against what
+    was measured on the data (step 1 of the verification pass). Domain-neutral:
+    nothing here names a dataset, a column or a value."""
+    system = (
+        "You audit the documentation of ONE database table. Another model wrote it; "
+        "you did not. You get, per column: its name, type, role, unit and description, "
+        "and what was MEASURED on the loaded data (rows with a value, distinct values, "
+        "min/max, example or valid values, and filled_only_where). You also get the "
+        "table's description, its grain and a few sample rows. Trust the measurements "
+        "over the words.\n\n"
+        "filled_only_where {other column: [values]}: the column has a value ONLY on rows "
+        "where that other column has one of those values (\"(empty)\" = the other column "
+        "is empty there). It tells you which rows, periods or reports the column "
+        "actually covers.\n\n"
+        "CHECK every column:\n"
+        "- the description says what the values really are (meaning, unit, scale) and "
+        "does not claim a coverage, period or source the measurements contradict; when "
+        "the column is filled only on some rows, the description says which;\n"
+        "- role is one of identifier (keys/codes), dimension (categories to group or "
+        "filter by), measure (numbers you aggregate), time (dates/periods), attribute "
+        "(other descriptive values), text (free text); a number that only identifies or "
+        "flags something is not a measure;\n"
+        "- unit matches the values (null when there is none).\n"
+        "Also check the table description and grain against the columns and the sample.\n\n"
+        "Return ONLY what must change. Keep correct text as it is; write a full "
+        "replacement description, not a comment. Use only column names that appear in "
+        "the input. Return JSON only."
+    )
+    user = ("TABLE:\n" + json.dumps(table, ensure_ascii=False, indent=1, default=str) + "\n\n"
+            'Return JSON: {"table_description": "..." | null, "grain": "..." | null, '
+            '"columns": [{"name": "...", "problem": "...", "description": "...", '
+            '"role": "...", "unit": "..." | null}]}')
+    return system, user
+
+
+def table_verify_items(table: dict[str, Any], stored: list[dict[str, Any]]) -> tuple[str, str]:
+    """Independent check of stored queries: does each compiled SQL statement do
+    what its label and description say, and is it a valid way to answer that
+    (step 2 of the verification pass). Domain-neutral."""
+    system = (
+        "You audit the stored queries of ONE database table. Another model wrote them; "
+        "you did not. A question-answering system picks a query BY ITS LABEL AND "
+        "DESCRIPTION and trusts the result, so a query whose words promise something "
+        "its SQL does not do gives wrong answers.\n\n"
+        "You get the table's VERIFIED column documentation (filled_only_where = the "
+        "rows a column has values on), and per stored query: label, description, "
+        "parameters, the SQL actually run, SHAPE (what the SQL does, written by a "
+        "program from the query itself -- it is exact) and a SAMPLE result run with "
+        "parameter values taken from the table. Every aggregate also returns "
+        "rows_aggregated and first_/last_ period columns, added by the program. "
+        "A lookup joins a second table: other_table_columns documents that table's "
+        "columns (written \"<other_table>.<column>\" in the query). "
+        "added_by_program lists WHERE conditions the program adds to the SQL on its own "
+        "(keep a table's total/summary rows apart from their parts; leave out rows whose "
+        "listed values are empty); they are correct -- judge the rest.\n\n"
+        "Each query also has CAPABILITY, written by a program from the final query: what it "
+        "calculates, its output grain, grouping columns, fixed conditions, parameters and "
+        "what leaving each optional parameter out does, period behaviour, ordering and "
+        "limit. It is exact.\n\n"
+        "CHECK each query:\n"
+        "1. CLAIM vs SQL: compare what the label, description and claimed capability say with "
+        "the finalized SQL: what it calculates, groups by, filters, orders, limits and "
+        "returns. Check what happens when each optional parameter is omitted (every value, "
+        "or the published total rows) and whether that matches the words. The id is words "
+        "too -- it is shown when the query is picked: "
+        "one total vs one row per entity/group; a complete result vs "
+        "top-N (limit); which column, period and rows it reads; what the user can choose "
+        "(a parameter) vs what is fixed (a constant or a column chosen in the SQL). A "
+        "label or description that promises a choice, a total, a coverage or a period "
+        "the SQL does not provide is WRONG.\n"
+        "2. VALID: the SQL must compute a correct answer for its purpose. " + _AVERAGE_RULE +
+        "No sum of a non-additive value; no combining rows that differ in a qualifier "
+        "(unit, currency, basis, period "
+        "length, report/version) unless the qualifier is grouped by; the columns used "
+        "must mean what the purpose needs (per the column documentation); a join must "
+        "match keys of the same kind; a time series must not mix periods.\n"
+        "3. RESULT: the sample result must look like what the label promises.\n\n"
+        + _PRESERVE_MEANING +
+        "VERDICT per query (decide by what the words PROMISE: users pick a query for the "
+        "question its words state, so that question must get a correct answer):\n"
+        "- ok: words and SQL agree and the SQL is valid;\n"
+        "- fix_query: the words state a useful question this table can answer, but the "
+        "SQL answers something else or answers it wrongly -- return a corrected query "
+        "spec (and params) that answers it, with label and description that match "
+        "(queries marked fixable only). Prefer this over rewording;\n"
+        "- split: the SQL is valid and useful as it is, AND the question its words state "
+        "is also useful and answerable but different -- the query is re-described "
+        "(label, description) to what it does, and \"add\" gives a NEW query (id, label, "
+        "description, query, params) that answers the question the old words stated;\n"
+        "- fix_text: the SQL is valid and useful and the question its words state is "
+        "not worth answering separately -- new label and description that describe "
+        "exactly what the SQL does;\n"
+        "- fix_definition (measures only): the measure is useful but its DEFINITION does not "
+        "deliver what its words promise -- a missing ordering field, a population "
+        "restriction the SQL does not apply, a wrong identity. Say in reason exactly what "
+        "the definition must change; a program repairs the definition and tests it again.\n"
+        "- drop: it cannot be made valid, or it duplicates another query.\n"
+        "Each query lists its allowed_verdicts: use only one of those (a measure is built "
+        "from its definition by a program, so it is ok, fix_text, fix_definition or drop -- "
+        "never fix_query or split). Give exactly one verdict for EVERY query listed.\n"
+        "new_id (with any verdict): a new snake_case id when the current id states "
+        "something the query does not do (e.g. names a total for a ranked list).\n"
+        "Give a short reason for every verdict other than ok.\n\n"
+        + _QUERY_SPEC_RULES +
+        "\nReturn JSON only."
+    )
+    user = ("TABLE:\n" + json.dumps(table, ensure_ascii=False, indent=1, default=str) + "\n\n"
+            "STORED QUERIES:\n" + json.dumps(stored, ensure_ascii=False, indent=1, default=str) + "\n\n"
+            'Return JSON: {"items": [{"id": "...", "verdict": "ok|fix_query|split|fix_text|fix_definition|drop", '
+            '"reason": "...", "new_id": "..." | null, "label": "...", "description": "...", '
+            '"query": {QUERY SPEC} (fix_query only), '
+            '"params": [{"name": "...", "description": "...", "example": "..."}] (fix_query only), '
+            '"add": {"id": "...", "label": "...", "description": "...", "query": {QUERY SPEC}, '
+            '"params": [...]} (split only)}]}')
     return system, user
 
 
@@ -4418,9 +4928,11 @@ def table_query_select(question: str, catalogs: list[dict[str, Any]],
     system = (
         "You answer questions from database tables, but you may ONLY read them through "
         "stored queries. You get the question and, for each candidate table, its "
-        "description, columns and a CATALOG of stored, tested queries (metrics, filters, "
-        "queries, lookups), each with its parameters. A program builds and runs the SQL; "
-        "you never write SQL.\n\n"
+        "description, columns and a CATALOG of stored, tested queries (measures, metrics, "
+        "filters, queries, lookups), each with its parameters and a read-only definition "
+        "of what it does. A program runs the stored query exactly as it was tested; you "
+        "only choose a query and fill its parameter values. You never write SQL or a query "
+        "definition: a call that contains one is refused.\n\n"
         "1. Decide if the question needs data from these tables (numbers, lists, dates, "
         "counts or records they hold). If the question is about something the tables do "
         "not contain, answer needed=false.\n"
@@ -4442,13 +4954,26 @@ def table_query_select(question: str, catalogs: list[dict[str, Any]],
         "occur together). A column with \"range\" holds values between min and max. "
         "Pick several queries when the question has several parts. Fewer, aggregated "
         "results are better than raw rows.\n"
-        "   MEASURES (kind \"measure\") were built and tested on the data: they return ONE "
-        "value per entity, period and qualifier, with repeated reports already reduced to "
-        "one. Prefer a measure whenever the question asks for that quantity; set its "
-        "period range to just the period(s) asked about. Follow the table's usage_notes "
-        "and its structure (values_repeated_across lists columns that identify only the "
-        "report a value came from: never aggregate across them or treat them as the "
-        "period). examples show how typical questions map to queries. RELEVANCE (after "
+        "   REQUIREMENTS FIRST: for each part (subquestion) identify the requested quantity, "
+        "calculation, output grain, population, filters, period, and ranking or limit. Then "
+        "select a verified stored query, or a supported chain, whose CAPABILITY covers those "
+        "requirements. Prefer an observation-level measure (kind \"measure\": one value per "
+        "observation at its documented output_grain) for an observation or a time series at "
+        "that grain; set its period range to just the period(s) asked about. For a total, "
+        "average, count, comparison or ranking, prefer a query that performs THAT calculation "
+        "over the requested population. A column appearing in a query's result does not mean "
+        "the query can FILTER by it: only its parameters and fixed_conditions filter (RESHAPE "
+        "below can group, order and aggregate its result columns). Use each parameter's documented when_omitted "
+        "behaviour (every value, or the published total rows). Distinguish an explicit "
+        "calendar period (a stated year or date: filter it exactly) from the latest period "
+        "available in the data (period_behavior / the column's periods). When no eligible "
+        "query or chain covers a required capability, return that part in no_match and name "
+        "the missing capability (coverage_gaps lists capabilities the table is known to "
+        "lack). Follow the table's usage_notes "
+        "and its structure (values_repeated_across lists columns across which a value is "
+        "often repeated unchanged -- possibly the report or version it came from: do not "
+        "add values up across them or treat them as the period unless the usage_notes say "
+        "they are real dimensions). examples show how typical questions map to queries. RELEVANCE (after "
         "the tables) lists the candidate tables most relevant first and, per table, the "
         "queries whose tags match the question's concepts, entities/places or periods "
         "(reached through the knowledge graph) -- prefer those queries when they fit.\n"
@@ -4467,11 +4992,37 @@ def table_query_select(question: str, catalogs: list[dict[str, Any]],
         "against its column before the query runs; a value that is not there is refused "
         "with the closest values that are.\n"
         "   CHAINED CALLS: when one part needs a value another call must find first (look an "
-        "item up by its name, then use its id or code in another query or table), give the "
+        "item up by its name, then use its id or code in another query or table) -- and only "
+        "when the later query accepts that output as a parameter and the chain covers the "
+        "requested population -- give the "
         "later call's param as {\"from_call\": <number of the earlier call in your calls "
         "list, counting from 1>, \"column\": \"<column of that call's result>\"}. The program "
         "fills it from that result: one run per returned value (at most 5); add "
         "\"as_list\": true to pass all the values to one list (in) param.\n"
+        "   LISTS OF VALUES: a parameter that filters by equality (op \"=\") may take a JSON "
+        "LIST of values (at most 25) -- one call for several items (several countries, "
+        "products or periods) instead of one call per item; the program turns that filter "
+        "into an IN. A parameter used any other way (a range bound such as _from/_to, a name "
+        "pattern) takes one value. A from_call reference may name several earlier calls "
+        "({\"from_call\": [1, 2, 3], \"column\": \"...\", \"as_list\": true}) to pass "
+        "all their values as one list -- e.g. look up three names, then fetch all three "
+        "items in one call.\n"
+        "   RESHAPE: when no stored query performs a needed aggregation, grouping, ordering "
+        "or limit, keep a stored query that reads the right rows (its filters and params "
+        "unchanged) and add \"reshape\" to the call: {\"aggregate\": [{\"fn\": "
+        "\"max\"|\"min\"|\"avg\"|\"count\", \"column\": \"<numeric result column>\"}], "
+        "\"group_by\": [\"<categorical or period result column>\"], \"order_by\": "
+        "[{\"column\": \"<numeric result column, or an aggregate as fn_column>\", "
+        "\"dir\": \"desc\"}], \"limit\": n} (any subset). Columns are the query's "
+        "\"returns\" columns. Example: the period with the highest value = the series query "
+        "with order_by value desc, limit 1. The program applies it to the stored query's own "
+        "rows; never write SQL. Do not average or compare values of different units or "
+        "qualifiers -- fix each qualifier to one value first.\n"
+        "   ANSWER FROM ROWS: when no stored query (even reshaped) computes a part but a "
+        "stored query returns the rows that contain its answer (a short series, a few items), "
+        "select it with \"listing\": true and the answer is read from its rows. At most 2 "
+        "such listing calls per question; keep each one narrow (fixed qualifiers, just the "
+        "periods and items asked about).\n"
         "   TOTAL ROWS: a table's structure may list total_rows (a column value whose rows "
         "already hold the total of the other rows of their group). The program keeps them "
         "from being counted twice: a query that does not use that column reads only the "
@@ -4494,11 +5045,17 @@ def table_query_select(question: str, catalogs: list[dict[str, Any]],
         "earliest..latest value per granularity), not from "
         "your own knowledge of the date; complete periods first (a partial current year "
         f"only when the question asks for it). Today is {today}.\n"
-        "3. ONLY when no catalog query can answer a part, give a new \"query\" spec for it "
-        "(same JSON shape as the catalog's, rules below), and say in why_not_catalog which "
-        "catalog ids you considered and why each cannot answer it (a catalog query with "
-        "the right filters/params DOES answer it -- fill its params instead).\n\n"
-        + _QUERY_SPEC_RULES +
+        "3. NO MATCH: when no stored query of these tables answers a part of the question -- "
+        "not with a list of values, a reshape, or by reading its answer from listed rows -- "
+        "do not approximate it with a query that answers something else -- list that part "
+        "in no_match with the reason (which catalog ids you considered and why none fits). "
+        "A stored query whose filters and params cover the part DOES answer it: fill its "
+        "params instead.\n"
+        "4. Each call answers ONE part with ONE stored query of the table you name: "
+        "{\"table\", \"query_id\", \"params\"} (plus \"listing\" when it is a listing, and "
+        "\"reshape\" when you reshape its result). The "
+        "query_id must belong to that table. Use only the parameter names the query "
+        "declares; give every parameter not marked optional a value of its type.\n\n"
         "Return JSON only."
     )
     # Layout for prompt caching: everything that is the same across questions
@@ -4509,10 +5066,18 @@ def table_query_select(question: str, catalogs: list[dict[str, Any]],
 
     fail_block = ""
     if failures:
-        fail_block = ("\n\nPREVIOUS ATTEMPT FAILED (fix it: other param values -- take them "
-                      "from allowed_values / valid_combinations above --, another catalog "
-                      "query, a new query spec, or chained calls; an identifier listed in "
-                      "unsupported_identifiers must not be used again):\n" + _j(failures))
+        fail_block = ("\n\nPREVIOUS ATTEMPT FAILED. Fix ONLY what is shown to be wrong: a "
+                      "refused selection (choose a stored query that exists in the named table), "
+                      "a parameter value that is invalid or absent from its column (take the "
+                      "valid one from allowed_values / valid_combinations / existing_similar), "
+                      "an identifier listed in unsupported_identifiers (never use it again), or "
+                      "a value another call must find first (chain the calls). Keep every value "
+                      "listed under keep -- the entity, period and qualifiers the question asks "
+                      "for -- unchanged, and never leave one out to get rows: a stored query "
+                      "that runs and returns no rows is a valid answer. Each retry call must name "
+                      "the failed call it replaces in \"retry_of\" (its number in the failures "
+                      "list, from 1). If no stored query can answer the part, report it in "
+                      "no_match instead.\n" + _j(failures))
     inv_block = ("\n\nALL TABLES (every loaded table; describe any of them):\n"
                  + _j(inventory)) if inventory else ""
     doc_block = ""
@@ -4528,16 +5093,22 @@ def table_query_select(question: str, catalogs: list[dict[str, Any]],
             'Return JSON: {"needed": true|false, "reason": "...", "describe": ["<table>"], '
             '"calls": [{"table": "...", '
             '"query_id": "<catalog id>", "params": {"name": value | {"from_call": 1, "column": "..."}}, '
-            '"listing": false} | '
-            '{"table": "...", "query": {QUERY SPEC}, "params": {"name": value}, "listing": false, '
-            '"purpose": "...", "why_not_catalog": "..."}]}'
+            '"listing": false, "reshape": null, "retry_of": null}], '
+            '"no_match": [{"part": "<part of the question>", "reason": "..."}]}'
             + rel_block + doc_block + fail_block + f"\n\nQUESTION: {question}")
     return system, user
 
 PROMPTS = {
     "table_profile": table_profile,
+    "table_profile_columns": table_profile_columns,
+    "table_profile_synthesis": table_profile_synthesis,
+    "table_profile_capabilities": table_profile_capabilities,
     "table_refine": table_refine,
+    "table_measure_repair": table_measure_repair,
+    "table_concept_map": table_concept_map,
     "table_sql_repair": table_sql_repair,
+    "table_verify_columns": table_verify_columns,
+    "table_verify_items": table_verify_items,
     "table_lookups": table_lookups,
     "table_query_select": table_query_select,
     "chunk_classification": chunk_classification,

@@ -67,6 +67,7 @@ class ImportReport:
     applied: bool = False
     class_edges: int = 0
     entity_edges: int = 0
+    tested: dict = field(default_factory=dict)      # data-test status counts after the import
 
     @property
     def changed(self) -> bool:
@@ -205,6 +206,12 @@ async def import_markdown(
         if rep.errors or dry_run:
             continue
         new["edited"] = True
+        # An edited query runs at retrieval only once its exact SQL passed the
+        # data tests (unchanged items keep their verification).
+        from backend.app.services.structured.refine import ensure_tested
+
+        rep.tested = await ensure_tested(new, analysis=new.get("analysis") or {}, all_types=types,
+                                         partners={n: r["meta"] for n, r in reg.items()})
         vec = (await embed([metadata_text(new)]))[0] if embed is not None else None
         async with session_scope() as s:
             from backend.app.services.structured.value_domains import attach_value_domains

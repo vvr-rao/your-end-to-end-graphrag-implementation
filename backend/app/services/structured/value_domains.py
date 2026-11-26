@@ -27,6 +27,7 @@ a failure that hands the valid values to the one retry.
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import date, datetime
 from decimal import Decimal
@@ -84,6 +85,43 @@ async def column_domain(session, table: str, column: dict, *, max_values: int = 
     return {"distinct": "many"}
 
 
+def _fixed_where(item: dict, cols: set[str]) -> list[dict]:
+    """The item's constant (param-free) single-table where entries: fixed
+    values and population predicates."""
+    out = []
+    for w in (item.get("query") or {}).get("where") or []:
+        c = w.get("column") if isinstance(w, dict) else None
+        if isinstance(c, str) and "." not in c and c in cols and w.get("param") in (None, "") \
+                and ("value" in w or str(w.get("op")) in {"is_null", "not_null"}):
+            out.append({k: w[k] for k in ("column", "op", "value") if k in w})
+    return out
+
+
+def _fixed_sql(table: str, types: dict[str, str], fixed: list[dict]) -> str:
+    """' WHERE ...' for constant entries, compiled by the query builder
+    (literals only, no binds); '' when there are none."""
+    if not fixed:
+        return ""
+    from backend.app.services.structured.query_builder import build_sql
+
+    built = build_sql({"select": [next(iter(types))], "where": fixed}, table, {table: types})
+    i = built.sql.find(" WHERE ")
+    if i < 0:
+        return ""
+    j = built.sql.find(" ORDER BY ", i)
+    return built.sql[i:j if j > 0 else None]
+
+
+async def _scoped_values(session, table: str, types: dict[str, str], column: str, fixed: list[dict],
+                         max_values: int) -> list | None:
+    where = _fixed_sql(table, types, fixed)
+    rows = (await session.execute(sql_text(
+        f"SELECT DISTINCT {_q(column)} FROM graphrag.{_q(table)}{where}"
+        f"{' AND' if where else ' WHERE'} {_q(column)} IS NOT NULL ORDER BY 1 LIMIT {max_values + 1}"
+    ))).scalars().all()
+    return [_plain(v) for v in rows] if len(rows) <= max_values else None
+
+
 def _eq_param_columns(item: dict) -> dict[str, str]:
     """param name -> column for the spec's single-table = / in filters."""
     out = {}
@@ -119,14 +157,25 @@ async def attach_value_domains(session, meta: dict, *, max_values: int = MAX_VAL
 
     stats = {"listed_columns": sum(1 for d in domains.values() if "values" in d),
              "params_with_values": 0, "items_with_combinations": 0}
-    combo_cache: dict[tuple[str, ...], list | None] = {}
+    combo_cache: dict[tuple, list | None] = {}
+    scoped_cache: dict[tuple, list | None] = {}
+    types = {c["name"]: c.get("type") or "text" for c in cols.values()}
     for _sec, it in items(meta):
+        fixed = _fixed_where(it, set(cols))
+        fkey = json.dumps(fixed, sort_keys=True, default=str)
         for p in it.get("params") or []:
             p.pop("allowed_values", None)
             p.pop("range", None)
             d = domains.get(p.get("column") or "")
             if d and "values" in d:
-                p["allowed_values"] = d["values"]
+                vals = d["values"]
+                if fixed:          # the item's fixed conditions (population) narrow the domain
+                    k = (p["column"], fkey)
+                    if k not in scoped_cache:
+                        scoped_cache[k] = await _scoped_values(session, table, types, p["column"], fixed,
+                                                               max_values)
+                    vals = scoped_cache[k] if scoped_cache[k] is not None else vals
+                p["allowed_values"] = vals
                 stats["params_with_values"] += 1
             elif d and "min" in d:
                 p["range"] = [d["min"], d["max"]]
@@ -136,11 +185,12 @@ async def attach_value_domains(session, meta: dict, *, max_values: int = MAX_VAL
         if len(eq) < 2:
             continue
         names = list(eq)
-        key = tuple(eq[n] for n in names)
+        key = (tuple(eq[n] for n in names), fkey)
         if key not in combo_cache:
+            where = _fixed_sql(table, types, fixed)
             rows = (await session.execute(sql_text(
-                f"SELECT DISTINCT {', '.join(_q(c) for c in key)} FROM graphrag.{_q(table)} "
-                f"ORDER BY {', '.join(str(i + 1) for i in range(len(key)))} LIMIT {max_combos + 1}"
+                f"SELECT DISTINCT {', '.join(_q(c) for c in key[0])} FROM graphrag.{_q(table)}{where} "
+                f"ORDER BY {', '.join(str(i + 1) for i in range(len(key[0])))} LIMIT {max_combos + 1}"
             ))).all()
             combo_cache[key] = ([[_plain(v) for v in r] for r in rows]
                                 if len(rows) <= max_combos else None)
@@ -216,3 +266,73 @@ def spec_declared(built_params: list[dict], domains: dict[str, dict]) -> list[di
         d = domains.get(p.get("column") or "") or {}
         out.append({**p, **({"allowed_values": d["values"]} if "values" in d else {})})
     return out
+
+
+# ------------------------------------------------------------ stored-query calls
+
+_BOOL_WORDS = {"true": True, "t": True, "yes": True, "y": True, "1": True,
+               "false": False, "f": False, "no": False, "n": False, "0": False}
+
+
+def _type_ok(kind: str, v: Any) -> bool:
+    """Whether ``v`` can be bound as ``kind`` without guessing."""
+    from backend.app.services.structured.sql_exec import _coerce_one
+
+    k = (kind or "text").lower()
+    if k.endswith("[]"):
+        vals = v if isinstance(v, list) else [v]
+        return bool(vals) and all(_type_ok(k[:-2], x) for x in vals)
+    if isinstance(v, (dict, list)):
+        return False
+    if k in {"boolean", "bool"}:
+        return isinstance(v, bool) or str(v).strip().lower() in _BOOL_WORDS
+    if isinstance(v, bool) and k != "text":
+        return False
+    out = _coerce_one(k, v)
+    if k in {"integer", "int", "bigint", "smallint"}:
+        return isinstance(out, int) and not isinstance(out, bool)
+    if k in {"numeric", "decimal", "float", "double", "real", "number"}:
+        return isinstance(out, Decimal)
+    if k == "date":
+        return isinstance(out, date)
+    if k in {"timestamp", "timestamptz", "datetime"}:
+        return isinstance(out, datetime)
+    return True
+
+
+def validate_call_params(params: dict[str, Any] | None, declared: list[dict] | None,
+                         combinations: dict | None = None,
+                         ) -> tuple[dict[str, Any], list[dict], list[dict]]:
+    """Check a selected stored query's parameter values against its DECLARED
+    parameters before anything runs. Returns (params to bind, problems,
+    substitutions); the call may run only when ``problems`` is empty.
+
+    * a name the query does not declare is refused (never silently dropped);
+    * a required parameter must have a value (an optional one may be left out:
+      its filter then covers every value, or the total row where the table
+      has one -- the behaviour compiled into the stored SQL);
+    * each value must bind as the declared type without guessing;
+    * then the column's valid values and the valid combinations
+      (:func:`check_params`)."""
+    declared = [p for p in declared or [] if isinstance(p, dict) and p.get("name")]
+    names = {str(p["name"]) for p in declared}
+    given = {str(k).lstrip(":"): v for k, v in (params or {}).items()}
+    problems: list[dict] = []
+    for k in sorted(set(given) - names):
+        problems.append({"param": k, "error": "not a parameter of this stored query",
+                         "declared": sorted(names)})
+    clean = {k: v for k, v in given.items() if k in names}
+    for p in declared:
+        n = str(p["name"])
+        if clean.get(n) is None:
+            clean.pop(n, None)
+            if not p.get("optional"):
+                problems.append({"param": n, "error": "required parameter has no value",
+                                 "column": p.get("column"), "type": p.get("type")})
+            continue
+        if not _type_ok(str(p.get("type") or "text"), clean[n]):
+            problems.append({"param": n, "value": clean[n], "column": p.get("column"),
+                             "error": f"value is not a valid {p.get('type')}"})
+    if problems:
+        return clean, problems, []
+    return check_params(clean, declared, combinations)

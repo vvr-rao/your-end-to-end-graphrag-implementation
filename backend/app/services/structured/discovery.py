@@ -218,3 +218,20 @@ def assign_table_names(tables: list[TableSource], reserved: set[str]) -> None:
                 i += 1
             t.table_name = cand
             taken.add(cand)
+
+
+def select_tables(found: list, limit: int | None = None, names: list[str] | None = None) -> list:
+    """The tables to process: those named in ``names`` (table names as
+    discovery assigned them over the WHOLE folder, so a selected table keeps
+    the name it gets in a full run), else the first ``limit``. A name that
+    is not found is an error that lists the available names."""
+    if names:
+        want = list(dict.fromkeys(names))
+        have = {t.table_name: t for t in found}
+        missing = [n for n in want if n not in have]
+        if missing:
+            raise SystemExit(f"--structured-table: not found: {', '.join(missing)} "
+                             f"(tables in this folder: {', '.join(sorted(have))})")
+        return [have[n] for n in want]
+    return found[:limit] if limit else list(found)
+

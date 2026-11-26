@@ -1442,6 +1442,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_ext.add_argument("--structured-limit", type=int, default=None, metavar="N",
                        help="Load only the first N tables (alphabetical) -- smoke testing.")
+    p_ext.add_argument("--structured-table", action="append", default=None, metavar="NAME",
+                       help=("Load/profile only this table (repeatable). NAME is the table name "
+                             "discovery assigns over the whole folder (printed at start)."))
     p_ext.add_argument("--table-profile-concurrency", type=int, default=None, metavar="N",
                        help="Concurrent table_profile calls for cache misses (default config).")
     p_ext.add_argument("--refresh-table-metadata", action="store_true",
@@ -1491,12 +1494,35 @@ def build_parser() -> argparse.ArgumentParser:
     p_tmr.add_argument("--refresh", action="store_true",
                        help="Refine again even when the metadata is already refined.")
     p_tmr.add_argument("--relink", action="store_true",
-                       help="For already-refined tables: no LLM call; re-derive query tags and the "
-                            "graph links (classes, entities, periods, places).")
+                       help="For already-refined tables: NO model and NO embedding call; re-compile "
+                            "and re-test every stored query, re-derive query tags and the graph links "
+                            "(classes, entities, periods, places). Verdicts whose SQL changed become "
+                            "stale (a later run without --relink re-verifies them).")
+    p_tmr.add_argument("--no-verify", action="store_true",
+                       help="Skip the independent verification (task table_verify) of the column "
+                            "metadata and of every stored query against its label/description.")
+    p_tmr.add_argument("--reverify", action="store_true",
+                       help="Verify again even when the metadata is already verified.")
     p_tmr.add_argument("--no-entity-links", action="store_true",
                        help="Rebuild only the class edges (skip matching key values to entities).")
     p_tmr.add_argument("--json", action="store_true", help="Print the per-table reports as JSON.")
     p_tmr.set_defaults(func=_cmd_table_metadata_refine)
+
+    p_tou = sub.add_parser(
+        "table-ontology-update",
+        help="Add the class proposals that table-metadata-refine persisted for the FINAL "
+             "verified catalogs (concepts no existing class matched) to a NEW ontology "
+             "version (existing dedup/parent resolution, configured base IRI), import it, "
+             "resolve the catalogs to the new IRIs and verify catalog = DB = OWL. "
+             "No measure discovery is re-run; repeating it reuses IRIs.",
+    )
+    p_tou.add_argument("--input", type=Path, required=True,
+                       help="Ontology version folder to extend (holds merged.json).")
+    p_tou.add_argument("--output-dir", type=Path, default=Path("output_ontologies"))
+    p_tou.add_argument("--no-import", action="store_true",
+                       help="Write the version folder only; do not import it or relink catalogs.")
+    p_tou.add_argument("--json", action="store_true")
+    p_tou.set_defaults(func=_cmd_table_ontology_update)
 
     p_tq = sub.add_parser(
         "table-query",
@@ -2887,7 +2913,8 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
         from backend.app.services.structured.prune_expand_hook import check_folder
 
         check_folder(Path(_sd), getattr(args, "structured_limit", None),
-                     when="and load after entity extraction")
+                     when="and load after entity extraction",
+                     tables=getattr(args, "structured_table", None))
 
     async def _structured() -> None:
         from backend.app.services.structured.graph_hook import run_structured_load
@@ -2896,6 +2923,7 @@ def _cmd_extract_entities(args: argparse.Namespace) -> int:
         await run_structured_load(
             Path(_sd),
             limit=getattr(args, "structured_limit", None),
+            tables=getattr(args, "structured_table", None),
             concurrency=resolve_concurrency(getattr(args, "table_profile_concurrency", None),
                                             get_settings_app_config()),
             refresh=getattr(args, "refresh_table_metadata", False),
@@ -2968,21 +2996,97 @@ def _cmd_table_metadata_import(args: argparse.Namespace) -> int:
     return 1 if bad else 0
 
 
+def _print_verification(table: str, v: dict) -> None:
+    print(f"[table-metadata-refine] {table}: verified -- {len(v['columns_fixed'])} column(s) "
+          f"corrected, {len(v['ok'])} ok, {len(v['text_fixed'])} re-described, "
+          f"{len(v['query_fixed'])} query fixed, {len(v['dropped'])} dropped, "
+          f"{len(v.get('renamed') or [])} renamed, {len(v.get('added') or [])} added, "
+          f"{len(v['unverified'])} still pending a verdict"
+          + (" (only the items pending from an earlier run)" if v.get("only_pending") else ""))
+    for r in v.get("rejected_verdicts") or []:
+        print(f"    verdict {r['verdict']!r} not allowed for {r['id']} (allowed: {', '.join(r['allowed'])}); asked again")
+    for c in v["columns_fixed"]:
+        print(f"    column {c['column']}: {c['problem']}")
+    for t in v["text_fixed"]:
+        print(f"    re-described {t['id']}: {t['reason']}")
+    for q in v["query_fixed"]:
+        print(f"    query fixed {q['id']}: {q['reason']}")
+    for r in v.get("renamed") or []:
+        print(f"    renamed {r['from']} -> {r['to']}")
+    for a in v.get("added") or []:
+        print(f"    added {a['id']} (from {a['from']}): {a['reason']}")
+    for a in v.get("add_failed") or []:
+        print(f"    add from {a['from']} failed: {a['error']}")
+    for d in v["dropped"]:
+        print(f"    dropped {d['section']}/{d['id']}: {d['reason']}"
+              + (f" (fix failed: {d['fix_error']})" if d.get("fix_error") else ""))
+
+
+def _cmd_table_ontology_update(args: argparse.Namespace) -> int:
+    from backend.app.core.config import get_settings
+    from backend.app.services.structured.concepts import (
+        apply_class_proposals,
+        check_agreement,
+    )
+    from backend.app.services.structured.refine import refine_registered
+
+    onto = (get_settings().app_config or {}).get("ontology") or {}
+    base_iri = onto.get("default_base_iri") or "https://veerla-ramrao.ai/ontology/merged#"
+
+    async def go():
+        rep = await apply_class_proposals(args.input, output_root=args.output_dir, base_iri=base_iri,
+                                          parent_iri=onto.get("default_parent_iri"),
+                                          import_db=not args.no_import)
+        if args.no_import:
+            return rep
+        from backend.app.db.embedding_guard import ensure_embedding_model
+        from backend.app.services.embeddings import Embedder
+        from backend.app.services.structured.cache import MetadataCache
+
+        embedder = Embedder()
+        await ensure_embedding_model(embedder)
+        # relink = no LLM: concepts resolve to the imported IRIs, edges are rebuilt
+        rep["relinked"] = await refine_registered(None, relink=True, cache=MetadataCache(),
+                                                  embed=embedder.embed)
+        rep["agreement"] = await check_agreement(Path(rep["version_dir"]) / "merged.owl")
+        return rep
+
+    rep = asyncio.run(go())
+    if args.json:
+        print(json.dumps(rep, indent=2, default=str))
+    print(f"[table-ontology-update] {rep['proposals']} proposal(s), {len(rep['created'])} new class(es) "
+          f"-> {rep['version_dir']}")
+    ag = rep.get("agreement")
+    if ag:
+        print(f"[table-ontology-update] catalog/DB/OWL agreement: {'OK' if ag['ok'] else 'MISMATCH'} "
+              f"({ag['checked']} class refs; {len(ag['missing_in_db'])} missing in DB, "
+              f"{len(ag['missing_in_owl'])} missing in OWL)")
+        return 0 if ag["ok"] else 1
+    return 0
+
+
 def _cmd_table_metadata_refine(args: argparse.Namespace) -> int:
     from backend.app.services.llm_router import LLMRouter
     from backend.app.services.structured.cache import MetadataCache
     from backend.app.services.structured.refine import refine_registered
 
     async def go():
-        from backend.app.db.embedding_guard import ensure_embedding_model
-        from backend.app.services.embeddings import Embedder
+        embed = None
+        if not args.relink:
+            # a relink makes NO model or embedding call: the metadata node keeps
+            # its stored vector (refresh it with a later non-relink run)
+            from backend.app.db.embedding_guard import ensure_embedding_model
+            from backend.app.services.embeddings import Embedder
 
-        embedder = Embedder()
-        await ensure_embedding_model(embedder)
-        router = LLMRouter()
+            embedder = Embedder()
+            await ensure_embedding_model(embedder)
+            embed = embedder.embed
+        router = LLMRouter()        # a relink only reads its config (no calls)
         reports = await refine_registered(router, tables=args.table, refresh=args.refresh,
                                           relink=args.relink,
-                                          cache=MetadataCache(), embed=embedder.embed,
+                                          verify=False if args.no_verify else None,
+                                          reverify=args.reverify,
+                                          cache=MetadataCache(), embed=embed,
                                           link_entities=not args.no_entity_links)
         return reports, router
 
@@ -2994,15 +3098,32 @@ def _cmd_table_metadata_refine(args: argparse.Namespace) -> int:
             print(f"[table-metadata-refine] {r['table']}: FAILED -- {r['error']}")
             continue
         if r.get("relinked"):
-            print(f"[table-metadata-refine] {r['table']}: relinked (no LLM call)")
+            t = r.get("test_status") or {}
+            print(f"[table-metadata-refine] {r['table']}: "
+                  f"{'migrated to the verified catalog' if r.get('migrated') else 'relinked'} (no LLM call)"
+                  + (f" -- {t.get('passed', 0)} selectable, {t.get('failed', 0)} failed, "
+                     f"{t.get('not_exercised', 0)} not exercised" if t else ""))
+            continue
+        if r.get("verified"):
+            _print_verification(r["table"], r["verified"])
+        if r.get("verified_only"):
             continue
         print(f"[table-metadata-refine] {r['table']}: measures {', '.join(r['measures']) or 'none'}; "
               f"repaired {len(r['repaired'])}, dropped {len(r['dropped'])}, "
               f"typical questions {r['questions']}")
+        t = r.get("test_status") or {}
+        if t:
+            print(f"    stored queries: {t.get('passed', 0)} selectable, {t.get('failed', 0)} failed, "
+                  f"{t.get('not_exercised', 0)} not exercised (not offered to retrieval)")
         for d in r["dropped"]:
             print(f"    dropped {d['section']}/{d['id']}: {d['error']}")
         for m in r["rejected_measures"]:
             print(f"    measure rejected {m['measure']}: {m['error']}")
+        for mid in r.get("failed_measures") or []:
+            print(f"    measure unresolved after repair (kept in failed_measures, not selectable): {mid}")
+        for mid, notes in (r.get("review") or {}).items():
+            for n in notes:
+                print(f"    review {mid}: {n}")
     try:
         print(f"[table-metadata-refine] LLM cost ${router.total_cost_usd:.4f}")
     except Exception:

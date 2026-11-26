@@ -397,14 +397,36 @@ Data files (CSV/TSV/JSON/JSONL/Parquet) can sit beside the documents:
    (the LLM never writes SQL). Cached by file content.
 2. `extract-entities --structured-data <DIR>` (or `--structured-only`) — loads
    the tables into the `graphrag` schema and links each table's metadata node to
-   classes and to existing entities found in key columns. Reads the cache: no
-   new LLM calls when prune-expand already profiled the files.
+   classes and to EXISTING entities found in key and place columns (it never
+   creates an entity; unknown places and unmatched class proposals are
+   reported). Reads the cache: no new LLM calls when prune-expand already
+   profiled the files. Every stored query is compiled and tested on the data.
+   Then `table-metadata-refine` runs on the loaded tables: measures the
+   structure, defines measures, tests every stored query on the data, and
+   VERIFIES independently (task `table_verify`): column metadata vs the measured
+   data, then each query's SQL vs its label/description (ok / re-describe / fix
+   and re-test / drop; a measure only ok / re-describe / drop). Items without a
+   verdict stay pending for the next run. `--no-verify` skips it, `--reverify`
+   repeats it, `--relink` re-tests everything with no LLM (and migrates older
+   catalogs). Only queries whose exact SQL passed (status passed, not failed or
+   not_exercised) are offered to retrieval.
+   Wide tables are profiled in column batches and refined by candidate id,
+   checkpointed and resumable, with call/token budgets (`continuation:` in
+   models.yaml); unfinished work is labelled, never dropped silently. Measures
+   carry an ordered version rule (precedence vs tie-break; unresolved ties keep
+   a measure unavailable), a population (applied to SQL, parameter values and
+   tests) and subject / uniqueness / dimension columns measured on the data.
+   Each table gets a coverage ledger (`coverage_ledger`: dedicated_measure,
+   generic_query, partial, unexercised, verifier_drop, unsupported,
+   unfinished, gap) and an entity-match report (`entity_matches`: raw value,
+   matched label/id, target type, method, decision).
 3. `query --use-structured-data` (simple_qa / deep_research; also the
    `use_structured_data` field of `POST /qa` and conversation turns) — tables
    reached through the graph walk are offered to one selection call that picks
-   STORED queries and fills their parameters; when none fits it may return a
-   new JSON query spec, never SQL. The SQL is compiled from the spec with no
-   LLM. Every statement runs read-only, with a timeout, and at most
+   STORED queries and fills their parameters, or reports no_match; inline SQL
+   or query specs are refused. The stored, tested SQL runs with its parameters
+   validated and bound by the driver; zero rows is an answer, and a retry may
+   not broaden the question. Every statement runs read-only, with a timeout, and at most
    `qa.structured_max_rows` (50) rows reach the prompt — aggregates still run
    over the whole table; the cap only bounds what the model reads, and a capped
    result says "N of M rows". Results are cited as `viao:SqlResult_…`. Off by

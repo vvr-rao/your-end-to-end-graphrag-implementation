@@ -65,7 +65,8 @@ def test_distinct_on_leads_order_by_and_year_fn():
             "order_by": [{"column": "filed", "dir": "desc"}, {"column": "end", "dir": "desc"}]})
     assert b.sql.startswith('SELECT DISTINCT ON ("end") "end", "val", "filed"')
     assert 'CAST(EXTRACT(YEAR FROM "end") AS integer) = CAST(:year AS bigint)' in b.sql
-    assert b.sql.endswith('ORDER BY "end" DESC NULLS LAST, "filed" DESC NULLS LAST')
+    # a row whose value is empty is kept only when no row with a value exists
+    assert b.sql.endswith('ORDER BY "end" DESC NULLS LAST, ("val" IS NULL) ASC, "filed" DESC NULLS LAST')
     assert b.params == [{"name": "year", "type": "integer", "column": "year_end"}]
 
 
@@ -246,3 +247,10 @@ def test_plain_rows_and_whole_table_aggregates_are_unchanged():
     assert "WHERE" not in _b({"select": ["cik", "val"]}).sql
     b = _b({"select": [{"agg": "sum", "column": "val", "as": "total"}]})
     assert "WHERE" not in b.sql and b.empty_excluded == []
+
+
+def test_conditions_the_compiler_adds_are_reported():
+    b = build_sql({"select": ["company", {"agg": "count", "as": "n"}]}, "companies", COLS,
+                  totals={"companies": {"commodity": "All"}})
+    assert b.added_conditions == ["\"commodity\" = 'All'", "NULLIF(\"company\", '') IS NOT NULL"]
+    assert _b({"select": ["cik", "val"]}).added_conditions == []

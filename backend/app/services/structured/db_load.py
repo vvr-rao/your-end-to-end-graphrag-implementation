@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -67,6 +68,7 @@ class LoadSummary:
     class_edges: int = 0
     entity_edges: int = 0
     nodes: dict[str, str] = field(default_factory=dict)   # table -> artifact id
+    tested: dict[str, dict] = field(default_factory=dict)  # table -> data-test status counts
 
 
 def q(ident: str) -> str:
@@ -338,6 +340,124 @@ def _edge(src_id, tgt_type: str, tgt_id, kind: str, gv: int, extra: dict) -> dic
     }
 
 
+_PLACE_KIND = re.compile(r"place|location|geograph|country|region|city|state|province|territor", re.I)
+FUZZY_AMBIGUITY_MARGIN = 0.03      # second-best fuzzy score this close to the best -> ambiguous
+DOMINANT_CLASS_SHARE = 0.6         # share of a column's exact matches that fixes its expected type
+
+
+async def _entity_info(session: AsyncSession, ids: list) -> dict:
+    if not ids:
+        return {}
+    rows = (await session.execute(sql_text(f"""
+        SELECT e.id, e.name, c.id, c.label FROM {SCHEMA}.entities e
+          JOIN {SCHEMA}.ontology_classes c ON c.id = e.class_id
+         WHERE e.id = ANY(CAST(:ids AS uuid[]))"""), {"ids": [str(i) for i in ids]})).all()
+    return {eid: {"name": n, "class_id": cid, "class": lab} for eid, n, cid, lab in rows}
+
+
+async def match_entities(session: AsyncSession, meta: dict, lookup: dict[str, uuid.UUID]
+                         ) -> tuple[dict[uuid.UUID, dict], list[dict]]:
+    """Table values -> EXISTING entities (none is created), with checks.
+
+    exact name: accepted unless it lands on a place entity from a column that
+    does not hold places. A shortened (``short_form``) or ``fuzzy`` match must
+    also fit the column's TYPE: the class most of the column's exact matches
+    have (when there is one), and never a place from a non-place column (a
+    company named after a country is not the country). A fuzzy match whose
+    runner-up scores within :data:`FUZZY_AMBIGUITY_MARGIN` is ambiguous.
+    Rejected and ambiguous values stay unresolved. Returns (hits by entity,
+    one report row per value: raw value, column, method, matched label / id,
+    target type, decision, reason)."""
+    from backend.app.services.db_entity_extract import _normalize_name, _short_form_variants
+    from backend.app.services.db_geo_enrich import DEFAULT_GEO_CLASS_LABELS, _place_entities
+    from backend.app.services.structured.graph_links import place_level
+
+    places = {r[0] for r in await _place_entities(session, DEFAULT_GEO_CLASS_LABELS)}
+    cols = {c["name"]: c for c in meta.get("columns") or []}
+    cand: list[dict] = []
+    misses: dict[str, tuple[str, str]] = {}
+    for col in entity_key_columns(meta):
+        vals = (await session.execute(sql_text(
+            f"SELECT DISTINCT {q(col)} FROM {SCHEMA}.{q(meta['table_name'])} "
+            f"WHERE {q(col)} IS NOT NULL LIMIT :n"), {"n": MAX_VALUES_PER_COLUMN})).scalars().all()
+        for v in vals:
+            norm = _normalize_name(str(v))
+            if not norm or len(norm) < 2:
+                continue
+            eid, method = lookup.get(norm), "exact"
+            if eid is None:
+                for short in _short_form_variants(norm)[1:]:
+                    eid = lookup.get(short)
+                    if eid is not None:
+                        method = "short_form"
+                        break
+            if eid is not None:
+                cand.append({"column": col, "raw": str(v), "entity_id": eid, "method": method})
+            elif len(misses) < MAX_FUZZY_VALUES and not norm.isdigit():
+                misses.setdefault(norm, (col, str(v)))
+    if misses:
+        rows = (await session.execute(sql_text(f"""
+            SELECT q.v, e.id, e.sim FROM unnest(CAST(:vals AS text[])) AS q(v)
+            CROSS JOIN LATERAL (
+                SELECT id, similarity(e.normalized_name, q.v) AS sim FROM {SCHEMA}.entities e
+                 WHERE e.status = 'ACTIVE' AND e.normalized_name % q.v
+                   AND similarity(e.normalized_name, q.v) >= :th
+                 ORDER BY 2 DESC LIMIT 2) e
+        """), {"vals": list(misses), "th": FUZZY_THRESHOLD})).all()
+        best: dict[str, list] = {}
+        for norm, eid, sim in rows:
+            best.setdefault(norm, []).append((eid, float(sim)))
+        for norm, opts in best.items():
+            col, raw = misses[norm]
+            opts.sort(key=lambda x: -x[1])
+            amb = len(opts) > 1 and opts[0][0] != opts[1][0] and opts[0][1] - opts[1][1] < FUZZY_AMBIGUITY_MARGIN
+            cand.append({"column": col, "raw": raw, "entity_id": opts[0][0], "method": "fuzzy",
+                         "score": round(opts[0][1], 3), **({"ambiguous_with": opts[1][0]} if amb else {})})
+    info = await _entity_info(session, list({c["entity_id"] for c in cand}
+                                            | {c["ambiguous_with"] for c in cand if c.get("ambiguous_with")}))
+    # the type a column's exact matches mostly have
+    dominant: dict[str, Any] = {}
+    for col in {c["column"] for c in cand}:
+        ex = [info[c["entity_id"]]["class_id"] for c in cand
+              if c["column"] == col and c["method"] == "exact" and c["entity_id"] in info]
+        if len(ex) >= 2:
+            top = max(set(ex), key=ex.count)
+            if ex.count(top) >= DOMINANT_CLASS_SHARE * len(ex):
+                dominant[col] = top
+    hits: dict[uuid.UUID, dict] = {}
+    report: list[dict] = []
+    for c in cand:
+        e = info.get(c["entity_id"]) or {}
+        col = cols.get(c["column"]) or {"name": c["column"]}
+        place_col = place_level(col) is not None or bool(
+            _PLACE_KIND.search(f"{col.get('entity_kind') or ''} {col.get('class_label') or ''}"))
+        row = {"column": c["column"], "raw_value": c["raw"], "method": c["method"],
+               "matched_label": e.get("name"), "entity_id": str(c["entity_id"]),
+               "target_type": e.get("class"), **({"score": c["score"]} if "score" in c else {})}
+        reason = None
+        if c.get("ambiguous_with"):
+            other = info.get(c["ambiguous_with"]) or {}
+            reason = f"ambiguous: also matches {other.get('name')!r} ({other.get('class')})"
+        elif c["entity_id"] in places and not place_col:
+            reason = (f"type mismatch: {e.get('class')} is a place, column {c['column']!r} does not hold places")
+        elif c["method"] != "exact" and dominant.get(c["column"]) not in (None, e.get("class_id")):
+            reason = (f"type mismatch: the column's exact matches are a different class than "
+                      f"{e.get('class')}")
+        row["decision"] = "unresolved" if reason else "linked"
+        if reason:
+            row["reason"] = reason
+        report.append(row)
+        if reason:
+            continue
+        h = hits.setdefault(c["entity_id"], {"columns": set(), "values": [], "match": c["method"], "matches": []})
+        h["columns"].add(c["column"])
+        if len(h["values"]) < 5 and c["raw"] not in h["values"]:
+            h["values"].append(c["raw"])
+        h["matches"].append({k: row[k] for k in ("column", "raw_value", "method", "matched_label",
+                                                  "entity_id", "target_type")})
+    return hits, report
+
+
 async def rebuild_edges(session: AsyncSession, node_id: uuid.UUID, meta: dict, gv: int,
                         entity_lookup: dict[str, uuid.UUID] | None = None,
                         *, link_entities: bool = True, embed=None,
@@ -374,56 +494,18 @@ async def rebuild_edges(session: AsyncSession, node_id: uuid.UUID, meta: dict, g
 
     n_ent = 0
     if link_entities:
-        from backend.app.services.db_entity_extract import _normalize_name, _short_form_variants
-
         lookup = entity_lookup if entity_lookup is not None else await _entity_lookup(session)
-        hits: dict[uuid.UUID, dict] = {}
-        misses: dict[str, tuple[str, str]] = {}
-        for col in entity_key_columns(meta):
-            vals = (await session.execute(sql_text(
-                f"SELECT DISTINCT {q(col)} FROM {SCHEMA}.{q(meta['table_name'])} "
-                f"WHERE {q(col)} IS NOT NULL LIMIT :n"), {"n": MAX_VALUES_PER_COLUMN})).scalars().all()
-            for v in vals:
-                norm = _normalize_name(str(v))
-                if not norm or len(norm) < 2:
-                    continue
-                eid = lookup.get(norm)
-                match = "exact"
-                if eid is None:
-                    # Tables carry full legal names ("BHP GROUP LIMITED"), the
-                    # text carries the short one ("BHP Group"): strip the
-                    # corporate suffixes on the TABLE side too, longest first.
-                    for short in _short_form_variants(norm)[1:]:
-                        eid = lookup.get(short)
-                        if eid is not None:
-                            match = "short_form"
-                            break
-                if eid is not None:
-                    h = hits.setdefault(eid, {"columns": set(), "values": [], "match": match})
-                    h["columns"].add(col)
-                    if len(h["values"]) < 5 and str(v) not in h["values"]:
-                        h["values"].append(str(v))
-                elif len(misses) < MAX_FUZZY_VALUES and not norm.isdigit():
-                    misses.setdefault(norm, (col, str(v)))
-        if misses:
-            rows = (await session.execute(sql_text(f"""
-                SELECT q.v, e.id FROM unnest(CAST(:vals AS text[])) AS q(v)
-                CROSS JOIN LATERAL (
-                    SELECT id FROM {SCHEMA}.entities e
-                     WHERE e.status = 'ACTIVE' AND e.normalized_name % q.v
-                       AND similarity(e.normalized_name, q.v) >= :th
-                     ORDER BY similarity(e.normalized_name, q.v) DESC LIMIT 1) e
-            """), {"vals": list(misses), "th": FUZZY_THRESHOLD})).all()
-            for norm, eid in rows:
-                col, raw = misses[norm]
-                h = hits.setdefault(eid, {"columns": set(), "values": [], "match": "fuzzy"})
-                h["columns"].add(col)
-                if len(h["values"]) < 5:
-                    h["values"].append(raw)
+        hits, report = await match_entities(session, meta, lookup)
+        meta["entity_matches"] = report
+        await session.execute(sql_text(
+            f"UPDATE {SCHEMA}.intelligence_artifacts SET extra_metadata = extra_metadata || "
+            f"jsonb_build_object('entity_matches', CAST(:r AS jsonb)) WHERE id = :id"),
+            {"r": json.dumps(report, default=str), "id": node_id})
         for eid, h in list(hits.items())[:MAX_ENTITY_EDGES]:
             edges.append(_edge(node_id, "entity", eid, "tableEntity", gv,
                                {"table": meta["table_name"], "columns": sorted(h["columns"]),
-                                "values": h["values"], "match": h["match"]}))
+                                "values": h["values"], "match": h["match"],
+                                "matches": h["matches"][:5]}))
         n_ent = len(edges) - n_class
 
         from backend.app.services.structured.graph_links import time_and_place_edges
@@ -431,10 +513,15 @@ async def rebuild_edges(session: AsyncSession, node_id: uuid.UUID, meta: dict, g
         tp_edges, tp = await time_and_place_edges(session, node_id, meta, gv, embed=embed)
         edges += tp_edges
         n_ent += tp["places"]
-        if log is not None and (tp["periods"] or tp["places"]):
+        if log is not None and (tp["periods"] or tp["places"] or tp.get("places_unresolved")):
+            unres = tp.get("places_unresolved") or []
             log(f"[structured] {meta['table_name']}: {tp['periods']} period(s) at {tp['time_level']} "
-                f"level from {tp['time_columns']}, {tp['places']} place(s) "
-                f"({tp['places_minted']} new), {tp['containment']} containment edge(s)")
+                f"level from {tp['time_columns']}, {tp['places']} existing place(s) linked, "
+                f"{len(unres)} place(s) not in the graph (not created"
+                + (f": {', '.join(unres[:8])}" if unres else "") + f"), "
+                f"{tp['containment']} containment edge(s)"
+                + (f"; place columns found by their values: {', '.join(tp['place_columns_by_values'])}"
+                   if tp.get("place_columns_by_values") else ""))
 
     for i in range(0, len(edges), 500):
         batch = edges[i:i + 500]
@@ -534,10 +621,60 @@ async def load_and_link(run, *, root_name: str, cache=None, embed: EmbedFn | Non
             summary.failed.append((meta["table_name"], f"{type(exc).__name__}: {exc}"))
             log(f"[structured] FAILED {meta['table_name']}: {exc}")
 
+    await _finalize_catalogs(summary, cache=cache, log=log)
     if summary.loaded or summary.nodes:
         async with session_scope() as s:
             await bump_version(s)
     return summary
+
+
+async def _finalize_catalogs(summary: LoadSummary, *, cache=None, log: Callable[[str], None] = print) -> None:
+    """Make every loaded table's stored SQL final and TESTED (SQL only, no LLM):
+    retrieval runs only items whose exact SQL passed (see
+    ``metadata.selectable``). A table whose catalog is already current is only
+    re-tested where its SQL changed."""
+    from backend.app.db.graph_version import current_version
+    from backend.app.db.session import session_scope
+    from backend.app.services.structured.analysis import analyze_table
+    from backend.app.services.structured.metadata import column_types
+    from backend.app.services.structured.refine import ensure_tested
+
+    if not summary.nodes:
+        return
+    async with session_scope() as s:
+        reg = await registered_tables(s)
+        gv = await current_version(s)
+    partners = {n: r["meta"] for n, r in reg.items()}
+    types = {n: column_types(m) for n, m in partners.items()}
+    # analyse every table whose analysis is missing or measured other data
+    # BEFORE any query is finalized (a lookup carries its partner's markers)
+    for meta in partners.values():
+        an = meta.get("analysis") or {}
+        if not an or an.get("file_sha") != (meta.get("source") or {}).get("file_sha"):
+            async with session_scope() as s:
+                meta["analysis"] = await analyze_table(s, meta)           # SQL only
+    # every registered table: a reloaded table invalidates the queries of
+    # other tables that read it (lookups), even when their SQL is unchanged
+    for name, meta in partners.items():
+        node = reg[name]["id"]
+        try:
+            counts = await ensure_tested(meta, analysis=meta["analysis"], all_types=types, partners=partners)
+            if name not in summary.nodes and not counts.get("retested"):
+                continue
+            summary.tested[name] = counts
+            async with session_scope() as s:
+                await upsert_node(s, meta, None, gv, uuid.UUID(str(node)))
+            if cache is not None and meta.get("cache_key"):
+                base = cache.get(meta["cache_key"], name) or {}
+                entry = {**base, **meta}
+                entry.setdefault("status", "complete")
+                if entry.get("format"):
+                    cache.put(entry)
+            log(f"[structured] {name}: stored queries tested -- {counts['passed']} selectable, "
+                f"{counts['failed']} failed, {counts['not_exercised']} not exercised")
+        except Exception as exc:  # one table must not stop the rest
+            log(f"[structured] {name}: stored queries not tested ({type(exc).__name__}: {exc}); "
+                "they stay unavailable to retrieval until table-metadata-refine --relink")
 
 
 def copy_meta(meta: dict) -> dict:

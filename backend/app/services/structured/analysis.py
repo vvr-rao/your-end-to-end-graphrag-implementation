@@ -9,11 +9,13 @@ table:
 * **functional dependencies** -- ``a -> b`` when every value of ``a`` has one
   value of ``b`` (a code and its name, a report id and its date).
 * **repeated values** -- a measure that stays the same when only some
-  columns change (and the columns that depend on them). Those columns
-  describe the REPORT or VERSION a value came from, not the quantity: the
-  same figure is restated in several reports, so summing across them counts
-  it several times. This is how a table of filings, vintages, revisions or
-  snapshots behaves, whatever its domain.
+  columns change (and the columns that depend on them), with how often
+  (share of groups with several rows, share of those whose rows agree). This
+  is EVIDENCE that the column may identify the REPORT or VERSION a value came
+  from (a filing, vintage, revision or snapshot restating the same figure) --
+  but a real dimension can repeat too (a price unchanged for years). Nothing
+  is decided here: a column is treated as a version only when a measure
+  definition names it, with a reason (``refine``).
 * **item columns** -- a text column in the grain whose values name different
   quantities (a long-format table); its most widely shared values are listed
   so the measures can be defined on them.
@@ -98,7 +100,9 @@ async def analyze_table(session, meta: dict) -> dict[str, Any]:
     ref = f"graphrag.{_q(table)}"
     rows = await _scalar(session, f"SELECT COUNT(*) FROM {ref}") or 0
     out: dict[str, Any] = {"row_count": rows, "grain": [], "grain_unique": False,
-                           "dependencies": {}, "near_dependencies": {}, "repeats": {}, "item_columns": {}}
+                           "dependencies": {}, "near_dependencies": {}, "repeats": {}, "item_columns": {},
+                           # the data this analysis measured: a reload makes it stale
+                           "file_sha": (meta.get("source") or {}).get("file_sha")}
     if rows == 0:
         return out
 
@@ -111,6 +115,12 @@ async def analyze_table(session, meta: dict) -> dict[str, Any]:
             distinct[c["name"]] = n
             nulls[c["name"]] = await _scalar(
                 session, f"SELECT COUNT(*) FROM {ref} WHERE {_q(c['name'])} IS NULL") or 0
+    # Columns unique and filled on EVERY row: row keys. They are left out of
+    # the grain search below (a unique column trivially "explains" the rows),
+    # but recorded so a per-row measure can be keyed by the subject's own
+    # identifier instead of a combination of descriptive columns.
+    out["row_keys"] = [c["name"] for c in cands if distinct.get(c["name"]) == rows
+                       and not nulls.get(c["name"])]
     # A column unique on (nearly) every row is a row id, not part of a grain.
     usable = [c["name"] for c in cands if c["name"] in distinct and 1 < distinct[c["name"]] < 0.95 * rows]
     usable = sorted(usable, key=lambda n: -distinct[n])[:MAX_CANDIDATES]
@@ -302,8 +312,9 @@ def total_markers(meta: dict | None) -> dict[str, str]:
 
 
 def report_columns(analysis: dict, measure: str | None = None) -> list[str]:
-    """Columns across which a measure's value is restated (plus the columns
-    they determine)."""
+    """Columns across which a measure's value often REPEATS (plus the columns
+    they determine): candidates for report/version columns, not a verdict --
+    see :func:`version_columns` for the confirmed ones."""
     out: list[str] = []
     reps = analysis.get("repeats") or {}
     for m, found in reps.items():
@@ -316,12 +327,39 @@ def report_columns(analysis: dict, measure: str | None = None) -> list[str]:
     return out
 
 
+def version_columns(meta: dict, analysis: dict | None = None) -> list[str]:
+    """Columns CONFIRMED to identify only the report/version of a value: the
+    ``version_column`` a measure definition names (with a reason), plus the
+    columns the analysis saw repeat together with it. Repeated values alone
+    are evidence, never a confirmation (:func:`report_columns` lists those)."""
+    an = analysis if analysis is not None else (meta.get("analysis") or {})
+    out: list[str] = []
+    for it in meta.get("measures") or []:
+        m = it.get("measure") or {}
+        v = m.get("version_column") or m.get("latest_by")
+        if not v:
+            continue
+        moved = [v]
+        for found in (an.get("repeats") or {}).values():
+            for f in found:
+                if f.get("column") == v:
+                    moved += list(f.get("with") or [])
+        for c in moved:
+            if c not in out:
+                out.append(c)
+    return out
+
+
 def summary_for_prompt(analysis: dict) -> dict:
     """The parts of the analysis the LLM and the selection model need."""
     out = {"grain": analysis.get("grain"), "grain_unique": analysis.get("grain_unique")}
+    if analysis.get("row_keys"):
+        out["row_keys"] = analysis["row_keys"]
     if analysis.get("repeats"):
         out["values_repeated_across"] = {
-            m: sorted({c for f in found for c in [f["column"], *f.get("with", [])]})
+            m: [{"columns": [f["column"], *f.get("with", [])],
+                 "share_of_groups_repeated": f.get("share_of_groups_repeated"),
+                 "share_identical": f.get("share_identical")} for f in found]
             for m, found in analysis["repeats"].items()}
     if analysis.get("dependencies"):
         out["determines"] = analysis["dependencies"]

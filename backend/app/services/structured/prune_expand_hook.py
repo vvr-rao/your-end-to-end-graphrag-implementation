@@ -16,15 +16,21 @@ from backend.app.services.structured.discovery import discover_tables
 from backend.app.services.structured.profiler import add_classes_to_ontology, profile_folder
 
 
-def check_folder(folder: Path, limit: int | None, when: str = "after Stage 4") -> int:
-    """Fail fast (before any paid stage) on a missing or empty folder."""
+def check_folder(folder: Path, limit: int | None, when: str = "after Stage 4",
+                 tables: list[str] | None = None) -> int:
+    """Fail fast (before any paid stage) on a missing or empty folder, or a
+    ``--structured-table`` name the folder does not have."""
+    from backend.app.services.structured.discovery import select_tables
+
     disc = discover_tables(Path(folder))
-    n = len(disc.tables[:limit] if limit else disc.tables)
+    chosen = select_tables(disc.tables, limit, tables)
+    n = len(chosen)
     if n == 0:
         raise SystemExit(f"--structured-data {folder}: no CSV/TSV/JSON/Parquet tables found")
     for rel, why in disc.skipped:
         print(f"[structured] skipping {rel}: {why}")
-    print(f"[structured] {n} table(s) found; metadata {when} (cache first)")
+    print(f"[structured] {n} table(s) selected: {', '.join(t.table_name for t in chosen)}; "
+          f"metadata {when} (cache first)")
     return n
 
 

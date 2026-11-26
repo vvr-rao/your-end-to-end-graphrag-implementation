@@ -509,15 +509,29 @@ tasks:
   table_profile:
     provider: anthropic
     model: claude-sonnet-4-6
-    timeout: 900
+    timeout: 3280
     temperature: 0.0
-    max_tokens: 16384
+    max_tokens: 32768
+    continuation: {batch: 40, max_calls: 40, max_output_tokens: 1500000, no_progress_calls: 2}   # wide tables: columns per call + per-table budgets
     response_format: json_object
+    max_tokens_by_model: {gpt-6.2-sol: 65536, claude-sonnet-4-6: 65536, claude-opus-4-8: 65536}
 
   # Second, data-driven pass on a LOADED table (refine): measured structure ->
   # measures, usage notes, typical questions; also repairs queries that fail
   # their data test. One call per table, cached with the metadata.
   table_refine:
+    provider: anthropic
+    model: claude-sonnet-4-6
+    timeout: 1640
+    temperature: 0.0
+    max_tokens: 32768
+    continuation: {batch: 15, max_calls: 40, max_output_tokens: 1500000, no_progress_calls: 2}   # candidate ids per call + per-table budgets
+    response_format: json_object
+
+  # Independent check after table_refine (on by default): column metadata vs
+  # the measured data, then every stored query's SQL vs its label/description.
+  # One call for the columns + one per 8 stored queries. enabled: false skips it.
+  table_verify:
     provider: anthropic
     model: claude-sonnet-4-6
     timeout: 600
@@ -527,6 +541,15 @@ tasks:
 
   # One call over all tables: shared keys -> LOOKUP join queries.
   table_lookups:
+    provider: anthropic
+    model: claude-sonnet-4-6
+    timeout: 600
+    temperature: 0.0
+    max_tokens: 8192
+    response_format: json_object
+
+  # Final catalog -> ontology concepts (after verification): reuse a class or propose one.
+  table_concept_map:
     provider: anthropic
     model: claude-sonnet-4-6
     timeout: 600
