@@ -113,6 +113,7 @@ _TIER = {
     "gpt-4.1-mini": 2, "gpt-5.4-mini": 2,
     "claude-sonnet-4-6": 3, "gpt-4.1": 3,
     "claude-opus-4-8": 4, "gpt-5.4": 4,
+    "claude-haiku-5-5": 1, "claude-sonnet-5-5": 3, "claude-opus-5-5": 4,
     "gpt-6-luna": 2, "gpt-6.2-sol": 4,
     # deepinfra preset: the dedicated Flash-Next deployment's id is filled in
     # by select_llm_mode.py; until then it is this placeholder.

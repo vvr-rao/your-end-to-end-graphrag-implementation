@@ -126,6 +126,11 @@ _PRICING_PER_1K = {
     "llama-3.3-70b-versatile": (0.00059, 0.00079),
     "llama-3.1-8b-instant": (0.00005, 0.00008),
     # Anthropic (per-1K tokens; $5/$25, $3/$15, $1/$5 per-1M respectively)
+    "claude-opus-5-5": (0.004, 0.02),
+    "claude-sonnet-5-5": (0.002, 0.01),
+    # Haiku 5.5: $0.10/$0.50 up to 100K-token prompts ($0.50/$2.50 beyond --
+    # not modelled here; long prompts are under-costed by up to 5x).
+    "claude-haiku-5-5": (0.0001, 0.0005),
     "claude-opus-4-8": (0.005, 0.025),
     "claude-sonnet-4-6": (0.003, 0.015),
     "claude-haiku-4-5": (0.001, 0.005),
@@ -197,6 +202,9 @@ _MODEL_CONTEXT_WINDOW = {
     "gpt-4o-mini": 128_000,
     "llama-3.3-70b-versatile": 131_072,
     "llama-3.1-8b-instant": 131_072,
+    "claude-opus-5-5": 1_000_000,
+    "claude-sonnet-5-5": 1_000_000,
+    "claude-haiku-5-5": 1_000_000,
     "claude-opus-4-8": 200_000,
     "claude-sonnet-4-6": 200_000,
     "claude-haiku-4-5": 200_000,
@@ -229,6 +237,9 @@ _MODEL_MAX_OUTPUT = {
     "gpt-6.2-sol": 128_000,
     "gpt-6-luna": 128_000,
     "gpt-6.1-terra": 128_000,    # API: "at most 128000 completion tokens" (2026-11-25)
+    "claude-opus-5-5": 128_000,
+    "claude-sonnet-5-5": 128_000,
+    "claude-haiku-5-5": 128_000,
     "claude-opus-4-8": 128_000,
     "claude-sonnet-4-6": 64_000,
     "claude-haiku-4-5": 64_000,
@@ -497,7 +508,25 @@ _ANTHROPIC_NO_SAMPLING_PREFIXES = (
     "claude-opus-4-8",
     "claude-fable",
     "claude-mythos",
+    # Claude 5 family: Opus 5/5.5 reject sampling params; Sonnet 5.5 and
+    # Haiku 5.5 reject any non-default value (Sonnet 5 removed them).
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-haiku-5",
 )
+
+
+# Anthropic `output_config.effort` (adaptive-thinking models). Sent only when a
+# task sets reasoning_effort; absent = the model's own default.
+ANTHROPIC_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+_ANTHROPIC_EFFORT_PREFIXES = (
+    "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8", "claude-opus-5",
+    "claude-sonnet-4-6", "claude-sonnet-5", "claude-haiku-5", "claude-fable", "claude-mythos",
+)
+
+
+def _anthropic_takes_effort(model: str) -> bool:
+    return model.startswith(_ANTHROPIC_EFFORT_PREFIXES)
 
 
 def _anthropic_accepts_temperature(model: str) -> bool:
@@ -538,6 +567,7 @@ class AnthropicProvider:
         response_format: str | None,
         cache_prefix: str | None = None,
         stream: bool = False,
+        reasoning_effort: str | None = None,
     ) -> ChatResult:
         # Anthropic takes the system prompt as a top-level arg, not a message.
         sys_prompt = system
@@ -569,6 +599,8 @@ class AnthropicProvider:
         # Opus 4.6+/Fable/Mythos 400 on sampling params.
         if _anthropic_accepts_temperature(model):
             kwargs["temperature"] = temperature
+        if reasoning_effort:
+            kwargs["output_config"] = {"effort": reasoning_effort}
 
         if stream:
             # Unlike OpenAI, Anthropic needs no include_usage equivalent: usage
@@ -808,19 +840,26 @@ class LLMRouter:
             )
 
     def _validate_reasoning_effort(self) -> None:
-        """`reasoning_effort` (optional, per task) is an OpenAI reasoning-model
-        parameter: only openai tasks on gpt-5.x / gpt-6.x / o-series take it.
-        Absent = the model's own default (nothing is sent)."""
+        """`reasoning_effort` (optional, per task): OpenAI reasoning models
+        (gpt-5.x / gpt-6.x / o-series: none..xhigh) and Anthropic adaptive-
+        thinking models (sent as output_config.effort: low..max). Absent = the
+        model's own default (nothing is sent)."""
         bad = []
         for name, spec in self._tasks.items():
             if spec.get("reasoning_effort") is None:
                 continue
             effort = str(spec["reasoning_effort"]).lower()
-            if spec.get("provider") != "openai" or not _openai_uses_completion_tokens(
-                    str(spec.get("model") or "")):
-                bad.append(f"{name} (only OpenAI reasoning models take reasoning_effort)")
-            elif effort not in REASONING_EFFORTS:
-                bad.append(f"{name} ({effort!r} is not one of {sorted(REASONING_EFFORTS)})")
+            model = str(spec.get("model") or "")
+            if spec.get("provider") == "openai" and _openai_uses_completion_tokens(model):
+                allowed = REASONING_EFFORTS
+            elif spec.get("provider") == "anthropic" and _anthropic_takes_effort(model):
+                allowed = ANTHROPIC_EFFORTS
+            else:
+                bad.append(f"{name} (only OpenAI reasoning models and Anthropic adaptive-"
+                           "thinking models take reasoning_effort)")
+                continue
+            if effort not in allowed:
+                bad.append(f"{name} ({effort!r} is not one of {sorted(allowed)})")
         if bad:
             raise ValueError("invalid reasoning_effort: " + "; ".join(bad))
 

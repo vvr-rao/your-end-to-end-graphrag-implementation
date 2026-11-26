@@ -116,7 +116,7 @@ def test_prompts_carry_every_pair_and_the_contract(prompt_set):
 @pytest.mark.parametrize("path, provider, model, prompt_set", [
     ("config/models.example.yaml", "openai", "gpt-6.1-terra", None),
     ("config/models.openai.example.yaml", "openai", "gpt-6.1-terra", None),
-    ("config/models.anthropic.example.yaml", "anthropic", "claude-sonnet-4-6", None),
+    ("config/models.anthropic.example.yaml", "anthropic", "claude-sonnet-5-5", None),
     ("config/models.deepinfra.example.yaml", "deepinfra", "__DEEPINFRA_FLASH_MODEL__", "qwen"),
 ])
 def test_every_preset_defines_the_judge(path, provider, model, prompt_set):
