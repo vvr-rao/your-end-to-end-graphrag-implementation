@@ -1828,6 +1828,11 @@ async def retrieve_and_answer(
             _sd_ev, _sd_plan = await structured_evidence(
                 _tq, router=router,
                 entity_ids=list(expanded_entity_ids),
+                # how strongly the question reached each entity: 1.0 for a
+                # seed or a named place, decaying with every hop of the walk
+                entity_scores={**{nid: float(v.get("score") or 0.0)
+                                  for (nid, ntype), v in bfs_nodes.items() if ntype == "entity"},
+                               **{nid: 1.0 for nid in seed_entity_ids}},
                 class_ids=[c["id"] for c in matched_classes if c.get("id")],
                 qvec=qvec,
                 max_tables=int(_qa_cfg("structured_max_tables", 3)),

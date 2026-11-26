@@ -62,7 +62,8 @@ def patched(monkeypatch):
     calls: list[tuple[str, dict, set]] = []
     results: list[SqlResult] = []
 
-    async def fake_cands(entity_ids, class_ids, qvec, *, max_tables=3, vector_max_distance=None, time_ids=None):
+    async def fake_cands(entity_ids, class_ids, qvec, *, max_tables=3, vector_max_distance=None, time_ids=None,
+                         entity_scores=None, question=None):
         return [{"id": NODE, "table": "prices", "meta": META, "score": 2.0, "via": ["entity:1"]}]
 
     async def fake_run(sql, params, allowed, *, max_rows=50, timeout_ms=5000, declared_params=None):

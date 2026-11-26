@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import time
 import unicodedata
@@ -113,6 +114,41 @@ def _vec(v: list[float]) -> str:
     return "[" + ",".join(f"{x:.7g}" for x in v) + "]"
 
 
+_RRF_K = 60           # reciprocal-rank-fusion constant (the usual value; measured insensitive)
+_RANK_STOPWORDS = _ID_STOPWORDS | {"data", "value", "values", "table", "tables"}
+
+
+def _rank_terms(text: str | None) -> set[str]:
+    """Content words for the lexical signal: lower-cased, function words and
+    words under three letters dropped, a plain plural reduced to its singular."""
+    out = set()
+    for w in re.findall(r"[a-z0-9][a-z0-9\-]*", (text or "").lower()):
+        w = w.strip("-")
+        if len(w) < 3 or w in _RANK_STOPWORDS:
+            continue
+        if w.endswith("ies") and len(w) > 4:
+            w = w[:-3] + "y"
+        elif w.endswith("s") and not w.endswith("ss") and len(w) > 3:
+            w = w[:-1]
+        out.add(w)
+    return out
+
+
+def _idf(n_tables: int, df: int) -> float:
+    return math.log((n_tables + 1) / (df + 0.5))
+
+
+def _fuse(signals: list[dict[uuid.UUID, float]], k: int = _RRF_K) -> dict[uuid.UUID, float]:
+    """Reciprocal-rank fusion of higher-is-better signals; a table scores
+    only on the signals it has (a positive value)."""
+    fused: dict[uuid.UUID, float] = {}
+    for sig in signals:
+        ranked = sorted((a for a, v in sig.items() if v > 0), key=lambda a: -sig[a])
+        for rank, aid in enumerate(ranked, start=1):
+            fused[aid] = fused.get(aid, 0.0) + 1.0 / (k + rank)
+    return fused
+
+
 async def candidate_tables(
     entity_ids: list[uuid.UUID],
     class_ids: list[uuid.UUID],
@@ -121,17 +157,49 @@ async def candidate_tables(
     max_tables: int = 3,
     vector_max_distance: float | None = None,
     time_ids: list[uuid.UUID] | None = None,
+    entity_scores: dict[uuid.UUID, float] | None = None,
+    question: str | None = None,
 ) -> list[dict[str, Any]]:
     """[{id, table, meta, score, via, hits}] best first. ``hits`` records what
     the question reached the table through (entity/place columns, class
-    labels, periods) so the table's tagged queries can be ranked."""
+    labels, periods) so the table's tagged queries can be ranked.
+
+    Three signals, each ranking the tables, fused by reciprocal rank:
+
+    - graph: the reached entities, matched classes and periods linked to the
+      table, each weighted by how few tables it links to (a country linked to
+      every table with a country column says little about which one is meant)
+      and an entity by how strongly the walk reached it (``entity_scores``:
+      1.0 for a seed, decaying per hop);
+    - vector: the question's distance to the table description;
+    - lexical: the question's content words found in the table description,
+      a word found in few tables counting more.
+
+    Raw link counts used to decide alone, so a question naming many places
+    ranked every table with a place column above the one it was about."""
     from backend.app.db.session import session_scope
 
-    scored: dict[uuid.UUID, dict[str, Any]] = {}
+    hits_of: dict[uuid.UUID, dict[str, Any]] = {}
+    via: dict[uuid.UUID, list[str]] = {}
+    graph: dict[uuid.UUID, float] = {}
+    vector: dict[uuid.UUID, float] = {}
+    lexical: dict[uuid.UUID, float] = {}
+    dist_of: dict[uuid.UUID, float] = {}
+
+    def _hits(aid):
+        return hits_of.setdefault(aid, {"columns": set(), "classes": set(), "time": False})
+
     async with session_scope() as s:
+        tables = (await s.execute(sql_text(
+            "SELECT id, text FROM graphrag.intelligence_artifacts "
+            "WHERE artifact_type = 'TableMetadata' AND status = 'ACTIVE'"))).all()
+        n_tables = len(tables)
+        if not n_tables:
+            return []
         if entity_ids or class_ids or time_ids:
             rows = (await s.execute(sql_text("""
-                SELECT a.id, gr.target_node_type, gr.relationship_type, gr.extra_metadata, oc.iri, oc.label
+                SELECT a.id, gr.target_node_type, gr.target_node_id, gr.relationship_type,
+                       gr.extra_metadata, oc.iri, oc.label
                   FROM graphrag.intelligence_artifacts a
                   JOIN graphrag.graph_relationships gr
                     ON gr.source_node_type = 'intelligence_artifact' AND gr.source_node_id = a.id
@@ -145,54 +213,77 @@ async def candidate_tables(
             """), {"kinds": list(_TABLE_EDGE_KINDS), "ents": [str(e) for e in entity_ids],
                    "cls": [str(c) for c in class_ids],
                    "tms": [str(t) for t in time_ids or []]})).all()
-            counts: dict[tuple[uuid.UUID, str], int] = {}
-            for aid, ttype, kind, extra, ciri, clabel in rows:
-                d = scored.setdefault(aid, {"score": 0.0, "via": [], "hits": {
-                    "columns": set(), "classes": set(), "time": False}})
-                extra = extra or {}
+            tables_of: dict[tuple[str, uuid.UUID], set[uuid.UUID]] = {}
+            counts: dict[tuple[uuid.UUID, str], set[uuid.UUID]] = {}
+            for aid, ttype, tid, kind, extra, ciri, clabel in rows:
+                tables_of.setdefault((ttype, tid), set()).add(aid)
+                h = _hits(aid)
                 if ttype == "time_instance":
-                    if not d["hits"]["time"]:
-                        d["score"] += 1.0          # once: a long series covers many periods
-                    d["hits"]["time"] = True
-                else:
-                    d["score"] += 2.0 if ttype == "entity" else 1.0
-                if ttype == "entity":
-                    d["hits"]["columns"].update(extra.get("columns") or [])
-                if ttype == "ontology_class":
-                    d["hits"]["classes"].update(x for x in (ciri, clabel) if x)
+                    h["time"] = True
+                elif ttype == "entity":
+                    h["columns"].update((extra or {}).get("columns") or [])
+                elif ttype == "ontology_class":
+                    h["classes"].update(x for x in (ciri, clabel) if x)
                 key = "place" if kind == "tablePlace" else ttype
-                counts[(aid, key)] = counts.get((aid, key), 0) + 1
-            for (aid, key), n in counts.items():
-                scored[aid]["via"].append(f"{key}:{n}")
+                counts.setdefault((aid, key), set()).add(tid)
+            time_best: dict[uuid.UUID, float] = {}
+            for (ttype, tid), aids in tables_of.items():
+                w = _idf(n_tables, len(aids))
+                if ttype == "entity":
+                    w *= float((entity_scores or {}).get(tid, 1.0))
+                for aid in aids:
+                    if ttype == "time_instance":   # once: a long series covers many periods
+                        time_best[aid] = max(time_best.get(aid, 0.0), w)
+                    else:
+                        graph[aid] = graph.get(aid, 0.0) + w
+            for aid, w in time_best.items():
+                graph[aid] = graph.get(aid, 0.0) + w
+            for (aid, key), tids in counts.items():
+                via.setdefault(aid, []).append(f"{key}:{len(tids)}")
         if qvec is not None:
-            # semantic search over EVERY table description, merged with the
-            # graph scores BEFORE the cutoff: a table the graph reached and the
-            # question describes ranks above one reached only one way
-            rows = (await s.execute(sql_text("""
+            for aid, dist in (await s.execute(sql_text("""
                 SELECT id, (embedding <-> CAST(:q AS vector)) AS dist
                   FROM graphrag.intelligence_artifacts
                  WHERE artifact_type = 'TableMetadata' AND status = 'ACTIVE' AND embedding IS NOT NULL
-                 ORDER BY dist LIMIT :n
-            """), {"q": _vec(qvec), "n": max(max_tables * 4, 12)})).all()
-            for aid, dist in rows:
+            """), {"q": _vec(qvec)})).all():
                 if vector_max_distance is not None and float(dist) > vector_max_distance:
                     continue
-                d = scored.setdefault(aid, {"score": 0.0, "via": [], "hits": {
-                    "columns": set(), "classes": set(), "time": False}})
-                d["score"] += 0.5 / (1.0 + float(dist))
-                d["via"].append(f"vector:{float(dist):.3f}")
-        if not scored:
+                dist_of[aid] = float(dist)
+                vector[aid] = 1.0 / (1.0 + float(dist))
+        q_terms = _rank_terms(question)
+        if q_terms:
+            terms = {aid: _rank_terms(text) for aid, text in tables}
+            df: dict[str, int] = {}
+            for ts in terms.values():
+                for w in ts & q_terms:
+                    df[w] = df.get(w, 0) + 1
+            for aid, ts in terms.items():
+                sc = sum(_idf(n_tables, df[w]) for w in ts & q_terms)
+                if sc > 0:
+                    lexical[aid] = sc
+        fused = _fuse([graph, vector, lexical])
+        if not fused:
             return []
-        best = sorted(scored.items(), key=lambda kv: -kv[1]["score"])[:max_tables]
+        best = sorted(fused, key=lambda a: (-fused[a], -graph.get(a, 0.0),
+                                            dist_of.get(a, float("inf"))))[:max_tables]
         metas = dict((await s.execute(sql_text("""
             SELECT id, extra_metadata FROM graphrag.intelligence_artifacts
              WHERE id = ANY(CAST(:ids AS uuid[]))
-        """), {"ids": [str(a) for a, _ in best]})).all())
+        """), {"ids": [str(a) for a in best]})).all())
     out = []
-    for aid, d in best:
+    for aid in best:
         meta = metas.get(aid) or {}
-        if meta.get("table_name"):
-            out.append({"id": aid, "table": meta["table_name"], "meta": meta, **d})
+        if not meta.get("table_name"):
+            continue
+        v = list(via.get(aid, []))
+        if aid in graph:
+            v.append(f"graph:{graph[aid]:.2f}")
+        if aid in dist_of:
+            v.append(f"vector:{dist_of[aid]:.3f}")
+        if aid in lexical:
+            v.append(f"lexical:{lexical[aid]:.2f}")
+        out.append({"id": aid, "table": meta["table_name"], "meta": meta, "score": fused[aid],
+                    "via": v, "hits": _hits(aid)})
     return out
 
 
@@ -1478,6 +1569,7 @@ async def structured_evidence(
     listing_max_rows: int = 2000,
     listing_char_cap: int = 60000,
     doc_context: list[dict[str, Any]] | None = None,
+    entity_scores: dict[uuid.UUID, float] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Evidence items (``kind='sql_result'``) + a plan record for persistence."""
     from backend.app.services.prompts import PROMPTS
@@ -1485,7 +1577,8 @@ async def structured_evidence(
     t0 = time.monotonic()
     plan: dict[str, Any] = {"candidates": [], "needed": False, "calls": [], "retried": False}
     cands = await candidate_tables(entity_ids, class_ids, qvec, max_tables=max_tables,
-                                   vector_max_distance=vector_max_distance, time_ids=time_ids)
+                                   vector_max_distance=vector_max_distance, time_ids=time_ids,
+                                   entity_scores=entity_scores, question=question)
     plan["candidates"] = [{"table": c["table"], "score": round(c["score"], 3), "via": c["via"]}
                           for c in cands]
     rankings = {c["table"]: rank_items(c["meta"], c.get("hits")) for c in cands}
