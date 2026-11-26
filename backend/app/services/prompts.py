@@ -2582,7 +2582,14 @@ _SQL_RESULT_NOTE = (
     "queries run on loaded data tables. Their numbers are exact values from "
     "the source data -- prefer them over approximate figures in prose, cite "
     "them like any other item, and do not assume rows that are not shown: a "
-    "result marked as capped is partial. A column rows_aggregated > 1 means the "
+    "result marked PARTIAL RESULT shows only some of the rows its query matched -- a "
+    "sum, count, average, share or ranking over the rows shown is NOT the complete "
+    "figure, so never present it as one, and never say the data lacks rows or values "
+    "that were simply not shown (say how many rows were shown of how many). A TOTAL "
+    "(over all partners, items, regions or periods) is stated from a result row that "
+    "computed it; a result that says its rows are the parts of a total, not a total, "
+    "does not give that total -- say the retrieved results do not include it rather "
+    "than that the data has none. A column rows_aggregated > 1 means the "
     "number on that row combines that many rows; first_*/last_* columns give the "
     "span they cover. If that span covers several periods, the number is NOT the "
     "value of a single period -- say what it combines, or use a row that holds "
@@ -2590,8 +2597,8 @@ _SQL_RESULT_NOTE = (
     "differ only in a report/version column. A result marked LISTING holds every "
     "row the query returned (header first, rows separated by ';;'): when the "
     "question asks for a list, give the whole list faithfully, as a table when "
-    "it is long, and state how many rows it has; if it says capped or 'more in "
-    "the returned data', say the list is partial. An item whose text starts with "
+    "it is long, and state how many rows it has; if it says PARTIAL RESULT, say the "
+    "list is partial and how many of its rows are shown. An item whose text starts with "
     "'Value check' lists values the table does NOT hold (an exact lookup found no "
     "row): say the data has no figures for them -- never that the table includes "
     "them or that the figure exists but was not retrieved -- and cite that item.)"
@@ -4992,6 +4999,16 @@ def table_query_select(question: str, catalogs: list[dict[str, Any]],
         "the tables) lists the candidate tables most relevant first and, per table, the "
         "queries whose tags match the question's concepts, entities/places or periods "
         "(reached through the knowledge graph) -- prefer those queries when they fit.\n"
+        "   TOTALS: when a part asks for a TOTAL over a population (an item's total over all "
+        "its partners, products, regions or periods -- 'total', 'overall', 'in all', 'from all "
+        "partners', 'combined'), select a stored query whose operation computes that total "
+        "(a sum or count over that population, one row per item asked about; several items "
+        "-> one call with a list of values) and mark the call \"scope\": \"total\". A "
+        "measure (operation 'one value per observation') or any other row-level query "
+        "returns the PARTS of a total, not the total: the program refuses such a call marked "
+        "total when a stored aggregate of the same quantity exists, and names it. When no "
+        "stored query computes the total, still mark the call total; its rows are then "
+        "reported as parts, not as a total.\n"
         f"   Use at most {max_calls} calls in total.\n"
         "   IDENTIFIERS: never fill an identifier (an id, code or accession number) from "
         "memory or by guessing which value belongs to an item. Use an identifier value only "
@@ -5037,7 +5054,7 @@ def table_query_select(question: str, catalogs: list[dict[str, Any]],
         "stored query returns the rows that contain its answer (a short series, a few items), "
         "select it with \"listing\": true and the answer is read from its rows. At most 2 "
         "such listing calls per question; keep each one narrow (fixed qualifiers, just the "
-        "periods and items asked about).\n"
+        "periods and items asked about). A total is not read from rows: see TOTALS.\n"
         "   TOTAL ROWS: a table's structure may list total_rows (a column value whose rows "
         "already hold the total of the other rows of their group). The program keeps them "
         "from being counted twice: a query that does not use that column reads only the "
@@ -5108,7 +5125,7 @@ def table_query_select(question: str, catalogs: list[dict[str, Any]],
             'Return JSON: {"needed": true|false, "reason": "...", "describe": ["<table>"], '
             '"calls": [{"table": "...", '
             '"query_id": "<catalog id>", "params": {"name": value | {"from_call": 1, "column": "..."}}, '
-            '"listing": false, "reshape": null, "retry_of": null}], '
+            '"listing": false, "reshape": null, "scope": null, "retry_of": null}], '
             '"no_match": [{"part": "<part of the question>", "reason": "..."}]}'
             + rel_block + doc_block + fail_block + f"\n\nQUESTION: {question}")
     return system, user

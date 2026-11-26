@@ -439,7 +439,7 @@ def test_evidence_says_empty_values_were_left_out_and_keeps_the_other_notes():
     out = _evidence_text(rec, res, {}, 4000)
     assert EMPTY_EXCLUDED_NOTE.format(columns="country") in out
     assert UNRANKED_NOTE.format(column="period", rows=1) in out      # a capped result kept it
-    assert "Result capped at 2 of 9 rows." in out
+    assert "PARTIAL RESULT: 2 row(s) shown here; the query matched 9 rows in total." in out
 
 
 @db_only

@@ -71,6 +71,22 @@ EMPTY_EXCLUDED_NOTE = ("Rows with an empty {columns} are not listed or counted a
 UNRANKED_NOTE = ("This query kept only the latest row(s) by {column}, but {rows} other matching "
                  "row(s) have an empty {column} and were never shown; they may hold values the "
                  "returned row(s) lack. Do not take a missing value as absent from the table.")
+def partial_note(shown: int, fetched: int, truncated: bool, total_rows: int | None) -> str:
+    """Say plainly when the rows in the prompt are not all the rows the query
+    matched: how many are shown, how many it returned, and the full count when
+    known. Empty when every matching row is shown."""
+    if shown >= fetched and not truncated:
+        return ""
+    if truncated:
+        full = (f"the query matched {total_rows} rows in total" if total_rows is not None
+                else f"the query matched more than the {fetched} rows fetched (full count unknown)")
+    else:
+        full = f"the query returned {fetched} rows"
+    return (f" PARTIAL RESULT: {shown} row(s) shown here; {full}. A sum, count, average, share or "
+            "ranking computed from the rows shown is NOT the complete figure, and rows not shown are "
+            "not missing from the data.")
+
+
 UNSUPPORTED_ID_ERROR = (
     "identifier value(s) not taken from the question or from an earlier call's result (see "
     "unsupported_identifiers; row_values shows what each id actually is in the table). Never "
@@ -589,6 +605,69 @@ def cap_listings(calls: list[dict], plan: dict) -> list[dict]:
     return out
 
 
+TOTAL_SCOPE_ERROR = ("the call is marked scope \"total\", but stored query {qid!r} returns the PARTS of a "
+                     "total (one row per {grain}), not the total; verified stored queries of the same "
+                     "table compute it: {alts}. Select one of them (same values for the item, period "
+                     "and qualifiers).")
+TOTAL_PARTS_NOTE = ("The question asks for a total, but no stored query computes it: these rows are its "
+                    "parts, not a total.")
+
+
+def _row_level(desc: dict) -> bool:
+    op = desc.get("operation")
+    return isinstance(op, str) and (op.startswith("one value per observation") or op in ("rows", "distinct rows"))
+
+
+def _family(meta: dict, cols) -> set[str]:
+    """Columns plus those they determine or are determined by (a code and its
+    name are one dimension), from the measured dependencies."""
+    deps = ((meta or {}).get("analysis") or {}).get("dependencies") or {}
+    out: set[str] = set()
+    for c in cols:
+        c = str(c).split(".")[-1]
+        out |= {c, *deps.get(c, [])} | {d for d, fixed in deps.items() if c in (fixed or [])}
+    return out
+
+
+def total_alternatives(meta: dict, section: str, item: dict,
+                       versions: dict[str, str | None] | None = None,
+                       params: dict | None = None) -> list[str]:
+    """Verified, retrieval-eligible stored queries of the same table that SUM
+    the quantity a row-level item returns, without breaking the total down by
+    a dimension the item's rows vary over and the call leaves open (that
+    would list the parts again). Empty when the item is itself an aggregate.
+    Read from each item's machine description, no LLM."""
+    from backend.app.services.structured.metadata import describe_query, items, selectable
+
+    desc = describe_query(meta, section, item)
+    if not _row_level(desc):
+        return []
+    wanted = {str(q).split(".")[-1] for q in desc.get("quantity") or [] if q}
+    given = {k for k, v in (params or {}).items() if v not in (None, "", [])}
+    # only an equality fixes a dimension (an exclusion such as <> 'total row' does not)
+    eq = ("=", "in", None)
+    fixed = [e.get("column") for e in desc.get("parameters") or []
+             if e.get("name") in given and e.get("column") and e.get("op") in eq]
+    fixed += [f.get("column") for f in desc.get("fixed_conditions") or []
+              if f.get("column") and f.get("op") in ("=", "in")]
+    fixed_fam = _family(meta, [c for c in fixed if c])
+    open_dims = _family(meta, [g for g in desc.get("output_grain") or []
+                               if isinstance(g, str) and g.split(".")[-1] not in fixed_fam])
+    out = []
+    for sec, it in items(meta):
+        if it is item or not selectable(meta, it, versions)[0]:
+            continue
+        d = describe_query(meta, sec, it)
+        ops = d.get("operation") if isinstance(d.get("operation"), list) else []
+        if not any(o.startswith("sum(") and o[4:-1].split(".")[-1] in wanted for o in ops):
+            continue
+        groups = {str(g).split(".")[-1] for g in d.get("grouping_columns") or [] if g}
+        if groups & open_dims:
+            continue
+        out.append(it["id"])
+    return out
+
+
 def selection_error(call: dict, err: str, **extra) -> tuple[dict, None, str]:
     rec = {"table": call.get("table"), "query_id": call.get("query_id"), "source": "catalog",
            "selection_error": True, "error": err, **extra}
@@ -635,6 +714,19 @@ async def _execute(call: dict, by_table: dict[str, dict], *, max_rows: int, time
         err = f"stored query {item['id']!r} is unavailable: {why}"
         return {**rec, "selection_error": True, "unavailable": True,
                 "action": rebuild_action(meta["table_name"], why), "error": err}, None, err
+    shape_in = call.get("reshape")
+    if str(call.get("scope") or "").lower() == "total" and not (
+            isinstance(shape_in, dict) and shape_in.get("aggregate")):
+        alts = total_alternatives(meta, section, item, versions, call.get("params") or {})
+        if alts:
+            from backend.app.services.structured.metadata import describe_query
+
+            grain = ", ".join(map(str, describe_query(meta, section, item).get("output_grain") or [])) \
+                or "source row"
+            err = TOTAL_SCOPE_ERROR.format(qid=item["id"], grain=grain, alts=", ".join(alts))
+            return {**rec, "params": call.get("params"), "selection_error": True,
+                    "total_alternatives": alts, "error": err}, None, err
+        rec["total_without_aggregate"] = True
     from backend.app.services.structured.reshape import ReshapeError, listify, output_columns, reshape_sql
 
     sql, declared = item["sql"], item["params"]
@@ -726,19 +818,36 @@ def _norm_any(x: Any) -> Any:
     return sorted(_norm_value(v) for v in x) if isinstance(x, list) else _norm_value(x)
 
 
-def broadens(call: dict, item: dict | None, keep: dict[str, Any]) -> str | None:
+def _grouped_columns(item: dict) -> set[str]:
+    """Columns an aggregate item returns one row per value of (none for a
+    row-level item)."""
+    spec = item.get("query") if isinstance(item.get("query"), dict) else {}
+    sel = spec.get("select") or []
+    if not any(isinstance(x, dict) and x.get("agg") for x in sel):
+        return set()
+    grp = spec.get("group_by") or [x for x in sel if not (isinstance(x, dict) and x.get("agg"))]
+    return {str(g.get("column") if isinstance(g, dict) else g).split(".")[-1] for g in grp if g}
+
+
+def broadens(call: dict, item: dict | None, keep: dict[str, Any], *,
+             grouping_keeps: bool = False) -> str | None:
     """Why a retry call would change or drop a value the user asked for
     (None when it keeps them all). Only parameters on the same column are
-    compared: a different stored query may filter differently."""
+    compared: a different stored query may filter differently.
+    ``grouping_keeps``: the retry uses an aggregate the program itself named
+    for a refused total (same quantity, summed); one that GROUPS BY a
+    requested column then keeps the requested values -- each as its own
+    result row -- so it does not broaden that column."""
     if not keep:
         return None
     if not item:
         return None                      # an unknown id fails on its own
     params = call.get("params") if isinstance(call.get("params"), dict) else {}
     covered = {p.get("column") for p in item.get("params") or [] if p.get("column")}
+    grouped = _grouped_columns(item) if grouping_keeps else set()
     for key, want in keep.items():
         col = key.split("|", 1)[0]
-        if col not in covered:
+        if col not in covered and col not in grouped:
             return (f"uses a stored query that cannot filter {col} = {want!r}, which the question asked "
                     "for (never broaden the question to get rows)")
     for p in item.get("params") or []:
@@ -1144,16 +1253,14 @@ def _listing_text(head: str, res: SqlResult, char_cap: int, summary: str = "", *
     shown = 0
     for r in rows:
         row = " | ".join(cell(v) for v in r)
-        if used + len(row) + 3 > char_cap - 160:
+        if used + len(row) + 3 > char_cap - 400:
             break
         lines.append(row)
         used += len(row) + 3
         shown += 1
-    note = f"{res.row_count} row(s)" + (f" of {res.total_rows if res.total_rows is not None else 'more'}"
-                                         " (capped)" if res.truncated else "")
-    if shown < len(rows):
-        note += f"; {shown} shown here, {len(rows) - shown} more in the returned data"
-    return head + f"LISTING, {note}. Rows: " + " ;; ".join(lines)
+    note = f"{res.row_count} row(s)"
+    return (head + f"LISTING, {note}. Rows: " + " ;; ".join(lines)
+            + partial_note(shown, len(rows), res.truncated, res.total_rows))
 
 
 def _listing_stats(rec: dict, res: SqlResult, meta: dict) -> dict | None:
@@ -1294,24 +1401,24 @@ def _evidence_text(rec: dict, res: SqlResult, meta: dict, char_cap: int, stats: 
 
         if rec.get("empty_excluded"):
             head += EMPTY_EXCLUDED_NOTE.format(columns=", ".join(rec["empty_excluded"])) + " "
+        if rec.get("total_without_aggregate"):
+            head += TOTAL_PARTS_NOTE + " "
         return _listing_text(head, res, char_cap, stats_text(stats) if stats else "", cols=cols, rows=rows)
     body = []
     used = len(head)
     for r in rows:
         row = "; ".join(f"{c}={'' if v is None else v}" for c, v in zip(cols, r, strict=False))
-        if used + len(row) + 4 > char_cap - 120:
-            body.append(f"... ({len(rows) - len(body)} more fetched row(s) not shown)")
+        if used + len(row) + 4 > char_cap - 400:
             break
         body.append("(" + row + ")")
         used += len(row) + 4
-    tail = ""
+    tail = partial_note(len(body), len(rows), res.truncated, res.total_rows)
+    if rec.get("total_without_aggregate"):
+        tail += " " + TOTAL_PARTS_NOTE
     if rec.get("unranked_rows"):
         tail += " " + UNRANKED_NOTE.format(**rec["unranked_rows"])
     if rec.get("empty_excluded"):
         tail += " " + EMPTY_EXCLUDED_NOTE.format(columns=", ".join(rec["empty_excluded"]))
-    if res.truncated:
-        tail += (f" Result capped at {res.row_count} of "
-                f"{res.total_rows if res.total_rows is not None else 'more'} rows.")
     return head + f"{res.row_count} row(s): " + " ".join(body) + tail
 
 
@@ -1528,7 +1635,10 @@ async def structured_evidence(
                     origin, why = _origin(call)
                     if origin is not None:
                         rec_origin = origin
-                        why = broadens(sub_call, _item_of(sub_call), failures[origin - 1].get("keep") or {})
+                        failed = failures[origin - 1]
+                        why = broadens(sub_call, _item_of(sub_call), failed.get("keep") or {},
+                                       grouping_keeps=sub_call.get("query_id") in (
+                                           failed.get("total_alternatives") or []))
                 if why:
                     rec, res, err = selection_error(sub_call, f"retry refused: it {why}", broadens=True)
                 else:
@@ -1544,6 +1654,8 @@ async def structured_evidence(
                     if sub.get("_fanout_cut"):
                         rec["fanout_cut"] = sub["_fanout_cut"]
                 rec["listing"] = bool(sub.get("listing"))
+                if sub.get("scope"):
+                    rec["scope"] = str(sub["scope"])
                 missing = await _value_failures(rec, res) or rec.get("missing_values") or []
                 if missing:
                     rec["missing_values"] = missing
@@ -1560,7 +1672,8 @@ async def structured_evidence(
                                               ("table", "query_id", "params", "listing", "reshape")},
                                      "error": err or "value(s) not found in their column (see missing_values)",
                                      **{k: rec[k] for k in ("invalid_values", "unsupported_identifiers",
-                                                            "value_combinations", "missing_values", "action")
+                                                            "value_combinations", "missing_values", "action",
+                                                            "total_alternatives")
                                         if rec.get(k)},
                                      **({"missing_values": missing} if missing else {}),
                                      "keep": requested_values(rec, _item_of(sub_call))})

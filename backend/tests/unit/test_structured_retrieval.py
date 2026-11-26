@@ -246,7 +246,8 @@ async def test_truncated_result_says_so_and_respects_char_cap(patched):
         {"needed": True, "calls": [{"table": "prices", "query_id": "avg_price", "params": {"c": "x"}}]}]})
     ev, _ = await _go(router, char_cap=600)
     t = ev[0]["text"]
-    assert "capped at 50 of 1234 rows" in t and "more fetched row(s) not shown" in t
+    assert "PARTIAL RESULT:" in t and "the query matched 1234 rows in total" in t
+    assert "is NOT the complete figure" in t
     assert len(t) <= 700
 
 
@@ -456,7 +457,8 @@ async def test_listing_call_gets_the_listing_budget_and_compact_rows(patched, mo
     ev2, _ = await _go(FakeRouter({"table_query_select": [{"needed": True, "calls": [
         {"table": "prices", "listing": True, "query_id": "all_prices", "params": {}}]}]}),
         listing_char_cap=600)
-    assert "more in the returned data" in ev2[0]["text"]          # shown part is cut; data is not
+    assert "PARTIAL RESULT:" in ev2[0]["text"]                     # shown part is cut; data is not
+    assert "the query returned 120 rows" in ev2[0]["text"]
     assert len(ev2[0]["rows"]) == 120
 
 
