@@ -207,7 +207,8 @@ concurrency:
   # batches taking ~15-18 min at 4.
   dedup: 4
   # prune-expand / extract-entities --structured-data: concurrent table_profile
-  # calls (one per table, gpt-4.1 @ max_tokens 16384 in the OpenAI presets).
+  # calls (one per table; replies average ~8-9k tokens on gpt-6.2-sol and
+  # Claude Sonnet 5.5, so scripts/tpm_check.py caps this stage at 16).
   table_profile: 4
   # prune-expand --tables / register-documents --tables: how many PDFs are
   # extracted CONCURRENTLY. Each PDF runs in its own subprocess

@@ -4,6 +4,11 @@
     uv run python scripts/tpm_check.py [<documents-dir>] [--selection F]
     uv run python scripts/tpm_check.py --apply            # write the suggestions
     uv run python scripts/tpm_check.py --set entity_extraction=32 --set dedup=8
+    uv run python scripts/tpm_check.py <documents-dir> --structured  # data tables in use
+
+--structured (or qa.use_structured_data: true) sizes `evaluation` with the
+table selector's large prompts as well; `table_profile` is the knob for
+prune-expand / extract-entities --structured-data.
 
 Pass a corpus directory to also size `streaming_batch_size`, which silently
 CAPS effective concurrency: only the current batch's windows exist, so a
@@ -79,7 +84,10 @@ STAGE_TASKS: dict[str, tuple[str, ...]] = {
     "class_proposal": ("class_proposal",),
     "dedup": ("match_dedup", "class_synonym_judge"),
     "table_mining": ("table_concept_grouping",),
-    "structured_data": ("table_profile", "table_lookups", "table_refine", "table_verify", "table_concept_map"),
+    # prune-expand / extract-entities --structured-data: the table_profile
+    # semaphore (concurrency.table_profile). table_refine / table_verify /
+    # table_concept_map run one table at a time after loading -- no knob.
+    "table_profile": ("table_profile", "table_lookups"),
     "entity_extraction": (
         "entity_extract", "concept_extract", "entity_validate",
         "relationship_extract", "relationship_verify",
@@ -105,13 +113,42 @@ PHASE2_STAGES = ("entity_extraction", "artifact_generation", "evaluation")
 
 # The rough input side of one call (a source window plus the prompt).
 INPUT_TOKENS_PER_CALL = 12_000
+# A task's typical reply when nothing better is known.
+OUTPUT_TOKENS_PER_CALL = 3_000
 MAX_SUGGESTION = 128
-# Tasks with a 32k output budget (class_proposal, match_dedup on gpt-4.1)
-# throttle when many run at once even with TPM to spare -- models.yaml warns of
-# it, and the measured-safe range is 12-16. TPM alone would suggest 128 on a
-# 30M-TPM account. Raise past this only incrementally, watching for 429s.
-LARGE_CALL_OUTPUT_TOKENS = 32_768
+# Typical (input, output) tokens per call, rounded up from the per-task cost
+# reports of the GPT-6 and Claude 5.5 runs of 2026-11-25/26 (router
+# `by_task` in_tokens / out_tokens means; replies include thinking). Sizing
+# uses min(max_tokens, typical output): `max_tokens` is a CEILING -- the
+# Claude 5.5 preset sets 64,000 on every chat task because thinking counts
+# against it -- and sizing on the ceiling suggested 1-3 workers for every
+# Anthropic stage. A task missing here uses INPUT/OUTPUT_TOKENS_PER_CALL.
+TYPICAL_CALL_TOKENS: dict[str, tuple[int, int]] = {
+    "class_proposal": (28_000, 12_000),
+    "match_dedup": (20_000, 12_000),
+    "table_profile": (10_000, 10_000),
+    "table_refine": (14_000, 10_000),
+    "table_verify": (12_000, 4_000),
+    "table_query_select": (100_000, 1_000),   # carries the candidate catalogs
+    "answer_simple_qa": (30_000, 1_500),
+    "answer_deep_research": (40_000, 6_000),
+    "evaluated_summary_chunk": (12_000, 8_000),
+    "summary_revise": (12_000, 8_000),
+}
+# Tasks whose replies are LARGE (thousands of tokens of JSON per call).
+# Many such calls at once throttle even with TPM to spare -- measured on
+# gpt-4.1 at 32k output: the safe range was 12-16, where TPM alone would
+# suggest 128 on a 30M-TPM account. Raise past this only incrementally,
+# watching for 429s.
+LARGE_CALL_TASKS = frozenset({"class_proposal", "match_dedup", "table_profile", "table_refine"})
 LARGE_CALL_CAP = 16
+
+
+def call_shape(task: str, spec: dict) -> tuple[int, int, bool]:
+    """(input tokens, expected output tokens, large) for one call of `task`."""
+    tin, tout = TYPICAL_CALL_TOKENS.get(task, (INPUT_TOKENS_PER_CALL, OUTPUT_TOKENS_PER_CALL))
+    cap = int(spec.get("max_tokens") or 8192)
+    return tin, min(cap, tout), task in LARGE_CALL_TASKS
 
 
 def _task_specs() -> dict[str, dict]:
@@ -205,7 +242,8 @@ async def probe(provider: str, model: str) -> dict:
     return row
 
 
-def suggest(limits: dict, output_tokens: int) -> int | None:
+def suggest(limits: dict, output_tokens: int, input_tokens: int = INPUT_TOKENS_PER_CALL,
+            large: bool = False) -> int | None:
     """Workers one model's limits support for calls of this shape.
 
     Assumes each worker issues about one call a minute (heavy calls take tens
@@ -213,10 +251,10 @@ def suggest(limits: dict, output_tokens: int) -> int | None:
     and other traffic on the same key. Returns None when no token limit is
     known -- an unknown limit must not look like an unlimited one.
     """
-    per_call = INPUT_TOKENS_PER_CALL + output_tokens
+    per_call = input_tokens + output_tokens
     bounds: list[int] = []
     if limits.get("itpm"):
-        bounds.append(int(limits["itpm"] * TARGET_UTILISATION / INPUT_TOKENS_PER_CALL))
+        bounds.append(int(limits["itpm"] * TARGET_UTILISATION / max(1, input_tokens)))
     if limits.get("otpm"):
         bounds.append(int(limits["otpm"] * TARGET_UTILISATION / max(1, output_tokens)))
     if limits.get("tpm") and not (limits.get("itpm") or limits.get("otpm")):
@@ -225,13 +263,21 @@ def suggest(limits: dict, output_tokens: int) -> int | None:
         return None
     if limits.get("rpm"):
         bounds.append(int(limits["rpm"] * TARGET_UTILISATION))
-    if output_tokens >= LARGE_CALL_OUTPUT_TOKENS:
+    if large:
         bounds.append(LARGE_CALL_CAP)
     return max(1, min(min(bounds), MAX_SUGGESTION))
 
 
-def stage_suggestions(limits_by_model: dict[tuple[str, str], dict]) -> dict[str, dict]:
-    """Per stage: the suggestion and the task/model that binds it."""
+# Tasks that only run when structured data (data tables) is in use. The table
+# selector's ~100k-token prompt would otherwise bind `evaluation` for users who
+# never load a table.
+STRUCTURED_ONLY_TASKS = frozenset({"table_query_select"})
+
+
+def stage_suggestions(limits_by_model: dict[tuple[str, str], dict],
+                      structured: bool = True) -> dict[str, dict]:
+    """Per stage: the suggestion and the task/model that binds it.
+    `structured=False` leaves out STRUCTURED_ONLY_TASKS."""
     specs = _task_specs()
     out: dict[str, dict] = {}
     for stage, tasks in STAGE_TASKS.items():
@@ -239,11 +285,12 @@ def stage_suggestions(limits_by_model: dict[tuple[str, str], dict]) -> dict[str,
         unknown: list[str] = []
         for t in tasks:
             spec = specs.get(t)
-            if not spec:
-                continue  # task not routed in this preset
+            if not spec or (not structured and t in STRUCTURED_ONLY_TASKS):
+                continue  # task not routed in this preset / not in use
             key = (spec.get("provider"), spec.get("model"))
             lim = limits_by_model.get(key) or {}
-            n = None if lim.get("error") else suggest(lim, int(spec.get("max_tokens") or 8192))
+            tin, tout, large = call_shape(t, spec)
+            n = None if lim.get("error") else suggest(lim, tout, tin, large)
             if n is None:
                 unknown.append(f"{t} ({key[0]}/{key[1]})")
                 continue
@@ -758,7 +805,9 @@ async def main() -> int:
                if r.get("itpm") or r.get("otpm") else f"{r.get('tpm') or '?'}")
         print(f"{name:<34} {tok:>22} {r.get('rpm') or '?':>8}")
 
-    sugg = stage_suggestions(limits)
+    structured = "--structured" in argv or bool(
+        (get_settings().app_config.get("qa") or {}).get("use_structured_data"))
+    sugg = stage_suggestions(limits, structured=structured)
     cur = (get_settings().app_config.get("concurrency") or {})
     print("\nSuggested concurrency per stage (bound by its TIGHTEST task):\n")
     print(f"  {'stage':<22} {'now':>6} {'suggest':>8}   binding task (model)")
@@ -778,9 +827,15 @@ async def main() -> int:
     print("\n  Phase-2 stages (" + ", ".join(PHASE2_STAGES) + ") are sized by the")
     print("  RATE LIMIT above like every other stage. The database bounds the POOL,")
     print("  reported below, not their worker count -- except `evaluation`.")
-    print("  class_proposal / dedup send 32k-token gpt-4.1 requests; models.yaml warns")
-    print("  concurrent large calls throttle, so raise those INCREMENTALLY and watch")
-    print("  for 429s. class_proposal is ~65% of prune-expand cost; dedup ~22%.")
+    print("  Sizing uses each task's TYPICAL reply (measured), not its max_tokens")
+    print("  ceiling. class_proposal / dedup / table_profile replies run to")
+    print("  ~10k+ tokens, and many large calls at once throttle, so those stages are")
+    print(f"  capped at {LARGE_CALL_CAP}: raise them INCREMENTALLY and watch for 429s.")
+    print("  class_proposal is ~65% of prune-expand cost; dedup ~22%.")
+    print("  `evaluation` " + ("includes" if structured else "leaves out")
+          + " the table selector (table_query_select, ~100k-token prompts):"
+          + (" structured data is in use." if structured else
+             " pass --structured if questions will read data tables."))
     sel = (get_settings().app_config.get("corpus_selection") or {}).get(
         "label_concurrency", 8)
     mini = sugg.get("chunk_classification", {}).get("value")
