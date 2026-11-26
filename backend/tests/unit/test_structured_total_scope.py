@@ -174,3 +174,15 @@ def test_a_retry_that_groups_by_a_requested_column_keeps_its_values():
     assert "cannot filter reporterdesc" in rs.broadens({"params": {}}, other, keep, grouping_keeps=True)
     rows = {"id": "all_rows", "params": [], "query": {"select": ["reporterdesc", "v"]}}
     assert "cannot filter reporterdesc" in rs.broadens({"params": {}}, rows, keep, grouping_keeps=True)
+
+
+async def test_a_total_on_a_stored_aggregate_runs_without_the_parts_note(harness):
+    # regression (step-4 rerun, 2026-11-26): a total-scope call that names a stored
+    # aggregate was labelled "these rows are its parts, not a total"
+    _meta, _ran = harness
+    call = {k: v for k, v in AGGREGATE.items() if k != "retry_of"}
+    ev, plan = await _go(FakeRouter({"table_query_select": [{"needed": True, "calls": [call]}]}))
+    assert not plan["calls"][0].get("selection_error")
+    assert not plan["calls"][0].get("total_without_aggregate")
+    text = next(e["text"] for e in ev if e["kind"] == "sql_result")
+    assert rs.TOTAL_PARTS_NOTE not in text and "7709020032.686" in text

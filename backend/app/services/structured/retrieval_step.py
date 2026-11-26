@@ -715,12 +715,14 @@ async def _execute(call: dict, by_table: dict[str, dict], *, max_rows: int, time
         return {**rec, "selection_error": True, "unavailable": True,
                 "action": rebuild_action(meta["table_name"], why), "error": err}, None, err
     shape_in = call.get("reshape")
+    from backend.app.services.structured.metadata import describe_query
+
+    # only a ROW-LEVEL query returns the parts of a total; a stored aggregate is one
     if str(call.get("scope") or "").lower() == "total" and not (
-            isinstance(shape_in, dict) and shape_in.get("aggregate")):
+            isinstance(shape_in, dict) and shape_in.get("aggregate")) \
+            and _row_level(describe_query(meta, section, item)):
         alts = total_alternatives(meta, section, item, versions, call.get("params") or {})
         if alts:
-            from backend.app.services.structured.metadata import describe_query
-
             grain = ", ".join(map(str, describe_query(meta, section, item).get("output_grain") or [])) \
                 or "source row"
             err = TOTAL_SCOPE_ERROR.format(qid=item["id"], grain=grain, alts=", ".join(alts))
