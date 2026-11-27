@@ -390,6 +390,40 @@ def test_selection_prompt_shows_document_evidence():
     assert "DOCUMENT EVIDENCE" not in user
 
 
+def test_phrase_in_matches_whole_names_only():
+    from backend.app.services.structured.retrieval_step import _context_text, _phrase_in
+    ctx = _context_text("The report places India and the United States, plus Côte d'Ivoire, at risk.")
+    assert _phrase_in("India", ctx) and _phrase_in("United States", ctx)
+    assert _phrase_in("Cote d'Ivoire", ctx)                          # folded accents/punctuation
+    assert not _phrase_in("Indiana", ctx)                            # not inside another word
+    assert not _phrase_in("States", _context_text("statesman"))
+    assert not _phrase_in("US", _context_text("the US economy"))     # names under 4 chars never match
+
+
+@db_only
+async def test_guard_accepts_an_id_whose_row_name_the_documents_state(pg):
+    """The question names its items only through the documents ("the countries
+    the report lists"): an id whose row NAME appears in the retrieved document
+    text is grounded there. An id naming something the documents do not
+    mention is still refused."""
+    meta = {"table_name": "t_items",
+            "columns": [{"name": "item_id", "type": "text", "role": "identifier"},
+                        {"name": "item_name", "type": "text", "role": "dimension"},
+                        {"name": "n", "type": "integer", "role": "measure"}],
+            "column_stats": {"item_id": {"distinct": 12}, "item_name": {"distinct": 12}}}
+    types = {"t_items": {"item_id": "text", "item_name": "text", "n": "integer"}}
+    sql = "SELECT n FROM t_items WHERE item_id = CAST(:id AS text)"
+    from backend.app.services.structured.retrieval_step import _context_text
+    kw = {"question": "What is n for the two items the report lists?", "seen_values": set(),
+          "types": types, "metas": {"t_items": meta}}
+    docs = _context_text("The report lists widget epsilon and widget gamma as the leaders.")
+    assert await identifier_guard(sql, {"id": "ID004"}, context_text=docs, **kw) == []   # widget epsilon
+    out = await identifier_guard(sql, {"id": "ID005"}, context_text=docs, **kw)          # not in the docs
+    assert out and out[0]["value"] == "ID005"
+    out = await identifier_guard(sql, {"id": "ID004"}, **kw)                             # no documents
+    assert out and out[0]["value"] == "ID004"
+
+
 async def test_guard_accepts_an_identifier_stated_in_the_document_evidence():
     sql = "SELECT n FROM items WHERE item_id = CAST(:id AS text)"
     kw = {"types": ITYPES, "metas": {"items": META}, "seen_values": set(), "question": "n for the trial?"}
@@ -505,3 +539,123 @@ async def test_pattern_value_is_rewritten_to_the_tables_spelling(pg):
         assert n == 1, (asked, params, subs)
     params, missing, subs = await prevalidate_values(sql, {"name": "Atlantis"}, col_types=types)
     assert params == {"name": "Atlantis"} and subs == []
+
+
+# --- total rows: rounded, labelled, partial coverage (2026-11-27, sc80 commodities) ---
+# A published table: per commodity and year, country rows plus a "World total"
+# row whose detail text is its own ("...: rounded") and whose value is rounded;
+# a text column restating the value; a one-country section with no totals; and
+# a commodity with ONE producer (its row equals the world total -- no evidence).
+
+def test_total_matches_allows_the_totals_own_rounding_only():
+    from backend.app.services.structured.analysis import _total_matches
+    assert _total_matches(190, 185) and _total_matches(380000, 384000)
+    assert not _total_matches(190, 180)                 # beyond half of 10
+    assert not _total_matches(187, 185)                 # unrounded: exact (0.5%)
+    assert not _total_matches(100, 60)                  # coarse total, but over 10%
+
+
+@pytest.fixture
+async def prod(pg):
+    from sqlalchemy import text
+    async with pg() as s:
+        await s.execute(text("DROP TABLE IF EXISTS graphrag.t_prod"))
+        await s.execute(text("CREATE TABLE graphrag.t_prod (section text, commodity text, country text, "
+                             "statistics text, detail text, year text, value_txt text, value numeric)"))
+        rows = []
+        for k in range(8):                                    # 8 commodities x 2 years = 16 groups
+            com = f"metal{k}"
+            for y in ("2024", "2025"):
+                parts = [37 + k, 52 + 2 * k, 96 + k]          # sum ends in no zero: total is rounded
+                for i, v in enumerate(parts):
+                    rows.append(("minerals", com, f"land{i}", "Production", "Mine production", y, f"{v:,}", v))
+                tot = round(sum(parts), -1)
+                rows.append(("minerals", com, "World total", "Production", "Mine production: rounded", y,
+                             f"{tot:,}", tot))
+        for y in ("2024", "2025"):                            # sole producer: equals the total, proves nothing
+            rows.append(("minerals", "rare1", "land0", "Production", "Mine production", y, "50", 50))
+            rows.append(("minerals", "rare1", "World total", "Production", "Mine production: rounded", y, "50", 50))
+        for k in range(30):                                   # one-country section, never totalled
+            for y in ("2024", "2025"):
+                for st in ("Price", "Imports"):
+                    rows.append(("home", f"metal{k % 8}", "land0", st, st, y, str(k + 1), k + 1))
+        for r in rows:
+            await s.execute(text("INSERT INTO graphrag.t_prod VALUES (:a,:b,:c,:d,:e,:f,:g,:h)"),
+                            dict(zip("abcdefgh", r, strict=True)))
+    yield pg
+    async with pg() as s:
+        await s.execute(text("DROP TABLE IF EXISTS graphrag.t_prod"))
+
+
+PROD_META = {"table_name": "t_prod", "columns": [
+    {"name": "section", "type": "text", "role": "dimension"},
+    {"name": "commodity", "type": "text", "role": "dimension"},
+    {"name": "country", "type": "text", "role": "dimension"},
+    {"name": "statistics", "type": "text", "role": "dimension"},
+    {"name": "detail", "type": "text", "role": "dimension"},
+    {"name": "year", "type": "text", "role": "time"},
+    {"name": "value_txt", "type": "text", "role": "attribute"},
+    {"name": "value", "type": "numeric", "role": "measure"}]}
+PROD_KEY = ["value_txt", "commodity", "year", "detail", "country", "section"]
+
+
+@db_only
+async def test_a_rounded_labelled_partial_total_is_detected(prod):
+    from backend.app.services.structured.analysis import detect_total_rows
+    types = {c["name"]: c["type"] for c in PROD_META["columns"]}
+    async with prod() as s:
+        found = await detect_total_rows(s, PROD_META, PROD_KEY, types, ["value"])
+    assert [(t["column"], t["value"]) for t in found] == [("country", "World total")]
+    t = found[0]
+    # the mirror column and the total's own label column are not groups; the
+    # distinction the label carried (statistics) is
+    assert "value_txt" not in t["groups_by"] and "detail" not in t["groups_by"]
+    assert "statistics" in t["groups_by"]
+    assert t["groups_compared"] == 16                    # the sole-producer groups are not evidence
+
+
+@db_only
+async def test_a_query_ignoring_the_column_reads_totals_where_present_and_parts_elsewhere(prod):
+    from backend.app.services.structured.analysis import detect_total_rows, total_groups, total_markers
+    from backend.app.services.structured.sql_exec import run_sql
+    types = {c["name"]: c["type"] for c in PROD_META["columns"]}
+    async with prod() as s:
+        found = await detect_total_rows(s, PROD_META, PROD_KEY, types, ["value"])
+    meta = {**PROD_META, "analysis": {"total_rows": found}}
+    spec = {"select": ["statistics", {"agg": "sum", "column": "value", "as": "v"}],
+            "where": [{"column": "commodity", "op": "=", "value": "metal0"},
+                      {"column": "year", "op": "=", "value": "2025"}]}
+    built = build_sql(spec, "t_prod", {"t_prod": types}, totals={"t_prod": total_markers(meta)},
+                      total_groups={"t_prod": total_groups(meta)})
+    res = await run_sql(built.sql, {}, {"t_prod"}, max_rows=10, timeout_ms=5000)
+    got = {r[0]: float(r[1]) for r in res.rows}
+    assert got["Production"] == 180.0                    # the published (rounded) total, not 185 summed
+    assert got["Price"] == sum(k + 1 for k in range(30) if k % 8 == 0)   # no total row: its own rows
+    # without the group columns: the old rule (only total rows) loses the untotalled groups
+    old = build_sql(spec, "t_prod", {"t_prod": types}, totals={"t_prod": total_markers(meta)})
+    res = await run_sql(old.sql, {}, {"t_prod"}, max_rows=10, timeout_ms=5000)
+    assert {r[0] for r in res.rows} == {"Production"}
+
+
+def test_catalog_points_the_selection_at_the_published_total():
+    """A table with a published total row: the catalog names the queries that
+    read it, and marks a query that sums the parts while leaving the total row
+    out -- but not one broken down by the parts (each row is one part)."""
+    from backend.app.services.structured.metadata import _annotate_published_totals
+
+    def q(qid, ops, grain, params=(), fixed=()):
+        return {"id": qid, "capability": {"operation": ops, "output_grain": grain,
+                                          "parameters": list(params), "fixed_conditions": list(fixed)}}
+    excl = {"column": "country", "op": "!=", "value": "World total"}
+    cat = {"queries": [
+        q("sum_of_parts", ["sum(v)"], ["item", "year"], fixed=[excl]),
+        q("per_country", ["sum(v)"], ["item", "country"], fixed=[excl]),
+        q("lookup", "rows", ["one row per matching source row"],
+          params=[{"name": "country", "column": "country", "op": "="}]),
+        q("unrelated", ["avg(v)"], ["item"])]}
+    tot = [{"column": "country", "value": "World total", "per": ["item", "year"]}]
+    _annotate_published_totals(cat, tot)
+    assert tot[0]["read_with"] == ["lookup"]
+    flagged = {x["id"] for x in cat["queries"] if x.get("excludes_published_total")}
+    assert flagged == {"sum_of_parts"}
+    assert "lookup" in cat["queries"][0]["excludes_published_total"]

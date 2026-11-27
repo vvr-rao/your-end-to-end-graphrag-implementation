@@ -54,9 +54,10 @@ async def prepare(table: str, *, query_id: str | None = None, spec: dict | None 
         raise QueryRunError(f"table {table!r} is not loaded (loaded: {', '.join(sorted(reg)) or 'none'})")
     meta = reg[table]["meta"]
     types = {n: column_types(r["meta"]) for n, r in reg.items()}
-    from backend.app.services.structured.analysis import total_markers
+    from backend.app.services.structured.analysis import total_groups, total_markers
 
     totals = {n: total_markers(r["meta"]) for n, r in reg.items()}
+    groups = {n: total_groups(r["meta"]) for n, r in reg.items()}
     if (query_id is None) == (spec is None):
         raise QueryRunError("give exactly one of a stored query id or a query spec")
     if query_id is not None:
@@ -81,7 +82,8 @@ async def prepare(table: str, *, query_id: str | None = None, spec: dict | None 
         return QueryRun(table=table, query_id=query_id, built=built, declared=list(item["params"]))
     from backend.app.services.structured.metadata import time_columns
 
-    built = build_sql(spec, table, types, time_columns={table: time_columns(meta)}, totals=totals)
+    built = build_sql(spec, table, types, time_columns={table: time_columns(meta)}, totals=totals,
+                      total_groups=groups)
     return QueryRun(table=table, query_id=None, built=built, declared=built.params)
 
 

@@ -36,9 +36,11 @@ All identifiers are double-quoted, so a column called ``end`` just works.
 
 TOTAL ROWS (``totals``: table -> {column: value}, from the table analysis):
 rows whose column holds the total value repeat the sum of the other rows.
-A query that does not use the column reads ONLY the total rows (one row per
-group, nothing counted twice); a query that selects, groups, counts or
-orders by it reads only the other rows (its parts). A where filter on the
+A query that does not use the column reads the total row of each group that
+has one, and the rows of a group that has none (``total_groups``: table ->
+{column: the columns a total's group is formed by}; without them, only the
+total rows) -- nothing counted twice, no group lost; a query that selects,
+groups, counts or orders by it reads only the other rows (its parts). A where filter on the
 column is left alone, except that an optional parameter on it, when left
 out, means the total rather than every value.
 """
@@ -98,12 +100,14 @@ def _lit(v: Any) -> str:
 
 class _Ctx:
     def __init__(self, table: str, columns: dict[str, dict[str, str]], join: dict | None,
-                 totals: dict[str, dict[str, Any]] | None = None):
+                 totals: dict[str, dict[str, Any]] | None = None,
+                 total_groups: dict[str, dict[str, list[str]]] | None = None):
         if table not in columns:
             raise QuerySpecError(f"unknown table '{table}'")
         self.base = table
         self.columns = columns
         self.totals = totals or {}
+        self.total_groups = total_groups or {}
         self.other: str | None = None
         if join:
             other = str(join.get("table") or "")
@@ -341,9 +345,20 @@ def _total_conditions(ctx: _Ctx, spec: dict) -> list[str]:
             sql = ctx.ref({"column": col, "table": tbl})[0]
             if (tbl, col) in used:
                 out.append(f"{sql} IS DISTINCT FROM {_lit(value)}")
-            else:
+                continue
+            groups = [g for g in (ctx.total_groups.get(tbl) or {}).get(col) or []
+                      if g in ctx.columns[tbl] and g != col]
+            if not groups:
                 out.append(f"{sql} = {_lit(value)}")
+                continue
+            # the total where the group has one; the group's own rows where it has none
+            match = " AND ".join(f"{_TOTAL_ALIAS}.{_q(g)} = {_q(tbl)}.{_q(g)}" for g in groups)
+            out.append(f"({sql} = {_lit(value)} OR NOT EXISTS (SELECT 1 FROM {_q(tbl)} AS {_TOTAL_ALIAS} "
+                       f"WHERE {_TOTAL_ALIAS}.{_q(col)} = {_lit(value)} AND {match}))")
     return out
+
+
+_TOTAL_ALIAS = '"yegi_total"'
 
 
 def _empty_key_condition(ctx: _Ctx, spec: dict, keys: list) -> tuple[str | None, list[str]]:
@@ -400,7 +415,8 @@ def _all_empty_expr(ctx: _Ctx, selected: list, keys: set[str]) -> str | None:
 
 def build_sql(spec: dict, table: str, columns: dict[str, dict[str, str]], *,
               time_columns: dict[str, list[str]] | None = None,
-              totals: dict[str, dict[str, Any]] | None = None) -> Built:
+              totals: dict[str, dict[str, Any]] | None = None,
+              total_groups: dict[str, dict[str, list[str]]] | None = None) -> Built:
     """Compile ``spec`` (reading ``table``) to SQL. ``columns``: table ->
     {column: type} for every table the spec may read.
 
@@ -418,7 +434,7 @@ def build_sql(spec: dict, table: str, columns: dict[str, dict[str, str]], *,
     # keeps the base it was written for).
     table = str(spec.get("from") or table)
     join = spec.get("join") or None
-    ctx = _Ctx(table, columns, join, totals)
+    ctx = _Ctx(table, columns, join, totals, total_groups)
 
     sel = spec.get("select") or []
     if not isinstance(sel, list) or not sel:

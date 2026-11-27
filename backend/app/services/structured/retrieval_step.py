@@ -484,6 +484,19 @@ def _sig_words(text: str) -> set[str]:
             if w not in _ID_STOPWORDS}
 
 
+def _context_text(text: str) -> str:
+    """Document text for whole-phrase matching: folded, lower case, single spaces."""
+    return " " + re.sub(r"[^a-z0-9]+", " ", fold_text(str(text)).lower()).strip() + " "
+
+
+def _phrase_in(value: Any, context_text: str) -> bool:
+    """Whether a row's name occurs in the context as a whole phrase (words in
+    order, bounded by non-letters). Names under 4 characters never match: too
+    many short words collide."""
+    v = re.sub(r"[^a-z0-9]+", " ", fold_text(str(value)).lower()).strip()
+    return len(v) >= 4 and f" {v} " in context_text
+
+
 def _word_regex(word: str) -> str:
     """Postgres ARE matching ``word`` as a whole word (not inside another word)."""
     return r"\m" + re.sub(r"([^a-z0-9])", r"\\\1", word) + r"\M"
@@ -571,10 +584,15 @@ def expand_refs(call: dict, done: dict[int, list[SqlResult]]) -> tuple[list[dict
 
 async def identifier_guard(sql: str, params: dict, *, question: str, seen_values: set[str],
                            types: dict[str, dict[str, str]], metas: dict[str, dict],
-                           context_norm: str = "") -> list[dict]:
+                           context_norm: str = "", context_text: str = "") -> list[dict]:
     """Values compared with an item-identifier column that the question does
     not state, no earlier result returned, and whose row's descriptive values
-    share no word with the question. Read-only."""
+    share no word with the question. Read-only.
+
+    ``context_text``: the retrieved document text the selector read. An id whose
+    row's NAME appears in it as a whole phrase ("IND" -> "India") is grounded
+    there -- the question often names its items only through the documents
+    ("the countries the report places in the high-risk zone")."""
     id_cols = {t: entity_id_columns(m) for t, m in metas.items()}
     if not any(id_cols.values()):
         return []
@@ -646,6 +664,8 @@ async def identifier_guard(sql: str, params: dict, *, question: str, seen_values
                                     break
                         if matched:
                             break
+                if not matched and context_text:
+                    matched = any(_phrase_in(v, context_text) for v in vals)
                 if matched:
                     continue
                 out.append({"table": c["table"], "column": c["column"], "value": c["value"],
@@ -1744,11 +1764,14 @@ async def structured_evidence(
     metas_all = {**{c["table"]: c["meta"] for c in cands}, **partners}
     seen_values: set[str] = set()       # every value an earlier call returned
 
-    doc_norm = _norm_value(" ".join(str(d.get("text") or "") for d in doc_context or []))
+    _doc_raw = " ".join(str(d.get("text") or "") for d in doc_context or [])
+    doc_norm = _norm_value(_doc_raw)
+    doc_text = _context_text(_doc_raw) if _doc_raw.strip() else ""
 
     async def _guard(sql: str, params: dict) -> list[dict]:
         return await identifier_guard(sql, params, question=question, seen_values=seen_values,
-                                      types=types, metas=metas_all, context_norm=doc_norm)
+                                      types=types, metas=metas_all, context_norm=doc_norm,
+                                      context_text=doc_text)
 
     async def _prevalidate(sql: str, params: dict) -> tuple[dict, list[dict], list[dict]]:
         return await prevalidate_values(sql, params, col_types=col_types, id_cols=id_cols)

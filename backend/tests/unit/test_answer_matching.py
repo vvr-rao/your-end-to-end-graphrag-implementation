@@ -49,3 +49,30 @@ def test_text_strings_still_need_the_words():
 def test_reply_recall_uses_number_matching():
     out = answer_metrics([], ["India", "7.7"], reply="India: $7,709,020,032")
     assert out["answer_in_reply"] == 1.0
+
+
+# --- 2026-11-27: expected strings with a scale word, and replies more precise
+# than the expected string (sc80: q004, q027, q030 were correct but scored wrong)
+
+@pytest.mark.parametrize("answer, text", [
+    ("1.24 million", "a capacity of 1,240,000 barrels per day"),
+    ("1.24 million", "about 1.24 million bpd"),
+    ("$2.5 trillion", "US$2,497,131,582,000"),
+    ("3,028", "India 3,028.744 TWh"),                 # truncated, not rounded (3,029)
+    ("5,358", "Qatar | 5,358,959.11 t"),             # thousands, truncated
+    ("1,540", "1,540.167 TWh"),
+    ("3,028", "3,027.9 TWh"),                        # rounding still matches
+])
+def test_scaled_and_truncated_numbers_match(answer, text):
+    assert _contains(answer, _norm(text))
+
+
+@pytest.mark.parametrize("answer, text", [
+    ("1.24 million", "1,250,000 barrels"),
+    ("1.24 million", "1.24 billion"),
+    ("3,028", "3,026.9 TWh"),
+    ("5,358", "5,356,000 t"),
+    ("1.2345 thousand", "1.2345 million"),
+])
+def test_scaled_numbers_do_not_match_other_values(answer, text):
+    assert not _contains(answer, _norm(text))
