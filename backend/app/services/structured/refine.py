@@ -2208,6 +2208,11 @@ async def reverify_changed(meta: dict, router, *, analysis: dict, all_types: dic
     rep = await verify_table(meta, router, analysis=analysis, all_types=all_types, partners=partners,
                              only_pending=True, log=log)
     final = await ensure_tested(meta, analysis=analysis, all_types=all_types, partners=partners)
+    still = [it["id"] for _s, it in items(meta) if semantic_status(meta, it) == "stale"]
+    if still:
+        log(f"[structured] {meta.get('table_name')}: {len(still)} stored quer(ies) changed again after "
+            f"the second verdict and stay unavailable to retrieval: {', '.join(still[:10])}"
+            f"{' ...' if len(still) > 10 else ''}")
     return final, int(rep.get("llm_calls") or 0)
 
 

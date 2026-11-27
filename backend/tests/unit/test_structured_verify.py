@@ -463,3 +463,30 @@ async def test_a_query_whose_sql_changed_after_its_verdict_is_verified_again(mon
     assert meta["metrics"][1]["verify_verdict"]["sql_sha"] == sql_sha("SELECT 2")
     # nothing stale: no call at all
     assert await refine.reverify_changed(meta, None, analysis={}, all_types={}, log=lambda *_: None) is None
+
+
+async def test_a_query_still_stale_after_the_second_verdict_is_logged(monkeypatch):
+    """Bounded: one extra pass. A query whose SQL changes AGAIN during it stays
+    unavailable -- and the log says which."""
+    from backend.app.services.structured import refine, verify
+    from backend.app.services.structured.metadata import sql_sha
+
+    async def fake_verify_table(meta, router, **kw):
+        for _s, it in verify.pending_items(meta):
+            it["verify_verdict"] = {"verdict": "ok", "version": verify.VERIFY_VERSION,
+                                    "sql_sha": sql_sha(it["sql"])}
+        return {"llm_calls": 1}
+
+    async def recompiling_ensure_tested(meta, **_k):
+        meta["metrics"][0]["sql"] = "SELECT 3"          # changes again after the verdict
+        return {"passed": 1, "failed": 0, "not_exercised": 0, "retested": 1}
+
+    monkeypatch.setattr(verify, "verify_table", fake_verify_table)
+    monkeypatch.setattr(refine, "ensure_tested", recompiling_ensure_tested)
+    meta = {"table_name": "t", "semantic_review": {"required": True}, "metrics": [
+        {"id": "moving", "sql": "SELECT 2",
+         "verify_verdict": {"verdict": "ok", "version": verify.VERIFY_VERSION, "sql_sha": sql_sha("SELECT 1")}}]}
+    logs: list[str] = []
+    out = await refine.reverify_changed(meta, None, analysis={}, all_types={}, log=logs.append)
+    assert out is not None and out[1] == 1                  # one pass only
+    assert any("stay unavailable" in m and "moving" in m for m in logs)

@@ -956,6 +956,38 @@ def lookup_calls(batch: list[dict]) -> set[int]:
     return out
 
 
+def lookup_coverage(call: dict, concrete: list[dict], item: dict | None,
+                    keep: dict[str, Any]) -> str | None:
+    """Why the values a call TAKES from earlier calls ({"from_call": k}) fail to
+    cover what the question asked for on that column (None when they cover it).
+    The values are pooled over every run the call fans out to, so a requested
+    value missing from the lookup -- or cut by the fan-out cap -- is caught."""
+    if not keep or not item:
+        return None
+    params = call.get("params") if isinstance(call.get("params"), dict) else {}
+    for p in item.get("params") or []:
+        n, col = p.get("name"), p.get("column")
+        ref = params.get(n)
+        if not col or not (isinstance(ref, dict) and "from_call" in ref):
+            continue
+        key = f"{col}|{str(n).endswith('_from')}|{str(n).endswith('_to')}"
+        if key not in keep:
+            continue
+        want = keep[key]
+        members = want["members"] if isinstance(want, dict) and "members" in want else [want]
+        have: set[str] = set()
+        for sub in concrete:
+            v = (sub.get("params") or {}).get(n)
+            have |= {_norm_value(x) for x in (v if isinstance(v, list) else [v]) if x is not None}
+        lost = [v for v in members if _norm_value(v) not in have]
+        if lost:
+            cut = next((c.get("_fanout_cut") for c in concrete if c.get("_fanout_cut")), None)
+            return (f"takes {col} values from an earlier call that do not include {lost!r}, which the "
+                    f"question asked for{f' ({cut} were run)' if cut else ''}; look up every requested "
+                    "value, or filter on the requested values directly")
+    return None
+
+
 def broadens(call: dict, item: dict | None, keep: dict[str, Any], *,
              grouping_keeps: bool = False) -> str | None:
     """Why a retry call would change or drop a value the user asked for
@@ -1783,7 +1815,8 @@ async def structured_evidence(
                                if isinstance(v, dict) and "from_call" in v}}}
                         why = broadens(as_written, _item_of(sub_call), failed.get("keep") or {},
                                        grouping_keeps=sub_call.get("query_id") in (
-                                           failed.get("total_alternatives") or []))
+                                           failed.get("total_alternatives") or [])) \
+                            or lookup_coverage(call, concrete, _item_of(sub_call), failed.get("keep") or {})
                 if why:
                     rec, res, err = selection_error(sub_call, f"retry refused: it {why}", broadens=True)
                 else:

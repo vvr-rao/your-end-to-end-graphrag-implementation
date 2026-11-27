@@ -293,3 +293,39 @@ async def test_a_retry_that_is_not_a_lookup_is_still_checked(harness):
     _ev, plan = await _go(router)
     retry = [c for c in plan["calls"] if c.get("retry")]
     assert retry and "retry refused" in retry[0]["error"] and not retry[0].get("lookup")
+
+
+async def test_a_lookup_that_misses_a_requested_value_is_refused(harness, monkeypatch):
+    """The lookup is exempt, but the values it passes on must still cover what
+    the question asked for (pooled over the fan-out)."""
+    _meta, ran = harness
+
+    async def fake_run(sql, params, allowed, *, max_rows=50, timeout_ms=5000, declared_params=None):
+        ran.append(sql)
+        return SqlResult(sql=sql, params=dict(params or {}), columns=["reporterdesc", "partnerdesc", "flowdesc"],
+                         rows=[["India", "World", "Import"]], row_count=1)     # Thailand not found
+
+    monkeypatch.setattr(rs, "run_sql", fake_run)
+    lookup = {"table": "trade_flows", "query_id": "find_flows",
+              "params": {"reporter": ["India", "Thailand"], "partner": "World"}, "retry_of": 1}
+    answer = {"table": "trade_flows", "query_id": "trade_value_by_year", "retry_of": 1,
+              "params": {"reporter": {"from_call": 1, "column": "reporterdesc"},
+                         "flow": "Import", "commodity": "Fertilizers"}}
+    router = FakeRouter({"table_query_select": [{"needed": True, "calls": [ORIGINAL]},
+                                                {"needed": True, "calls": [lookup, answer]}]})
+    _ev, plan = await _go(router)
+    answers = [c for c in plan["calls"] if c.get("retry") and c["query_id"] == "trade_value_by_year"]
+    assert answers and all("retry refused" in c["error"] and "Thailand" in c["error"] for c in answers)
+
+
+def test_lookup_coverage_pools_values_over_the_fan_out():
+    item = {"params": [{"name": "reporter", "column": "reporterdesc"}]}
+    keep = {"reporterdesc|False|False": {"members": ["India", "Thailand"]}}
+    call = {"params": {"reporter": {"from_call": 1, "column": "reporterdesc"}}}
+    both = [{"params": {"reporter": "India"}}, {"params": {"reporter": "Thailand"}}]
+    assert rs.lookup_coverage(call, both, item, keep) is None
+    cut = [{"params": {"reporter": "India"}, "_fanout_cut": "first 5 of 7 value combinations"}]
+    why = rs.lookup_coverage(call, cut, item, keep)
+    assert "Thailand" in why and "first 5 of 7" in why
+    # a parameter typed in directly is broadens()'s job, not this check's
+    assert rs.lookup_coverage({"params": {"reporter": "India"}}, cut, item, keep) is None
