@@ -555,6 +555,12 @@ class AnthropicProvider:
     def __init__(self, api_key: str) -> None:
         self._client = AsyncAnthropic(api_key=api_key, max_retries=0)  # see OpenAIProvider
 
+    async def count_tokens(self, *, model: str, text: str) -> int:
+        """The model's own token count for ``text`` (free endpoint, no output)."""
+        r = await self._client.messages.count_tokens(
+            model=model, messages=[{"role": "user", "content": text}])
+        return int(r.input_tokens)
+
     async def chat(
         self,
         *,
@@ -749,6 +755,11 @@ def _dump_cost_reports() -> None:
         rep = r.cost_report()
         if rep["total_calls"]:
             (out / f"{stamp}-{os.getpid()}-{cmd}-{i}.json").write_text(json.dumps(rep, indent=2))
+
+
+# Used only when the provider's token count fails: measured on Stage-2
+# proposal JSON (claude-sonnet-5-5 1.72-1.94 tokens per tiktoken token).
+_FALLBACK_TOKEN_RATIO = {"anthropic": 2.0}
 
 
 class LLMRouter:
@@ -955,6 +966,38 @@ class LLMRouter:
         """Fraction of input tokens served from the prompt cache (0.0-1.0)."""
         tot = self.total_input_tokens
         return (self._cache_read_tokens / tot) if tot else 0.0
+
+    async def token_ratio(self, task: str, sample: str) -> float:
+        """Model tokens per local (tiktoken) token for text like ``sample``.
+
+        Budgets are counted locally with tiktoken, but a reply is capped in the
+        MODEL's tokens. For JSON proposals Claude counts 1.7-1.9x tiktoken, so
+        a batch sized locally overran a 64k reply cap (8 of 30 dedup replies
+        cut off in an 80-document run). Order: the task's ``token_ratio``
+        setting; the provider's own count of ``sample`` (Anthropic: free
+        endpoint); 1.0 when neither is available. Never below 1.0."""
+        spec = self.task_spec(task)
+        if spec.get("token_ratio"):
+            return max(1.0, float(spec["token_ratio"]))
+        prov = (getattr(self, "_providers", None) or {}).get(spec.get("provider"))
+        counter = getattr(prov, "count_tokens", None)
+        if counter is None or not sample:
+            return 1.0
+        cache = self.__dict__.setdefault("_token_ratio_cache", {})
+        key = (spec.get("provider"), spec.get("model"))
+        if key in cache:
+            return cache[key]
+        from backend.app.services.token_budget import count_tokens
+
+        local = count_tokens(sample)
+        try:
+            ratio = max(1.0, await counter(model=spec["model"], text=sample) / max(1, local))
+        except Exception as exc:     # a sizing aid, never fatal
+            ratio = _FALLBACK_TOKEN_RATIO.get(spec.get("provider"), 1.0)
+            print(f"[router] {task}: token count unavailable ({type(exc).__name__}); "
+                  f"assuming {ratio:.2f} model tokens per local token")
+        cache[key] = ratio
+        return ratio
 
     def task_spec(self, task: str) -> dict[str, Any]:
         if task not in self._tasks:

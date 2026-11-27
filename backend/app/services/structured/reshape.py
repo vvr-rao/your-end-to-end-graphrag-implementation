@@ -133,13 +133,20 @@ def reshape_sql(sql: str, spec: dict[str, Any], kinds: dict[str, str], *, max_ro
 
     spec: {"aggregate": [{"fn": max|min|avg|count, "column": c}],
            "group_by": [c, ...], "order_by": [{"column": c, "dir": asc|desc}],
-           "limit": n}"""
+           "limit": n}
+       or  {"latest": {"per": [c, ...], "by": <period column>}} (+ order_by, limit):
+           for each combination of the ``per`` columns keep only its row with the
+           LATEST ``by`` value among rows whose numeric value is filled. Items
+           can have different latest periods; one fixed period window would
+           drop an item whose newest value is older."""
     if not isinstance(spec, dict) or not spec:
         raise ReshapeError("reshape must be a JSON object")
-    unknown = set(spec) - {"aggregate", "group_by", "order_by", "limit"}
+    unknown = set(spec) - {"aggregate", "group_by", "order_by", "limit", "latest"}
     if unknown:
         raise ReshapeError(f"reshape keys not allowed: {sorted(unknown)} "
-                           "(allowed: aggregate, group_by, order_by, limit)")
+                           "(allowed: aggregate, group_by, order_by, limit, latest)")
+    if spec.get("latest") not in (None, {}, []):
+        return _latest_sql(sql, spec, kinds, max_rows=max_rows)
 
     def _col(c: Any, what: str) -> str:
         if not isinstance(c, str) or c not in kinds:
@@ -210,3 +217,51 @@ def reshape_sql(sql: str, spec: dict[str, Any], kinds: dict[str, str], *, max_ro
     if lim:
         desc.append(f"first {lim} row(s)")
     return out, "; ".join(desc)
+
+
+def _latest_sql(sql: str, spec: dict[str, Any], kinds: dict[str, str], *, max_rows: int) -> tuple[str, str]:
+    """``{"latest": {"per": [...], "by": c}}``: one row per ``per`` combination,
+    the one with the latest ``by`` value whose numeric columns are not all empty."""
+    if spec.get("aggregate") or spec.get("group_by"):
+        raise ReshapeError("latest cannot be combined with aggregate or group_by")
+    lat = spec["latest"]
+    if not isinstance(lat, dict):
+        raise ReshapeError('latest must be {"per": [columns], "by": "<period column>"}')
+    per = lat.get("per") or []
+    per = [per] if isinstance(per, str) else per
+    by = lat.get("by")
+    if not per or not all(isinstance(c, str) and c in kinds for c in per):
+        raise ReshapeError(f"latest.per: {per!r} must name output columns of this query "
+                           f"(output columns: {', '.join(kinds)})")
+    if any(kinds[c] == "numeric" for c in per):
+        raise ReshapeError("latest.per: group by the item columns (categorical), not a numeric column")
+    if not isinstance(by, str) or by not in kinds or kinds[by] != "time":
+        times = [c for c, k in kinds.items() if k == "time"]
+        raise ReshapeError(f"latest.by: {by!r} must be a period output column of this query "
+                           f"(period columns: {', '.join(times) or 'none'})")
+    values = [c for c, k in kinds.items() if k == "numeric" and c not in per and c != by]
+    order = []
+    for o in spec.get("order_by") or []:
+        col = o.get("column") if isinstance(o, dict) else o
+        if col not in kinds or kinds[col] == "categorical":
+            raise ReshapeError(f"order_by: {col!r} must be a numeric or period output column")
+        d = str((o.get("dir") if isinstance(o, dict) else None) or "asc").lower()
+        if d not in ("asc", "desc"):
+            raise ReshapeError(f"order_by dir must be asc or desc, not {d!r}")
+        order.append(f"latest.{_q(col)} {d.upper()} NULLS LAST")
+    lim = spec.get("limit")
+    if lim is not None and (isinstance(lim, bool) or not isinstance(lim, int) or not 1 <= lim <= max_rows):
+        raise ReshapeError(f"limit must be an integer from 1 to {max_rows}")
+    body = sql.strip().rstrip(";")
+    keys = ", ".join(f"base.{_q(c)}" for c in per)
+    where = (" WHERE " + " OR ".join(f"base.{_q(c)} IS NOT NULL" for c in values)) if values else ""
+    out = (f"SELECT latest.* FROM (SELECT DISTINCT ON ({keys}) base.* FROM ({body}) AS base{where} "
+           f"ORDER BY {keys}, base.{_q(by)} DESC NULLS LAST) AS latest")
+    if order:
+        out += " ORDER BY " + ", ".join(order)
+    if lim:
+        out += f" LIMIT {lim}"
+    desc = f"latest {by} per {', '.join(per)} (rows with a value)"
+    if lim:
+        desc += f"; first {lim} row(s)"
+    return out, desc

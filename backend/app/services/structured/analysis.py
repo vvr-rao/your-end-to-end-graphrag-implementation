@@ -33,6 +33,7 @@ stored query.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from sqlalchemy import text as sql_text
@@ -48,12 +49,22 @@ TIMEOUT_MS = 30000
 NEAR_DEP_MIN_VALUES = 50     # near-dependency only over columns this varied
 NEAR_DEP_SHARE = 0.02         # ... and at most this share of exceptions
 SPARSE_NULL_SHARE = 0.3       # columns this often null are annotations, not identity
-TOTAL_CANDIDATE_VALUES = 5    # per grain column, the values present in the most groups
-TOTAL_MIN_COVERAGE = 0.5      # a total value appears in at least this share of groups
-TOTAL_MIN_GROUPS = 5          # groups where total and parts can be compared
+TOTAL_CANDIDATE_VALUES = 5    # per grain column, the values on the most rows (+ as many named as totals)
+TOTAL_MIN_COVERAGE = 0.1      # a total may cover only some groups (a section's totals); the builder reads parts where it is absent
+TOTAL_FULL_COVERAGE = 0.5     # below this coverage a total needs TOTAL_MIN_GROUPS_PARTIAL compared groups
+TOTAL_MIN_GROUPS = 5          # groups where total and (>= 2) parts can be compared
+TOTAL_MIN_GROUPS_PARTIAL = 10 # ... for a total present in only some groups
 TOTAL_MIN_SHARE = 0.9         # ... and where the total equals the sum of the parts
 TOTAL_TOLERANCE = 0.005       # relative difference still counted as equal (rounding)
 TOTAL_MAX_MEASURES = 6
+TOTAL_MAX_GROUPS = 20000      # groups read per check
+TOTAL_ROUNDED_MAX = 0.1       # a rounded total may differ from its parts by at most this share
+MIRROR_MIN_SHARE = 0.5        # a text column restating a measure has about as many values as it
+MIRROR_MAX_SPLIT = 0.05       # ... allowing this share of numbers with several spellings
+LABEL_MIN_SHARE = 0.8         # a column is a total's label when this share of its values is the total's own
+COARSER_MAX = 4               # columns a dropped label column determines, added back to the grouping
+# words that nominate a value as a total candidate (the numeric check decides)
+TOTAL_WORDS = r"\m(total|all|world|overall|aggregate|sum|grand)\M"
 
 
 def _q(ident: str) -> str:
@@ -243,63 +254,210 @@ async def detect_total_rows(session, meta: dict, key: list[str], types: dict[str
                             measures: list[str]) -> list[dict]:
     """Values of a grain column whose rows are the totals of the other rows of
     their group: [{"column", "value", "groups_by", "groups_compared",
-    "share_equal", "measure"}]. A value qualifies when it is present in most
-    groups (the rest of the grain) and, for at least one measure, its row
-    equals the sum of the group's other rows in nearly every group where both
-    exist. SQL only."""
+    "share_equal", "measure"}]. SQL only.
+
+    A value qualifies when, for at least one measure, its row equals the sum of
+    the group's other rows in nearly every group where it can be compared:
+
+    * groups are formed by the rest of the grain, minus columns that only
+      MIRROR the measure (its value written as text: grouping by it pairs a
+      total with its parts only when they are written alike), minus columns
+      whose values on the candidate's rows never occur on other rows (the
+      total's own label, e.g. a detail column reading "production: rounded");
+    * a group is compared only when it has ONE candidate row and at least TWO
+      other rows (a total over a single part proves nothing: when one entity
+      is the only producer, its row equals the world total);
+    * equal = within TOTAL_TOLERANCE, or within half the total's own rounding
+      unit (a published "190" covers 185-195), capped at TOTAL_ROUNDED_MAX;
+    * of a column's qualifying values, the best supported one is kept.
+    Candidates are the values on the most rows plus values whose words name a
+    total (TOTAL_WORDS); only the numeric check decides."""
     table = meta["table_name"]
     ref = f"graphrag.{_q(table)}"
     found: list[dict] = []
     if not measures:
         return found
+    mirrors: dict[str, set[str]] = {}
+    for m in measures[:TOTAL_MAX_MEASURES]:
+        mirrors[m] = {g for g in key if types.get(g) == "text" and await _mirrors(session, ref, g, m)}
     for c in key:
         if types.get(c) != "text":
-            continue
-        group = [g for g in key if g != c]
-        if not group:
-            continue
-        grp = _cols(group)
-        n_groups = await _distinct(session, ref, group)
-        if not n_groups:
             continue
         try:
             async with session.begin_nested():
                 await session.execute(sql_text(f"SET LOCAL statement_timeout = {TIMEOUT_MS}"))
-                cands = (await session.execute(sql_text(
-                    f"SELECT {_q(c)}, COUNT(DISTINCT ROW({grp})) AS n FROM {ref} "
-                    f"WHERE {_q(c)} IS NOT NULL GROUP BY 1 ORDER BY 2 DESC, 1 "
-                    f"LIMIT {TOTAL_CANDIDATE_VALUES}"))).all()
+                top = (await session.execute(sql_text(
+                    f"SELECT {_q(c)} FROM {ref} WHERE {_q(c)} IS NOT NULL GROUP BY 1 "
+                    f"ORDER BY COUNT(*) DESC, 1 LIMIT {TOTAL_CANDIDATE_VALUES}"))).scalars().all()
+                named = (await session.execute(sql_text(
+                    f"SELECT DISTINCT {_q(c)} FROM {ref} WHERE {_q(c)} ~* :w LIMIT {TOTAL_CANDIDATE_VALUES}"),
+                    {"w": TOTAL_WORDS})).scalars().all()
         except Exception as exc:
             log.info("total-row candidates skipped: %s", str(exc).splitlines()[0][:200])
             continue
-        for value, n in cands:
-            if n < TOTAL_MIN_COVERAGE * n_groups:
-                break                                    # ordered by coverage
-            best = None
+        best = None
+        for value in list(dict.fromkeys([*named, *top])):
+            labels = [g for g in key if g != c and await _label_only(session, ref, c, value, g)]
+            # a dropped label column still carries a coarser distinction (a
+            # "production: rounded" detail is still production): keep the
+            # columns it determines that the candidate's rows share with others
+            coarser: list[str] = []
+            for g in labels:
+                for x in await _coarser(session, ref, meta, g, c, value, [*key, *coarser]):
+                    coarser.append(x)
             for m in measures[:TOTAL_MAX_MEASURES]:
-                mq = _q(m)
-                st = await _scalar(session, f"""
-                    SELECT json_build_object(
-                        'compared', COUNT(*) FILTER (WHERE ok),
-                        'equal', COUNT(*) FILTER (WHERE ok AND abs(tot - rest)
-                                 <= {TOTAL_TOLERANCE} * greatest(abs(tot), abs(rest), 1e-9)))
-                      FROM (SELECT SUM({mq}) FILTER (WHERE {_q(c)} = :v) AS tot,
-                                   SUM({mq}) FILTER (WHERE {_q(c)} IS DISTINCT FROM :v) AS rest,
-                                   COUNT({mq}) FILTER (WHERE {_q(c)} = :v) = 1
-                                   AND COUNT({mq}) FILTER (WHERE {_q(c)} IS DISTINCT FROM :v) >= 1 AS ok
-                              FROM {ref} GROUP BY {grp}) g""", {"v": value})
-                if not st or not st.get("compared"):
+                group = [g for g in key if g != c and g not in mirrors[m] and g not in labels] + coarser
+                if not group:
                     continue
-                share = st["equal"] / st["compared"]
-                if st["compared"] >= TOTAL_MIN_GROUPS and share >= TOTAL_MIN_SHARE and (
-                        best is None or share > best[1]):
-                    best = (m, share, st["compared"])
-            if best is not None:
-                found.append({"column": c, "value": str(value), "groups_by": group,
-                              "groups_compared": best[2], "share_equal": round(best[1], 3),
-                              "measure": best[0]})
-                break                                    # one total value per column
-    return found
+                st = await _compare_total(session, ref, c, value, m, group)
+                if st is None:
+                    continue
+                compared, equal, eligible = st
+                need = TOTAL_MIN_GROUPS if compared >= TOTAL_FULL_COVERAGE * eligible else TOTAL_MIN_GROUPS_PARTIAL
+                if compared < need or compared < TOTAL_MIN_COVERAGE * eligible:
+                    continue
+                share = equal / compared
+                if share >= TOTAL_MIN_SHARE and (best is None or (share, compared) > (best[1], best[2])):
+                    best = (str(value), share, compared, m, group)
+        if best is not None:
+            found.append({"column": c, "value": best[0], "groups_by": best[4],
+                          "groups_compared": best[2], "share_equal": round(best[1], 3),
+                          "measure": best[3]})
+    return await _distinct_totals(session, ref, found)
+
+
+async def _distinct_totals(session, ref: str, found: list[dict]) -> list[dict]:
+    """One marker per set of total rows: a total's own label (a detail column
+    reading "production: rounded") marks the very same rows as the total value
+    of another column, and two markers on one set of rows would make a query
+    that groups by one of them read nothing. Keeps the value whose words name a
+    total, then the better supported one."""
+    def rank(t: dict) -> tuple:
+        return (bool(re.search(TOTAL_WORDS.replace(r"\m", r"\b").replace(r"\M", r"\b"), t["value"], re.I)),
+                t["groups_compared"], t["share_equal"])
+
+    kept: list[dict] = []
+    for t in sorted(found, key=rank, reverse=True):
+        same = False
+        for k in kept:
+            diff = await _scalar(session, f"""
+                SELECT COUNT(*) FROM {ref}
+                 WHERE ({_q(t["column"])} = :a) IS DISTINCT FROM ({_q(k["column"])} = :b)""",
+                {"a": t["value"], "b": k["value"]})
+            if diff == 0:
+                same = True
+                break
+        if not same:
+            kept.append(t)
+    return [t for t in found if t in kept]
+
+
+async def _mirrors(session, ref: str, col: str, measure: str) -> bool:
+    """Whether a text column only restates a measure: (nearly) every value of
+    the measure has one text -- spelling variants such as "1,000" / "1000" are
+    tolerated -- and the text has about as many values as the measure."""
+    st = await _scalar(session, f"""
+        SELECT json_build_object(
+          'split', (SELECT COUNT(*) FROM (SELECT {_q(measure)} FROM {ref} WHERE {_q(measure)} IS NOT NULL
+                    GROUP BY 1 HAVING COUNT(DISTINCT {_q(col)}) > 1) x),
+          'nm', (SELECT COUNT(DISTINCT {_q(measure)}) FROM {ref}),
+          'nc', (SELECT COUNT(DISTINCT {_q(col)}) FROM {ref} WHERE {_q(measure)} IS NOT NULL))""")
+    if not st or not st.get("nm"):
+        return False
+    return st["split"] <= MIRROR_MAX_SPLIT * st["nm"] and st["nc"] >= MIRROR_MIN_SHARE * st["nm"]
+
+
+async def _label_only(session, ref: str, c: str, value: Any, g: str) -> bool:
+    """Whether column g's values on the candidate's rows are (nearly all) its
+    own: values no other row has -- the total's label, not a shared dimension."""
+    st = await _scalar(session, f"""
+        SELECT json_build_object('n', COUNT(*), 'shared', COUNT(*) FILTER (WHERE EXISTS (
+                   SELECT 1 FROM {ref} b WHERE b.{_q(g)} = a.v AND b.{_q(c)} IS DISTINCT FROM :v)))
+          FROM (SELECT DISTINCT {_q(g)} AS v FROM {ref} WHERE {_q(c)} = :v AND {_q(g)} IS NOT NULL) a""",
+        {"v": value})
+    if not st or not st.get("n"):
+        return False
+    return st["n"] - st["shared"] >= LABEL_MIN_SHARE * st["n"]
+
+
+async def _coarser(session, ref: str, meta: dict, g: str, c: str, value: Any,
+                   have: list[str]) -> list[str]:
+    """Columns that label column g determines (each g value has one of their
+    values, with few exceptions) and that the candidate's rows share with
+    other rows: the distinction g carries besides the total's label."""
+    out = []
+    for col in meta.get("columns") or []:
+        x = col.get("name")
+        if (not x or x in have or x in (g, c) or col.get("role") in {"measure", "text"}
+                or col.get("type") != "text"):
+            continue
+        st = await _scalar(session, f"""
+            SELECT json_build_object(
+              'n', (SELECT COUNT(DISTINCT {_q(g)}) FROM {ref}),
+              'split', (SELECT COUNT(*) FROM (SELECT {_q(g)} FROM {ref} GROUP BY 1
+                        HAVING COUNT(DISTINCT {_q(x)}) > 1) y),
+              'filled', (SELECT COUNT(*) FROM {ref} WHERE {_q(c)} = :v AND {_q(x)} IS NOT NULL))""",
+            {"v": value})
+        if not st or not st.get("n") or not st.get("filled") or st["split"] > NEAR_DEP_SHARE * st["n"]:
+            continue
+        if await _label_only(session, ref, c, value, x):
+            continue
+        out.append(x)
+        if len(out) >= COARSER_MAX:
+            break
+    return out
+
+
+async def _compare_total(session, ref: str, c: str, value: Any, m: str,
+                         group: list[str]) -> tuple[int, int, int] | None:
+    """(groups compared, groups where total == sum of parts, groups with >= 2
+    parts) for one candidate value, measure and grouping."""
+    try:
+        async with session.begin_nested():
+            await session.execute(sql_text(f"SET LOCAL statement_timeout = {TIMEOUT_MS}"))
+            rows = (await session.execute(sql_text(f"""
+                SELECT tot, rest, nt FROM (
+                  SELECT SUM({_q(m)}) FILTER (WHERE {_q(c)} = :v) AS tot,
+                         SUM({_q(m)}) FILTER (WHERE {_q(c)} IS DISTINCT FROM :v) AS rest,
+                         COUNT({_q(m)}) FILTER (WHERE {_q(c)} = :v) AS nt,
+                         COUNT({_q(m)}) FILTER (WHERE {_q(c)} IS DISTINCT FROM :v) AS nr
+                    FROM {ref} GROUP BY {_cols(group)}) g
+                 WHERE nr >= 2 LIMIT {TOTAL_MAX_GROUPS}"""), {"v": value})).all()
+    except Exception as exc:
+        log.info("total-row check skipped: %s", str(exc).splitlines()[0][:200])
+        return None
+    compared = equal = 0
+    for tot, rest, nt in rows:
+        if nt != 1 or tot is None or rest is None:
+            continue
+        compared += 1
+        equal += _total_matches(float(tot), float(rest))
+    return compared, equal, len(rows)
+
+
+def _total_matches(tot: float, rest: float) -> bool:
+    """A total equals its parts' sum: within TOTAL_TOLERANCE, or within half the
+    total's rounding unit as written (190 -> 10s, 380000 -> 10,000s), capped."""
+    diff = abs(tot - rest)
+    if diff <= TOTAL_TOLERANCE * max(abs(tot), abs(rest), 1e-9):
+        return True
+    if tot == 0 or tot != int(tot):
+        return False
+    unit, t = 1, int(abs(tot))
+    while t % 10 == 0:
+        t //= 10
+        unit *= 10
+    return unit > 1 and diff <= unit / 2 and diff <= TOTAL_ROUNDED_MAX * abs(tot)
+
+
+def total_groups(meta: dict | None) -> dict[str, list[str]]:
+    """{column: the columns its total rows are grouped by} (from the analysis):
+    a row's group HAS a total when a total row shares its values on them."""
+    out: dict[str, list[str]] = {}
+    for t in ((meta or {}).get("analysis") or {}).get("total_rows") or []:
+        if isinstance(t, dict) and t.get("column") and t.get("groups_by"):
+            out.setdefault(str(t["column"]), [str(g) for g in t["groups_by"]])
+    return out
 
 
 def total_markers(meta: dict | None) -> dict[str, str]:

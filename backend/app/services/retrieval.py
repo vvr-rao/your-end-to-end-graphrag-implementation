@@ -462,16 +462,24 @@ def structured_doc_context(evidence: list[dict[str, Any]], *, items: int = 6,
                            chars: int = 4000) -> list[dict[str, Any]]:
     """The best-ranked text evidence (chunks and graph relationships), as the
     table-selection step sees it: facts there may fill a query parameter (the
-    city a company is based in, the drug a trial tested). ``items`` 0 = off."""
+    city a company is based in, the drug a trial tested). ``items`` 0 = off.
+
+    ``items * chars`` is ONE budget shared by the passages, best first: a long
+    passage is shown whole while the budget lasts (a per-passage cut hid the
+    names the question asked about when they sat past the cut)."""
     if items <= 0:
         return []
+    budget = items * max(chars, 0)
     out = []
     for ev in sorted((e for e in evidence if e.get("kind") in {"chunk", "relationship"}),
                      key=lambda e: e.get("rank") or 0):
+        if budget <= 0:
+            break
         text = " ".join(str(ev.get("text") or "").split())
         if not text:
             continue
-        out.append({"id": ev.get("iri"), "text": text[:chars]})
+        out.append({"id": ev.get("iri"), "text": text[:budget]})
+        budget -= len(out[-1]["text"])
         if len(out) >= items:
             break
     return out

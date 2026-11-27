@@ -27,6 +27,7 @@ match "7.7"; "83.82%" matches "84"). Nothing here depends on a dataset.
 """
 from __future__ import annotations
 
+import math
 import re
 import unicodedata
 from typing import Any
@@ -83,7 +84,8 @@ def _norm(text: str) -> str:
 
 
 # A plain number, optionally with a currency sign and/or percent sign.
-_EXPECTED_NUMBER = re.compile(r"\s*(?:us)?[$\u20ac\u00a3\u00a5]?\s*(-?\d[\d,]*(?:\.\d+)?)\s*%?\s*", re.I)
+_EXPECTED_NUMBER = re.compile(r"\s*(?:us)?[$\u20ac\u00a3\u00a5]?\s*(-?\d[\d,]*(?:\.\d+)?)\s*"
+                              r"(trillion|tn|billion|bn|million|mn|mln|thousand)?\s*%?\s*", re.I)
 # Numbers in running text: grouped thousands or plain digits, optional scale word.
 _TEXT_NUMBER = re.compile(
     r"(?<![\w.])(-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)"
@@ -93,7 +95,9 @@ _SCALE = {"trillion": 1e12, "tn": 1e12, "billion": 1e9, "bn": 1e9, "million": 1e
 
 
 def _expected_number(answer: str) -> tuple[float, int] | None:
-    """(value, decimal places) when the answer string is a plain number."""
+    """(value, decimal places) when the answer string is a plain number. With a
+    scale word ("1.24 million") the value is absolute and the places can be
+    negative (stated to the nearest 10,000); see ``_is_scaled``."""
     m = _EXPECTED_NUMBER.fullmatch(answer or "")
     if not m:
         return None
@@ -101,7 +105,23 @@ def _expected_number(answer: str) -> tuple[float, int] | None:
     if "," in raw and not re.fullmatch(r"-?\d{1,3}(?:,\d{3})+(?:\.\d+)?", raw):
         return None
     raw = raw.replace(",", "")
-    return float(raw), len(raw.split(".")[1]) if "." in raw else 0
+    places = len(raw.split(".")[1]) if "." in raw else 0
+    scale = _SCALE.get((m.group(2) or "").lower(), 1.0)
+    if scale > 1:      # "1.24 million" = 1,240,000 stated to the nearest 10,000
+        return float(raw) * scale, places - round(math.log10(scale))
+    return float(raw), places
+
+
+def _is_scaled(answer: str) -> bool:
+    m = _EXPECTED_NUMBER.fullmatch(answer or "")
+    return bool(m and m.group(2))
+
+
+def _truncated(x: float, places: int) -> float:
+    """``x`` cut (not rounded) to ``places`` decimals: an expected "3,028" is
+    met by a reply's 3,028.744, which rounds to 3,029."""
+    f = 10.0 ** places
+    return round(math.trunc(x * f + (1e-9 if x >= 0 else -1e-9)) / f, max(places, 0))
 
 
 def _number_in(answer: str, text: str) -> bool:
@@ -111,12 +131,15 @@ def _number_in(answer: str, text: str) -> bool:
     if exp is None:
         return False
     want, places = exp
+    # an expected "1.24 million" states its own magnitude: compare as written only
+    units = (1.0,) if _is_scaled(answer) else (1.0, 1e3, 1e6, 1e9, 1e12)
     for m in _TEXT_NUMBER.finditer(text or ""):
         value = float(m.group(1).replace(",", "")) * _SCALE.get((m.group(2) or "").lower(), 1.0)
-        for unit in (1.0, 1e3, 1e6, 1e9, 1e12):
+        for unit in units:
             if unit > 1 and abs(value) < unit:
                 break
-            if round(value / unit, places) == round(want, places):
+            got = value / unit
+            if round(got, places) == round(want, places) or _truncated(got, places) == round(want, places):
                 return True
     return False
 

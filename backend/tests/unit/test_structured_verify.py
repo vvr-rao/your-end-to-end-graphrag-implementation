@@ -331,3 +331,162 @@ async def test_a_fixed_lookup_is_tested_with_the_partner_tables_metadata(monkeyp
     await verify.verify_table(meta, router, analysis={}, all_types={"a": {"k": "text"}, "b": {"k": "text"}},
                               partners=partner_meta, log=lambda *_: None)
     assert seen and all(p is partner_meta for p in seen)
+
+
+# ------------------------------------------------- verdicts are given on the FINAL SQL
+
+def _stub_sql_helpers(monkeypatch, verify, refine, session_mod, db_load):
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def no_session():
+        yield None
+
+    async def no_filled(_s, _meta):
+        return {}
+
+    async def no_rows(*_a, **_k):
+        return []
+
+    async def sample(meta, sec, it, types):
+        return {"sql": it.get("sql"), "columns": ["v"], "rows": []}
+
+    async def registered(_s):
+        return {}
+
+    monkeypatch.setattr(session_mod, "session_scope", no_session)
+    monkeypatch.setattr(verify, "filled_only_where", no_filled)
+    monkeypatch.setattr(verify, "_sample_result", sample)
+    monkeypatch.setattr(refine, "_sample_rows", no_rows)
+    monkeypatch.setattr(db_load, "registered_tables", registered)
+
+
+async def test_a_column_correction_recompiles_before_the_items_are_verified(monkeypatch):
+    """Regression (sc80 fertilizer table, 2026-11-26): the column step changed
+    year_code from identifier to time; the catalog was recompiled only AFTER
+    the item verdicts, so 18 queries' SQL no longer matched the SQL their
+    verdict was given on and retrieval refused them as "semantic review
+    stale". Now the recompile happens between the two steps. The compiler is
+    stubbed: a query's period span uses every column whose role is time,
+    which is what made the real SQL change."""
+    from backend.app.db import session as session_mod
+    from backend.app.services.structured import db_load, refine, verify
+    from backend.app.services.structured.metadata import semantic_status, sql_sha
+
+    _stub_sql_helpers(monkeypatch, verify, refine, session_mod, db_load)
+    order = []
+
+    def compiled(meta):
+        span = [c["name"] for c in meta["columns"] if c.get("role") == "time"]
+        return "SELECT SUM(v)" + "".join(f", MIN({c})" for c in span) + " FROM t"
+
+    async def fake_ensure_tested(meta, *, analysis, all_types, partners=None, force=False):
+        order.append("recompile")
+        for it in meta["metrics"]:
+            it["sql"] = compiled(meta)
+        return {"passed": 1, "failed": 0, "not_exercised": 0, "retested": 1}
+
+    monkeypatch.setattr(refine, "ensure_tested", fake_ensure_tested)
+    meta = {"table_name": "t", "semantic_review": {"required": True},
+            "columns": [{"name": "year", "type": "integer", "role": "time"},
+                        {"name": "year_code", "type": "integer", "role": "identifier"},
+                        {"name": "v", "type": "numeric", "role": "measure"}],
+            "metrics": [{"id": "total_by_year", "label": "Total by year", "params": [],
+                         "query": {"select": ["v"]}}]}
+    meta["metrics"][0]["sql"] = compiled(meta)
+    before = meta["metrics"][0]["sql"]
+
+    class Router(FakeRouter):
+        async def chat(self, task, **kw):
+            order.append("verdicts" if "items" in kw.get("user", "") or len(self.calls) else "columns")
+            return await super().chat(task, **kw)
+
+    router = Router({"table_verify": [
+        {"columns": [{"name": "year_code", "role": "time", "problem": "a copy of year"}]},
+        {"items": [{"id": "total_by_year", "verdict": "ok", "reason": ""}]}]})
+    await verify.verify_table(meta, router, analysis={}, all_types={"t": {}}, log=lambda *_: None)
+
+    it = meta["metrics"][0]
+    assert order == ["columns", "recompile", "verdicts"]
+    assert it["sql"] != before and "MIN(year_code)" in it["sql"]
+    assert it["verify_verdict"]["sql_sha"] == sql_sha(it["sql"])
+    assert semantic_status(meta, it) == "ok"
+
+
+async def test_without_a_column_correction_nothing_is_recompiled(monkeypatch):
+    from backend.app.db import session as session_mod
+    from backend.app.services.structured import db_load, refine, verify
+
+    _stub_sql_helpers(monkeypatch, verify, refine, session_mod, db_load)
+    called = []
+
+    async def fake_ensure_tested(*_a, **_k):
+        called.append(1)
+        return {}
+
+    monkeypatch.setattr(refine, "ensure_tested", fake_ensure_tested)
+    meta = {"table_name": "t", "columns": [{"name": "v", "type": "numeric", "role": "measure"}],
+            "metrics": [{"id": "m", "label": "M", "params": [], "query": {"select": ["v"]}, "sql": "SELECT v"}]}
+    router = FakeRouter({"table_verify": [{"columns": []}, {"items": [{"id": "m", "verdict": "ok"}]}]})
+    await verify.verify_table(meta, router, analysis={}, all_types={"t": {}}, log=lambda *_: None)
+    assert called == []
+
+
+async def test_a_query_whose_sql_changed_after_its_verdict_is_verified_again(monkeypatch):
+    """Safety net: whatever recompiles a query after its verdict, the query is
+    verified again (only the changed ones, no column step) instead of staying
+    unavailable to retrieval."""
+    from backend.app.services.structured import refine, verify
+    from backend.app.services.structured.metadata import sql_sha
+
+    seen = {}
+
+    async def fake_verify_table(meta, router, **kw):
+        seen.update(kw)
+        for _s, it in verify.pending_items(meta):
+            it["verify_verdict"] = {"verdict": "ok", "version": verify.VERIFY_VERSION,
+                                    "sql_sha": sql_sha(it["sql"])}
+        return {"llm_calls": 1}
+
+    async def fake_ensure_tested(*_a, **_k):
+        return {"passed": 2, "failed": 0, "not_exercised": 0, "retested": 0}
+
+    monkeypatch.setattr(verify, "verify_table", fake_verify_table)
+    monkeypatch.setattr(refine, "ensure_tested", fake_ensure_tested)
+    ok_v = {"verdict": "ok", "version": verify.VERIFY_VERSION}
+    meta = {"table_name": "t", "semantic_review": {"required": True}, "metrics": [
+        {"id": "same", "sql": "SELECT 1", "verify_verdict": {**ok_v, "sql_sha": sql_sha("SELECT 1")}},
+        {"id": "changed", "sql": "SELECT 2", "verify_verdict": {**ok_v, "sql_sha": sql_sha("SELECT old")}}]}
+    out = await refine.reverify_changed(meta, None, analysis={}, all_types={}, log=lambda *_: None)
+    assert out == ({"passed": 2, "failed": 0, "not_exercised": 0, "retested": 0}, 1)
+    assert seen.get("only_pending") is True
+    assert meta["metrics"][1]["verify_verdict"]["sql_sha"] == sql_sha("SELECT 2")
+    # nothing stale: no call at all
+    assert await refine.reverify_changed(meta, None, analysis={}, all_types={}, log=lambda *_: None) is None
+
+
+async def test_a_query_still_stale_after_the_second_verdict_is_logged(monkeypatch):
+    """Bounded: one extra pass. A query whose SQL changes AGAIN during it stays
+    unavailable -- and the log says which."""
+    from backend.app.services.structured import refine, verify
+    from backend.app.services.structured.metadata import sql_sha
+
+    async def fake_verify_table(meta, router, **kw):
+        for _s, it in verify.pending_items(meta):
+            it["verify_verdict"] = {"verdict": "ok", "version": verify.VERIFY_VERSION,
+                                    "sql_sha": sql_sha(it["sql"])}
+        return {"llm_calls": 1}
+
+    async def recompiling_ensure_tested(meta, **_k):
+        meta["metrics"][0]["sql"] = "SELECT 3"          # changes again after the verdict
+        return {"passed": 1, "failed": 0, "not_exercised": 0, "retested": 1}
+
+    monkeypatch.setattr(verify, "verify_table", fake_verify_table)
+    monkeypatch.setattr(refine, "ensure_tested", recompiling_ensure_tested)
+    meta = {"table_name": "t", "semantic_review": {"required": True}, "metrics": [
+        {"id": "moving", "sql": "SELECT 2",
+         "verify_verdict": {"verdict": "ok", "version": verify.VERIFY_VERSION, "sql_sha": sql_sha("SELECT 1")}}]}
+    logs: list[str] = []
+    out = await refine.reverify_changed(meta, None, analysis={}, all_types={}, log=logs.append)
+    assert out is not None and out[1] == 1                  # one pass only
+    assert any("stay unavailable" in m and "moving" in m for m in logs)

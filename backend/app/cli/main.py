@@ -3251,6 +3251,11 @@ def _cmd_enrich_geo(args: argparse.Namespace) -> int:
         )
     # Places and containment edges changed: standing corpus evaluation (free).
     if not args.dry_run:
+        # the enrichment's asyncio.run loop is dead; its cached engine holds
+        # connections bound to it ("attached to a different loop")
+        from backend.app.db.engine import reset_engine_cache
+
+        reset_engine_cache()
         try:
             _print_corpus_eval(asyncio.run(_run_corpus_eval()))
         except Exception as exc:

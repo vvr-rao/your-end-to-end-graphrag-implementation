@@ -118,13 +118,13 @@ _RRF_K = 60           # reciprocal-rank-fusion constant (the usual value; measur
 _RANK_STOPWORDS = _ID_STOPWORDS | {"data", "value", "values", "table", "tables"}
 
 
-def _rank_terms(text: str | None) -> set[str]:
+def _rank_terms(text: str | None, stop: frozenset[str] | set[str] | None = None) -> set[str]:
     """Content words for the lexical signal: lower-cased, function words and
     words under three letters dropped, a plain plural reduced to its singular."""
     out = set()
     for w in re.findall(r"[a-z0-9][a-z0-9\-]*", (text or "").lower()):
         w = w.strip("-")
-        if len(w) < 3 or w in _RANK_STOPWORDS:
+        if len(w) < 3 or w in (_RANK_STOPWORDS if stop is None else stop):
             continue
         if w.endswith("ies") and len(w) > 4:
             w = w[:-3] + "y"
@@ -132,6 +132,60 @@ def _rank_terms(text: str | None) -> set[str]:
             w = w[:-1]
         out.add(w)
     return out
+
+
+_NAMED_VALUE_MIN_WORDS = 3     # a stored value this long, named in full and held by one table, reserves a slot
+
+
+def _value_phrase(value: Any) -> frozenset[str] | None:
+    """A stored text value (an indicator name, a product, an element) as the
+    content words it is matched on; None for numbers, codes and empty text."""
+    if not isinstance(value, str) or not re.search(r"[A-Za-z]{3}", value):
+        return None
+    # only function words dropped: 'value' tells 'Export value' from 'Export quantity'
+    t = _rank_terms(value, _ID_STOPWORDS)
+    return frozenset(t) if t else None
+
+
+def value_matches(domains: dict | None, q_terms: set[str]) -> dict[frozenset[str], str]:
+    """Text values of a table's columns that the question names: every content
+    word of the value is in the question (a long value, 4+ words, may miss one
+    in four). {phrase: the value as stored}."""
+    out: dict[frozenset[str], str] = {}
+    if not q_terms:
+        return out
+    for dom in (domains or {}).values():
+        for v in (dom or {}).get("values") or [] if isinstance(dom, dict) else []:
+            ph = _value_phrase(v)
+            if not ph or ph in out:
+                continue
+            hit = len(ph & q_terms)
+            if hit == len(ph) or (len(ph) >= 4 and hit / len(ph) >= 0.75):
+                out[ph] = v
+    return out
+
+
+def reserve_named_value_slots(ordered: list, max_tables: int, matched_values: dict,
+                              vdf: dict) -> tuple[list, list]:
+    """The top ``max_tables`` of ``ordered``, except that a table which alone
+    holds a value the question names in full (3+ words: an indicator, a product
+    line) gets a slot even when the shared signals rank it low -- countries and
+    wording are common to many tables, such a value is not. It takes the place
+    of the lowest-ranked table without one. Returns (tables, reserved)."""
+    best = list(ordered[:max_tables])
+    named = [aid for aid in ordered
+             if any(len(ph) >= _NAMED_VALUE_MIN_WORDS and vdf.get(ph) == 1
+                    for ph in matched_values.get(aid) or {})]
+    reserved = []
+    for aid in named:
+        if aid in best or not best:
+            continue
+        drop = next((x for x in reversed(best) if x not in named), None)
+        if drop is None:
+            break
+        best[best.index(drop)] = aid
+        reserved.append(aid)
+    return best, reserved
 
 
 def _idf(n_tables: int, df: int) -> float:
@@ -184,18 +238,36 @@ async def candidate_tables(
     graph: dict[uuid.UUID, float] = {}
     vector: dict[uuid.UUID, float] = {}
     lexical: dict[uuid.UUID, float] = {}
+    values: dict[uuid.UUID, float] = {}
     dist_of: dict[uuid.UUID, float] = {}
+    q_terms = _rank_terms(question)
+    qv_terms = _rank_terms(question, _ID_STOPWORDS)     # matched against stored values
 
     def _hits(aid):
-        return hits_of.setdefault(aid, {"columns": set(), "classes": set(), "time": False})
+        return hits_of.setdefault(aid, {"columns": set(), "classes": set(), "time": False,
+                                        "values": {}, "q_terms": qv_terms})
 
     async with session_scope() as s:
-        tables = (await s.execute(sql_text(
-            "SELECT id, text FROM graphrag.intelligence_artifacts "
+        rows_t = (await s.execute(sql_text(
+            "SELECT id, text, extra_metadata->'value_domains' FROM graphrag.intelligence_artifacts "
             "WHERE artifact_type = 'TableMetadata' AND status = 'ACTIVE'"))).all()
+        tables = [(aid, txt) for aid, txt, _d in rows_t]
         n_tables = len(tables)
         if not n_tables:
             return []
+        # values the question names (an indicator, a product, an element):
+        # often the only thing that tells which table holds the measure, since
+        # the countries and years a question names are in most tables
+        matched_values = {aid: value_matches(d if isinstance(d, dict) else None, qv_terms)
+                          for aid, _t, d in rows_t}
+        vdf: dict[frozenset[str], int] = {}
+        for mv in matched_values.values():
+            for ph in mv:
+                vdf[ph] = vdf.get(ph, 0) + 1
+        for aid, mv in matched_values.items():
+            if mv:
+                _hits(aid)["values"] = mv
+                values[aid] = sum(_idf(n_tables, vdf[ph]) * len(ph) for ph in mv)
         if entity_ids or class_ids or time_ids:
             rows = (await s.execute(sql_text("""
                 SELECT a.id, gr.target_node_type, gr.target_node_id, gr.relationship_type,
@@ -250,7 +322,6 @@ async def candidate_tables(
                     continue
                 dist_of[aid] = float(dist)
                 vector[aid] = 1.0 / (1.0 + float(dist))
-        q_terms = _rank_terms(question)
         if q_terms:
             terms = {aid: _rank_terms(text) for aid, text in tables}
             df: dict[str, int] = {}
@@ -261,11 +332,14 @@ async def candidate_tables(
                 sc = sum(_idf(n_tables, df[w]) for w in ts & q_terms)
                 if sc > 0:
                     lexical[aid] = sc
-        fused = _fuse([graph, vector, lexical])
+        fused = _fuse([graph, vector, lexical, values])
         if not fused:
             return []
-        best = sorted(fused, key=lambda a: (-fused[a], -graph.get(a, 0.0),
-                                            dist_of.get(a, float("inf"))))[:max_tables]
+        ordered = sorted(fused, key=lambda a: (-fused[a], -graph.get(a, 0.0),
+                                               dist_of.get(a, float("inf"))))
+        best, reserved = reserve_named_value_slots(ordered, max_tables, matched_values, vdf)
+        for aid in reserved:
+            via.setdefault(aid, []).append("reserved:named_value")
         metas = dict((await s.execute(sql_text("""
             SELECT id, extra_metadata FROM graphrag.intelligence_artifacts
              WHERE id = ANY(CAST(:ids AS uuid[]))
@@ -282,9 +356,40 @@ async def candidate_tables(
             v.append(f"vector:{dist_of[aid]:.3f}")
         if aid in lexical:
             v.append(f"lexical:{lexical[aid]:.2f}")
+        if aid in values:
+            v.append(f"values:{values[aid]:.2f}")
         out.append({"id": aid, "table": meta["table_name"], "meta": meta, "score": fused[aid],
                     "via": v, "hits": _hits(aid)})
     return out
+
+
+def _item_value_score(it: dict, matched: dict, q_terms: set[str]) -> tuple[float, list[str]]:
+    """How well a stored query's values fit the values the question names: a
+    value the query FIXES (a where condition) counts most, partly named ones
+    count by the share of their words in the question ('export quantity' for
+    a question about exports); a value a parameter may take counts less."""
+    score, why = 0.0, []
+    fixed = [c.get("value") for c in ((it.get("query") or {}).get("where") or [])
+             if isinstance(c, dict) and c.get("op") in ("=", "in") and "value" in c]
+    fixed = [x for v in fixed for x in (v if isinstance(v, list) else [v])]
+    for v in [*fixed, it.get("label")]:
+        ph = _value_phrase(v)
+        if not ph:
+            continue
+        if ph in matched:
+            score += 3.0
+            why.append(repr(matched[ph]))
+        elif q_terms and len(ph & q_terms) / len(ph) >= 0.5 and v in fixed:
+            score += 1.0
+            why.append(f"{v!r} (partly)")
+    if matched:
+        for p in it.get("params") or []:
+            hit = [matched[ph] for ph in {_value_phrase(v) for v in p.get("allowed_values") or []} - {None}
+                   if ph in matched]
+            if hit:
+                score += 1.0
+                why.append(f"{p.get('name')}={hit[0]!r}")
+    return score, why
 
 
 def rank_items(meta: dict, hits: dict | None) -> dict[str, tuple[float, list[str]]]:
@@ -313,6 +418,10 @@ def rank_items(meta: dict, hits: dict | None) -> dict[str, tuple[float, list[str
         if hits.get("time") and tags.get("time_columns"):
             score += 1.0
             why.append("period in " + ", ".join(tags["time_columns"]))
+        vs, vwhy = _item_value_score(it, hits.get("values") or {}, hits.get("q_terms") or set())
+        if vs:
+            score += vs
+            why.append("value " + ", ".join(vwhy))
         if score and sec == "measures":
             score += 0.5
         out[it["id"]] = (score, why)
@@ -484,6 +593,19 @@ def _sig_words(text: str) -> set[str]:
             if w not in _ID_STOPWORDS}
 
 
+def _context_text(text: str) -> str:
+    """Document text for whole-phrase matching: folded, lower case, single spaces."""
+    return " " + re.sub(r"[^a-z0-9]+", " ", fold_text(str(text)).lower()).strip() + " "
+
+
+def _phrase_in(value: Any, context_text: str) -> bool:
+    """Whether a row's name occurs in the context as a whole phrase (words in
+    order, bounded by non-letters). Names under 4 characters never match: too
+    many short words collide."""
+    v = re.sub(r"[^a-z0-9]+", " ", fold_text(str(value)).lower()).strip()
+    return len(v) >= 4 and f" {v} " in context_text
+
+
 def _word_regex(word: str) -> str:
     """Postgres ARE matching ``word`` as a whole word (not inside another word)."""
     return r"\m" + re.sub(r"([^a-z0-9])", r"\\\1", word) + r"\M"
@@ -569,12 +691,38 @@ def expand_refs(call: dict, done: dict[int, list[SqlResult]]) -> tuple[list[dict
     return out, None
 
 
+async def _linked_entity_names(s, table: str, column: str, values: list[str]) -> list[str]:
+    """Names of the graph entities the table's links attach to one of
+    ``values`` in ``column`` (the place / entity linking done at load)."""
+    if not values:
+        return []
+    rows = (await s.execute(sql_text("""
+        SELECT DISTINCT e.name
+          FROM graphrag.intelligence_artifacts a
+          JOIN graphrag.graph_relationships r
+            ON r.source_node_type = 'intelligence_artifact' AND r.source_node_id = a.id
+           AND r.target_node_type = 'entity'
+          JOIN graphrag.entities e ON e.id = r.target_node_id
+         WHERE a.artifact_type = 'TableMetadata' AND a.status = 'ACTIVE'
+           AND a.extra_metadata->>'table_name' = :t
+           AND jsonb_exists(COALESCE(r.extra_metadata->'columns', '[]'::jsonb), :c)
+           AND jsonb_exists_any(COALESCE(r.extra_metadata->'values', '[]'::jsonb), CAST(:v AS text[]))
+         LIMIT 20
+    """), {"t": table, "c": column, "v": list(dict.fromkeys(values))})).scalars().all()
+    return [str(n) for n in rows if n]
+
+
 async def identifier_guard(sql: str, params: dict, *, question: str, seen_values: set[str],
                            types: dict[str, dict[str, str]], metas: dict[str, dict],
-                           context_norm: str = "") -> list[dict]:
+                           context_norm: str = "", context_text: str = "") -> list[dict]:
     """Values compared with an item-identifier column that the question does
     not state, no earlier result returned, and whose row's descriptive values
-    share no word with the question. Read-only."""
+    share no word with the question. Read-only.
+
+    ``context_text``: the retrieved document text the selector read. An id whose
+    row's NAME appears in it as a whole phrase ("IND" -> "India") is grounded
+    there -- the question often names its items only through the documents
+    ("the countries the report places in the high-risk zone")."""
     id_cols = {t: entity_id_columns(m) for t, m in metas.items()}
     if not any(id_cols.values()):
         return []
@@ -645,6 +793,19 @@ async def identifier_guard(sql: str, params: dict, *, question: str, seen_values
                                     matched = True
                                     break
                         if matched:
+                            break
+                if not matched and context_text:
+                    matched = any(_phrase_in(v, context_text) for v in vals)
+                if not matched:
+                    # the graph already resolved this value to an entity (a code
+                    # 'KOR' -> 'South Korea', a row named 'Rep. of Korea'): the id
+                    # is grounded when that entity is named in the question or
+                    # the documents the selector read
+                    q_ctx = _context_text(question)
+                    for name in await _linked_entity_names(s, c["table"], c["column"],
+                                                           [str(c["value"]), *vals]):
+                        if _phrase_in(name, q_ctx) or (context_text and _phrase_in(name, context_text)):
+                            matched = True
                             break
                 if matched:
                     continue
@@ -720,6 +881,32 @@ def _family(meta: dict, cols) -> set[str]:
     return out
 
 
+def open_dimensions(meta: dict, desc: dict, params: dict | None) -> set[str]:
+    """Row dimensions of a row-level query that the call leaves OPEN (rows vary
+    over them, so the rows are parts to be summed). A dimension is pinned by
+    an equality parameter the call fills (one value, or a list of values the
+    call asks for -- one row per listed value is what was asked), by a fixed
+    equality condition, or by a range whose two bounds are the same value
+    (year 2024..2024). Column families count as one dimension (a code and its
+    name). Empty set = every dimension pinned."""
+    given = {k: v for k, v in (params or {}).items() if v not in (None, "", [])}
+    # only an equality fixes a dimension (an exclusion such as <> 'total row' does not)
+    eq = ("=", "in", None)
+    fixed = [e.get("column") for e in desc.get("parameters") or []
+             if e.get("name") in given and e.get("column") and e.get("op") in eq]
+    fixed += [f.get("column") for f in desc.get("fixed_conditions") or []
+              if f.get("column") and f.get("op") in ("=", "in")]
+    bounds: dict[str, list] = {}
+    for e in desc.get("parameters") or []:
+        if e.get("op") == "between" and e.get("column") and e.get("name") in given:
+            bounds.setdefault(e["column"], []).append(given[e["name"]])
+    fixed += [c for c, vals in bounds.items()
+              if len(vals) == 2 and not isinstance(vals[0], list) and str(vals[0]) == str(vals[1])]
+    fixed_fam = _family(meta, [c for c in fixed if c])
+    return _family(meta, [g for g in desc.get("output_grain") or []
+                          if isinstance(g, str) and g.split(".")[-1] not in fixed_fam])
+
+
 def total_alternatives(meta: dict, section: str, item: dict,
                        versions: dict[str, str | None] | None = None,
                        params: dict | None = None) -> list[str]:
@@ -734,16 +921,9 @@ def total_alternatives(meta: dict, section: str, item: dict,
     if not _row_level(desc):
         return []
     wanted = {str(q).split(".")[-1] for q in desc.get("quantity") or [] if q}
-    given = {k for k, v in (params or {}).items() if v not in (None, "", [])}
-    # only an equality fixes a dimension (an exclusion such as <> 'total row' does not)
-    eq = ("=", "in", None)
-    fixed = [e.get("column") for e in desc.get("parameters") or []
-             if e.get("name") in given and e.get("column") and e.get("op") in eq]
-    fixed += [f.get("column") for f in desc.get("fixed_conditions") or []
-              if f.get("column") and f.get("op") in ("=", "in")]
-    fixed_fam = _family(meta, [c for c in fixed if c])
-    open_dims = _family(meta, [g for g in desc.get("output_grain") or []
-                               if isinstance(g, str) and g.split(".")[-1] not in fixed_fam])
+    open_dims = open_dimensions(meta, desc, params)
+    if not open_dims:      # every row dimension pinned: the rows ARE the totals asked for
+        return []
     out = []
     for sec, it in items(meta):
         if it is item or not selectable(meta, it, versions)[0]:
@@ -808,10 +988,12 @@ async def _execute(call: dict, by_table: dict[str, dict], *, max_rows: int, time
     shape_in = call.get("reshape")
     from backend.app.services.structured.metadata import describe_query
 
-    # only a ROW-LEVEL query returns the parts of a total; a stored aggregate is one
+    # only a ROW-LEVEL query returns the parts of a total; a stored aggregate is
+    # one, and so is a row-level query whose every row dimension the call pins
+    _desc = describe_query(meta, section, item)
     if str(call.get("scope") or "").lower() == "total" and not (
             isinstance(shape_in, dict) and shape_in.get("aggregate")) \
-            and _row_level(describe_query(meta, section, item)):
+            and _row_level(_desc) and open_dimensions(meta, _desc, call.get("params") or {}):
         alts = total_alternatives(meta, section, item, versions, call.get("params") or {})
         if alts:
             grain = ", ".join(map(str, describe_query(meta, section, item).get("output_grain") or [])) \
@@ -920,6 +1102,51 @@ def _grouped_columns(item: dict) -> set[str]:
         return set()
     grp = spec.get("group_by") or [x for x in sel if not (isinstance(x, dict) and x.get("agg"))]
     return {str(g.get("column") if isinstance(g, dict) else g).split(".")[-1] for g in grp if g}
+
+
+def lookup_calls(batch: list[dict]) -> set[int]:
+    """Numbers (1-based) of the calls in ``batch`` whose results a LATER call
+    of the same batch takes a parameter from (``{"from_call": k, ...}``)."""
+    out: set[int] = set()
+    for n, call in enumerate(batch, start=1):
+        params = call.get("params") if isinstance(call.get("params"), dict) else {}
+        for v in params.values():
+            if isinstance(v, dict) and "from_call" in v:
+                ks = v["from_call"] if isinstance(v["from_call"], list) else [v["from_call"]]
+                out |= {k for k in ks if isinstance(k, int) and 1 <= k < n}
+    return out
+
+
+def lookup_coverage(call: dict, concrete: list[dict], item: dict | None,
+                    keep: dict[str, Any]) -> str | None:
+    """Why the values a call TAKES from earlier calls ({"from_call": k}) fail to
+    cover what the question asked for on that column (None when they cover it).
+    The values are pooled over every run the call fans out to, so a requested
+    value missing from the lookup -- or cut by the fan-out cap -- is caught."""
+    if not keep or not item:
+        return None
+    params = call.get("params") if isinstance(call.get("params"), dict) else {}
+    for p in item.get("params") or []:
+        n, col = p.get("name"), p.get("column")
+        ref = params.get(n)
+        if not col or not (isinstance(ref, dict) and "from_call" in ref):
+            continue
+        key = f"{col}|{str(n).endswith('_from')}|{str(n).endswith('_to')}"
+        if key not in keep:
+            continue
+        want = keep[key]
+        members = want["members"] if isinstance(want, dict) and "members" in want else [want]
+        have: set[str] = set()
+        for sub in concrete:
+            v = (sub.get("params") or {}).get(n)
+            have |= {_norm_value(x) for x in (v if isinstance(v, list) else [v]) if x is not None}
+        lost = [v for v in members if _norm_value(v) not in have]
+        if lost:
+            cut = next((c.get("_fanout_cut") for c in concrete if c.get("_fanout_cut")), None)
+            return (f"takes {col} values from an earlier call that do not include {lost!r}, which the "
+                    f"question asked for{f' ({cut} were run)' if cut else ''}; look up every requested "
+                    "value, or filter on the requested values directly")
+    return None
 
 
 def broadens(call: dict, item: dict | None, keep: dict[str, Any], *,
@@ -1678,11 +1905,14 @@ async def structured_evidence(
     metas_all = {**{c["table"]: c["meta"] for c in cands}, **partners}
     seen_values: set[str] = set()       # every value an earlier call returned
 
-    doc_norm = _norm_value(" ".join(str(d.get("text") or "") for d in doc_context or []))
+    _doc_raw = " ".join(str(d.get("text") or "") for d in doc_context or [])
+    doc_norm = _norm_value(_doc_raw)
+    doc_text = _context_text(_doc_raw) if _doc_raw.strip() else ""
 
     async def _guard(sql: str, params: dict) -> list[dict]:
         return await identifier_guard(sql, params, question=question, seen_values=seen_values,
-                                      types=types, metas=metas_all, context_norm=doc_norm)
+                                      types=types, metas=metas_all, context_norm=doc_norm,
+                                      context_text=doc_text)
 
     async def _prevalidate(sql: str, params: dict) -> tuple[dict, list[dict], list[dict]]:
         return await prevalidate_values(sql, params, col_types=col_types, id_cols=id_cols)
@@ -1715,6 +1945,7 @@ async def structured_evidence(
 
     async def _run_calls(batch: list[dict], *, retry: bool) -> None:
         done: dict[int, list[SqlResult]] = {}       # call number -> its results (chaining)
+        feeders = lookup_calls(batch)
         for n, call in enumerate(batch, start=1):
             concrete, ref_err = expand_refs(call, done)
             if ref_err:
@@ -1726,14 +1957,30 @@ async def structured_evidence(
             for sub in concrete:
                 sub_call = {k: v for k, v in sub.items() if not k.startswith("_")}
                 why = None
-                if retry:
+                rec_origin = None
+                if retry and n in feeders:
+                    # a LOOKUP: its rows only supply a value (an id) to a later
+                    # call, which is checked against the question's values
+                    # itself. It need not filter the question's other values
+                    # nor replace a failed call -- refusing it blocked the
+                    # very id lookup the identifier guard asks for.
+                    rec_origin, _why = _origin(call)
+                elif retry:
                     origin, why = _origin(call)
                     if origin is not None:
                         rec_origin = origin
                         failed = failures[origin - 1]
-                        why = broadens(sub_call, _item_of(sub_call), failed.get("keep") or {},
+                        # judge parameters taken from an earlier call as written
+                        # ({"from_call": k}): after fan-out each sub-call holds ONE
+                        # of the looked-up values, never the whole requested list
+                        as_written = {**sub_call, "params": {
+                            **(sub_call.get("params") or {}),
+                            **{k: v for k, v in (call.get("params") or {}).items()
+                               if isinstance(v, dict) and "from_call" in v}}}
+                        why = broadens(as_written, _item_of(sub_call), failed.get("keep") or {},
                                        grouping_keeps=sub_call.get("query_id") in (
-                                           failed.get("total_alternatives") or []))
+                                           failed.get("total_alternatives") or [])) \
+                            or lookup_coverage(call, concrete, _item_of(sub_call), failed.get("keep") or {})
                 if why:
                     rec, res, err = selection_error(sub_call, f"retry refused: it {why}", broadens=True)
                 else:
@@ -1742,8 +1989,10 @@ async def structured_evidence(
                                                    guard=_guard, prevalidate=_prevalidate, versions=versions)
                 if retry:
                     rec["retry"] = True
-                    if why is None:
+                    if why is None and rec_origin is not None:
                         rec["retry_of"] = rec_origin
+                    if n in feeders:
+                        rec["lookup"] = True
                 if sub.get("_from_calls"):
                     rec["from_calls"] = sub["_from_calls"]
                     if sub.get("_fanout_cut"):

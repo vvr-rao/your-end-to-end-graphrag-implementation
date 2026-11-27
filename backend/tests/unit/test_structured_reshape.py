@@ -189,3 +189,52 @@ def test_selection_prompt_has_the_generic_ranking_rule():
     assert "prefer a stored ranking query" in rule
     assert "RESHAPE" in rule and "order_by" in rule
     assert "only a total" in rule
+
+
+# ---------------------------------------------------------------- latest per item (2026-11-27)
+# "most recent value" questions: items can have different latest periods, and a
+# fixed period window drops an item whose newest value is older (sc80 q024).
+
+def test_latest_keeps_one_row_per_item_at_its_latest_filled_period():
+    kinds = output_columns(SERIES_SQL, TYPES, ROLES)
+    sql, how = reshape_sql(SERIES_SQL, {"latest": {"per": ["item"], "by": "period"}}, kinds, max_rows=50)
+    assert 'DISTINCT ON (base."item")' in sql
+    assert 'ORDER BY base."item", base."period" DESC NULLS LAST' in sql
+    assert 'WHERE base."value" IS NOT NULL' in sql                  # only rows with a value
+    assert SERIES_SQL.rstrip(";") in sql                             # the stored rows, unchanged
+    assert "latest period per item" in how
+
+
+@pytest.mark.parametrize("spec, msg", [
+    ({"latest": {"per": ["item"], "by": "unit"}}, "period"),         # not a period column
+    ({"latest": {"per": ["value"], "by": "period"}}, "categorical"),
+    ({"latest": {"per": ["nope"], "by": "period"}}, "output columns"),
+    ({"latest": {"per": ["item"], "by": "period"}, "group_by": ["item"]}, "cannot be combined"),
+])
+def test_latest_refuses_what_it_may_not_do(spec, msg):
+    kinds = output_columns(SERIES_SQL, TYPES, ROLES)
+    with pytest.raises(ReshapeError, match=msg):
+        reshape_sql(SERIES_SQL, spec, kinds, max_rows=50)
+
+
+@db_only
+async def test_latest_runs_on_the_stored_rows(pg):
+    from sqlalchemy import text
+
+    from backend.app.services.structured.retrieval_step import _execute
+    async with pg() as s:      # b's newest period has no value: its latest FILLED period is 2026M02
+        await s.execute(text("INSERT INTO graphrag.t_obs VALUES ('b', 'south', '2026M03', 'kg', NULL)"))
+    call = {"table": "t_obs", "query_id": "series",
+            "params": {"item": None, "unit": "kg", "p_from": "2000M01", "p_to": "2099M12"},
+            "reshape": {"latest": {"per": ["item"], "by": "period"}}}
+    rec, res, err = await _execute(call, _by_table(), max_rows=50, timeout_ms=5000, all_tables={"t_obs"})
+    assert err is None, rec
+    got = {r[0]: (r[2], float(r[4])) for r in res.rows}
+    assert got == {"a": ("2026M03", 20.0), "b": ("2026M02", 7.0), "c": ("2026M01", 100.0)}
+
+
+def test_selection_prompt_has_the_latest_per_item_rule():
+    from backend.app.services.prompts import table_query_select
+
+    system, _user = table_query_select("What is the most recent value for each item?", [])
+    assert "MOST RECENT VALUE per item" in system and '"latest"' in system

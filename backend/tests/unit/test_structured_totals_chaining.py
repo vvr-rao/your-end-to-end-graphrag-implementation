@@ -375,8 +375,10 @@ def test_doc_context_takes_the_best_ranked_text_evidence():
           {"kind": "chunk", "rank": 3, "iri": "c2", "text": "second  chunk"},
           {"kind": "chunk", "rank": 2, "iri": "c1", "text": "first chunk " * 10},
           {"kind": "relationship", "rank": 4, "iri": "r", "text": "X locatedIn Y."}]
-    out = structured_doc_context(ev, items=3, chars=20)
-    assert [d["id"] for d in out] == ["c1", "c2", "r"] and len(out[0]["text"]) == 20
+    out = structured_doc_context(ev, items=3, chars=30)     # one budget of 90 characters
+    assert [d["id"] for d in out] == ["c1"] and len(out[0]["text"]) == 90
+    out = structured_doc_context(ev, items=3, chars=60)     # 180: the first whole, then the rest
+    assert [d["id"] for d in out] == ["c1", "c2", "r"] and len(out[0]["text"]) == 119
     assert out[1]["text"] == "second chunk"
     assert structured_doc_context(ev, items=0) == []
 
@@ -388,6 +390,40 @@ def test_selection_prompt_shows_document_evidence():
     assert "DOCUMENT EVIDENCE" in user and "[viao:Chunk_1] Made in Rivertown." in user
     _s, user = PROMPTS["table_query_select"]("q?", [])
     assert "DOCUMENT EVIDENCE" not in user
+
+
+def test_phrase_in_matches_whole_names_only():
+    from backend.app.services.structured.retrieval_step import _context_text, _phrase_in
+    ctx = _context_text("The report places India and the United States, plus Côte d'Ivoire, at risk.")
+    assert _phrase_in("India", ctx) and _phrase_in("United States", ctx)
+    assert _phrase_in("Cote d'Ivoire", ctx)                          # folded accents/punctuation
+    assert not _phrase_in("Indiana", ctx)                            # not inside another word
+    assert not _phrase_in("States", _context_text("statesman"))
+    assert not _phrase_in("US", _context_text("the US economy"))     # names under 4 chars never match
+
+
+@db_only
+async def test_guard_accepts_an_id_whose_row_name_the_documents_state(pg):
+    """The question names its items only through the documents ("the countries
+    the report lists"): an id whose row NAME appears in the retrieved document
+    text is grounded there. An id naming something the documents do not
+    mention is still refused."""
+    meta = {"table_name": "t_items",
+            "columns": [{"name": "item_id", "type": "text", "role": "identifier"},
+                        {"name": "item_name", "type": "text", "role": "dimension"},
+                        {"name": "n", "type": "integer", "role": "measure"}],
+            "column_stats": {"item_id": {"distinct": 12}, "item_name": {"distinct": 12}}}
+    types = {"t_items": {"item_id": "text", "item_name": "text", "n": "integer"}}
+    sql = "SELECT n FROM t_items WHERE item_id = CAST(:id AS text)"
+    from backend.app.services.structured.retrieval_step import _context_text
+    kw = {"question": "What is n for the two items the report lists?", "seen_values": set(),
+          "types": types, "metas": {"t_items": meta}}
+    docs = _context_text("The report lists widget epsilon and widget gamma as the leaders.")
+    assert await identifier_guard(sql, {"id": "ID004"}, context_text=docs, **kw) == []   # widget epsilon
+    out = await identifier_guard(sql, {"id": "ID005"}, context_text=docs, **kw)          # not in the docs
+    assert out and out[0]["value"] == "ID005"
+    out = await identifier_guard(sql, {"id": "ID004"}, **kw)                             # no documents
+    assert out and out[0]["value"] == "ID004"
 
 
 async def test_guard_accepts_an_identifier_stated_in_the_document_evidence():
@@ -505,3 +541,217 @@ async def test_pattern_value_is_rewritten_to_the_tables_spelling(pg):
         assert n == 1, (asked, params, subs)
     params, missing, subs = await prevalidate_values(sql, {"name": "Atlantis"}, col_types=types)
     assert params == {"name": "Atlantis"} and subs == []
+
+
+# --- total rows: rounded, labelled, partial coverage (2026-11-27, sc80 commodities) ---
+# A published table: per commodity and year, country rows plus a "World total"
+# row whose detail text is its own ("...: rounded") and whose value is rounded;
+# a text column restating the value; a one-country section with no totals; and
+# a commodity with ONE producer (its row equals the world total -- no evidence).
+
+def test_total_matches_allows_the_totals_own_rounding_only():
+    from backend.app.services.structured.analysis import _total_matches
+    assert _total_matches(190, 185) and _total_matches(380000, 384000)
+    assert not _total_matches(190, 180)                 # beyond half of 10
+    assert not _total_matches(187, 185)                 # unrounded: exact (0.5%)
+    assert not _total_matches(100, 60)                  # coarse total, but over 10%
+
+
+@pytest.fixture
+async def prod(pg):
+    from sqlalchemy import text
+    async with pg() as s:
+        await s.execute(text("DROP TABLE IF EXISTS graphrag.t_prod"))
+        await s.execute(text("CREATE TABLE graphrag.t_prod (section text, commodity text, country text, "
+                             "statistics text, detail text, year text, value_txt text, value numeric)"))
+        rows = []
+        for k in range(8):                                    # 8 commodities x 2 years = 16 groups
+            com = f"metal{k}"
+            for y in ("2024", "2025"):
+                parts = [37 + k, 52 + 2 * k, 96 + k]          # sum ends in no zero: total is rounded
+                for i, v in enumerate(parts):
+                    rows.append(("minerals", com, f"land{i}", "Production", "Mine production", y, f"{v:,}", v))
+                tot = round(sum(parts), -1)
+                rows.append(("minerals", com, "World total", "Production", "Mine production: rounded", y,
+                             f"{tot:,}", tot))
+        for y in ("2024", "2025"):                            # sole producer: equals the total, proves nothing
+            rows.append(("minerals", "rare1", "land0", "Production", "Mine production", y, "50", 50))
+            rows.append(("minerals", "rare1", "World total", "Production", "Mine production: rounded", y, "50", 50))
+        for k in range(30):                                   # one-country section, never totalled
+            for y in ("2024", "2025"):
+                for st in ("Price", "Imports"):
+                    rows.append(("home", f"metal{k % 8}", "land0", st, st, y, str(k + 1), k + 1))
+        for r in rows:
+            await s.execute(text("INSERT INTO graphrag.t_prod VALUES (:a,:b,:c,:d,:e,:f,:g,:h)"),
+                            dict(zip("abcdefgh", r, strict=True)))
+    yield pg
+    async with pg() as s:
+        await s.execute(text("DROP TABLE IF EXISTS graphrag.t_prod"))
+
+
+PROD_META = {"table_name": "t_prod", "columns": [
+    {"name": "section", "type": "text", "role": "dimension"},
+    {"name": "commodity", "type": "text", "role": "dimension"},
+    {"name": "country", "type": "text", "role": "dimension"},
+    {"name": "statistics", "type": "text", "role": "dimension"},
+    {"name": "detail", "type": "text", "role": "dimension"},
+    {"name": "year", "type": "text", "role": "time"},
+    {"name": "value_txt", "type": "text", "role": "attribute"},
+    {"name": "value", "type": "numeric", "role": "measure"}]}
+PROD_KEY = ["value_txt", "commodity", "year", "detail", "country", "section"]
+
+
+@db_only
+async def test_a_rounded_labelled_partial_total_is_detected(prod):
+    from backend.app.services.structured.analysis import detect_total_rows
+    types = {c["name"]: c["type"] for c in PROD_META["columns"]}
+    async with prod() as s:
+        found = await detect_total_rows(s, PROD_META, PROD_KEY, types, ["value"])
+    assert [(t["column"], t["value"]) for t in found] == [("country", "World total")]
+    t = found[0]
+    # the mirror column and the total's own label column are not groups; the
+    # distinction the label carried (statistics) is
+    assert "value_txt" not in t["groups_by"] and "detail" not in t["groups_by"]
+    assert "statistics" in t["groups_by"]
+    assert t["groups_compared"] == 16                    # the sole-producer groups are not evidence
+
+
+@db_only
+async def test_a_query_ignoring_the_column_reads_totals_where_present_and_parts_elsewhere(prod):
+    from backend.app.services.structured.analysis import detect_total_rows, total_groups, total_markers
+    from backend.app.services.structured.sql_exec import run_sql
+    types = {c["name"]: c["type"] for c in PROD_META["columns"]}
+    async with prod() as s:
+        found = await detect_total_rows(s, PROD_META, PROD_KEY, types, ["value"])
+    meta = {**PROD_META, "analysis": {"total_rows": found}}
+    spec = {"select": ["statistics", {"agg": "sum", "column": "value", "as": "v"}],
+            "where": [{"column": "commodity", "op": "=", "value": "metal0"},
+                      {"column": "year", "op": "=", "value": "2025"}]}
+    built = build_sql(spec, "t_prod", {"t_prod": types}, totals={"t_prod": total_markers(meta)},
+                      total_groups={"t_prod": total_groups(meta)})
+    res = await run_sql(built.sql, {}, {"t_prod"}, max_rows=10, timeout_ms=5000)
+    got = {r[0]: float(r[1]) for r in res.rows}
+    assert got["Production"] == 180.0                    # the published (rounded) total, not 185 summed
+    assert got["Price"] == sum(k + 1 for k in range(30) if k % 8 == 0)   # no total row: its own rows
+    # without the group columns: the old rule (only total rows) loses the untotalled groups
+    old = build_sql(spec, "t_prod", {"t_prod": types}, totals={"t_prod": total_markers(meta)})
+    res = await run_sql(old.sql, {}, {"t_prod"}, max_rows=10, timeout_ms=5000)
+    assert {r[0] for r in res.rows} == {"Production"}
+
+
+def test_catalog_points_the_selection_at_the_published_total():
+    """A table with a published total row: the catalog names the queries that
+    read it, and marks a query that sums the parts while leaving the total row
+    out -- but not one broken down by the parts (each row is one part)."""
+    from backend.app.services.structured.metadata import _annotate_published_totals
+
+    def q(qid, ops, grain, params=(), fixed=()):
+        return {"id": qid, "capability": {"operation": ops, "output_grain": grain,
+                                          "parameters": list(params), "fixed_conditions": list(fixed)}}
+    excl = {"column": "country", "op": "!=", "value": "World total"}
+    cat = {"queries": [
+        q("sum_of_parts", ["sum(v)"], ["item", "year"], fixed=[excl]),
+        q("per_country", ["sum(v)"], ["item", "country"], fixed=[excl]),
+        q("lookup", "rows", ["one row per matching source row"],
+          params=[{"name": "country", "column": "country", "op": "="}]),
+        q("unrelated", ["avg(v)"], ["item"])]}
+    tot = [{"column": "country", "value": "World total", "per": ["item", "year"]}]
+    _annotate_published_totals(cat, tot)
+    assert tot[0]["read_with"] == ["lookup"]
+    flagged = {x["id"] for x in cat["queries"] if x.get("excludes_published_total")}
+    assert flagged == {"sum_of_parts"}
+    assert "lookup" in cat["queries"][0]["excludes_published_total"]
+
+
+def test_values_the_question_names_match_whole_and_keep_value_words():
+    from backend.app.services.structured.retrieval_step import _ID_STOPWORDS, _rank_terms, value_matches
+
+    doms = {"indicator": {"values": ["Energy imports, net (% of energy use)", "GDP (current US$)"]},
+            "element": {"values": ["Export value", "Export quantity"]},
+            "item": {"values": ["Urea", "Potash"]}, "year": {"values": [2023, 2024]}}
+    q1 = _rank_terms("What were their net energy imports as a share of energy use in 2024?", _ID_STOPWORDS)
+    assert list(value_matches(doms, q1).values()) == ["Energy imports, net (% of energy use)"]
+    q2 = _rank_terms("How much urea did each export in 2024?", _ID_STOPWORDS)
+    # 'Export value' / 'Export quantity' name more than the question does
+    assert list(value_matches(doms, q2).values()) == ["Urea"]
+
+
+def test_a_query_fixing_the_named_value_ranks_first():
+    from backend.app.services.structured.retrieval_step import (
+        _ID_STOPWORDS,
+        _rank_terms,
+        rank_items,
+        value_matches,
+    )
+
+    q = _rank_terms("How much urea did each export in 2024?", _ID_STOPWORDS)
+    doms = {"element": {"values": ["Export quantity", "Import quantity"]}, "item": {"values": ["Urea"]}}
+    item = {"name": "item", "column": "item", "allowed_values": ["Urea", "Potash"]}
+
+    def m(qid, element):
+        return {"id": qid, "label": element, "params": [item], "tags": {"classes": []},
+                "query": {"where": [{"op": "=", "column": "element", "value": element},
+                                    {"op": "=", "column": "item", "param": "item"}]}}
+    meta = {"measures": [m("imports", "Import quantity"), m("exports", "Export quantity")]}
+    r = rank_items(meta, {"values": value_matches(doms, q), "q_terms": q})
+    assert r["exports"][0] > r["imports"][0] > 0
+
+
+def test_selection_context_shows_a_long_passage_whole_within_one_budget():
+    from backend.app.services.retrieval import structured_doc_context
+
+    long = "x " * 2300 + "Egypt: 6.4%. China: 9.1%."      # past a 4000-character cut
+    ev = [{"kind": "chunk", "rank": 1, "iri": "c1", "text": long},
+          {"kind": "chunk", "rank": 2, "iri": "c2", "text": "y " * 3000},
+          {"kind": "chunk", "rank": 3, "iri": "c3", "text": "z"}]
+    out = structured_doc_context(ev, items=2, chars=4000)
+    assert "China: 9.1%" in out[0]["text"]
+    assert sum(len(o["text"]) for o in out) <= 8000 and len(out) == 2
+
+
+@db_only
+async def test_guard_accepts_an_id_the_graph_links_to_an_entity_the_documents_name(pg):
+    """The table spells the row differently from the documents ('widget
+    omicron' vs 'Omicron Widget Co'), but the graph links the id to the
+    entity the documents name: grounded. Without that link, refused."""
+    import json as _json
+    import uuid as _uuid
+
+    from sqlalchemy import text
+
+    from backend.app.services.structured.retrieval_step import _context_text
+    cls, ent, art = _uuid.uuid4(), _uuid.uuid4(), _uuid.uuid4()
+    async with pg() as s:
+        await s.execute(text("INSERT INTO graphrag.ontology_classes (id, iri, namespace, label) "
+                             "VALUES (:i, :r, 'test', 'TestKind')"), {"i": cls, "r": f"urn:test:{cls}"})
+        await s.execute(text("INSERT INTO graphrag.entities (id, entity_identifier, name, normalized_name, "
+                             "class_id, iri) VALUES (:i, :i2, 'Omicron Widget Co', 'omicron widget co', :c, :r)"),
+                        {"i": ent, "i2": str(ent), "c": cls, "r": f"urn:test:{ent}"})
+        await s.execute(text("INSERT INTO graphrag.intelligence_artifacts (id, artifact_identifier, artifact_type, "
+                             "text, graph_version, extra_metadata) VALUES (:i, :i2, 'TableMetadata', 't', 1, "
+                             "CAST(:m AS jsonb))"), {"i": art, "i2": str(art), "m": _json.dumps({"table_name": "t_items"})})
+        await s.execute(text("INSERT INTO graphrag.graph_relationships (source_node_type, source_node_id, "
+                             "target_node_type, target_node_id, predicate_iri, relationship_source, graph_version, "
+                             "extra_metadata) VALUES ('intelligence_artifact', :a, 'entity', :e, 'urn:p', 'MANUAL', 1, "
+                             "CAST(:m AS jsonb))"),
+                        {"a": art, "e": ent, "m": _json.dumps({"columns": ["item_id"], "values": ["ID011"]})})
+    try:
+        meta = {"table_name": "t_items",
+                "columns": [{"name": "item_id", "type": "text", "role": "identifier"},
+                            {"name": "item_name", "type": "text", "role": "dimension"},
+                            {"name": "n", "type": "integer", "role": "measure"}],
+                "column_stats": {"item_id": {"distinct": 12}, "item_name": {"distinct": 12}}}
+        types = {"t_items": {"item_id": "text", "item_name": "text", "n": "integer"}}
+        sql = "SELECT n FROM t_items WHERE item_id = CAST(:id AS text)"
+        kw = {"question": "What is n for the company the report names?", "seen_values": set(),
+              "types": types, "metas": {"t_items": meta}}
+        docs = _context_text("The report names Omicron Widget Co as the leader.")
+        assert await identifier_guard(sql, {"id": "ID011"}, context_text=docs, **kw) == []
+        out = await identifier_guard(sql, {"id": "ID010"}, context_text=docs, **kw)     # no link
+        assert out and out[0]["value"] == "ID010"
+    finally:
+        async with pg() as s:
+            await s.execute(text("DELETE FROM graphrag.graph_relationships WHERE source_node_id = :a"), {"a": art})
+            await s.execute(text("DELETE FROM graphrag.intelligence_artifacts WHERE id = :a"), {"a": art})
+            await s.execute(text("DELETE FROM graphrag.entities WHERE id = :e"), {"e": ent})
+            await s.execute(text("DELETE FROM graphrag.ontology_classes WHERE id = :c"), {"c": cls})

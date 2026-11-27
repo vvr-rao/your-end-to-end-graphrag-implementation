@@ -579,3 +579,20 @@ def test_ontology_runs_record_the_folder_not_a_database(ls_config, monkeypatch):
     meta = stub.runs[0]["extra"]["metadata"]
     assert meta["folder"] == "v1-prune-expand" and "database" not in meta
     assert "some-db-host" not in stub.runs[0]["tags"]
+
+
+def test_trace_records_which_tables_reached_the_picker_and_why_it_declined():
+    from types import SimpleNamespace
+
+    from backend.app.evals.question_eval import trace_from_result
+
+    plan = {"candidates": [{"table": "energy", "score": 0.05, "via": ["vector"]}],
+            "needed": False, "calls": [], "retried": False, "reason": "electricity only",
+            "no_match": [{"part": "net energy imports", "reason": "no such measure"}]}
+    res = SimpleNamespace(answer="a", retrieval_run_id=None, evidence=[], wall_seconds=1.0, cost_usd=0.0,
+                          parsed={"structured_data": plan})
+    t = trace_from_result("q", res)
+    sel = t["structured_selection"]
+    assert sel["candidates"][0]["table"] == "energy"
+    assert sel["reason"] == "electricity only" and sel["no_match"][0]["part"] == "net energy imports"
+    assert "calls" not in sel and t["structured_needed"] is False

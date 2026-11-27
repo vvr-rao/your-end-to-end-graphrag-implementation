@@ -135,8 +135,11 @@ def compile_item(meta: dict, section: str, item: dict,
     types.setdefault(meta["table_name"], column_types(meta))
     if totals is None:
         totals = item_totals(meta, section, item)
+    from backend.app.services.structured.analysis import total_groups
+
     built = build_sql(spec, meta["table_name"], types,
-                      time_columns={meta["table_name"]: time_columns(meta)}, totals=totals)
+                      time_columns={meta["table_name"]: time_columns(meta)}, totals=totals,
+                      total_groups={meta["table_name"]: total_groups(meta)})
     check_sql(built.sql, tables)      # defence in depth: the guard still applies
     return built
 
@@ -560,7 +563,8 @@ def describe_query(meta: dict, section: str, item: dict) -> dict:
         if e["optional"]:
             base = _base_col(col)
             if base in totals:
-                e["when_omitted"] = f"reads the published total rows ({base} = {totals[base]!r})"
+                e["when_omitted"] = (f"reads the published total row ({base} = {totals[base]!r}) where its "
+                                     "group has one, the other rows where it has none")
             else:
                 e["when_omitted"] = f"no filter on {base}: every value"
         plist.append(e)
@@ -599,6 +603,37 @@ def describe_query(meta: dict, section: str, item: dict) -> dict:
     return out
 
 
+def _annotate_published_totals(cat: dict, tot: list[dict]) -> None:
+    """Point the selection at the published total rows: each total names the
+    offered queries that read it (an equality param on its column), and a query
+    that sums a measure while leaving the total row out says it computes a sum
+    of the listed parts -- which can differ from the published total (rounding,
+    members the table does not list)."""
+    def _cap(q: dict) -> dict:
+        return q.get("capability") if isinstance(q.get("capability"), dict) else {}
+
+    for t in tot:
+        col, val = t["column"], str(t["value"])
+        t["read_with"] = [q["id"] for q in cat["queries"]
+                          if any(p.get("column") == col and p.get("op") in ("=", None) and p.get("name")
+                                 for p in _cap(q).get("parameters") or [])]
+        for q in cat["queries"]:
+            c = _cap(q)
+            ops = c.get("operation") if isinstance(c.get("operation"), list) else []
+            sums = any(str(o).lower().startswith("sum(") for o in ops)
+            # broken down BY the column (one row per part): each row is a part, not a sum of parts
+            per_part = col in [str(g).split(".")[-1] for g in c.get("output_grain") or []]
+            excl = any(f.get("column") == col and str(f.get("op")) in ("!=", "<>", "not_in")
+                       and (val == str(f.get("value")) or val in [str(v) for v in f.get("value") or []
+                                                                  if isinstance(f.get("value"), list)])
+                       for f in c.get("fixed_conditions") or [] if isinstance(f, dict))
+            if sums and excl and not per_part:
+                q["excludes_published_total"] = (
+                    f"adds up the listed parts and leaves out the published total rows ({col} = {val!r}); "
+                    "the sum can differ from the published total. For the total itself read the total row"
+                    + (f" with {', '.join(t['read_with'])} ({col} = {val!r})" if t["read_with"] else ""))
+
+
 def catalog_for_prompt(meta: dict, max_items: int = 40,
                        ranking: dict[str, tuple[float, list[str]]] | None = None,
                        *, stable: bool = False, only_selectable: bool = False,
@@ -633,6 +668,10 @@ def catalog_for_prompt(meta: dict, max_items: int = 40,
            "grain": meta.get("grain"), "row_count": meta.get("row_count"),
            "columns": [_col(c) for c in meta.get("columns") or []],
            "queries": []}
+    tot = [{"column": t["column"], "value": t["value"], "per": t.get("groups_by")}
+           for t in (meta.get("analysis") or {}).get("total_rows") or [] if isinstance(t, dict)]
+    if tot:
+        cat["total_rows"] = tot      # published totals: read them, do not re-add the parts
     combos: list[dict] = []
     allowed = ({id(it) for _s, it in selectable_items(meta, versions)[0]} if only_selectable else None)
 
@@ -675,6 +714,8 @@ def catalog_for_prompt(meta: dict, max_items: int = 40,
             "capability": it.get("capability") or describe_query(meta, sec, it),
             **({"other_table": it["other_table"]} if it.get("other_table") else {}),
         })
+    if tot:
+        _annotate_published_totals(cat, tot)
     if combos:
         cat["value_combinations"] = combos
     if meta.get("usage_notes"):

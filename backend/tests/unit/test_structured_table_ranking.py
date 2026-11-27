@@ -33,3 +33,20 @@ def test_fusion_ignores_absent_and_zero_signals():
     assert _fuse([{a: 0.0}, {}]) == {}
     fused = _fuse([{a: 1.0, b: 0.0}])
     assert set(fused) == {a}
+
+
+def test_a_table_alone_holding_a_long_named_value_gets_a_slot():
+    from backend.app.services.structured.retrieval_step import reserve_named_value_slots
+
+    t1, t2, t3, t4, t5 = "t1", "t2", "t3", "t4", "t5"
+    long_v = frozenset({"energy", "import", "net", "use"})
+    short_v = frozenset({"import"})
+    shared = frozenset({"fertilizer", "export", "quantity"})
+    matched = {t5: {long_v: "Energy imports, net (% of energy use)"}, t4: {short_v: "Import"},
+               t1: {shared: "x"}, t2: {shared: "x"}}
+    vdf = {long_v: 1, short_v: 1, shared: 2}
+    best, reserved = reserve_named_value_slots([t1, t2, t3, t4, t5], 3, matched, vdf)
+    assert best == [t1, t2, t5] and reserved == [t5]          # replaces the lowest-ranked table
+    # a short value or one several tables hold reserves nothing
+    best, reserved = reserve_named_value_slots([t1, t2, t3, t4], 2, matched, vdf)
+    assert best == [t1, t2] and reserved == []

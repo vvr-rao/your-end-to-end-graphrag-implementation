@@ -94,6 +94,12 @@ def trace_from_result(question: str, result: Any) -> dict[str, Any]:
                if result.parsed.get("structured_seconds") is not None else {}),
             **({"structured_needed": bool((result.parsed.get("structured_data") or {}).get("needed"))}
                if result.parsed.get("structured_data") is not None else {}),
+            # which tables reached the picker and why it ran nothing: tells a table
+            # that was never shown apart from one the picker declined
+            **({"structured_selection": {k: v for k, v in (result.parsed.get("structured_data") or {}).items()
+                                         if k in ("candidates", "ranked_queries", "reason", "no_match",
+                                                  "select_error", "unavailable_action") and v}}
+               if result.parsed.get("structured_data") is not None else {}),
             **({"usage_by_task": result.parsed["usage_by_task"]}
                if result.parsed.get("usage_by_task") else {}),
             **(result.parsed.get("eval_trace") or {})}
@@ -288,7 +294,7 @@ def _row(t: dict[str, Any], tq: Any, kinds: dict, levels: dict, names: dict,
         "evidence_chunk_ids": t.get("evidence_chunk_ids") or [],
         **({"structured_calls": t["structured_calls"]} if t.get("structured_calls") else {}),
         **{k: t[k] for k in ("seconds", "cost_usd", "structured_seconds", "structured_needed",
-                             "usage_by_task") if k in t},
+                             "structured_selection", "usage_by_task") if k in t},
         "gold_documents": gold,
         "retrieval": retrieval_metrics(ranked, gold, k) if gold else None,
         "answers": (answer_metrics(
