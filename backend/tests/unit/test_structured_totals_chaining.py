@@ -375,8 +375,10 @@ def test_doc_context_takes_the_best_ranked_text_evidence():
           {"kind": "chunk", "rank": 3, "iri": "c2", "text": "second  chunk"},
           {"kind": "chunk", "rank": 2, "iri": "c1", "text": "first chunk " * 10},
           {"kind": "relationship", "rank": 4, "iri": "r", "text": "X locatedIn Y."}]
-    out = structured_doc_context(ev, items=3, chars=20)
-    assert [d["id"] for d in out] == ["c1", "c2", "r"] and len(out[0]["text"]) == 20
+    out = structured_doc_context(ev, items=3, chars=30)     # one budget of 90 characters
+    assert [d["id"] for d in out] == ["c1"] and len(out[0]["text"]) == 90
+    out = structured_doc_context(ev, items=3, chars=60)     # 180: the first whole, then the rest
+    assert [d["id"] for d in out] == ["c1", "c2", "r"] and len(out[0]["text"]) == 119
     assert out[1]["text"] == "second chunk"
     assert structured_doc_context(ev, items=0) == []
 
@@ -659,3 +661,49 @@ def test_catalog_points_the_selection_at_the_published_total():
     flagged = {x["id"] for x in cat["queries"] if x.get("excludes_published_total")}
     assert flagged == {"sum_of_parts"}
     assert "lookup" in cat["queries"][0]["excludes_published_total"]
+
+
+def test_values_the_question_names_match_whole_and_keep_value_words():
+    from backend.app.services.structured.retrieval_step import _ID_STOPWORDS, _rank_terms, value_matches
+
+    doms = {"indicator": {"values": ["Energy imports, net (% of energy use)", "GDP (current US$)"]},
+            "element": {"values": ["Export value", "Export quantity"]},
+            "item": {"values": ["Urea", "Potash"]}, "year": {"values": [2023, 2024]}}
+    q1 = _rank_terms("What were their net energy imports as a share of energy use in 2024?", _ID_STOPWORDS)
+    assert list(value_matches(doms, q1).values()) == ["Energy imports, net (% of energy use)"]
+    q2 = _rank_terms("How much urea did each export in 2024?", _ID_STOPWORDS)
+    # 'Export value' / 'Export quantity' name more than the question does
+    assert list(value_matches(doms, q2).values()) == ["Urea"]
+
+
+def test_a_query_fixing_the_named_value_ranks_first():
+    from backend.app.services.structured.retrieval_step import (
+        _ID_STOPWORDS,
+        _rank_terms,
+        rank_items,
+        value_matches,
+    )
+
+    q = _rank_terms("How much urea did each export in 2024?", _ID_STOPWORDS)
+    doms = {"element": {"values": ["Export quantity", "Import quantity"]}, "item": {"values": ["Urea"]}}
+    item = {"name": "item", "column": "item", "allowed_values": ["Urea", "Potash"]}
+
+    def m(qid, element):
+        return {"id": qid, "label": element, "params": [item], "tags": {"classes": []},
+                "query": {"where": [{"op": "=", "column": "element", "value": element},
+                                    {"op": "=", "column": "item", "param": "item"}]}}
+    meta = {"measures": [m("imports", "Import quantity"), m("exports", "Export quantity")]}
+    r = rank_items(meta, {"values": value_matches(doms, q), "q_terms": q})
+    assert r["exports"][0] > r["imports"][0] > 0
+
+
+def test_selection_context_shows_a_long_passage_whole_within_one_budget():
+    from backend.app.services.retrieval import structured_doc_context
+
+    long = "x " * 2300 + "Egypt: 6.4%. China: 9.1%."      # past a 4000-character cut
+    ev = [{"kind": "chunk", "rank": 1, "iri": "c1", "text": long},
+          {"kind": "chunk", "rank": 2, "iri": "c2", "text": "y " * 3000},
+          {"kind": "chunk", "rank": 3, "iri": "c3", "text": "z"}]
+    out = structured_doc_context(ev, items=2, chars=4000)
+    assert "China: 9.1%" in out[0]["text"]
+    assert sum(len(o["text"]) for o in out) <= 8000 and len(out) == 2

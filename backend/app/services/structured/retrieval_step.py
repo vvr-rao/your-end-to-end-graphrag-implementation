@@ -118,13 +118,13 @@ _RRF_K = 60           # reciprocal-rank-fusion constant (the usual value; measur
 _RANK_STOPWORDS = _ID_STOPWORDS | {"data", "value", "values", "table", "tables"}
 
 
-def _rank_terms(text: str | None) -> set[str]:
+def _rank_terms(text: str | None, stop: frozenset[str] | set[str] | None = None) -> set[str]:
     """Content words for the lexical signal: lower-cased, function words and
     words under three letters dropped, a plain plural reduced to its singular."""
     out = set()
     for w in re.findall(r"[a-z0-9][a-z0-9\-]*", (text or "").lower()):
         w = w.strip("-")
-        if len(w) < 3 or w in _RANK_STOPWORDS:
+        if len(w) < 3 or w in (_RANK_STOPWORDS if stop is None else stop):
             continue
         if w.endswith("ies") and len(w) > 4:
             w = w[:-3] + "y"
@@ -132,6 +132,60 @@ def _rank_terms(text: str | None) -> set[str]:
             w = w[:-1]
         out.add(w)
     return out
+
+
+_NAMED_VALUE_MIN_WORDS = 3     # a stored value this long, named in full and held by one table, reserves a slot
+
+
+def _value_phrase(value: Any) -> frozenset[str] | None:
+    """A stored text value (an indicator name, a product, an element) as the
+    content words it is matched on; None for numbers, codes and empty text."""
+    if not isinstance(value, str) or not re.search(r"[A-Za-z]{3}", value):
+        return None
+    # only function words dropped: 'value' tells 'Export value' from 'Export quantity'
+    t = _rank_terms(value, _ID_STOPWORDS)
+    return frozenset(t) if t else None
+
+
+def value_matches(domains: dict | None, q_terms: set[str]) -> dict[frozenset[str], str]:
+    """Text values of a table's columns that the question names: every content
+    word of the value is in the question (a long value, 4+ words, may miss one
+    in four). {phrase: the value as stored}."""
+    out: dict[frozenset[str], str] = {}
+    if not q_terms:
+        return out
+    for dom in (domains or {}).values():
+        for v in (dom or {}).get("values") or [] if isinstance(dom, dict) else []:
+            ph = _value_phrase(v)
+            if not ph or ph in out:
+                continue
+            hit = len(ph & q_terms)
+            if hit == len(ph) or (len(ph) >= 4 and hit / len(ph) >= 0.75):
+                out[ph] = v
+    return out
+
+
+def reserve_named_value_slots(ordered: list, max_tables: int, matched_values: dict,
+                              vdf: dict) -> tuple[list, list]:
+    """The top ``max_tables`` of ``ordered``, except that a table which alone
+    holds a value the question names in full (3+ words: an indicator, a product
+    line) gets a slot even when the shared signals rank it low -- countries and
+    wording are common to many tables, such a value is not. It takes the place
+    of the lowest-ranked table without one. Returns (tables, reserved)."""
+    best = list(ordered[:max_tables])
+    named = [aid for aid in ordered
+             if any(len(ph) >= _NAMED_VALUE_MIN_WORDS and vdf.get(ph) == 1
+                    for ph in matched_values.get(aid) or {})]
+    reserved = []
+    for aid in named:
+        if aid in best or not best:
+            continue
+        drop = next((x for x in reversed(best) if x not in named), None)
+        if drop is None:
+            break
+        best[best.index(drop)] = aid
+        reserved.append(aid)
+    return best, reserved
 
 
 def _idf(n_tables: int, df: int) -> float:
@@ -184,18 +238,36 @@ async def candidate_tables(
     graph: dict[uuid.UUID, float] = {}
     vector: dict[uuid.UUID, float] = {}
     lexical: dict[uuid.UUID, float] = {}
+    values: dict[uuid.UUID, float] = {}
     dist_of: dict[uuid.UUID, float] = {}
+    q_terms = _rank_terms(question)
+    qv_terms = _rank_terms(question, _ID_STOPWORDS)     # matched against stored values
 
     def _hits(aid):
-        return hits_of.setdefault(aid, {"columns": set(), "classes": set(), "time": False})
+        return hits_of.setdefault(aid, {"columns": set(), "classes": set(), "time": False,
+                                        "values": {}, "q_terms": qv_terms})
 
     async with session_scope() as s:
-        tables = (await s.execute(sql_text(
-            "SELECT id, text FROM graphrag.intelligence_artifacts "
+        rows_t = (await s.execute(sql_text(
+            "SELECT id, text, extra_metadata->'value_domains' FROM graphrag.intelligence_artifacts "
             "WHERE artifact_type = 'TableMetadata' AND status = 'ACTIVE'"))).all()
+        tables = [(aid, txt) for aid, txt, _d in rows_t]
         n_tables = len(tables)
         if not n_tables:
             return []
+        # values the question names (an indicator, a product, an element):
+        # often the only thing that tells which table holds the measure, since
+        # the countries and years a question names are in most tables
+        matched_values = {aid: value_matches(d if isinstance(d, dict) else None, qv_terms)
+                          for aid, _t, d in rows_t}
+        vdf: dict[frozenset[str], int] = {}
+        for mv in matched_values.values():
+            for ph in mv:
+                vdf[ph] = vdf.get(ph, 0) + 1
+        for aid, mv in matched_values.items():
+            if mv:
+                _hits(aid)["values"] = mv
+                values[aid] = sum(_idf(n_tables, vdf[ph]) * len(ph) for ph in mv)
         if entity_ids or class_ids or time_ids:
             rows = (await s.execute(sql_text("""
                 SELECT a.id, gr.target_node_type, gr.target_node_id, gr.relationship_type,
@@ -250,7 +322,6 @@ async def candidate_tables(
                     continue
                 dist_of[aid] = float(dist)
                 vector[aid] = 1.0 / (1.0 + float(dist))
-        q_terms = _rank_terms(question)
         if q_terms:
             terms = {aid: _rank_terms(text) for aid, text in tables}
             df: dict[str, int] = {}
@@ -261,11 +332,14 @@ async def candidate_tables(
                 sc = sum(_idf(n_tables, df[w]) for w in ts & q_terms)
                 if sc > 0:
                     lexical[aid] = sc
-        fused = _fuse([graph, vector, lexical])
+        fused = _fuse([graph, vector, lexical, values])
         if not fused:
             return []
-        best = sorted(fused, key=lambda a: (-fused[a], -graph.get(a, 0.0),
-                                            dist_of.get(a, float("inf"))))[:max_tables]
+        ordered = sorted(fused, key=lambda a: (-fused[a], -graph.get(a, 0.0),
+                                               dist_of.get(a, float("inf"))))
+        best, reserved = reserve_named_value_slots(ordered, max_tables, matched_values, vdf)
+        for aid in reserved:
+            via.setdefault(aid, []).append("reserved:named_value")
         metas = dict((await s.execute(sql_text("""
             SELECT id, extra_metadata FROM graphrag.intelligence_artifacts
              WHERE id = ANY(CAST(:ids AS uuid[]))
@@ -282,9 +356,40 @@ async def candidate_tables(
             v.append(f"vector:{dist_of[aid]:.3f}")
         if aid in lexical:
             v.append(f"lexical:{lexical[aid]:.2f}")
+        if aid in values:
+            v.append(f"values:{values[aid]:.2f}")
         out.append({"id": aid, "table": meta["table_name"], "meta": meta, "score": fused[aid],
                     "via": v, "hits": _hits(aid)})
     return out
+
+
+def _item_value_score(it: dict, matched: dict, q_terms: set[str]) -> tuple[float, list[str]]:
+    """How well a stored query's values fit the values the question names: a
+    value the query FIXES (a where condition) counts most, partly named ones
+    count by the share of their words in the question ('export quantity' for
+    a question about exports); a value a parameter may take counts less."""
+    score, why = 0.0, []
+    fixed = [c.get("value") for c in ((it.get("query") or {}).get("where") or [])
+             if isinstance(c, dict) and c.get("op") in ("=", "in") and "value" in c]
+    fixed = [x for v in fixed for x in (v if isinstance(v, list) else [v])]
+    for v in [*fixed, it.get("label")]:
+        ph = _value_phrase(v)
+        if not ph:
+            continue
+        if ph in matched:
+            score += 3.0
+            why.append(repr(matched[ph]))
+        elif q_terms and len(ph & q_terms) / len(ph) >= 0.5 and v in fixed:
+            score += 1.0
+            why.append(f"{v!r} (partly)")
+    if matched:
+        for p in it.get("params") or []:
+            hit = [matched[ph] for ph in {_value_phrase(v) for v in p.get("allowed_values") or []} - {None}
+                   if ph in matched]
+            if hit:
+                score += 1.0
+                why.append(f"{p.get('name')}={hit[0]!r}")
+    return score, why
 
 
 def rank_items(meta: dict, hits: dict | None) -> dict[str, tuple[float, list[str]]]:
@@ -313,6 +418,10 @@ def rank_items(meta: dict, hits: dict | None) -> dict[str, tuple[float, list[str
         if hits.get("time") and tags.get("time_columns"):
             score += 1.0
             why.append("period in " + ", ".join(tags["time_columns"]))
+        vs, vwhy = _item_value_score(it, hits.get("values") or {}, hits.get("q_terms") or set())
+        if vs:
+            score += vs
+            why.append("value " + ", ".join(vwhy))
         if score and sec == "measures":
             score += 0.5
         out[it["id"]] = (score, why)
