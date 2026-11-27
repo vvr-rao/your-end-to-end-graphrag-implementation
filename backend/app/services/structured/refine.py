@@ -2151,6 +2151,10 @@ async def refine_table(meta: dict, router, *, all_types: dict[str, dict[str, str
     # with the final metadata (verification may have changed column roles) and
     # re-test whatever changed.
     final = await ensure_tested(meta, analysis=analysis, all_types=all_types, partners=partners)
+    if verified is not None:
+        final, n = await reverify_changed(meta, router, analysis=analysis, all_types=all_types,
+                                          partners=partners, log=log) or (final, 0)
+        calls += n
     finish_coverage(meta)
     async with session_scope() as s:
         await _measure_classes(s, meta)
@@ -2183,6 +2187,28 @@ async def refine_table(meta: dict, router, *, all_types: dict[str, dict[str, str
         f"{len(report['not_exercised'])} not exercised, {final['passed']} selectable, "
         f"{len(meta['common_questions'])} typical question(s), {calls} LLM call(s), {report['seconds']}s")
     return report
+
+
+async def reverify_changed(meta: dict, router, *, analysis: dict, all_types: dict[str, dict[str, str]],
+                           partners: dict[str, dict] | None = None,
+                           log: Callable[[str], None] = print) -> tuple[dict, int] | None:
+    """Safety net after the final recompile: a stored query whose SQL changed
+    after its semantic verdict would stay unavailable to retrieval ("semantic
+    review stale"). Verify just those items again (one bounded pass, no
+    column step) and re-test. Returns (test counts, LLM calls), or None when
+    every verdict still matches its SQL."""
+    from backend.app.services.structured.metadata import semantic_status
+    from backend.app.services.structured.verify import verify_table
+
+    stale = [it["id"] for _s, it in items(meta) if semantic_status(meta, it) == "stale"]
+    if not stale:
+        return None
+    log(f"[structured] {meta.get('table_name')}: {len(stale)} stored quer(ies) changed after their "
+        f"verdict -- verifying them again")
+    rep = await verify_table(meta, router, analysis=analysis, all_types=all_types, partners=partners,
+                             only_pending=True, log=log)
+    final = await ensure_tested(meta, analysis=analysis, all_types=all_types, partners=partners)
+    return final, int(rep.get("llm_calls") or 0)
 
 
 MEASURE_REPAIR_ROUNDS = 1      # bounded: one call for all failed measures of a table
@@ -2341,6 +2367,10 @@ async def _verify_only(meta: dict, router, *, all_types: dict[str, dict[str, str
     rep = await verify_table(meta, router, analysis=meta["analysis"], all_types=all_types,
                              partners=partners, only_pending=only_pending, log=log)
     await ensure_tested(meta, analysis=meta["analysis"], all_types=all_types, partners=partners)
+    again = await reverify_changed(meta, router, analysis=meta["analysis"], all_types=all_types,
+                                   partners=partners, log=log)
+    if again:
+        rep["llm_calls"] += again[1]
     async with session_scope() as s:
         await attach_value_domains(s, meta)
         await _measure_classes(s, meta)

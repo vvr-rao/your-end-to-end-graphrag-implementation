@@ -720,6 +720,32 @@ def _family(meta: dict, cols) -> set[str]:
     return out
 
 
+def open_dimensions(meta: dict, desc: dict, params: dict | None) -> set[str]:
+    """Row dimensions of a row-level query that the call leaves OPEN (rows vary
+    over them, so the rows are parts to be summed). A dimension is pinned by
+    an equality parameter the call fills (one value, or a list of values the
+    call asks for -- one row per listed value is what was asked), by a fixed
+    equality condition, or by a range whose two bounds are the same value
+    (year 2024..2024). Column families count as one dimension (a code and its
+    name). Empty set = every dimension pinned."""
+    given = {k: v for k, v in (params or {}).items() if v not in (None, "", [])}
+    # only an equality fixes a dimension (an exclusion such as <> 'total row' does not)
+    eq = ("=", "in", None)
+    fixed = [e.get("column") for e in desc.get("parameters") or []
+             if e.get("name") in given and e.get("column") and e.get("op") in eq]
+    fixed += [f.get("column") for f in desc.get("fixed_conditions") or []
+              if f.get("column") and f.get("op") in ("=", "in")]
+    bounds: dict[str, list] = {}
+    for e in desc.get("parameters") or []:
+        if e.get("op") == "between" and e.get("column") and e.get("name") in given:
+            bounds.setdefault(e["column"], []).append(given[e["name"]])
+    fixed += [c for c, vals in bounds.items()
+              if len(vals) == 2 and not isinstance(vals[0], list) and str(vals[0]) == str(vals[1])]
+    fixed_fam = _family(meta, [c for c in fixed if c])
+    return _family(meta, [g for g in desc.get("output_grain") or []
+                          if isinstance(g, str) and g.split(".")[-1] not in fixed_fam])
+
+
 def total_alternatives(meta: dict, section: str, item: dict,
                        versions: dict[str, str | None] | None = None,
                        params: dict | None = None) -> list[str]:
@@ -734,16 +760,9 @@ def total_alternatives(meta: dict, section: str, item: dict,
     if not _row_level(desc):
         return []
     wanted = {str(q).split(".")[-1] for q in desc.get("quantity") or [] if q}
-    given = {k for k, v in (params or {}).items() if v not in (None, "", [])}
-    # only an equality fixes a dimension (an exclusion such as <> 'total row' does not)
-    eq = ("=", "in", None)
-    fixed = [e.get("column") for e in desc.get("parameters") or []
-             if e.get("name") in given and e.get("column") and e.get("op") in eq]
-    fixed += [f.get("column") for f in desc.get("fixed_conditions") or []
-              if f.get("column") and f.get("op") in ("=", "in")]
-    fixed_fam = _family(meta, [c for c in fixed if c])
-    open_dims = _family(meta, [g for g in desc.get("output_grain") or []
-                               if isinstance(g, str) and g.split(".")[-1] not in fixed_fam])
+    open_dims = open_dimensions(meta, desc, params)
+    if not open_dims:      # every row dimension pinned: the rows ARE the totals asked for
+        return []
     out = []
     for sec, it in items(meta):
         if it is item or not selectable(meta, it, versions)[0]:
@@ -808,10 +827,12 @@ async def _execute(call: dict, by_table: dict[str, dict], *, max_rows: int, time
     shape_in = call.get("reshape")
     from backend.app.services.structured.metadata import describe_query
 
-    # only a ROW-LEVEL query returns the parts of a total; a stored aggregate is one
+    # only a ROW-LEVEL query returns the parts of a total; a stored aggregate is
+    # one, and so is a row-level query whose every row dimension the call pins
+    _desc = describe_query(meta, section, item)
     if str(call.get("scope") or "").lower() == "total" and not (
             isinstance(shape_in, dict) and shape_in.get("aggregate")) \
-            and _row_level(describe_query(meta, section, item)):
+            and _row_level(_desc) and open_dimensions(meta, _desc, call.get("params") or {}):
         alts = total_alternatives(meta, section, item, versions, call.get("params") or {})
         if alts:
             grain = ", ".join(map(str, describe_query(meta, section, item).get("output_grain") or [])) \

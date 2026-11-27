@@ -349,6 +349,17 @@ async def verify_table(meta: dict, router, *, analysis: dict, all_types: dict[st
             table_fixes[key] = {"before": meta.get(key), "after": v.strip()}
             meta[key] = v.strip()
 
+    # A corrected column (its role above all: identifier -> time) changes how
+    # every stored query compiles, e.g. which column carries an aggregate's
+    # period span. Recompile and re-test NOW, so the verdicts below are given
+    # on -- and stamped with -- the SQL retrieval will run. Recompiling after
+    # the verdicts left them stale and their queries unavailable (sc80
+    # fertilizer table, 2026-11-26: 18 of 33).
+    if column_fixes or table_fixes:
+        from backend.app.services.structured.refine import ensure_tested
+
+        await ensure_tested(meta, analysis=analysis or {}, all_types=all_types, partners=partners)
+
     # 2. stored queries, against the verified columns
     verified_cols = [_column_entry(meta, c, filled) for c in meta.get("columns") or []]
     ctx = {"table": table, "description": meta.get("description"), "grain": meta.get("grain"),
