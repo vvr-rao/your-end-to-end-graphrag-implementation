@@ -707,3 +707,51 @@ def test_selection_context_shows_a_long_passage_whole_within_one_budget():
     out = structured_doc_context(ev, items=2, chars=4000)
     assert "China: 9.1%" in out[0]["text"]
     assert sum(len(o["text"]) for o in out) <= 8000 and len(out) == 2
+
+
+@db_only
+async def test_guard_accepts_an_id_the_graph_links_to_an_entity_the_documents_name(pg):
+    """The table spells the row differently from the documents ('widget
+    omicron' vs 'Omicron Widget Co'), but the graph links the id to the
+    entity the documents name: grounded. Without that link, refused."""
+    import json as _json
+    import uuid as _uuid
+
+    from sqlalchemy import text
+
+    from backend.app.services.structured.retrieval_step import _context_text
+    cls, ent, art = _uuid.uuid4(), _uuid.uuid4(), _uuid.uuid4()
+    async with pg() as s:
+        await s.execute(text("INSERT INTO graphrag.ontology_classes (id, iri, namespace, label) "
+                             "VALUES (:i, :r, 'test', 'TestKind')"), {"i": cls, "r": f"urn:test:{cls}"})
+        await s.execute(text("INSERT INTO graphrag.entities (id, entity_identifier, name, normalized_name, "
+                             "class_id, iri) VALUES (:i, :i2, 'Omicron Widget Co', 'omicron widget co', :c, :r)"),
+                        {"i": ent, "i2": str(ent), "c": cls, "r": f"urn:test:{ent}"})
+        await s.execute(text("INSERT INTO graphrag.intelligence_artifacts (id, artifact_identifier, artifact_type, "
+                             "text, graph_version, extra_metadata) VALUES (:i, :i2, 'TableMetadata', 't', 1, "
+                             "CAST(:m AS jsonb))"), {"i": art, "i2": str(art), "m": _json.dumps({"table_name": "t_items"})})
+        await s.execute(text("INSERT INTO graphrag.graph_relationships (source_node_type, source_node_id, "
+                             "target_node_type, target_node_id, predicate_iri, relationship_source, graph_version, "
+                             "extra_metadata) VALUES ('intelligence_artifact', :a, 'entity', :e, 'urn:p', 'MANUAL', 1, "
+                             "CAST(:m AS jsonb))"),
+                        {"a": art, "e": ent, "m": _json.dumps({"columns": ["item_id"], "values": ["ID011"]})})
+    try:
+        meta = {"table_name": "t_items",
+                "columns": [{"name": "item_id", "type": "text", "role": "identifier"},
+                            {"name": "item_name", "type": "text", "role": "dimension"},
+                            {"name": "n", "type": "integer", "role": "measure"}],
+                "column_stats": {"item_id": {"distinct": 12}, "item_name": {"distinct": 12}}}
+        types = {"t_items": {"item_id": "text", "item_name": "text", "n": "integer"}}
+        sql = "SELECT n FROM t_items WHERE item_id = CAST(:id AS text)"
+        kw = {"question": "What is n for the company the report names?", "seen_values": set(),
+              "types": types, "metas": {"t_items": meta}}
+        docs = _context_text("The report names Omicron Widget Co as the leader.")
+        assert await identifier_guard(sql, {"id": "ID011"}, context_text=docs, **kw) == []
+        out = await identifier_guard(sql, {"id": "ID010"}, context_text=docs, **kw)     # no link
+        assert out and out[0]["value"] == "ID010"
+    finally:
+        async with pg() as s:
+            await s.execute(text("DELETE FROM graphrag.graph_relationships WHERE source_node_id = :a"), {"a": art})
+            await s.execute(text("DELETE FROM graphrag.intelligence_artifacts WHERE id = :a"), {"a": art})
+            await s.execute(text("DELETE FROM graphrag.entities WHERE id = :e"), {"e": ent})
+            await s.execute(text("DELETE FROM graphrag.ontology_classes WHERE id = :c"), {"c": cls})

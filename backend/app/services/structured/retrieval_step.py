@@ -691,6 +691,27 @@ def expand_refs(call: dict, done: dict[int, list[SqlResult]]) -> tuple[list[dict
     return out, None
 
 
+async def _linked_entity_names(s, table: str, column: str, values: list[str]) -> list[str]:
+    """Names of the graph entities the table's links attach to one of
+    ``values`` in ``column`` (the place / entity linking done at load)."""
+    if not values:
+        return []
+    rows = (await s.execute(sql_text("""
+        SELECT DISTINCT e.name
+          FROM graphrag.intelligence_artifacts a
+          JOIN graphrag.graph_relationships r
+            ON r.source_node_type = 'intelligence_artifact' AND r.source_node_id = a.id
+           AND r.target_node_type = 'entity'
+          JOIN graphrag.entities e ON e.id = r.target_node_id
+         WHERE a.artifact_type = 'TableMetadata' AND a.status = 'ACTIVE'
+           AND a.extra_metadata->>'table_name' = :t
+           AND jsonb_exists(COALESCE(r.extra_metadata->'columns', '[]'::jsonb), :c)
+           AND jsonb_exists_any(COALESCE(r.extra_metadata->'values', '[]'::jsonb), CAST(:v AS text[]))
+         LIMIT 20
+    """), {"t": table, "c": column, "v": list(dict.fromkeys(values))})).scalars().all()
+    return [str(n) for n in rows if n]
+
+
 async def identifier_guard(sql: str, params: dict, *, question: str, seen_values: set[str],
                            types: dict[str, dict[str, str]], metas: dict[str, dict],
                            context_norm: str = "", context_text: str = "") -> list[dict]:
@@ -775,6 +796,17 @@ async def identifier_guard(sql: str, params: dict, *, question: str, seen_values
                             break
                 if not matched and context_text:
                     matched = any(_phrase_in(v, context_text) for v in vals)
+                if not matched:
+                    # the graph already resolved this value to an entity (a code
+                    # 'KOR' -> 'South Korea', a row named 'Rep. of Korea'): the id
+                    # is grounded when that entity is named in the question or
+                    # the documents the selector read
+                    q_ctx = _context_text(question)
+                    for name in await _linked_entity_names(s, c["table"], c["column"],
+                                                           [str(c["value"]), *vals]):
+                        if _phrase_in(name, q_ctx) or (context_text and _phrase_in(name, context_text)):
+                            matched = True
+                            break
                 if matched:
                     continue
                 out.append({"table": c["table"], "column": c["column"], "value": c["value"],
