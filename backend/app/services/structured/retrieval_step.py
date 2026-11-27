@@ -943,6 +943,19 @@ def _grouped_columns(item: dict) -> set[str]:
     return {str(g.get("column") if isinstance(g, dict) else g).split(".")[-1] for g in grp if g}
 
 
+def lookup_calls(batch: list[dict]) -> set[int]:
+    """Numbers (1-based) of the calls in ``batch`` whose results a LATER call
+    of the same batch takes a parameter from (``{"from_call": k, ...}``)."""
+    out: set[int] = set()
+    for n, call in enumerate(batch, start=1):
+        params = call.get("params") if isinstance(call.get("params"), dict) else {}
+        for v in params.values():
+            if isinstance(v, dict) and "from_call" in v:
+                ks = v["from_call"] if isinstance(v["from_call"], list) else [v["from_call"]]
+                out |= {k for k in ks if isinstance(k, int) and 1 <= k < n}
+    return out
+
+
 def broadens(call: dict, item: dict | None, keep: dict[str, Any], *,
              grouping_keeps: bool = False) -> str | None:
     """Why a retry call would change or drop a value the user asked for
@@ -1736,6 +1749,7 @@ async def structured_evidence(
 
     async def _run_calls(batch: list[dict], *, retry: bool) -> None:
         done: dict[int, list[SqlResult]] = {}       # call number -> its results (chaining)
+        feeders = lookup_calls(batch)
         for n, call in enumerate(batch, start=1):
             concrete, ref_err = expand_refs(call, done)
             if ref_err:
@@ -1747,12 +1761,27 @@ async def structured_evidence(
             for sub in concrete:
                 sub_call = {k: v for k, v in sub.items() if not k.startswith("_")}
                 why = None
-                if retry:
+                rec_origin = None
+                if retry and n in feeders:
+                    # a LOOKUP: its rows only supply a value (an id) to a later
+                    # call, which is checked against the question's values
+                    # itself. It need not filter the question's other values
+                    # nor replace a failed call -- refusing it blocked the
+                    # very id lookup the identifier guard asks for.
+                    rec_origin, _why = _origin(call)
+                elif retry:
                     origin, why = _origin(call)
                     if origin is not None:
                         rec_origin = origin
                         failed = failures[origin - 1]
-                        why = broadens(sub_call, _item_of(sub_call), failed.get("keep") or {},
+                        # judge parameters taken from an earlier call as written
+                        # ({"from_call": k}): after fan-out each sub-call holds ONE
+                        # of the looked-up values, never the whole requested list
+                        as_written = {**sub_call, "params": {
+                            **(sub_call.get("params") or {}),
+                            **{k: v for k, v in (call.get("params") or {}).items()
+                               if isinstance(v, dict) and "from_call" in v}}}
+                        why = broadens(as_written, _item_of(sub_call), failed.get("keep") or {},
                                        grouping_keeps=sub_call.get("query_id") in (
                                            failed.get("total_alternatives") or []))
                 if why:
@@ -1763,8 +1792,10 @@ async def structured_evidence(
                                                    guard=_guard, prevalidate=_prevalidate, versions=versions)
                 if retry:
                     rec["retry"] = True
-                    if why is None:
+                    if why is None and rec_origin is not None:
                         rec["retry_of"] = rec_origin
+                    if n in feeders:
+                        rec["lookup"] = True
                 if sub.get("_from_calls"):
                     rec["from_calls"] = sub["_from_calls"]
                     if sub.get("_fanout_cut"):

@@ -237,3 +237,59 @@ def test_open_dimensions_a_requested_list_pins_its_dimension():
     # an exclusion does not pin a dimension
     desc2 = _desc(["reporteriso", "partnercode"], params, fixed=[{"column": "partnercode", "op": "!=", "value": 0}])
     assert rs.open_dimensions({}, desc2, {"iso": "IND"}) == {"partnercode"}
+
+
+# --- a lookup in a retry is not "broadening" (2026-11-27, sc80 q023/q024) ---
+# The identifier guard tells the selector to find an id with one call and pass
+# it to the next ({"from_call": k}). The broadening check then refused that
+# lookup because the lookup query cannot filter the question's other values
+# (commodity, year), and the answer call had nothing to take its value from.
+
+def test_lookup_calls_are_the_ones_a_later_call_takes_values_from():
+    batch = [{"query_id": "a"}, {"query_id": "b"},
+             {"query_id": "c", "params": {"x": {"from_call": 1, "column": "k"},
+                                          "y": {"from_call": [2], "column": "k"}}},
+             {"query_id": "d", "params": {"z": {"from_call": 4, "column": "k"}}}]   # not an EARLIER call
+    assert rs.lookup_calls(batch) == {1, 2}
+
+
+async def test_a_retry_lookup_runs_and_feeds_the_answer_call(harness, monkeypatch):
+    _meta, ran = harness
+
+    async def fake_run(sql, params, allowed, *, max_rows=50, timeout_ms=5000, declared_params=None):
+        ran.append(sql)
+        if "SUM(" in sql.upper():
+            return SqlResult(sql=sql, params=dict(params or {}), columns=["reporterdesc", "total_value"],
+                             rows=[["India", "7709020032.686"], ["Thailand", "2561055865.113"]], row_count=2)
+        return SqlResult(sql=sql, params=dict(params or {}), columns=["reporterdesc", "partnerdesc", "flowdesc"],
+                         rows=[["India", "World", "Import"], ["Thailand", "World", "Import"]], row_count=2)
+
+    monkeypatch.setattr(rs, "run_sql", fake_run)
+    lookup = {"table": "trade_flows", "query_id": "find_flows",
+              "params": {"reporter": ["India", "Thailand"], "partner": "World"}, "retry_of": 1}
+    answer = {"table": "trade_flows", "query_id": "trade_value_by_year", "retry_of": 1,
+              "params": {"reporter": {"from_call": 1, "column": "reporterdesc"},
+                         "flow": "Import", "commodity": "Fertilizers"}}
+    router = FakeRouter({"table_query_select": [{"needed": True, "calls": [ORIGINAL]},
+                                                {"needed": True, "calls": [lookup, answer]}]})
+    ev, plan = await _go(router)
+
+    retry = [c for c in plan["calls"] if c.get("retry")]
+    assert retry[0]["query_id"] == "find_flows" and retry[0].get("lookup")
+    assert not retry[0].get("selection_error") and "retry refused" not in str(retry[0].get("error"))
+    answers = [c for c in retry if c["query_id"] == "trade_value_by_year"]
+    assert answers and not any("retry refused" in str(c.get("error")) for c in answers)
+    assert any(e["kind"] == "sql_result" and e["query_id"] == "trade_value_by_year" for e in ev)
+
+
+async def test_a_retry_that_is_not_a_lookup_is_still_checked(harness):
+    _meta, _ran = harness
+    # the same query, but nothing takes values from it: it would answer the
+    # question without its commodity and year, so it is refused as before
+    lone = {"table": "trade_flows", "query_id": "find_flows",
+            "params": {"reporter": ["India", "Thailand"], "partner": "World"}, "retry_of": 1}
+    router = FakeRouter({"table_query_select": [{"needed": True, "calls": [ORIGINAL]},
+                                                {"needed": True, "calls": [lone]}]})
+    _ev, plan = await _go(router)
+    retry = [c for c in plan["calls"] if c.get("retry")]
+    assert retry and "retry refused" in retry[0]["error"] and not retry[0].get("lookup")
