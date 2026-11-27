@@ -203,3 +203,60 @@ def test_existing_concept_names_are_local_names_not_snippets() -> None:
         ]
     )
     assert names == ["Aspirin", "Ibuprofen"]
+
+
+# -- the reply cap is in the MODEL's tokens; batches are counted locally ----------
+
+class _Counting:
+    def __init__(self, factor: float = 2.0, fail: bool = False) -> None:
+        self.factor, self.fail, self.calls = factor, fail, 0
+
+    async def count_tokens(self, *, model: str, text: str) -> int:
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("offline")
+        from backend.app.services.token_budget import count_tokens
+        return int(count_tokens(text) * self.factor)
+
+
+def _router(spec: dict, provider) -> object:
+    from backend.app.services.llm_router import LLMRouter
+
+    r = LLMRouter.__new__(LLMRouter)
+    r.reset_counters()
+    r._tasks = {"match_dedup": spec}
+    r._providers = {spec["provider"]: provider} if provider else {}
+    return r
+
+
+@pytest.mark.asyncio
+async def test_token_ratio_measures_the_models_count_once_per_model():
+    p = _Counting(1.9)
+    r = _router({"provider": "anthropic", "model": "m"}, p)
+    sample = json.dumps(_proposals(20))
+    assert abs(await r.token_ratio("match_dedup", sample) - 1.9) < 0.05
+    await r.token_ratio("match_dedup", sample)
+    assert p.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_token_ratio_setting_wins_and_counting_failure_falls_back():
+    assert await _router({"provider": "anthropic", "model": "m", "token_ratio": 1.5},
+                         _Counting()).token_ratio("match_dedup", "x") == 1.5
+    assert await _router({"provider": "anthropic", "model": "m"},
+                         _Counting(fail=True)).token_ratio("match_dedup", "x y z") == 2.0
+    # a provider without its own count: local counts are the model's (never below 1)
+    assert await _router({"provider": "openai", "model": "m"}, object()).token_ratio("match_dedup", "x") == 1.0
+    assert await _router({"provider": "anthropic", "model": "m"},
+                         _Counting(0.5)).token_ratio("match_dedup", "x y z") == 1.0
+
+
+@pytest.mark.asyncio
+async def test_batches_shrink_by_the_models_token_ratio():
+    from backend.app.services.pipeline_llm import _plan_dedup_batches
+
+    merged = {"MATCH NOT FOUND": _proposals(120)}
+    one = await _plan_dedup_batches(merged, [], 8000, token_ratio=1.0)
+    two = await _plan_dedup_batches(merged, [], 8000, token_ratio=2.0)
+    assert len(two) >= 2 * len(one) - 1 and len(one) >= 2
+    assert sum(len(b["MATCH NOT FOUND"]) for b in two) == 120

@@ -1567,7 +1567,8 @@ def _cluster_text(key: str, entry: dict[str, Any]) -> str:
 
 
 async def _plan_dedup_batches(
-    merged_results: dict[str, Any], existing_concepts: list[str], max_tokens: int
+    merged_results: dict[str, Any], existing_concepts: list[str], max_tokens: int,
+    token_ratio: float = 1.0,
 ) -> list[dict[str, Any]]:
     """Split the proposal set into batches that fit `max_tokens` of output.
 
@@ -1581,7 +1582,9 @@ async def _plan_dedup_batches(
     the deterministic post-merge catches exact string matches only -- so
     'USA' and 'United States' in different batches both survive.
     """
-    budget = max(1, int(max_tokens * _DEDUP_INPUT_SHARE))
+    # max_tokens is in the MODEL's tokens, the counts below are local
+    # (tiktoken): token_ratio converts (Claude counts this JSON ~1.8x).
+    budget = max(1, int(max_tokens * _DEDUP_INPUT_SHARE / max(1.0, token_ratio)))
     # Rule 1 needs the existing-concept list in EVERY batch, so it is fixed
     # overhead that has to come out of the per-batch budget.
     overhead = count_tokens(json.dumps(existing_concepts, ensure_ascii=False))
@@ -1602,6 +1605,14 @@ async def _plan_dedup_batches(
         for group in groups:
             batches.append({key: group})
     return batches
+
+
+def _dedup_token_sample(merged_results: dict[str, Any], per_kind: int = 150) -> str:
+    """Proposals of every kind, rendered as the batches render them, for
+    measuring the model's tokens per local token."""
+    sample = [e for k in _DEDUP_KEYS
+              for e in [x for x in (merged_results.get(k) or []) if isinstance(x, dict)][:per_kind]]
+    return json.dumps(sample, ensure_ascii=False, default=str)
 
 
 def _split_dedup_batch(batch: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1656,10 +1667,14 @@ async def _dedup(
     # reasoning ("thinking") model get a larger max_tokens for its trace
     # without also changing how much each batch holds. Default: max_tokens.
     max_tokens = int(_dedup_spec.get("batch_budget_tokens", _dedup_spec.get("max_tokens", 4096)))
-    batches = await _plan_dedup_batches(merged_results, existing_concepts, max_tokens)
+    ratio = (await router.token_ratio("match_dedup", _dedup_token_sample(merged_results))
+             if hasattr(router, "token_ratio") else 1.0)     # stub routers in tests
+    batches = await _plan_dedup_batches(merged_results, existing_concepts, max_tokens,
+                                        token_ratio=ratio)
     n = len(batches)
     if n > 1:
-        print(f"[stage3] dedup: {n} batches (output budget {max_tokens} tok/batch)")
+        print(f"[stage3] dedup: {n} batches (output budget {max_tokens} tok/batch, "
+              f"{ratio:.2f} model tokens per local token)")
 
     cost_before = router.total_cost_usd
     results: list[dict[str, Any]] = [None] * n  # type: ignore[list-item]
