@@ -677,6 +677,36 @@ DeepInfra 32,768. **DeepInfra / Qwen mode may need the value lowered to 1200**:
 the 27B produced runaway replies even on 1,200-token chunks. Unset the key to
 restore the old cut.
 
+**4000 is the default for OpenAI and Anthropic modes; a smaller value gives a
+more granular class list.** Smaller chunks make the model list more fine-grained
+concepts per piece of text, so the ontology gains more specific classes (along
+with more one-off ones from incidental page text). Offer a smaller value (1200
+or 2000) when the user wants finer-grained classes and accepts the extra cost.
+
+Measured 2026-11-27, OpenAI mode (gpt-6.1-terra, 17 supply-chain docs, same
+cached summaries, full build + 24-question eval), 1,200 vs 4,000:
+
+| | 1,200 | 4,000 |
+|---|---|---|
+| class_proposal calls / cost | 61 / $3.63 | 22 / $1.77 |
+| whole build: time / cost | 44 min / $8.99 | 30 min / $6.85 |
+| new classes / classes in DB | 1,488 / 2,188 | 957 / 1,655 |
+| entities / concepts | 331 / 242 | 356 / 234 |
+| classes used by entities / by concepts | 48 / 136 | 51 / 106 |
+| extracted relationships | 345 | 295 |
+| entities / concepts per summary chunk | 11.8 / 5.7 | 11.7 / 5.3 |
+| questions answered | 23/24 | 23/24 |
+
+Same number of entities and concepts, fewer classes: the concepts spread over
+about a fifth fewer classes and some types get coarser (e.g. oil companies typed
+`Organization` instead of `OilAndGasCompany`; "fuel shortage" under `Shortage`
+instead of `FuelShortage`). Of the ~740 classes only the 1,200 run proposed, 67
+carried entities; the rest were unused, a mix of specific domain classes
+(FlashMemory, NetworkChip, OilExportTerminal, SeaborneTrade) and page clutter
+(Mattress, Balloon, WordGame). Anthropic (Opus 5.5, 36 docs) showed the same
+pattern: 1,486 -> 1,048 new-class proposals. Run-to-run variation at a fixed
+size was not measured, so part of the difference is noise.
+
 | Knob | Drives | Model / limit | Sane value |
 |---|---|---|---|
 | `concurrency.summarization` | evaluated summarizer | mini, ~10M TPM | 32-64 (tier 3+), 8 (tier 1-2) |

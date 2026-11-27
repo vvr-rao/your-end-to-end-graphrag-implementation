@@ -73,7 +73,10 @@ and both scale with chunk count, hence with document count. Measured on a
 30-doc run: $15.77 of $23.06 was Stage 2 alone. Since 2026-11-26 Stage 2 runs on
 4,000-token chunks (`expansion.proposal_chunk_tokens`, separate from the 1,200-
 token pieces stored for retrieval): about 60% fewer calls for the same documents,
-at a measured 1.5-point checklist cost.
+at a measured 1.5-point checklist cost. 4,000 is the default in OpenAI and
+Anthropic modes; a smaller value (1,200–2,000) gives a more granular class list
+at a higher cost (measured on 17 docs: ~1/3 more classes, same entities, concepts
+and answer score; see run-prune-expand "Class-proposal chunk size").
 
 How the subset is chosen:
 1. Every document is summarized, compressed to ~6000 tokens, type-labelled by a
