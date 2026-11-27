@@ -344,6 +344,13 @@ expansion:
   # Measured 2026-11-26 (Opus 5.5 high, 6 supply-chain docs, frozen 77-concept
   # checklist): 1200 -> 4000 cut class-proposal cost 51% ($4.93 -> $2.43),
   # checklist 71.5 -> 70.0, 241 -> 174 new classes; 80 docs: 248 -> 100 calls.
+  # Measured 2026-11-27 (OpenAI mode, 17 docs, full build): 4000 vs 1200 cost
+  # $6.85 vs $8.99 for the whole build (class proposal $1.77 vs $3.63) and gave
+  # LESS GRANULAR classes (957 vs 1,488 new; concepts spread over 106 vs 136
+  # classes, e.g. OilAndGasCompany -> Organization), but about the same number
+  # of entities (356 vs 331), concepts (234 vs 242) and relationships (295 vs
+  # 345), and the same answer score (23/24). Use 1200 when finer-grained
+  # classes matter more than cost.
   # Unset = the old behaviour (summary pieces / chunking.chunk_size).
   # Bigger chunks mean longer replies per call: watch class_proposal
   # finish=max_tokens in cost.json after a smoke test.
