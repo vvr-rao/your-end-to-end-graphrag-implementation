@@ -59,12 +59,14 @@ tasks:
     provider: openai
     model: gpt-6.1-terra
     reasoning_effort: none
-    timeout: 2400
+    timeout: 3200
     temperature: 0.0
-    # gpt-4.1 supports up to 32k output tokens. 32k = ceiling; the model
-    # only emits the tokens it needs so cost scales with actual response
-    # size. At 8192 the JSON response truncated on rich chunks.
-    max_tokens: 32768
+    # gpt-6.1-terra allows 128k output tokens (gpt-4.1: 32k). 64k = ceiling; the
+    # model only emits the tokens it needs so cost scales with actual response
+    # size. OpenAI's TPM limiter reserves max_tokens per request, so a higher
+    # cap fits fewer concurrent calls -- re-run tpm_check.py. Timeout 3200 s =
+    # 64k / 20 tok/s (test_timeout_budgets). At 8192 the JSON response truncated on rich chunks.
+    max_tokens: 64000
     response_format: json_object
 
   # ---------------------------------------------------------------------------
@@ -75,13 +77,13 @@ tasks:
     provider: openai
     model: gpt-6.1-terra
     reasoning_effort: none
-    timeout: 2400
+    timeout: 3200
     temperature: 0.0
     # Dedup echoes the whole deduplicated batch back, so output size tracks
     # input size. At 4096 the JSON truncated mid-object, the parse returned
     # nothing, and the stage silently passed its input through undeduplicated.
     # pipeline_llm._dedup sizes its batches against this value.
-    max_tokens: 32768
+    max_tokens: 64000
     response_format: json_object
 
   # ---------------------------------------------------------------------------

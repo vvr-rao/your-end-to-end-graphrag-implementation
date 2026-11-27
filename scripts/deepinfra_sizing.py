@@ -52,6 +52,8 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import yaml
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -223,6 +225,30 @@ def load_ratios() -> dict[str, dict]:
         except (OSError, ValueError, KeyError):
             pass
     return ratios
+
+
+# Stage 1-2 call ratios were fitted on 1,200-token class-proposal chunks.
+# expansion.proposal_chunk_tokens re-cuts the same summaries into bigger chunks;
+# measured on 80 docs: 248 chunks @1200, 140 @2400, 100 @4000 ~ (1200/N)^0.75
+# (not 1200/N: every document ends in a partial chunk).
+_PROPOSAL_FIT_TOKENS = 1200
+
+
+def scale_for_proposal_chunks(ratios: dict[str, dict], cfg_path: Path | None = None) -> dict[str, dict]:
+    try:
+        cfg = yaml.safe_load((cfg_path or ROOT / "config" / "config.yaml").read_text(encoding="utf-8")) or {}
+        n = int(((cfg.get("expansion") or {}).get("proposal_chunk_tokens")) or 0)
+    except (OSError, ValueError, TypeError):
+        n = 0
+    if n <= _PROPOSAL_FIT_TOKENS:
+        return ratios
+    f = (_PROPOSAL_FIT_TOKENS / n) ** 0.75
+    print(f"   class-proposal chunks {n} tokens: Stage 1-2 calls x{f:.2f}")
+    out = {k: dict(v) for k, v in ratios.items()}
+    for task in ("chunk_classification", "class_proposal"):
+        if task in out:
+            out[task]["per_mtok"] = out[task]["per_mtok"] * f
+    return out
 
 
 def project_workload(total_tokens: int, ratios: dict[str, dict]) -> dict[str, dict]:
@@ -765,7 +791,7 @@ def report(docs_dir: str, argv: list[str]) -> int:
     if model not in MODELS:
         print(f"unknown --model {model}; one of {', '.join(MODELS)}")
         return 2
-    ratios = load_ratios()
+    ratios = scale_for_proposal_chunks(load_ratios())
     stages = project_workload(total, ratios)
     print(f"\n   Projected creation workload ({MODELS[model]['label']}, dedicated):")
     print(f"   {'stage':<22} {'calls':>8} {'in tok':>12} {'out tok':>11} {'ctx/call':>9}")

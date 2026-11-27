@@ -45,22 +45,22 @@ tasks:
     provider: openai
     model: gpt-6.1-terra
     reasoning_effort: none
-    timeout: 2400
+    timeout: 3200
     temperature: 0.0
-    max_tokens: 32768
+    max_tokens: 64000
     response_format: json_object
 
   match_dedup:
     provider: openai
     model: gpt-6.1-terra
     reasoning_effort: none
-    timeout: 2400
+    timeout: 3200
     temperature: 0.0
     # Dedup echoes the whole deduplicated batch back, so output size tracks
     # input size. At 4096 the JSON truncated mid-object, the parse returned
     # nothing, and the stage silently passed its input through undeduplicated.
     # pipeline_llm._dedup sizes its batches against this value.
-    max_tokens: 32768
+    max_tokens: 64000
     response_format: json_object
 
   concept_grouping:

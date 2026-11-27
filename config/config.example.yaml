@@ -334,6 +334,23 @@ corpus_selection:
 expansion:
   # How many ontology classes to send per LLM batch (matches notebook's split_dict_by_size).
   ontology_chunk_size: 50
+  # Class-proposal (Stage 2) chunk size in tokens. Separate from the summary
+  # pieces register-documents stores and retrieval searches
+  # (summarization.summary_chunk_max_tokens, 1200) and from chunking.chunk_size:
+  # prune-expand re-cuts the SAME cached summaries at this size, so changing it
+  # never re-summarizes. Every Stage-2 call carries a fixed ~30k-token load
+  # (instructions + ontology slice) and its reply is about the same size
+  # whatever the chunk, so fewer, larger chunks cost proportionally less.
+  # Measured 2026-11-26 (Opus 5.5 high, 6 supply-chain docs, frozen 77-concept
+  # checklist): 1200 -> 4000 cut class-proposal cost 51% ($4.93 -> $2.43),
+  # checklist 71.5 -> 70.0, 241 -> 174 new classes; 80 docs: 248 -> 100 calls.
+  # Unset = the old behaviour (summary pieces / chunking.chunk_size).
+  # Bigger chunks mean longer replies per call: watch class_proposal
+  # finish=max_tokens in cost.json after a smoke test.
+  # DeepInfra / Qwen mode may need this LOWERED TO 1200: the 27B produced
+  # runaway class_proposal replies even on 1200-token chunks, and that preset
+  # keeps a 32,768-token reply cap (OpenAI presets: 64,000; Anthropic: 64,000).
+  proposal_chunk_tokens: 4000
   # Concurrency cap for LLM calls inside a run (respects provider rate limits).
   #
   # TUNE THIS PER PROVIDER (set via config/models.yaml). Stage-1
