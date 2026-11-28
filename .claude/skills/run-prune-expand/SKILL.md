@@ -832,8 +832,9 @@ uv run python -m backend.app.cli graph-stats --no-db --ontology <PE_DIR>
 ```
 
 **Ontology evaluation (always run it, then report it).** An LLM judge
-(DeepSeek-V4.1-Flash serverless in DeepInfra mode; the cheap judge model in the
-other modes — task `eval_definition_judge`) says yes/no for every class
+(task `eval_definition_judge`: `gpt-6-luna` in the OpenAI presets,
+`claude-haiku-5-5` in Anthropic mode, DeepSeek-V4.1-Flash serverless in DeepInfra
+mode) says yes/no for every class
 definition in the new ontology. Classes with no definition are counted, not
 sent. Cheap (~1 call per 20 classes; ~5,000 classes cost about $0.08):
 ```
@@ -843,10 +844,15 @@ Smoke-test a big ontology first with `--limit 60`. It prints Yes / judged and
 Yes / all for all classes, concept vs other classes, and new (minted by this
 run) vs source classes, and saves every verdict with its one-line reason to
 `.build/evals/ontology/<PE_DIR name>/definitions-<time>.jsonl` (gitignored) for
-the user to review. **LangSmith:** when `LANGSMITH_API_KEY` is installed, the
-report uploads by itself to the `graphrag-corpus-evals` tracing project (the
-output ends with a `[langsmith] project ...` line; check with `uv run python scripts/check_env.py LANGSMITH_API_KEY`, which
-never prints the key). With no key nothing is sent; say so.
+the user to review. **LangSmith (optional -- only needed if the user wants the
+report saved there):** when `LANGSMITH_API_KEY` is in `.env` and `langsmith.user`
+is set in `config/config.yaml`, the report uploads by itself to the
+`graphrag-corpus-evals` tracing project (the output ends with a
+`[langsmith] project ...` line; check with
+`uv run python scripts/check_env.py --optional LANGSMITH_API_KEY --config langsmith.user`,
+which never prints the key). If not set, do not block: say "LangSmith: not
+configured, nothing uploaded"; the user adds the key to `.env` themselves if they
+want it (never in the chat).
 
 **With `--structured-data`:** also report the `[structured] N table(s): N
 profiled, N from cache, N failed; N new class(es); N lookup(s)` line, any

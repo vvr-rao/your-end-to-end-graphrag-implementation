@@ -108,6 +108,31 @@ are present in `.env`. Every mode except DeepInfra needs `OPENAI_API_KEY`
 of the build: DeepInfra builds on rented GPUs (step 2b) and needs its own
 database (step 2).
 
+### 1b. Optional: LangSmith + Hugging Face (ask once, never required)
+Both are **optional**. The build, the evaluations and every answer work without
+them. Mention them once here, and skip if the user is not interested:
+
+- `LANGSMITH_API_KEY` (in `.env`) + `langsmith.user` (in `config/config.yaml`,
+  a name, not a secret) -- **only** needed if the user wants evaluation runs and
+  traces saved to LangSmith. Without them the evaluations still run and print
+  locally; nothing is uploaded.
+- `HF_TOKEN` (in `.env`; "read" to download, "write" to upload) -- **only**
+  needed if the user wants to download datasets (corpora, structured data, test
+  sets) from Hugging Face, or store their own in a private repo
+  (`source_documents/hf_dataset.py`, needs `uv sync --extra hf`).
+
+Check presence only (prints present / not set, never a value; always exits 0
+for optional keys):
+```
+uv run python scripts/check_env.py --optional LANGSMITH_API_KEY HF_TOKEN --config langsmith.user
+```
+If one is not set and the user wants that feature, tell them which line to add
+**themselves**: open `.env` in their editor and set `LANGSMITH_API_KEY=` or
+`HF_TOKEN=`, and set `langsmith.user:` in `config/config.yaml`. **Never** ask
+for a key in the chat, never read `.env`, and re-run the check above to confirm.
+If the user declines, carry on: report "LangSmith: not configured, nothing
+uploaded" with each evaluation.
+
 ### 2. Database  →  invoke skill **setup-database**
 Ask "have a Postgres DSN, or make a local one?" — warn that a local DB isn't
 deploy-ready. Bring up docker Postgres if needed, then migrate + verify. Can run

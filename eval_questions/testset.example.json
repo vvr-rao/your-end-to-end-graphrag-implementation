@@ -1,0 +1,38 @@
+{
+ "format": "graphrag-testset/1",
+ "name": "my-corpus",
+ "corpus": "source_documents/my-corpus",
+ "description": "Template: copy to eval_questions/testsets/<name>.json and replace the questions. Documents are named by file name.",
+ "use_structured_data": false,
+ "questions": [
+  {
+   "id": "q001",
+   "question": "What was Example Corp's revenue in fiscal 2025?",
+   "gold_documents": ["example_corp_10k_2025.pdf"],
+   "supporting_documents": ["example_corp_q4_2025_press_release.pdf"],
+   "answer_strings": ["12,345"],
+   "answer_match": "all",
+   "tags": ["finance", "single-doc"]
+  },
+  {
+   "id": "q002",
+   "question": "Which two subsidiaries did Example Corp acquire in 2024?",
+   "gold_documents": ["example_corp_10k_2024.pdf", "example_corp_10k_2025.pdf"],
+   "answer_strings": ["Alpha Ltd", "Beta GmbH"],
+   "answer_match": "all",
+   "tags": ["multi-doc"]
+  },
+  {
+   "id": "q003",
+   "question": "Name any supplier mentioned in the 2025 annual report.",
+   "gold_documents": ["example_corp_10k_2025.pdf"],
+   "answer_strings": ["Gamma Inc", "Delta plc"],
+   "answer_match": "any"
+  },
+  {
+   "id": "q004",
+   "question": "Summarise the main supply-chain risks discussed across the corpus.",
+   "tags": ["open-ended", "no-gold"]
+  }
+ ]
+}

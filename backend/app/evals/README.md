@@ -39,7 +39,7 @@ A judge model says **yes or no** for every item, with a one-line reason. Cheap
 (about one call per 20 items) but not free; nothing in the graph or the
 ontology is changed. The model is the task `eval_typing_judge` /
 `eval_definition_judge` in models.yaml: DeepSeek-V4.1-Flash (serverless) in
-DeepInfra mode, gpt-4o-mini in the OpenAI presets, claude-haiku-4-5 in the
+DeepInfra mode, gpt-6-luna in the OpenAI presets, claude-haiku-5-5 in the
 Anthropic preset.
 
 ```
