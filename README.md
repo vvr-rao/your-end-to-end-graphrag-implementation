@@ -82,7 +82,7 @@ Conversation view: a prior *simple_qa* turn with its cited answer, plus a *deep_
 
 ## Build it by chatting with Claude Code
 
-**New in v3.** YEGI includes a set of [Claude Code](https://claude.com/claude-code) skills so you can build the whole system by talking to Claude instead of running each CLI command yourself. Clone the repo, open Claude Code inside it, and say **"where do I start"** (or "build the app").
+YEGI includes a set of [Claude Code](https://claude.com/claude-code) skills so you can build the whole system by talking to Claude instead of running each CLI command yourself. Clone the repo, open Claude Code inside it, and say **"where do I start"** (or "build the app").
 
 ### Prerequisites
 
@@ -137,6 +137,259 @@ What makes it safe and resumable:
 ### Deploying to Render — fork the repo first
 
 Render deploys from **your** GitHub repository via the `render.yaml` blueprint, so to deploy you must **fork this repo to your own GitHub account** (or push a copy there), then point Claude / `render-init` at your fork. You can build and run everything locally without forking — the fork is only needed for the Render deploy step.
+
+
+## Evaluations
+
+YEGI ships standing evaluations for the two halves of the pipeline: how
+well the **ontology and graph** were built, and how well **retrieval and
+answers** work against a test set. Run them after every build and on every
+question test. Every report is printed and saved as JSON under
+`.build/evals/<database>/` (gitignored). `--out` writes the JSON elsewhere.
+Full definitions are in [`backend/app/evals/README.md`](backend/app/evals/README.md).
+
+> **If you build through Claude Code** (the `build-app` / `run-prune-expand` /
+> `ingest-corpus` skills), Claude runs the ontology and entity evaluations for
+> you (`eval-ontology`, `eval-corpus`, `eval-typing`) and reports the results.
+> If you give it a question file or test set, it also runs `eval-questions`, and
+> asks before the paid `--answer` step. If you run the CLI yourself, only
+> `eval-corpus` runs on its own, at the end of `extract-entities` and
+> `enrich-geo`. Run the others by hand.
+
+| Command | Run it | Cost |
+|---|---|---|
+| `eval-ontology <prune-expand folder>` | after `prune-expand` | LLM judge, about 1 cheap call per 20 classes |
+| `eval-corpus` | runs automatically at the end of `extract-entities` and `enrich-geo`; re-run after anything that changes entities or relationships | free (database queries only) |
+| `eval-typing` | after `extract-entities` | LLM judge, about 1 cheap call per 20 entities |
+| `eval-questions <test set>` | whenever a question set is created or tested | the question parse only; `--answer` adds the answer call |
+| `evaluate-queries` | judged answer quality (see [10. Automated Evaluation](#10-automated-evaluation)) | judge models, several runs per question |
+
+**Integrations (both optional; nothing is sent without a key):**
+
+- **LangSmith.** Add `LANGSMITH_API_KEY` to `.env` and set `langsmith.user`
+  in `config/config.yaml`. Every evaluation is then uploaded automatically
+  (details [below](#langsmith)). `--no-langsmith` skips one upload.
+- **Hugging Face.** Add `HF_TOKEN` to `.env` ("write" to push, "read" to
+  pull) and `uv sync --extra hf`. You can then store test sets in a
+  **private** Hugging Face dataset repo, together with the corpus they belong
+  to, and download them into another checkout:
+  `uv run python source_documents/hf_dataset.py push --repo <name> --corpus source_documents/<corpus> --eval eval_questions/testsets/<name>.json`,
+  and `pull --repo <owner>/<name> [--kind eval]`. Pull restores each file to
+  the same path, so the test set's `"corpus"` still resolves. See
+  [Saving datasets to Hugging Face](#saving-datasets-to-hugging-face-optional).
+
+### Ontology and Entity creation Evals
+
+#### `eval-ontology`: class definitions (LLM judge)
+
+```bash
+uv run python -m backend.app.cli eval-ontology output_ontologies/<v...-prune-expand> [--limit N] [--label NAME] [--no-langsmith]
+```
+
+For every class in the prune-expand output, a judge model sees the class
+label, its definition and its parent classes, and answers **yes or no** (with
+a one-line reason): does the definition fit the class? Classes with no
+definition are not sent; they are counted as `no_definition`. Results are
+grouped as: all classes, concept classes vs other classes, and **new** classes
+(minted by prune-expand) vs **source** classes (from the input ontologies).
+
+#### `eval-typing`: entity and concept classes (LLM judge)
+
+```bash
+uv run python -m backend.app.cli eval-typing [--limit N] [--label NAME] [--no-langsmith]
+```
+
+For every entity and concept in the database, the judge sees its name,
+whether it is an entity or a concept, its class, the class definition, the
+parent classes and a passage where it is mentioned. It answers yes or no: is
+the class right? Results are grouped as: all, entities, concepts and places.
+
+Both judges report, per group: yes, no, unanswered (failed call),
+no definition, and two percentages: **Yes / judged**, and **Yes / all**
+(unanswered and no-definition items count against the second). `--limit N`
+judges a fixed pseudo-random sample. The judge model is the task
+`eval_typing_judge` / `eval_definition_judge` in `config/models.yaml`
+(`gpt-6-luna` in the OpenAI presets, `claude-haiku-5-5` in Anthropic mode,
+`DeepSeek-V4.1-Flash` in DeepInfra mode). Nothing in the graph or the ontology
+is changed. Every verdict and reason is saved for review:
+`.build/evals/<database>/typing-<time>.jsonl` and
+`.build/evals/ontology/<folder>/definitions-<time>.jsonl`, each with a `.json`
+summary.
+
+#### `eval-corpus`: graph coverage (free)
+
+```bash
+uv run python -m backend.app.cli eval-corpus [--label NAME] [--no-langsmith]
+```
+
+Entities are split three ways: **concepts** (typed under
+`extraction.concept_class_roots`), **places** (typed under a geographic class)
+and other **named entities**.
+
+| Metric | Definition |
+|---|---|
+| Entities / concepts per chunk | Mean and median, per chunk kind (summary, fulltext), counted from `viao:assertsAbout` mention edges |
+| Chunks without entities or concepts | Per chunk kind; also without entities, and without concepts |
+| Chunks by count | How many chunks mention 0, 1, 2, 3, 4, 5 and more than 5 entities and concepts (together, entities alone, concepts alone) |
+| Relationships | Edges split entity–entity, entity–concept, concept–concept; place-containment edges counted separately |
+| Entities per class | Mean and median over classes with at least one entity (entity classes, concept classes, both) |
+| Classes with more than 50 entities | Count and the largest classes |
+| Relationships per node | Entities and concepts with 0, 1, 2, 3 and more than 3 relationships |
+
+### Retrieval Evals
+
+#### `eval-questions`: what it needs
+
+1. **A database built from the test set's corpus.** It runs the real
+   retrieval pipeline against `DATABASE_URL`. Documents are matched by file
+   name (`documents.file_name`), so any database built from that corpus works.
+2. **A test set** in the `graphrag-testset/1` JSON format below (keep them in
+   `eval_questions/testsets/<corpus>.json`, which is gitignored). A plain
+   question file (one question per line, `#` comments allowed) also runs, but
+   it gets only the coverage metrics, with no scores.
+
+```bash
+# retrieval only (cost: the question parse)
+uv run python -m backend.app.cli eval-questions eval_questions/testsets/<name>.json [--k 10]
+# retrieval + the answer call (paid), scored against answer_strings
+uv run python -m backend.app.cli eval-questions eval_questions/testsets/<name>.json --answer \
+  [--mode simple_qa|deep_research] [--use-structured-data] [--out report.json]
+# a test set stored in LangSmith
+uv run python -m backend.app.cli eval-questions --dataset graphrag-<name> --answer
+# score finished `query` runs from their stored traces (free); --testset adds gold
+uv run python -m backend.app.cli eval-questions --logs results/q*.log --testset eval_questions/testsets/<name>.json
+uv run python -m backend.app.cli eval-questions --run-ids <id> <id> ...
+```
+
+| Flag | Meaning |
+|---|---|
+| `--answer` | also generate the answer (paid synthesis call per question) |
+| `--mode` | `simple_qa` (default) or `deep_research` |
+| `--k N` | cut-off for Recall/Precision/MRR (default `evals.k`, 10) |
+| `--use-structured-data` | answer from the loaded tables too (a test set with `"use_structured_data": true` does this without the flag) |
+| `--dataset NAME` | read the test set from LangSmith instead of a file |
+| `--batch-size N`, `--traces-dir DIR` | long sets run `evals.batch_size` (25) questions per child process; re-running with the same `--traces-dir` skips finished batches. `--batch-size 0` runs everything in one process |
+
+#### Test set format
+
+Template: [`eval_questions/testset.example.json`](eval_questions/testset.example.json).
+Copy it to `eval_questions/testsets/<name>.json` and replace the questions.
+
+```json
+{"format": "graphrag-testset/1",
+ "name": "fingen",
+ "corpus": "source_documents/fin-gen-subset",
+ "description": "...",
+ "use_structured_data": false,
+ "questions": [
+   {"id": "q001",
+    "question": "What was LGES revenue in 1Q 2025?",
+    "gold_documents": ["2025_1Q_LGES_Audit_Report_FS_en.pdf"],
+    "supporting_documents": [],
+    "answer_strings": ["6,265"],
+    "answer_match": "all",
+    "tags": ["finance"]}]}
+```
+
+| Field | Required | Notes |
+|---|---|---|
+| `format` | no | if present, must be `graphrag-testset/1` |
+| `name` | yes | also names the LangSmith dataset |
+| `questions` | yes, non-empty | duplicate ids or duplicate question texts are rejected |
+| `question` | yes | |
+| `id` | no | defaults to `q001`, `q002`, … |
+| `gold_documents` | no | file names of the documents holding the answer; drive the document scores |
+| `supporting_documents` | no | recorded, not scored |
+| `answer_strings` | no | verbatim text the answer contains (a figure, a name); drive the answer scores |
+| `answer_match` | no | `all` (default: every string needed) or `any` (one is enough) |
+| `tags` | no | free labels |
+| `corpus`, `description` | no | informational; `corpus` is the folder the database was built from |
+| `use_structured_data` | no | run every question with SQL over the tables |
+
+The loader validates the file and stops with a message naming the problem.
+A question with no gold documents still gets the coverage metrics and is left
+out of the document scores; the same for answer strings and the answer scores.
+
+#### What it reports
+
+**Coverage, per question (every question):**
+
+1. *What the question ties to*: its seed named entities, concepts, places and
+   time periods, and their classes (entity, concept and place classes, time
+   levels), plus the ontology classes the parse matched and the concept-area
+   classes its terms name. The summary counts questions that tie to nothing,
+   to no entities, to no concepts, and to places and time.
+2. *What the graph walk found*: entities the walk reached, the summary chunks
+   they are mentioned in, and how many of those reached the final evidence.
+   Also whether the document arm fired (and why) and what the full-text
+   bridge's document limit cut.
+
+**Document scores (questions with `gold_documents`).** The ranked evidence
+chunks become a ranked list of distinct documents (a document counts once, at
+its first chunk; intelligence artifacts are not counted):
+
+| Metric | Definition |
+|---|---|
+| Recall@K | gold documents in the top K / all gold documents |
+| Precision@K | gold documents in the top K / K (always divided by K, so with one gold document the best score at K=10 is 0.1) |
+| MRR@K | 1 / rank of the first gold document within the top K, else 0 |
+
+**NDCG is not implemented**: gold is binary (a document is gold or it is
+not), with no relevance grades.
+
+**Answer scores (questions with `answer_strings`).** Checked at the passage
+level, over the text of the retrieved evidence chunks:
+
+| Metric | Definition |
+|---|---|
+| `answer_recall` | share of the needed answer strings found in the evidence |
+| `answer_found` | 1 when enough strings were found (all, or one for `any`) |
+| `answer_mrr` / `answer_rank` | rank of the first evidence chunk holding an answer string (over all evidence, not cut at K) |
+| `answer_in_reply` | with `--answer` only: share of the needed answer strings found in the generated reply |
+
+Matching rules:
+
+- **Text** is compared after normalising: curly quotes and dash variants
+  folded, accents removed, case ignored.
+- **Plain numbers** are matched by value, never as substrings. "31.4" does not
+  match "131.4". An expected "6,270,000,000" is met by "6.27 billion". A reply
+  number rounded *or* truncated to the expected decimals counts, so "3,028"
+  matches 3,028.744. An expected number with its own unit ("1.24 million") is
+  compared at that magnitude only.
+- `answer_in_reply` is a string check, not a judge. A correct answer worded
+  differently, or in a unit the rules above do not convert, counts as a miss.
+  For judged answer quality use `evaluate-queries`.
+- The evidence-side scores read chunk text only. A figure that came from a
+  table via SQL appears in `answer_in_reply`, not in `answer_recall`.
+
+### LangSmith
+
+With `LANGSMITH_API_KEY` in `.env`, uploads happen automatically. Without it
+nothing is sent and nothing fails. Uploads are skipped with a message until
+`langsmith.user` is set in `config/config.yaml`.
+
+- **Question evaluations.** The test set becomes the dataset
+  `<langsmith.dataset_prefix>-<test set name>` (default prefix `graphrag`;
+  only missing questions are added). Each run becomes an experiment named
+  `<langsmith.user>-<test set>-<mode>`. Each trace carries the answer (when one
+  was generated), the ranked documents, the evidence chunk ids, the gold and
+  answer strings found and missed, and every score above as a feedback column.
+  **Chunk text is never uploaded.**
+- **Corpus and judge evaluations** have no questions, so no dataset. Each
+  becomes a run in the tracing project `langsmith.corpus_project` (default
+  `graphrag-corpus-evals`), named `corpus-eval: <label or database>`,
+  `typing-eval: <label or database>` or `ontology-eval: <label or folder>`.
+  Every number is a feedback score on the run (89 for the corpus evaluation),
+  and the metadata holds the user, database, label, git commit and config
+  paths. Filter on `metadata.database` or `metadata.label` to follow one
+  corpus, and chart any score over time in the monitoring tab.
+- **Moving test sets:**
+
+```bash
+uv run python -m backend.app.cli eval-dataset push eval_questions/testsets/<name>.json
+uv run python -m backend.app.cli eval-dataset list
+uv run python -m backend.app.cli eval-dataset pull graphrag-<name> [--out FILE]
+```
 
 
 ## Other Important Details

@@ -700,8 +700,9 @@ count; free, saved under `.build/evals/`). Definitions:
 `backend/app/evals/README.md`.
 
 **Typing evaluation (always run it after the corpus evaluation, then report
-it).** An LLM judge (DeepSeek-V4.1-Flash serverless in DeepInfra mode; the cheap
-judge model otherwise — task `eval_typing_judge`) says yes/no for every entity's
+it).** An LLM judge (task `eval_typing_judge`: `gpt-6-luna` in the OpenAI
+presets, `claude-haiku-5-5` in Anthropic mode, DeepSeek-V4.1-Flash serverless in
+DeepInfra mode) says yes/no for every entity's
 class and every concept's concept class, reading the class definition, its
 parents and a passage where the entity is mentioned. ~1 call per 20 entities
 (~1,200 entities cost about $0.05); smoke-test with `--limit 60` first:
@@ -712,17 +713,36 @@ It prints Yes / judged and Yes / all for all, entities, concepts and places, and
 saves every verdict and reason to `.build/evals/<database>/typing-<time>.jsonl`
 (gitignored) for the user to review.
 
-**LangSmith (corpus and typing evaluations).** When `LANGSMITH_API_KEY` is
-installed both reports upload by themselves to the `graphrag-corpus-evals`
-tracing project (each output ends with a `[langsmith] project ...` line). Check
-without reading `.env`: `uv run python scripts/check_env.py LANGSMITH_API_KEY`
-(prints present / MISSING, never the key).
+**LangSmith (optional).** LangSmith is only needed if the user wants the
+evaluations saved there; every evaluation runs and prints locally without it.
+When `LANGSMITH_API_KEY` is in `.env` and `langsmith.user` is set in
+`config/config.yaml`, both reports upload by themselves to the
+`graphrag-corpus-evals` tracing project (each output ends with a
+`[langsmith] project ...` line). Check without reading `.env`:
+`uv run python scripts/check_env.py --optional LANGSMITH_API_KEY --config langsmith.user`
+(prints present / not set, never the key). If not set, do not block: say
+"LangSmith: not configured, nothing uploaded" in the hand-back, and if the user
+wants it, tell them to add the key to `.env` themselves (never in the chat; see
+build-app step 1b).
 Pass the same `--label <build name>` to `eval-corpus` and `eval-typing` so the
-runs line up. With no key nothing is sent; say so in the hand-back.
+runs line up.
 
-If the user has an evaluation question set, also
-run `uv run python -m backend.app.cli eval-questions <file>` (question parse
-cost only) and report what the questions tie to and what the walk finds.
+**Question evaluation.** If the user has questions, run `eval-questions`. A
+plain question file (one per line) gives only the coverage metrics (what the
+questions tie to, what the walk finds). A **test set** adds scores: copy the
+template `eval_questions/testset.example.json` to
+`eval_questions/testsets/<name>.json` and fill in `gold_documents` (file names)
+for Recall@K / Precision@K / MRR@K, and `answer_strings` for the answer scores
+(format and metrics: README "Evaluations"). Retrieval only costs the question
+parse; `--answer` adds a paid answer call per question (needed for
+`answer_in_reply`) -- give the user the question count and ask before adding it:
+```
+uv run python -m backend.app.cli eval-questions eval_questions/testsets/<name>.json
+uv run python -m backend.app.cli eval-questions eval_questions/testsets/<name>.json --answer
+```
+Report recall@K, precision@K, mrr@K and the answer scores with the coverage
+numbers. With LangSmith configured, the run is uploaded as an experiment on the
+dataset `graphrag-<name>` (no chunk text is sent).
 
 **If structured tables were loaded (Step 3b),** every answer command needs the
 flag, or the tables are never read (`qa.use_structured_data` is off by default):

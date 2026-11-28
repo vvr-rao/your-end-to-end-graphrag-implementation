@@ -469,7 +469,7 @@ Once a folder is used, the later steps take matching flags (all listed below):
 `uv run python -m backend.app.cli --help`. Groups: ontology (`merge`, `prune`,
 `expand`, `prune-expand`, `build`), DB (`db-migrate`, `db-status`, `db-size`, `graph-stats`,
 `enrich-geo`, `embed-relationships`, `relink-artifact-entities`, `classify-concepts`,
-`db-init`, `clear-corpus`), evaluation (`eval-corpus`, `eval-typing` and `eval-ontology` (LLM-as-judge yes/no on entity typing and class definitions), `eval-questions`, `eval-dataset`; Recall@K/Precision@K/MRR on `eval_questions/testsets/`; optional LangSmith upload; see `backend/app/evals/README.md`), corpus (`register-documents`, `list-documents`,
+`db-init`, `clear-corpus`), evaluation (`eval-corpus`, `eval-typing` and `eval-ontology` (LLM-as-judge yes/no on entity typing and class definitions), `eval-questions`, `eval-dataset`; Recall@K/Precision@K/MRR on `eval_questions/testsets/`; optional LangSmith upload (needs `LANGSMITH_API_KEY` + `langsmith.user`, only to save runs there) and optional Hugging Face test-set storage (`HF_TOKEN`, only to download/store datasets); test set template `eval_questions/testset.example.json`; see README "Evaluations" and `backend/app/evals/README.md`), corpus (`register-documents`, `list-documents`,
 `update-document`, `delete-document`), enrichment (`extract-entities`,
 `enrich-time`, `generate-artifacts`), structured data (`table-metadata-export`,
 `table-metadata-import`, `table-metadata-refine`, `table-ontology-update`,

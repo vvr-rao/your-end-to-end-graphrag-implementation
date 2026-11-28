@@ -72,6 +72,34 @@ def test_check_env_missing_key_exits_nonzero():
     assert "MISSING" in r.stdout
 
 
+def test_check_env_optional_keys_never_fail():
+    r = _run([str(SCRIPTS / "check_env.py"), "--optional", "DEFINITELY_NOT_A_REAL_KEY_9Z"])
+    assert r.returncode == 0
+    assert "not set (optional)" in r.stdout
+    assert "MISSING" not in r.stdout
+
+
+def test_check_env_config_key_reports_set_only(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("langsmith:\n  user: someone\n  blank: \"\"\n", encoding="utf-8")
+    env = {"APP_CONFIG_PATH": str(cfg)}
+    r = _run([str(SCRIPTS / "check_env.py"), "--config", "langsmith.user",
+              "langsmith.blank", "langsmith.absent"], env=env)
+    assert r.returncode == 0
+    assert "langsmith.user (config.yaml): set" in r.stdout
+    assert "langsmith.blank (config.yaml): not set" in r.stdout
+    assert "langsmith.absent (config.yaml): not set" in r.stdout
+    assert "someone" not in r.stdout          # the value is never printed
+
+
+def test_check_env_required_still_fails_alongside_optional():
+    r = _run([str(SCRIPTS / "check_env.py"), "DEFINITELY_NOT_A_REAL_KEY_9Z",
+              "--optional", "ANOTHER_FAKE_KEY_9Z"])
+    assert r.returncode == 1
+    assert "DEFINITELY_NOT_A_REAL_KEY_9Z: MISSING" in r.stdout
+    assert "ANOTHER_FAKE_KEY_9Z: not set (optional)" in r.stdout
+
+
 @pytest.mark.parametrize("code,expect", [(0, "SUCCESS"), (3, "FAILED")])
 def test_durable_harness_launch_and_status(tmp_path, code, expect):
     """Launch a detached job and poll its status to completion — the cross-platform
